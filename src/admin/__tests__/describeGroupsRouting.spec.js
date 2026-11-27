@@ -2290,7 +2290,8 @@ describe('Admin > describeGroups > a coordinator node that moved to another addr
    * A real Kafka admin over a cluster whose node 1 is the coordinator of every group, at `OLD`
    * until `state.moved`, then at `NEW`; both addresses stay up and answer as node 1. Metadata and
    * FindCoordinator name node 1 at its current address. ConsumerGroupDescribe is answered by
-   * `answer(host, groupId, call)` on the real broker the client picked, by that broker's address.
+   * `answer(host, groupId, call, state)` on the real broker the client picked, by that broker's
+   * address; `metadataSeen` holds how many Metadata requests had been written at each such call.
    */
   const movingCluster = (answer) => {
     const state = { moved: false }
@@ -2312,21 +2313,23 @@ describe('Admin > describeGroups > a coordinator node that moved to another addr
         })),
       }))
     const asked = []
+    const metadataSeen = []
+    const metadataRequests = () => scripted.requests().filter(({ api }) => api === 'Metadata')
     jest.spyOn(Broker.prototype, 'consumerGroupDescribe').mockImplementation(async function ({
       groupIds,
     }) {
       asked.push([this.connectionPool.host, ...groupIds])
+      metadataSeen.push(metadataRequests().length)
       return {
         groups: groupIds.flatMap((groupId) =>
-          answer(this.connectionPool.host, groupId, asked.length)
+          answer(this.connectionPool.host, groupId, asked.length, state)
         ),
       }
     })
     const admin = new Kafka(
       scripted.kafkaOptions({ brokers: [`${A.host}:${A.port}`], retry: tenMsRetry })
     ).admin()
-    const metadataRequests = () => scripted.requests().filter(({ api }) => api === 'Metadata')
-    return { scripted, admin, state, asked, metadataRequests }
+    return { scripted, admin, state, asked, metadataSeen, metadataRequests }
   }
 
   const run = async ({ scripted, admin }, work) => {
@@ -2342,24 +2345,26 @@ describe('Admin > describeGroups > a coordinator node that moved to another addr
   }
 
   test('sends the next request to the new address after the old address answers NOT_COORDINATOR, with one metadata refresh', async () => {
-    const fixture = movingCluster((host, groupId) =>
-      host === OLD.host
-        ? [{ ...consumerGroupRow(groupId), errorCode: NOT_COORDINATOR, members: [] }]
-        : [consumerGroupRow(groupId)]
-    )
-    let before
-    const outcome = await run(fixture, () => {
-      fixture.state.moved = true
-      before = fixture.metadataRequests().length
-      return fixture.admin.describeGroups(['g'])
+    const fixture = movingCluster((host, groupId, _call, state) => {
+      if (host !== OLD.host) return [consumerGroupRow(groupId)]
+      // The coordinator moves while its old address still answers: from this answer on, Metadata
+      // and FindCoordinator name node 1 at the new address, which the client has not learned yet.
+      state.moved = true
+      return [{ ...consumerGroupRow(groupId), errorCode: NOT_COORDINATOR, members: [] }]
     })
+    const outcome = await run(fixture, () => fixture.admin.describeGroups(['g']))
 
     expect(outcome.error).toBeUndefined()
+    // The client knew node 1 at the old address, so its first request went there and got 16...
     expect(fixture.asked).toEqual([
       [OLD.host, 'g'],
       [NEW.host, 'g'],
     ])
-    expect(fixture.metadataRequests().length - before).toBe(1)
+    expect(fixture.state.moved).toBe(true)
+    // ...then exactly one Metadata request, served after the 16, moved node 1 to the new address
+    // before the next request, and none followed.
+    expect(fixture.metadataSeen[1] - fixture.metadataSeen[0]).toBe(1)
+    expect(fixture.metadataRequests()).toHaveLength(fixture.metadataSeen[1])
     expect(outcome.value.groups.map(({ groupId, errorCode }) => [groupId, errorCode])).toEqual([
       ['g', 0],
     ])
