@@ -558,20 +558,35 @@ describe('Consumer > classic group protocol > the leader round guards', () => {
     )
   })
 
+  /** The rows `a:[0]` then `a:[1]`. */
+  const repeatedRows = new Encoder()
+    .writeInt16(1)
+    .writeArray([
+      new Encoder().writeString('a').writeArray([0]),
+      new Encoder().writeString('a').writeArray([1]),
+    ])
+    .writeBytes(Buffer.alloc(0)).buffer
+
   /**
-   * A cooperative leader `m1` whose custom assigner hands `m3` the rows `a:[0]` then `a:[1]`, as a
-   * coordinator relays them unread, while `m2` advertises `owned` of topic `a`.
+   * The row `a:[0]` then a row `b` whose partition list is the null array: this client refuses the
+   * whole assignment, while an older reader applies `a-0` and reads the null list as empty.
+   */
+  const nullListRows = new Encoder()
+    .writeInt16(1)
+    .writeArray([
+      new Encoder().writeString('a').writeArray([0]),
+      new Encoder().writeString('b').writeInt32(-1),
+    ])
+    .writeBytes(Buffer.alloc(0)).buffer
+
+  /**
+   * A cooperative leader `m1` whose custom assigner hands `m3` the bytes `rows`, as a coordinator
+   * relays them unread, while `m2` advertises `owned` of topic `a`.
    * @param {number[]} owned
+   * @param {Buffer} [rows]
    * @returns {{ protocol: ClassicGroupProtocol, syncGroup: jest.Mock }}
    */
-  const cooperativeLeader = (owned) => {
-    const rows = new Encoder()
-      .writeInt16(1)
-      .writeArray([
-        new Encoder().writeString('a').writeArray([0]),
-        new Encoder().writeString('a').writeArray([1]),
-      ])
-      .writeBytes(Buffer.alloc(0)).buffer
+  const cooperativeLeader = (owned, rows = repeatedRows) => {
     const protocol = leader({
       mode: COOPERATIVE,
       assigners: [
@@ -634,6 +649,38 @@ describe('Consumer > classic group protocol > the leader round guards', () => {
     expect(syncGroup.mock.calls[0][0].groupAssignment).toContainEqual({
       memberId: 'm3',
       memberAssignment: expect.any(Buffer),
+    })
+  })
+
+  it('checks the rows an older reader applies from bytes this member refuses, and sends no SyncGroup while another member owns one of them', async () => {
+    const { protocol, syncGroup } = cooperativeLeader([0], nullListRows)
+
+    await expect(
+      protocol.sync({
+        topics: ['a'],
+        topicsSubscribed: ['a'],
+        beforeSync: jest.fn(),
+        round: fakeRound(),
+      })
+    ).rejects.toThrow('a-0 to m3 while m2 still owns it')
+    expect(syncGroup).not.toHaveBeenCalled()
+  })
+
+  it('sends bytes this member refuses unchanged when no other member owns a partition an older reader applies from them', async () => {
+    const { protocol, syncGroup } = cooperativeLeader([], nullListRows)
+
+    await expect(
+      protocol.sync({
+        topics: ['a'],
+        topicsSubscribed: ['a'],
+        beforeSync: jest.fn(),
+        round: fakeRound(),
+      })
+    ).resolves.toMatchObject({ assignment: {} })
+    expect(syncGroup).toHaveBeenCalledTimes(1)
+    expect(syncGroup.mock.calls[0][0].groupAssignment).toContainEqual({
+      memberId: 'm3',
+      memberAssignment: nullListRows,
     })
   })
 })

@@ -1,15 +1,21 @@
+const { performance: realClock } = require('perf_hooks')
 const Encoder = require('../../protocol/encoder')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const joinGroupV8 = require('../../../testHelpers/wire/joinGroupV8')
+const syncGroupV5 = require('../../../testHelpers/wire/syncGroupV5')
 const { createGroupApiBroker } = require('../../broker/__tests__/fixtures/groupApiHarness')
 const createConsumer = require('../index')
 const ConsumerGroup = require('../consumerGroup')
 const OffsetOperations = require('../offsetManager/offsetOperations')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
-const { MemberAssignment } = require('../assignerProtocol')
+const { MemberAssignment, MemberMetadata } = require('../assignerProtocol')
 const { assertJoinAnswer } = require('../../protocol/requests/groupProtocolCheck')
 const { createErrorFromCode } = require('../../protocol/error')
-const { KafkaJSPartialMessageError, KafkaJSProtocolError } = require('../../errors')
+const {
+  KafkaJSNonRetriableError,
+  KafkaJSPartialMessageError,
+  KafkaJSProtocolError,
+} = require('../../errors')
 const { LEVELS } = require('../../loggers')
 const { newLogger } = require('testHelpers')
 
@@ -58,12 +64,13 @@ const joinAnswer = (fields = {}) =>
  * A successful SyncGroup answer, with no throttling. v5 reports the protocol this member sent.
  * @param {Buffer|null} assignment null writes the null of the version's bytes type
  * @param {number} [version]
+ * @param {string} [protocolName] what v5 reports
  * @returns {Buffer}
  */
-const syncAnswer = (assignment, version = 3) => {
+const syncAnswer = (assignment, version = 3, protocolName = PROTOCOL) => {
   const encoder = new Encoder().writeInt32(0).writeInt16(0)
   if (version < 4) return encoder.writeBytes(assignment).buffer
-  if (version >= 5) encoder.writeUVarIntString('consumer').writeUVarIntString(PROTOCOL)
+  if (version >= 5) encoder.writeUVarIntString('consumer').writeUVarIntString(protocolName)
   return encoder.writeUVarIntBytes(assignment).writeTaggedFields().buffer
 }
 
@@ -98,10 +105,12 @@ describe('Consumer > classic group answers no coordinator sends', () => {
    * A classic consumer group whose coordinator is a real broker over a scripted socket. Each
    * JoinGroup and SyncGroup takes the next answer of its list.
    * @param {{ joins: Buffer[], syncs: Buffer[], retries?: number, maxTotalTime?: number,
-   *   logger?: object, syncMaxVersion?: number }} script
+   *   logger?: object, syncMaxVersion?: number, assignerName?: string,
+   *   assign?: Function }} script `assignerName` and `assign` make the one assigner
    * @returns {{ group: ConsumerGroup, apis: () => number[], joinedAs: () => string[],
-   *   syncVersions: () => number[] }} `apis` is the API key of every request written, `joinedAs`
-   *   the member id of every JoinGroup, `syncVersions` the version of every SyncGroup
+   *   syncVersions: () => number[], bodies: (apiKey: number) => Buffer[] }} `apis` is the API
+   *   key of every request written, `joinedAs` the member id of every JoinGroup, `syncVersions`
+   *   the version of every SyncGroup, `bodies` the request bodies of one API
    */
   const exchange = ({
     joins,
@@ -110,6 +119,8 @@ describe('Consumer > classic group answers no coordinator sends', () => {
     maxTotalTime,
     logger = newLogger(),
     syncMaxVersion = 3,
+    assignerName = PROTOCOL,
+    assign,
   }) => {
     const harness = createGroupApiBroker({
       versions: versionsUpTo(syncMaxVersion),
@@ -132,7 +143,11 @@ describe('Consumer > classic group answers no coordinator sends', () => {
       logger,
       instrumentationEmitter: new InstrumentationEventEmitter(),
       assigners: [
-        { name: PROTOCOL, protocol: () => ({ name: PROTOCOL, metadata: Buffer.alloc(0) }) },
+        {
+          name: assignerName,
+          protocol: () => ({ name: assignerName, metadata: Buffer.alloc(0) }),
+          ...(assign ? { assign } : {}),
+        },
       ],
       sessionTimeout: 30000,
       rebalanceTimeout: 60000,
@@ -161,6 +176,8 @@ describe('Consumer > classic group answers no coordinator sends', () => {
         harness.requests
           .filter(({ apiKey }) => apiKey === apiKeys.SyncGroup)
           .map(({ apiVersion }) => apiVersion),
+      bodies: (apiKey) =>
+        harness.requests.filter((request) => request.apiKey === apiKey).map(({ body }) => body),
     }
   }
 
@@ -377,7 +394,7 @@ describe('Consumer > classic group answers no coordinator sends', () => {
     expect(failure).toBeInstanceOf(KafkaJSPartialMessageError)
     expect(failure).toMatchObject({ retriable: false, cause: undefined })
     expect(failure.message).toBe(
-      `Group ${GROUP_ID} member ${MEMBER}: the join retries ran out on an answer no coordinator sends: SyncGroup response carries an assignment shorter than its version`
+      `Group ${GROUP_ID} member ${MEMBER}: the join ended on a refused group answer: SyncGroup response carries an assignment shorter than its version`
     )
     expect(apis()).toEqual([JOIN, SYNC, JOIN, SYNC])
   })
@@ -396,7 +413,7 @@ describe('Consumer > classic group answers no coordinator sends', () => {
     expect(failure).toBeInstanceOf(KafkaJSPartialMessageError)
     expect(failure).toMatchObject({ retriable: false, cause: undefined })
     expect(failure.message).toBe(
-      `Group ${GROUP_ID} member ${MEMBER}: the join retries ran out on an answer no coordinator sends: SyncGroup response carries an assignment shorter than its version`
+      `Group ${GROUP_ID} member ${MEMBER}: the join ended on a refused group answer: SyncGroup response carries an assignment shorter than its version`
     )
     expect(apis()).toEqual([JOIN, SYNC])
   })
@@ -454,6 +471,44 @@ describe('Consumer > classic group answers no coordinator sends', () => {
     expect(result.userData).toEqual(userData)
     expect(apis()).toEqual([JOIN, SYNC])
   })
+
+  test('an assigner whose name has a lone surrogate is offered as its UTF-8 bytes, and the echo of that name is accepted and leads the round', async () => {
+    // UTF-8 writes the lone surrogate as U+FFFD, and the coordinator selects and echoes that.
+    const echoed = 'planner-�'
+    const leaderAnswer = joinAnswer({
+      groupProtocol: echoed,
+      leaderId: MEMBER,
+      members: [
+        {
+          memberId: MEMBER,
+          groupInstanceId: 'instance-1',
+          memberMetadata: MemberMetadata.encode({ version: 0, topics: [TOPIC] }),
+        },
+      ],
+    })
+    const { group, apis, bodies } = exchange({
+      assignerName: 'planner-\uD800',
+      assign: async () => [{ memberId: MEMBER, memberAssignment: VALID }],
+      syncMaxVersion: 5,
+      joins: [leaderAnswer, leaderAnswer],
+      syncs: [syncAnswer(VALID, 5, echoed)],
+    })
+
+    await expect(group.joinAndSync()).resolves.toMatchObject({ assignment: { [TOPIC]: [0, 1] } })
+
+    expect(apis()).toEqual([JOIN, SYNC])
+    expect(
+      bodies(JOIN).map((body) =>
+        joinGroupV8.readRequest(body).groupProtocols.map(({ name }) => name)
+      )
+    ).toEqual([[echoed]])
+    expect(bodies(SYNC).map((body) => syncGroupV5.readRequest(body))).toMatchObject([
+      {
+        protocolName: echoed,
+        groupAssignment: [{ memberId: MEMBER, memberAssignment: VALID.toString('hex') }],
+      },
+    ])
+  })
 })
 
 describe('Consumer > classic group answers refused until the join retries run out', () => {
@@ -462,12 +517,18 @@ describe('Consumer > classic group answers refused until the join retries run ou
   const RESTART_DELAY = 300
   const REBALANCE_IN_PROGRESS = 27
   const consumers = []
+  /** The group of the running case, whose journal is printed when the case does not finish. */
+  let watched = null
 
   // Real setImmediate and nextTick, as for the other first-round crash cleanups: a fetcher's
   // empty round yields through setImmediate, and a faked one runs at the same fake instant again
   // and again, so the pump would never reach the backoff of the member being refused.
   beforeEach(() => jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick'] }))
   afterEach(async () => {
+    if (watched && !watched.finished) {
+      console.log('Unfinished case, what the group saw:', JSON.stringify(seen(watched), null, 1))
+    }
+    watched = null
     const stopping = Promise.all(consumers.splice(0).map((c) => c.disconnect().catch(() => {})))
     await jest.advanceTimersByTimeAsync(1000)
     await stopping
@@ -483,30 +544,56 @@ describe('Consumer > classic group answers refused until the join retries run ou
    * One classic group behind a coordinator double its members share. A JoinGroup with an empty
    * member id is a new entry and a LeaveGroup an exit; either asks every other member to rejoin
    * through its next heartbeat, as a coordinator rebalances a group a member enters or leaves.
-   * @returns {{ members: string[], rejoin: Set<string>, fetches: string[] }} `fetches` names the
-   *   member of every partition fetched
+   * `events` journals each member's group requests and consumer events with the fake time, and
+   * `fetchRounds` counts each member's fetch preparations, which a spinning fetch loop inflates.
+   * @returns {{ members: string[], rejoin: Set<string>, fetches: string[], events: string[],
+   *   fetchRounds: Object<string, number>, finished: boolean }} `fetches` names the member of
+   *   every partition fetched
    */
-  const createGroup = () => ({ members: [], rejoin: new Set(), fetches: [] })
+  const createGroup = () =>
+    (watched = {
+      members: [],
+      rejoin: new Set(),
+      fetches: [],
+      events: [],
+      fetchRounds: {},
+      finished: false,
+    })
+
+  /**
+   * What a case's group saw, for assertion messages.
+   * @param {object} group
+   * @returns {{ events: string[], fetchRounds: Object<string, number>, fetches: number }}
+   */
+  const seen = ({ events, fetchRounds, fetches }) => ({
+    events,
+    fetchRounds,
+    fetches: fetches.length,
+  })
 
   /**
    * A real classic consumer of `group`, over a double of the Broker's group calls. A dynamic
    * member's first JoinGroup goes through the MEMBER_ID_REQUIRED handshake the Broker performs
    * (`onMemberIdRequired` with the new id, then the answer), a static one gets its id at once.
    * The answers pass the Broker's own check, so an answer it refuses is refused as on the wire,
-   * and every SyncGroup answers `assignment`.
+   * and each SyncGroup answers the next of `assignment`, the last one again once they run out.
    * @param {object} group from `createGroup`
    * @param {string} memberId the id the coordinator gives this member
-   * @param {{ assignment: Buffer, join?: object, retry?: object, groupInstanceId?: string|null }} options
-   *   `join` overrides fields of the JoinGroup answer
+   * @param {{ assignment: Buffer|Buffer[], join?: object, retry?: object,
+   *   groupInstanceId?: string|null, maxPollInterval?: number,
+   *   assigners?: Function[] }} options `join` overrides fields of the JoinGroup answer;
+   *   `assigners` replaces the one assigner
    * @returns {{ consumer: object, coordinator: object, crashes: object[] }}
    */
   const createMember = (
     group,
     memberId,
-    { assignment, join = {}, retry = {}, groupInstanceId }
+    { assignment, join = {}, retry = {}, groupInstanceId, maxPollInterval, assigners }
   ) => {
     const crashes = []
+    const assignments = [].concat(assignment)
     let generation = 0
+    const note = (event) => group.events.push(`${Date.now() % 1000000} ${memberId} ${event}`)
     const rebalanceOthers = () => {
       for (const other of group.members) if (other !== memberId) group.rejoin.add(other)
     }
@@ -527,6 +614,7 @@ describe('Consumer > classic group answers refused until the join retries run ou
         })),
       })),
       joinGroup: jest.fn(async (request, options) => {
+        note(`JoinGroup as ${request.memberId || '(no id)'}`)
         if (request.memberId === '') {
           if (!request.groupInstanceId) options?.onMemberIdRequired?.(memberId)
           rebalanceOthers()
@@ -543,13 +631,22 @@ describe('Consumer > classic group answers refused until the join retries run ou
         assertJoinAnswer(answer, request.groupProtocols)
         return answer
       }),
-      syncGroup: jest.fn(async () => ({ memberAssignment: assignment })),
+      syncGroup: jest.fn(async () => {
+        note('SyncGroup')
+        return {
+          memberAssignment: assignments.length > 1 ? assignments.shift() : assignments[0],
+        }
+      }),
       heartbeat: jest.fn(async () => {
         if (group.rejoin.delete(memberId)) {
+          note('Heartbeat answered REBALANCE_IN_PROGRESS')
           throw new KafkaJSProtocolError(createErrorFromCode(REBALANCE_IN_PROGRESS))
         }
       }),
-      leaveGroup: jest.fn(async () => rebalanceOthers()),
+      leaveGroup: jest.fn(async () => {
+        note('LeaveGroup')
+        rebalanceOthers()
+      }),
     }
     const broker = {
       fetch: jest.fn(async ({ topics }) => {
@@ -567,7 +664,10 @@ describe('Consumer > classic group answers refused until the join retries run ou
       onTopicRecreated: jest.fn(() => () => {}),
       addMultipleTargetTopics: jest.fn(async () => {}),
       refreshMetadata: jest.fn(async () => {}),
-      refreshMetadataIfNecessary: jest.fn(async () => {}),
+      // Called once by every fetch preparation.
+      refreshMetadataIfNecessary: jest.fn(async () => {
+        group.fetchRounds[memberId] = (group.fetchRounds[memberId] ?? 0) + 1
+      }),
       committedOffsets: () => ({}),
       offsetOperations: () => new OffsetOperations(),
       defaultOffset: () => -2,
@@ -591,24 +691,33 @@ describe('Consumer > classic group answers refused until the join retries run ou
       groupId: GROUP_ID,
       logger: newLogger(),
       instrumentationEmitter: cluster.instrumentationEmitter,
-      partitionAssigners: [
-        () => ({
-          name: PROTOCOL,
-          version: 0,
-          protocol: () => ({ name: PROTOCOL, metadata: Buffer.alloc(0) }),
-          assign: async () => [],
-        }),
-      ],
+      partitionAssigners: assigners ?? [assignerNamed(PROTOCOL)],
       sessionTimeout: 30000,
       heartbeatInterval: 100,
       retry: { initialRetryTime: RESTART_DELAY, retries: 2, ...retry },
       ...(groupInstanceId ? { groupInstanceId } : {}),
+      ...(maxPollInterval === undefined ? {} : { maxPollInterval }),
     })
-    consumer.on(consumer.events.CRASH, ({ payload }) => crashes.push(payload))
+    consumer.on(consumer.events.CRASH, ({ payload }) => {
+      note(`CRASH ${payload.error.name} restart=${payload.restart}: ${payload.error.message}`)
+      crashes.push(payload)
+    })
+    consumer.on(consumer.events.GROUP_JOIN, () => note('GROUP_JOIN'))
     group.members.push(memberId)
     consumers.push(consumer)
     return { consumer, coordinator, crashes }
   }
+
+  /**
+   * @param {string} name
+   * @returns {Function} the factory of an eager assigner named `name` that assigns nothing
+   */
+  const assignerNamed = (name) => () => ({
+    name,
+    version: 0,
+    protocol: () => ({ name, metadata: Buffer.alloc(0) }),
+    assign: async () => [],
+  })
 
   /** @param {{ consumer: object }} member @returns {Promise<void>} */
   const start = async ({ consumer }) => {
@@ -617,13 +726,16 @@ describe('Consumer > classic group answers refused until the join retries run ou
   }
 
   /**
-   * Advances fake time in 10 ms steps until `done()` holds, for at most `budget` ms.
+   * Advances fake time in 10 ms steps until `done()` holds, for at most `budget` ms of fake time
+   * and 20 s of real time, so a case whose loop spins reaches its assertions and prints its
+   * journal instead of timing out.
    * @param {() => boolean} done
    * @param {number} [budget]
    * @returns {Promise<void>}
    */
   const until = async (done, budget = 2000) => {
-    for (let spent = 0; !done() && spent < budget; spent += 10) {
+    const realDeadline = realClock.now() + 20000
+    for (let spent = 0; !done() && spent < budget && realClock.now() < realDeadline; spent += 10) {
       await jest.advanceTimersByTimeAsync(10)
     }
   }
@@ -631,53 +743,168 @@ describe('Consumer > classic group answers refused until the join retries run ou
   /** @param {object} group @param {string} memberId @returns {number} */
   const fetchesOf = (group, memberId) => group.fetches.filter((id) => id === memberId).length
 
+  /**
+   * Starts a healthy member, lets it fetch, then starts a member whose every assignment is
+   * refused and pumps fake time until that member crashes. Every check carries the journal.
+   * @param {string|null} groupInstanceId the refused member's
+   * @param {object} [options] more `createMember` options for the refused member
+   * @returns {Promise<{ group: object, healthy: object, refused: object }>}
+   */
+  const refusedBesideHealthy = async (groupInstanceId, options = {}) => {
+    const group = createGroup()
+    const healthy = createMember(group, HEALTHY, { assignment: assignmentOf([0]) })
+    const refused = createMember(group, REFUSED, {
+      assignment: Buffer.from([0]),
+      groupInstanceId,
+      ...options,
+    })
+    await start(healthy)
+    await until(() => fetchesOf(group, HEALTHY) > 0)
+    expect({ healthyFetched: fetchesOf(group, HEALTHY) > 0, seen: seen(group) }).toEqual({
+      healthyFetched: true,
+      seen: expect.anything(),
+    })
+    await start(refused)
+    await until(() => refused.crashes.length > 0, 20000)
+    expect({
+      crashes: refused.crashes.map(({ error, restart }) => [error.name, restart]),
+      seen: seen(group),
+    }).toEqual({ crashes: [['KafkaJSPartialMessageError', false]], seen: expect.anything() })
+    return { group, healthy, refused }
+  }
+
+  /**
+   * Checks the stop itself, then that for `observeMs` after the cleanup settled the refused member
+   * joins no more and the healthy member keeps fetching without joining again.
+   * @param {{ group: object, healthy: object, refused: object }} members
+   * @param {{ joins: number, groupInstanceId: string|null, reason: string, observeMs: number }} expected
+   * @returns {Promise<void>}
+   */
+  const expectOneStop = async ({ group, healthy, refused }, expected) => {
+    const [{ error, groupId }] = refused.crashes
+    expect({
+      joins: refused.coordinator.joinGroup.mock.calls.length,
+      syncs: refused.coordinator.syncGroup.mock.calls.length,
+      // The crash cleanup leaves for a dynamic member; a static one keeps its slot.
+      leaves: refused.coordinator.leaveGroup.mock.calls.length,
+      groupId,
+      retriable: error.retriable,
+      message: error.message,
+      seen: seen(group),
+    }).toEqual({
+      joins: expected.joins,
+      syncs: expected.joins,
+      leaves: expected.groupInstanceId ? 0 : 1,
+      groupId: GROUP_ID,
+      retriable: false,
+      message: `Group ${GROUP_ID} member ${REFUSED}: the join ended on a refused group answer: ${expected.reason}`,
+      seen: expect.anything(),
+    })
+
+    await until(() => false, 2000)
+    const healthyJoins = healthy.coordinator.joinGroup.mock.calls.length
+    const healthyFetches = fetchesOf(group, HEALTHY)
+    await until(() => false, expected.observeMs)
+
+    expect({
+      refusedJoins: refused.coordinator.joinGroup.mock.calls.length,
+      refusedCrashes: refused.crashes.length,
+      healthyJoins: healthy.coordinator.joinGroup.mock.calls.length,
+      healthyCrashes: healthy.crashes.length,
+      healthyFetchedMore: fetchesOf(group, HEALTHY) > healthyFetches,
+      seen: seen(group),
+    }).toEqual({
+      refusedJoins: expected.joins,
+      refusedCrashes: 1,
+      healthyJoins,
+      healthyCrashes: 0,
+      healthyFetchedMore: true,
+      seen: expect.anything(),
+    })
+    group.finished = true
+  }
+
+  const SHORTER = 'SyncGroup response carries an assignment shorter than its version'
+
   test.each([
     ['dynamic', null],
     ['static', 'instance-refused'],
   ])(
     'a %s member whose assignment is refused on every attempt crashes once with restart false and joins no more, while a healthy member keeps fetching',
     async (_, groupInstanceId) => {
-      const group = createGroup()
-      const healthy = createMember(group, HEALTHY, { assignment: assignmentOf([0]) })
-      const refused = createMember(group, REFUSED, {
-        assignment: Buffer.from([0]),
-        groupInstanceId,
-      })
-      await start(healthy)
-      await until(() => fetchesOf(group, HEALTHY) > 0)
-      expect(fetchesOf(group, HEALTHY)).toBeGreaterThan(0)
-      await start(refused)
-      await until(() => refused.crashes.length > 0, 10000)
+      const members = await refusedBesideHealthy(groupInstanceId)
 
       // retries: 2 is three attempts, each a JoinGroup and a refused SyncGroup.
-      expect(refused.coordinator.joinGroup).toHaveBeenCalledTimes(3)
-      expect(refused.coordinator.syncGroup).toHaveBeenCalledTimes(3)
-      // The crash cleanup leaves for a dynamic member; a static one keeps its slot.
-      expect(refused.coordinator.leaveGroup).toHaveBeenCalledTimes(groupInstanceId ? 0 : 1)
-      expect(refused.crashes).toHaveLength(1)
-      const [{ error, groupId, restart }] = refused.crashes
-      expect(error).toBeInstanceOf(KafkaJSPartialMessageError)
-      expect({ groupId, restart, retriable: error.retriable }).toEqual({
-        groupId: GROUP_ID,
-        restart: false,
-        retriable: false,
+      await expectOneStop(members, {
+        joins: 3,
+        groupInstanceId,
+        reason: SHORTER,
+        observeMs: RESTART_DELAY * 10,
       })
-      expect(error.message).toBe(
-        `Group ${GROUP_ID} member ${REFUSED}: the join retries ran out on an answer no coordinator sends: SyncGroup response carries an assignment shorter than its version`
-      )
-
-      await jest.advanceTimersByTimeAsync(2000)
-      const healthyJoins = healthy.coordinator.joinGroup.mock.calls.length
-      const healthyFetches = fetchesOf(group, HEALTHY)
-      await jest.advanceTimersByTimeAsync(RESTART_DELAY * 10)
-
-      expect(refused.coordinator.joinGroup).toHaveBeenCalledTimes(3)
-      expect(refused.crashes).toHaveLength(1)
-      expect(healthy.coordinator.joinGroup).toHaveBeenCalledTimes(healthyJoins)
-      expect(healthy.crashes).toEqual([])
-      expect(fetchesOf(group, HEALTHY)).toBeGreaterThan(healthyFetches)
     }
   )
+
+  test.each([
+    ['dynamic', null],
+    ['static', 'instance-refused'],
+  ])(
+    'a %s member whose round deadline passes in the backoff after a refused assignment crashes once with restart false and joins no more, while a healthy member keeps fetching',
+    async (_, groupInstanceId) => {
+      // A 5 s round and a first backoff of 10 s +/- 20%: the round ends while retries are left.
+      const members = await refusedBesideHealthy(groupInstanceId, {
+        maxPollInterval: 5000,
+        retry: { initialRetryTime: 10000, retries: 5 },
+      })
+
+      // Longer than the 10 s a restart would wait.
+      await expectOneStop(members, {
+        joins: 1,
+        groupInstanceId,
+        reason: SHORTER,
+        observeMs: 30000,
+      })
+    }
+  )
+
+  test('a member whose assignment is refused once and then accepted in the same join fetches and does not crash', async () => {
+    const group = createGroup()
+    const member = createMember(group, REFUSED, {
+      assignment: [Buffer.from([0]), assignmentOf([1])],
+    })
+    await start(member)
+    await until(() => fetchesOf(group, REFUSED) > 0, 5000)
+
+    expect({
+      joins: member.coordinator.joinGroup.mock.calls.length,
+      syncs: member.coordinator.syncGroup.mock.calls.length,
+      crashes: member.crashes.length,
+      fetched: fetchesOf(group, REFUSED) > 0,
+      seen: seen(group),
+    }).toEqual({ joins: 2, syncs: 2, crashes: 0, fetched: true, seen: expect.anything() })
+    group.finished = true
+  })
+
+  test('two assigners whose names are written as the same bytes are refused when the consumer is created, and one name listed twice is not', () => {
+    const group = createGroup()
+
+    expect(() =>
+      createMember(group, REFUSED, {
+        assignment: assignmentOf([0]),
+        assigners: [assignerNamed('planner-\uD800'), assignerNamed('planner-\uDBFF')],
+      })
+    ).toThrow(
+      new KafkaJSNonRetriableError(
+        'The partition assigners "planner-\uD800" and "planner-\uDBFF" are both sent as "planner-�", so the group cannot tell them apart'
+      )
+    )
+    expect(() =>
+      createMember(group, REFUSED, {
+        assignment: assignmentOf([0]),
+        assigners: [assignerNamed('planner'), assignerNamed('planner')],
+      })
+    ).not.toThrow()
+    group.finished = true
+  })
 
   test('a JoinGroup answer refused on every attempt crashes the member once with restart false, before any SyncGroup', async () => {
     const group = createGroup()
@@ -695,12 +922,13 @@ describe('Consumer > classic group answers refused until the join retries run ou
     expect(error).toBeInstanceOf(KafkaJSPartialMessageError)
     expect({ groupId, restart }).toEqual({ groupId: GROUP_ID, restart: false })
     expect(error.message).toBe(
-      `Group ${GROUP_ID} member (no id yet): the join retries ran out on an answer no coordinator sends: JoinGroup response has no member id`
+      `Group ${GROUP_ID} member (no id yet): the join ended on a refused group answer: JoinGroup response has no member id`
     )
 
     await jest.advanceTimersByTimeAsync(RESTART_DELAY * 10)
     expect(refused.coordinator.joinGroup).toHaveBeenCalledTimes(3)
     expect(refused.crashes).toHaveLength(1)
+    group.finished = true
   })
 
   test('a restartOnFailure that returns true receives the stop and restarts the member, as for any crash it decides', async () => {
@@ -720,5 +948,6 @@ describe('Consumer > classic group answers refused until the join retries run ou
 
     await until(() => refused.coordinator.joinGroup.mock.calls.length > 3, RESTART_DELAY * 4)
     expect(refused.coordinator.joinGroup.mock.calls.length).toBeGreaterThan(3)
+    group.finished = true
   })
 })
