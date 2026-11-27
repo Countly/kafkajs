@@ -1,3 +1,4 @@
+const { isProxy } = require('util').types
 const Long = require('../../utils/long')
 const {
   KafkaJSInvalidConfigurationError,
@@ -36,6 +37,8 @@ const getTime = Date.prototype.getTime
 const Bytes = Uint8Array
 
 const CHANGED = 'A Buffer changed size while its send was being read'
+/** Marks a `RecordEntries` in every loaded copy of this module. */
+const BRAND = Symbol.for('@countly/kafkajs.RecordEntries')
 
 /** What each field of a record must be. */
 const ENCODABLE = {
@@ -370,8 +373,6 @@ const putHeader = (headers, name, value) => {
  * time for no record.
  */
 class RecordEntries {
-  #entries = true
-
   /**
    * @param {Buffer} store
    * @param {number[]} starts each entry's offset in `store`
@@ -379,6 +380,7 @@ class RecordEntries {
    * @param {number|bigint} max
    */
   constructor(store, starts, first, max) {
+    Object.defineProperty(this, BRAND, { value: true })
     this.store = store
     this.starts = starts
     this.first = first
@@ -386,11 +388,16 @@ class RecordEntries {
   }
 
   /**
+   * Whether `value` is a `RecordEntries`, also one made by another loaded copy of this module (a
+   * request codec can be loaded later than the broker that captured the entries), checked without
+   * running a getter or a trap: a `Proxy` never is one.
    * @param {*} value
-   * @returns {boolean} whether it is a `RecordEntries`, checked without running a trap
+   * @returns {boolean}
    */
   static is(value) {
-    return value !== null && typeof value === 'object' && #entries in value
+    return (
+      value !== null && typeof value === 'object' && !isProxy(value) && Object.hasOwn(value, BRAND)
+    )
   }
 
   /** @returns {number} how many records */
@@ -471,12 +478,16 @@ class RecordEntries {
  * @param {object[]} messages
  * @param {{ now: number }} options `now` is the send time
  * @returns {RecordEntries}
- * @throws {KafkaJSNonRetriableError} for a hole or a record that is not an object, naming its
- *   index, and for a Buffer detached or out of bounds at its capture or its copy
+ * @throws {KafkaJSNonRetriableError} when `messages` is not an array, for a hole or a record that
+ *   is not an object, naming its index, and for a Buffer detached or out of bounds at its capture
+ *   or its copy
  * @throws {KafkaJSInvalidConfigurationError} for a field that cannot be written, naming the index
  *   and the field, never its value
  */
 const captureEntries = (messages, { now }) => {
+  if (!Array.isArray(messages)) {
+    throw new KafkaJSNonRetriableError('Invalid messages: they must be an array')
+  }
   const count = messages.length
   const slots = []
   let bytes = 0
