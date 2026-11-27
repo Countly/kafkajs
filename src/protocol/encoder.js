@@ -64,6 +64,21 @@ module.exports = class Encoder {
   }
 
   /**
+   * Whether `echoed` is the string a broker reads back from what `writeString` and
+   * `writeUVarIntString` wrote for `sent`. UTF-8 writes each lone surrogate as U+FFFD, so a
+   * broker's echo of such a string differs from `sent`.
+   * @param {string|null} echoed
+   * @param {string} sent
+   * @returns {boolean}
+   */
+  static isEchoOf(echoed, sent) {
+    return (
+      echoed === sent ||
+      (typeof sent === 'string' && echoed === Buffer.from(sent, 'utf8').toString('utf8'))
+    )
+  }
+
+  /**
    * Construct a new encoder with the given initial size
    *
    * @param {number} [initialSize] initial size
