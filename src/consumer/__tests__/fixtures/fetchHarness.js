@@ -322,6 +322,7 @@ const decodeFetchRequest = (writes) => {
 
 const INT32_MIN = -(2 ** 31)
 const INT32_MAX = 2 ** 31 - 1
+const INT64_MIN = -(2n ** 63n)
 const INT64_MAX = 2n ** 63n - 1n
 
 /**
@@ -359,35 +360,77 @@ const int64 = (value, name, min) => {
 }
 
 /**
- * An OffsetForLeaderEpoch v4 response body: one topic, one entry per partition. Each field must
- * be a value a broker can send: a partition of 0 or more, an int16 error code from -1, and a
- * `LeaderEpoch` (int32) and `EndOffset` (int64) of -1 or more.
+ * An OffsetForLeaderEpoch v4 response body exactly as scripted: one topic, one entry per
+ * partition, any value the field types hold (int16 code, int32 partition and `LeaderEpoch`, int64
+ * `EndOffset`) and no broker rule. Only for a test that sends a malformed answer on purpose to
+ * exercise the client's refusal of it; a broker's answer is `offsetForLeaderEpochResponse`.
  *
  * @see clients/src/main/resources/common/message/OffsetForLeaderEpochResponse.json (Apache Kafka 4.3.1)
- * @param {{ partition: number, errorCode?: number, leaderEpoch?: number,
- *   endOffset?: number|string|bigint }[]} partitions
+ * @param {{ partition: number, errorCode: number, leaderEpoch: number,
+ *   endOffset: number|string|bigint }[]} partitions
  * @returns {Buffer}
- * @throws {Error} for a field value no broker sends
+ * @throws {Error} for a value the field's type cannot hold
  */
-const offsetForLeaderEpochResponse = (partitions) =>
+const offsetForLeaderEpochRawResponse = (partitions) =>
   new Encoder()
     .writeInt32(0) // throttleTimeMs
     .writeUVarIntArray([
       new Encoder()
         .writeUVarIntString(TOPIC)
         .writeUVarIntArray(
-          partitions.map(({ partition, errorCode = 0, leaderEpoch = 4, endOffset = '20' }) =>
+          partitions.map(({ partition, errorCode, leaderEpoch, endOffset }) =>
             new Encoder()
-              .writeInt16(integer(errorCode, 'error code', -1, 2 ** 15 - 1))
-              .writeInt32(integer(partition, 'partition', 0))
-              .writeInt32(integer(leaderEpoch, 'leader epoch', -1))
-              .writeInt64(int64(endOffset, 'end offset', -1n).toString())
+              .writeInt16(integer(errorCode, 'error code', -(2 ** 15), 2 ** 15 - 1))
+              .writeInt32(integer(partition, 'partition', INT32_MIN))
+              .writeInt32(integer(leaderEpoch, 'leader epoch', INT32_MIN))
+              .writeInt64(int64(endOffset, 'end offset', INT64_MIN).toString())
               .writeTaggedFields()
           )
         )
         .writeTaggedFields(),
     ])
     .writeTaggedFields().buffer
+
+/**
+ * One row as a broker answers it, with the defaults filled in.
+ * @param {{ partition: number, errorCode?: number, leaderEpoch?: number,
+ *   endOffset?: number|string|bigint }} row
+ * @returns {{ partition: number, errorCode: number, leaderEpoch: number,
+ *   endOffset: number|string|bigint }}
+ * @throws {Error} for a row no broker sends
+ */
+const brokerRow = ({ partition, errorCode = 0, ...fields }) => {
+  integer(partition, 'partition', 0)
+  integer(errorCode, 'error code', -1, 2 ** 15 - 1)
+  const failed = errorCode !== 0
+  const { leaderEpoch = failed ? -1 : 4, endOffset = failed ? '-1' : '20' } = fields
+  integer(leaderEpoch, 'leader epoch', -1)
+  const undefinedEnd = int64(endOffset, 'end offset', -1n) === -1n
+  if (failed ? leaderEpoch !== -1 || !undefinedEnd : (leaderEpoch === -1) !== undefinedEnd) {
+    throw new Error(
+      `partition ${partition}: error ${errorCode} with LeaderEpoch ${leaderEpoch} and EndOffset ` +
+        `${endOffset} is no broker answer (an error or an undefined answer is -1 with -1)`
+    )
+  }
+  return { partition, errorCode, leaderEpoch, endOffset }
+}
+
+/**
+ * An OffsetForLeaderEpoch v4 response body as a broker sends it: one topic, one entry per
+ * partition. Apache Kafka 4.0.0 and 4.4.0 answer a found epoch with its end offset (both 0 or
+ * more), an undefined lookup with `LeaderEpoch` -1 and `EndOffset` -1, and an error with the
+ * partition and code alone, so both fields keep their -1 defaults (`Partition#
+ * lastOffsetForLeaderEpoch`, `UnifiedLog#endOffsetForEpoch`, `KafkaApis`). A row with a non-zero
+ * code therefore defaults to -1 and -1, a successful one to epoch 4 and end 20.
+ *
+ * @see clients/src/main/resources/common/message/OffsetForLeaderEpochResponse.json (Apache Kafka 4.3.1)
+ * @param {{ partition: number, errorCode?: number, leaderEpoch?: number,
+ *   endOffset?: number|string|bigint }[]} partitions
+ * @returns {Buffer}
+ * @throws {Error} for a field value or an epoch and end pair no broker sends
+ */
+const offsetForLeaderEpochResponse = (partitions) =>
+  offsetForLeaderEpochRawResponse(partitions.map(brokerRow))
 
 /**
  * @param {string} type an error type of `src/protocol/error.js`
@@ -487,6 +530,12 @@ const scriptedEpochLog = ({ epochs, logEnd, leader = true, leaderEpoch }) => {
     }
     // Code 6, Kafka's NOT_LEADER_OR_FOLLOWER.
     if (!leader) return error('NOT_LEADER_FOR_PARTITION')
+    if (requested < -1) {
+      throw new Error(
+        `partition ${partition} asks for epoch ${requested}, which no client sends: script the ` +
+          'answer to that malformed request with offsetForLeaderEpochRawResponse'
+      )
+    }
     return { partition, errorCode: 0, ...endOffsetFor(requested) }
   }
 
@@ -545,15 +594,21 @@ const decodeOffsetForLeaderEpochRequests = (writes) =>
  * the header version its api key and version imply, and goes to the socket the frame was written
  * to, never to another: a destroyed socket gets nothing.
  *
+ * Playback is driven by the writes themselves: each frame written to a socket is answered one
+ * `setImmediate` later, in write order, whoever wrote it. A frame is owned by its socket and the
+ * correlation id in its header, and nothing else.
+ *
  * A Buffer is played back at once. A thenable is a withheld answer: it is played back when it
  * resolves, and later requests are answered meanwhile. A broker answers one connection in order;
- * overtaking here stands in for the separate connection the real pool gives Fetch.
+ * overtaking here stands in for the separate connection the real pool gives Fetch. A thenable
+ * created before `answer` returns it must come from `withheldAnswer()`, which is handled from
+ * creation, so rejecting it early is never an unhandled rejection.
  *
- * A playback failure fails the request it belongs to, with the error itself, and nothing is
- * played back for it: `answer` throwing, a withheld answer rejecting, or the playback of an answer
- * throwing (a `chunks` assertion, say), at once or later. Every frame is tied to the send that
- * wrote it, so a failure never lands on another request answered in the same pump. A failure after
- * its request has settled (a withheld answer rejected after a close) changes nothing.
+ * A playback failure (`answer` throwing, a withheld answer rejecting, or the playback of an answer
+ * throwing, a `chunks` assertion say) fails exactly the request the frame belongs to, with the
+ * error itself, through the connection's own in-flight entry: the entry leaves the queue as an
+ * answered one does, so the connection stays usable and an ordinary `disconnect()` drains. A
+ * failure after its request has settled (a withheld answer rejected after a close) changes nothing.
  * `broker.disconnect({ drainTimeout: 0 })` closes at once and fails every request still waiting.
  * Setup gets two minutes to tolerate coverage runner delays; Jest still bounds a hung test.
  * @param {(header: { apiKey: number, apiVersion: number, correlationId: number },
@@ -563,12 +618,8 @@ const decodeOffsetForLeaderEpochRequests = (writes) =>
  */
 const createFakeBroker = (answer, chunks) => {
   const { factory: socketFactory, state } = createFakeSocketFactory()
-  /** @type {((error: Error) => void)|null} the failure route of the send writing its frame now */
-  let writing = null
-  /** @type {WeakMap<Buffer, (error: Error) => void>} each recorded frame's failure route */
-  const failureRoutes = new WeakMap()
   /**
-   * The fake socket factory, with each write tied to the send that made it.
+   * The fake socket factory, with every recorded write answered one `setImmediate` later.
    * @param {object} options what `Connection` passes the socket factory
    * @returns {object} the fake socket
    */
@@ -577,8 +628,8 @@ const createFakeBroker = (answer, chunks) => {
     const write = socket.write
     socket.write = (...args) => {
       const written = write(...args)
-      if (writing) failureRoutes.set(socket.writes[socket.writes.length - 1], writing)
-      writing = null
+      const frame = socket.writes[socket.writes.length - 1]
+      setImmediate(() => playBack(socket, frame))
       return written
     }
     return socket
@@ -621,14 +672,37 @@ const createFakeBroker = (answer, chunks) => {
   }
 
   /**
-   * Answers one frame on the socket it was written to; any failure goes to `fail`.
-   * @param {object} socket
-   * @param {Buffer} frame
-   * @param {(error: Error) => void} fail the failure route of the frame's send
+   * Fails one in-flight request with `error` the way the queue settles an answered one: the entry
+   * leaves the in-flight set, pending requests may go out, the request settles, and the queue's
+   * observers (the drain of `disconnect()` among them) hear of it. A request no longer in flight on
+   * `socket`'s generation (answered, or failed by a close) is left alone.
+   * @param {object} socket the socket the request's frame was written to
+   * @param {number} correlationId
+   * @param {Error} error
    * @returns {void}
    */
-  const playBack = (socket, frame, fail) => {
+  const failRequest = (socket, correlationId, error) => {
+    const queue = connection.requestQueue
+    const request = queue.inflight.get(correlationId)
+    if (connection.socket !== socket || !request) return
+    queue.inflight.delete(correlationId)
+    try {
+      queue.checkPendingRequests()
+    } finally {
+      request.rejected(error)
+    }
+    queue.emitQueueState()
+  }
+
+  /**
+   * Answers one written frame on its socket; a failure fails that frame's request alone.
+   * @param {object} socket
+   * @param {Buffer} frame
+   * @returns {void}
+   */
+  const playBack = (socket, frame) => {
     const header = readRequestHeader(frame)
+    const fail = (error) => failRequest(socket, header.correlationId, error)
     const deliver = (body) => {
       if (!socket.destroyed) reply({ socket }, header, body)
     }
@@ -641,21 +715,6 @@ const createFakeBroker = (answer, chunks) => {
       }
     } catch (error) {
       fail(error)
-    }
-  }
-
-  let answered = 0
-  const pump = async () => {
-    while (answered < state.writes.length) {
-      const frame = state.writes[answered]
-      answered += 1
-      const fail = failureRoutes.get(frame)
-      if (!fail) throw new Error('fake broker: a frame was written outside the pool send')
-      playBack(
-        state.sockets.find(({ writes }) => writes.includes(frame)),
-        frame,
-        fail
-      )
     }
   }
 
@@ -676,29 +735,31 @@ const createFakeBroker = (answer, chunks) => {
       await connection.connect()
       return connection
     },
-    send: async (protocolRequest) => {
-      let fail
-      const failed = new Promise((_resolve, reject) => (fail = reject))
-      const answered = connection.send({
-        ...protocolRequest,
-        onWrite: () => {
-          protocolRequest.onWrite?.()
-          writing = fail
-        },
-      })
-      const outcome = Promise.race([answered, failed])
-      // Returned below, so the caller receives every rejection; until then a close or a playback
-      // failure must not count as unhandled.
-      outcome.catch(() => {})
-      await new Promise(setImmediate)
-      await pump()
-      return outcome
-    },
+    send: (protocolRequest) => connection.send(protocolRequest),
     setVersions: () => {},
     destroy: async (options) => connection.disconnect(options),
   })
 
   return { broker: new Broker({ connectionPool, logger: newLogger() }), state }
+}
+
+/**
+ * A withheld answer a spec holds before the fake broker asks for it: return `promise` from an
+ * answer callback, then `resolve(body)` to play the body back or `reject(error)` to fail the
+ * request it answers with `error`. The promise is handled from creation, so a rejection that comes
+ * before the fake broker takes it is never unhandled; a hold no answer ever returns answers nothing.
+ * @returns {{ promise: Promise<Buffer>, resolve: (body: Buffer) => void,
+ *   reject: (error: Error) => void }}
+ */
+const withheldAnswer = () => {
+  let resolve
+  let reject
+  const promise = new Promise((settle, fail) => {
+    resolve = settle
+    reject = fail
+  })
+  promise.catch(() => {})
+  return { promise, resolve, reject }
 }
 
 /**
@@ -896,7 +957,9 @@ const buildConsumerGroup = ({
  *   id with its own fake broker and connection (node `NODE_ID` keeps the shared one), so each
  *   leader has its own request queue; every broker answers with the same scripts
  * @param {string} [options.endOffset] the `EndOffset` the OffsetForLeaderEpoch reply carries
- * @param {number} [options.validationErrorCode] the per-partition code that reply carries
+ *   with `LeaderEpoch` 4; `'-1'` is the broker's undefined answer, which carries `LeaderEpoch` -1
+ * @param {number} [options.validationErrorCode] the per-partition code that reply carries; a
+ *   non-zero code comes with `LeaderEpoch` -1 and `EndOffset` -1, as from a broker
  * @param {boolean} [options.validationThrows] make the OffsetForLeaderEpoch answer throw
  * @param {boolean} [options.advertiseOffsetForLeaderEpoch] whether ApiVersions lists api key 23
  * @param {number[]} [options.withholdValidationFor] partitions the reply leaves out entirely
@@ -969,12 +1032,11 @@ const createFetchGroup = async ({
     return offsetForLeaderEpochResponse(
       requestedPartitions
         .filter((partition) => !withholdValidationFor.includes(partition))
-        .map((partition) => ({
-          partition,
-          errorCode: validationErrorCode,
-          leaderEpoch: 4,
-          endOffset,
-        }))
+        .map((partition) =>
+          validationErrorCode !== 0
+            ? { partition, errorCode: validationErrorCode }
+            : { partition, leaderEpoch: BigInt(endOffset) === -1n ? -1 : 4, endOffset }
+        )
     )
   }
   const setValidationResponse = (fn) => {
@@ -1319,8 +1381,10 @@ module.exports = {
   decodeOffsetForLeaderEpochRequests,
   createFakeBroker,
   createFakeCoordinator,
+  withheldAnswer,
   fetchResponse,
   offsetForLeaderEpochResponse,
+  offsetForLeaderEpochRawResponse,
   scriptedEpochLog,
   createFetchGroup,
 }
