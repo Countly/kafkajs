@@ -1,6 +1,8 @@
 const { createLogger } = require('../../../loggers')
 const createConsumer = require('../../index')
+const Runner = require('../../runner')
 const RebalanceCoordinator = require('../../rebalanceCoordinator')
+const { MemberAssignment } = require('../../assignerProtocol')
 const OffsetOperations = require('../../offsetManager/offsetOperations')
 const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
 const { KafkaJSProtocolError } = require('../../../errors')
@@ -317,6 +319,107 @@ async function start({
   }
 }
 
+/** An eager classic assigner, named as the coordinator double's JoinGroup answer names it. */
+const eager = () => ({
+  name: 'eager',
+  version: 0,
+  protocol: () => ({ name: 'eager', metadata: Buffer.alloc(0) }),
+  assign: async () => [],
+})
+
+/**
+ * Starts a run of topic-a over the scripted cluster under the classic protocol, as a follower
+ * that joins with JoinGroup and SyncGroup, or under manual assignment. Waits until `run()` settled,
+ * or, when `joined` holds the first JoinGroup answer, until that JoinGroup was sent. A handler
+ * receives the payload and `held`, which the run's teardown resolves.
+ * @param {'classic'|'manual'} kind
+ * @param {object} [options]
+ * @param {Record<string, number[]>} [options.records] the offsets served by `topic|partition`;
+ *   `topic-a|0` serves 40 when a handler is given and this is omitted
+ * @param {number[]} [options.partitions=[0]] the partitions of topic-a SyncGroup assigns
+ * @param {object} [options.run] further `run()` options
+ * @returns {Promise<object>} the run, its runner and its group
+ */
+const startClassic = async (
+  kind,
+  {
+    eachMessage,
+    eachBatch,
+    hook,
+    joined,
+    config,
+    autoCommitThreshold,
+    records,
+    partitions = [0],
+    run: runOptions,
+  } = {}
+) => {
+  const runs = jest.spyOn(Runner.prototype, 'start')
+  const built = buildConsumer({ groupProtocol: 'classic', partitionAssigners: [eager], ...config })
+  const { consumer, coordinator, cluster, state } = built
+  Object.assign(coordinator, {
+    joinGroup: jest.fn(async () => {
+      await joined?.promise
+      return {
+        generationId: 1,
+        leaderId: 'another-member',
+        memberId: 'member-1',
+        members: [],
+        groupProtocol: 'eager',
+      }
+    }),
+    syncGroup: jest.fn(async () => ({
+      memberAssignment: MemberAssignment.encode({
+        version: 0,
+        assignment: { 'topic-a': partitions },
+      }),
+    })),
+    heartbeat: jest.fn(async () => {}),
+    leaveGroup: jest.fn(async () => {}),
+  })
+  cluster.stageMetadata = jest.fn(async ({ topics }) => ({
+    topicMetadata: topics.map((topic) => ({
+      topic,
+      partitionMetadata: [{ partitionId: 0 }, { partitionId: 1 }],
+    })),
+  }))
+  if (records) Object.assign(state.queue, records)
+  else if (eachMessage || eachBatch) state.queue['topic-a|0'] = [40]
+  if (kind === 'manual') {
+    const assigned = settled(consumer.assign([{ topic: 'topic-a', partitions: [0] }]))
+    await advanceUntil(() => assigned.done, 1000)
+    expect(assigned).toMatchObject({ done: true, value: undefined })
+  } else {
+    await consumer.subscribe({ topic: 'topic-a' })
+  }
+  const held = deferred()
+  const started = settled(
+    consumer.run({
+      eachMessage: eachMessage && ((payload) => eachMessage(payload, held)),
+      eachBatch: eachBatch && ((payload) => eachBatch(payload, held)),
+      ...(hook && { rebalanceListener: hook }),
+      ...(autoCommitThreshold && { autoCommitThreshold }),
+      ...runOptions,
+    })
+  )
+  cleanup = async () => {
+    held.resolve()
+    const end = settled(consumer.disconnect({ timeout: 0 }))
+    await jest.advanceTimersByTimeAsync(10)
+    expect(end.done).toBe(true)
+  }
+  if (joined) {
+    await advanceUntil(() => coordinator.joinGroup.mock.calls.length > 0)
+    expect(started.done).toBe(false)
+  } else {
+    await advanceUntil(() => started.done)
+    expect(started).toMatchObject({ done: true, value: undefined })
+  }
+  expect(runs).toHaveBeenCalledTimes(1)
+  const runner = runs.mock.contexts[0]
+  return { ...built, held, started, runner, group: runner.consumerGroup }
+}
+
 const protocolError = (code) => new KafkaJSProtocolError(createErrorFromCode(code))
 
 /** Whether `error` or one of its causes is `target`. */
@@ -354,6 +457,8 @@ module.exports = {
   deferred,
   settled,
   start,
+  eager,
+  startClassic,
   teardown,
   forget,
   beats,

@@ -1,0 +1,844 @@
+const ConsumerGroup = require('../consumerGroup')
+const { KafkaJSError, KafkaJSTopicRecreatedError } = require('../../errors')
+const {
+  advanceUntil,
+  deferred,
+  settled,
+  startClassic,
+  teardown,
+  forget,
+  protocolError,
+  recordingLogger,
+} = require('./fixtures/scriptedConsumer')
+
+const INSTANCE = 'instance-1'
+const FENCED_INSTANCE_ID = 82
+
+beforeEach(() => jest.useFakeTimers({ doNotFake: ['queueMicrotask', 'nextTick', 'setImmediate'] }))
+afterEach(async () => {
+  await teardown()
+  jest.useRealTimers()
+  jest.restoreAllMocks()
+})
+
+/** How each recorded step reads in a trail. */
+const STEPS = {
+  POLL: () => 'POLL_INTERVAL_EXCEEDED',
+  commit: ({ tp, offset }) => `commit ${tp} ${offset}`,
+  revoked: () => 'revoked callback',
+  final: () => 'final commit',
+  leave: ({ memberId, groupInstanceId }) => `leave ${memberId} ${groupInstanceId}`,
+  STOP: () => 'STOP',
+  DISCONNECT: () => 'DISCONNECT',
+  CRASH: ({ restart }) => `CRASH restart ${restart}`,
+}
+
+/** @returns {string[]} the run's commits, leaves, close steps and events, in the order they happened */
+const trail = (run) =>
+  run.log.filter(({ kind }) => STEPS[kind]).map((entry) => STEPS[entry.kind](entry))
+
+/** @returns {KafkaJSError} what a handler throws */
+const failure = (retriable) => new KafkaJSError('the handler failed', { retriable })
+
+/** @returns {KafkaJSTopicRecreatedError} the error a recreation stop reports */
+const recreated = () =>
+  new KafkaJSTopicRecreatedError('Topic topic-a was recreated', {
+    topic: 'topic-a',
+    previousTopicId: 'aAaAaAaAaAaAaAaAaAaAaA',
+    topicId: 'zZzZzZzZzZzZzZzZzZzZzZ',
+    groupId: 'loss-driver-group',
+  })
+
+/** The crash retry options of these tests: no retry in place, a 300 ms restart without jitter. */
+const RETRY = { retries: 0, factor: 0, initialRetryTime: 300 }
+
+/**
+ * Starts a classic member of topic-a that resolves without committing (threshold 100), and
+ * records each LeaveGroup, the start of the stop's final commit, the close callback and the
+ * POLL_INTERVAL_EXCEEDED, DISCONNECT and CRASH events in `run.log`, beside the commits and STOP the
+ * fixture records.
+ * @param {object} [options] those of `startClassic`, and
+ * @param {boolean} [options.instance] whether the member is static
+ * @param {object} [options.retry] the consumer's retry options
+ * @param {(payload: object, held: object, call: number) => Promise<void>} [options.eachMessage]
+ *   called with the count of calls made so far, this one included
+ * @param {() => Promise<void>} [options.closeCallback] what the revoked callback of a close awaits
+ * @returns {Promise<object>} the run, with `delivered`: `partition|offset` of each handler call
+ */
+const begin = async ({
+  instance = false,
+  retry,
+  config,
+  eachMessage,
+  closeCallback,
+  ...options
+} = {}) => {
+  const ref = {}
+  const delivered = []
+  const run = await startClassic('classic', {
+    autoCommitThreshold: 100,
+    records: { 'topic-a|0': [40, 41] },
+    ...options,
+    config: { ...(instance && { groupInstanceId: INSTANCE }), ...(retry && { retry }), ...config },
+    eachMessage: async (payload, held) => {
+      delivered.push(`${payload.partition}|${payload.message.offset}`)
+      if (eachMessage) await eachMessage(payload, held, delivered.length)
+    },
+    ...(closeCallback && {
+      hook: {
+        onPartitionsRevoked: async ({ partitions }) => {
+          if (partitions.length === 0) return
+          ref.log.push({ kind: 'revoked' })
+          await closeCallback()
+        },
+      },
+    }),
+  })
+  const { consumer, coordinator, runner, log } = run
+  ref.log = log
+  coordinator.leaveGroup.mockImplementation(async ({ memberId, groupInstanceId }) => {
+    log.push({ kind: 'leave', memberId, groupInstanceId })
+  })
+  const commitFinal = runner.commitFinalOffsetsContained.bind(runner)
+  jest.spyOn(runner, 'commitFinalOffsetsContained').mockImplementation(async (scope) => {
+    log.push({ kind: 'final' })
+    return commitFinal(scope)
+  })
+  consumer.on(consumer.events.POLL_INTERVAL_EXCEEDED, ({ payload }) =>
+    log.push({ kind: 'POLL', isStatic: payload.isStatic })
+  )
+  consumer.on(consumer.events.DISCONNECT, () => log.push({ kind: 'DISCONNECT' }))
+  consumer.on(consumer.events.CRASH, ({ payload }) =>
+    log.push({ kind: 'CRASH', restart: payload.restart, at: Date.now() })
+  )
+  return Object.assign(run, { delivered })
+}
+
+/** @returns {number} when the run's CRASH was emitted, on the fake clock */
+const crashedAt = (run) => run.log.find(({ kind }) => kind === 'CRASH').at
+
+/**
+ * Checks that no restart starts in the 299 ms after CRASH, then whether one starts by 1 s.
+ * @returns {Promise<void>}
+ */
+const expectRestart = async (run, restart, delay = 300) => {
+  const waited = Date.now() - crashedAt(run)
+  expect(waited).toBeLessThan(delay - 1)
+  await jest.advanceTimersByTimeAsync(delay - 1 - waited)
+  expect(run.cluster.connect).toHaveBeenCalledTimes(1)
+  await advanceUntil(() => run.cluster.connect.mock.calls.length > 1, 1000)
+  expect(run.cluster.connect).toHaveBeenCalledTimes(restart ? 2 : 1)
+}
+
+/**
+ * Disconnects a run whose handlers have all returned, then checks that it left no timer behind.
+ * @returns {Promise<void>}
+ */
+const closeClean = async (run) => {
+  const closing = settled(run.consumer.disconnect())
+  await advanceUntil(() => closing.done, 2000)
+  expect(closing).toMatchObject({ done: true, value: undefined })
+  await jest.advanceTimersByTimeAsync(1000)
+  expect(jest.getTimerCount()).toBe(0)
+  forget()
+}
+
+describe('Consumer > how a classic run ends', () => {
+  describe('one cause alone', () => {
+    it.each([
+      [
+        'stop()',
+        'a dynamic',
+        true,
+        ['final commit', 'commit topic-a|0 42', 'leave member-1 null', 'STOP'],
+      ],
+      ['stop()', 'a static', true, ['final commit', 'commit topic-a|0 42', 'STOP']],
+      ['stop()', 'a dynamic', false, ['final commit', 'leave member-1 null', 'STOP']],
+      [
+        'disconnect()',
+        'a dynamic',
+        true,
+        ['final commit', 'commit topic-a|0 42', 'leave member-1 null', 'STOP', 'DISCONNECT'],
+      ],
+      [
+        'disconnect({ leaveGroup: true })',
+        'a static',
+        true,
+        ['final commit', 'commit topic-a|0 42', 'leave member-1 instance-1', 'STOP', 'DISCONNECT'],
+      ],
+    ])(
+      '%s of %s idle member with autoCommit %s and offset 42 resolved ends with this trail',
+      async (cause, kind, autoCommit, expected) => {
+        const run = await begin({ instance: kind === 'a static', run: { autoCommit } })
+        await advanceUntil(() => run.delivered.length === 2)
+        await jest.advanceTimersByTimeAsync(200)
+        expect(trail(run)).toEqual([])
+
+        const ending = settled(
+          cause === 'stop()'
+            ? run.consumer.stop()
+            : run.consumer.disconnect(cause === 'disconnect()' ? undefined : { leaveGroup: true })
+        )
+        await advanceUntil(() => ending.done, 2000)
+
+        expect(ending).toMatchObject({ done: true, value: undefined })
+        expect(trail(run)).toEqual(expected)
+        expect(run.crashes).toEqual([])
+        expect(run.group.memberId).toBeNull()
+        await jest.advanceTimersByTimeAsync(1000)
+        expect(jest.getTimerCount()).toBe(0)
+      },
+      30000
+    )
+
+    it.each([
+      [
+        'a dynamic',
+        true,
+        [
+          'commit topic-a|0 41',
+          'final commit',
+          'leave member-1 null',
+          'STOP',
+          'DISCONNECT',
+          'CRASH restart false',
+        ],
+      ],
+      [
+        'a static',
+        true,
+        ['commit topic-a|0 41', 'final commit', 'STOP', 'DISCONNECT', 'CRASH restart false'],
+      ],
+      [
+        'a dynamic',
+        false,
+        ['final commit', 'leave member-1 null', 'STOP', 'DISCONNECT', 'CRASH restart false'],
+      ],
+    ])(
+      'a handler error of %s member with autoCommit %s commits the progress before it, cleans up through the stages of stop() and disconnects before CRASH',
+      async (kind, autoCommit, expected) => {
+        const error = failure(false)
+        const run = await begin({
+          instance: kind === 'a static',
+          run: { autoCommit },
+          eachMessage: async ({ message }) => {
+            if (message.offset === '41') throw error
+          },
+        })
+        await advanceUntil(() => run.crashes.length > 0)
+        await jest.advanceTimersByTimeAsync(1000)
+
+        expect(trail(run)).toEqual(expected)
+        expect(run.crashes).toHaveLength(1)
+        expect(run.crashes[0].error.name).toBe('KafkaJSNonRetriableError')
+        expect(run.crashes[0].error.cause).toBe(error)
+        expect(run.cluster.disconnect.mock.calls).toEqual([[{ preserveSetupState: true }]])
+        expect(run.cluster.connect).toHaveBeenCalledTimes(1)
+        expect(run.group.memberId).toBeNull()
+        expect(jest.getTimerCount()).toBe(0)
+      },
+      30000
+    )
+
+    it('a start failure before the run is running commits and leaves nothing, emits STOP and then DISCONNECT before CRASH, and restarts by the crash rules', async () => {
+      const error = new KafkaJSError('the connection failed', { retriable: true })
+      const connect = jest.spyOn(ConsumerGroup.prototype, 'connect').mockRejectedValueOnce(error)
+      const run = await startClassic('classic', { config: { retry: RETRY } })
+
+      expect(run.crashes.map((crash) => [crash.error, crash.restart])).toEqual([[error, true]])
+      expect(
+        run.log.filter(({ kind }) => ['STOP', 'disconnect', 'commit'].includes(kind))
+      ).toMatchObject([{ kind: 'STOP' }, { kind: 'disconnect' }])
+      expect(run.cluster.disconnect.mock.calls).toEqual([[{ preserveSetupState: true }]])
+      expect(run.coordinator.joinGroup).not.toHaveBeenCalled()
+      expect(run.coordinator.offsetCommit).not.toHaveBeenCalled()
+      expect(run.coordinator.leaveGroup).not.toHaveBeenCalled()
+
+      await jest.advanceTimersByTimeAsync(250)
+      expect(connect).toHaveBeenCalledTimes(1)
+      await advanceUntil(() => run.coordinator.joinGroup.mock.calls.length > 0, 1000)
+      expect(connect).toHaveBeenCalledTimes(2)
+      expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(1)
+    }, 30000)
+  })
+
+  describe('two ways to stop, one after the other', () => {
+    it.each([
+      ['stop()', 'disconnect()'],
+      ['disconnect()', 'stop()'],
+    ])(
+      '%s then %s share one stop: one final commit and one LeaveGroup, stop() settles at STOP and disconnect() after the cluster teardown',
+      async (first, second) => {
+        const run = await begin()
+        await advanceUntil(() => run.delivered.length === 2)
+        await jest.advanceTimersByTimeAsync(200)
+        const transport = deferred()
+        run.state.disconnecting = transport.promise
+        const call = (name) =>
+          settled(name === 'stop()' ? run.consumer.stop() : run.consumer.disconnect())
+        const calls = { [first]: call(first) }
+        calls[second] = call(second)
+        await advanceUntil(() => calls['stop()'].done, 2000)
+        await jest.advanceTimersByTimeAsync(100)
+
+        expect(calls['stop()']).toMatchObject({ done: true, value: undefined })
+        expect(calls['disconnect()'].done).toBe(false)
+        expect(trail(run)).toEqual([
+          'final commit',
+          'commit topic-a|0 42',
+          'leave member-1 null',
+          'STOP',
+        ])
+        expect(run.cluster.disconnect.mock.calls).toEqual([[]])
+
+        transport.resolve()
+        await advanceUntil(() => calls['disconnect()'].done, 1000)
+
+        expect(calls['disconnect()']).toMatchObject({ done: true, value: undefined })
+        expect(trail(run)).toEqual([
+          'final commit',
+          'commit topic-a|0 42',
+          'leave member-1 null',
+          'STOP',
+          'DISCONNECT',
+        ])
+        await jest.advanceTimersByTimeAsync(1000)
+        expect(jest.getTimerCount()).toBe(0)
+      },
+      30000
+    )
+
+    it('a disconnect({ timeout }) that joins a disconnect() without one does not bound it: both wait for the running handler', async () => {
+      const run = await begin({
+        eachMessage: async ({ message }, held) => {
+          if (message.offset === '41') await held.promise
+        },
+      })
+      await advanceUntil(() => run.delivered.length === 2)
+      const plain = settled(run.consumer.disconnect())
+      const bounded = settled(run.consumer.disconnect({ timeout: 100 }))
+      await jest.advanceTimersByTimeAsync(1000)
+
+      expect([plain.done, bounded.done]).toEqual([false, false])
+      expect(trail(run)).toEqual([])
+
+      run.held.resolve()
+      await advanceUntil(() => plain.done && bounded.done, 2000)
+
+      expect(plain).toMatchObject({ done: true, value: undefined })
+      expect(bounded).toMatchObject({ done: true, value: undefined })
+      expect(trail(run)).toEqual([
+        'final commit',
+        'commit topic-a|0 42',
+        'leave member-1 null',
+        'STOP',
+        'DISCONNECT',
+      ])
+      expect(run.cluster.disconnect.mock.calls).toEqual([[]])
+      await jest.advanceTimersByTimeAsync(1000)
+      expect(jest.getTimerCount()).toBe(0)
+    }, 30000)
+  })
+
+  describe('a handler error while a sibling handler of another partition is parked', () => {
+    it.each([
+      ['returns', ['final commit', 'commit topic-a|1 41', 'leave member-1 null']],
+      ['fails too', ['final commit', 'leave member-1 null']],
+    ])(
+      'is reported only once the sibling %s, and the final commit carries what the sibling resolved',
+      async (sibling, cleanup) => {
+        const first = failure(false)
+        const second = failure(false)
+        const run = await begin({
+          partitions: [0, 1],
+          records: { 'topic-a|0': [40], 'topic-a|1': [40] },
+          run: { partitionsConsumedConcurrently: 2 },
+          eachMessage: async ({ partition }, held) => {
+            if (partition === 0) throw first
+            await held.promise
+            if (sibling === 'fails too') throw second
+          },
+        })
+        await advanceUntil(() => run.delivered.length === 2)
+        await jest.advanceTimersByTimeAsync(5000)
+
+        expect([...run.delivered].sort()).toEqual(['0|40', '1|40'])
+        expect(trail(run)).toEqual([])
+        expect(run.crashes).toEqual([])
+
+        run.held.resolve()
+        await advanceUntil(() => run.crashes.length > 0)
+        await jest.advanceTimersByTimeAsync(1000)
+
+        expect(trail(run)).toEqual([...cleanup, 'STOP', 'DISCONNECT', 'CRASH restart false'])
+        expect(run.crashes).toHaveLength(1)
+        expect(run.crashes[0].error.cause).toBe(first)
+        expect(jest.getTimerCount()).toBe(0)
+      },
+      30000
+    )
+  })
+
+  describe('the restart after a handler error', () => {
+    const POLICIES = {
+      absent: undefined,
+      'returning true': async () => true,
+      'returning false': async () => false,
+      rejecting: async () => {
+        throw new Error('the policy failed')
+      },
+    }
+    const CLEANUP = [
+      'commit topic-a|0 41',
+      'final commit',
+      'leave member-1 null',
+      'STOP',
+      'DISCONNECT',
+    ]
+
+    it.each([
+      ['retriable', 'absent', true, 'KafkaJSNumberOfRetriesExceeded'],
+      ['retriable', 'returning true', true, 'KafkaJSNumberOfRetriesExceeded'],
+      ['retriable', 'returning false', false, 'KafkaJSNumberOfRetriesExceeded'],
+      ['retriable', 'rejecting', true, 'KafkaJSNumberOfRetriesExceeded'],
+      ['non-retriable', 'absent', false, 'KafkaJSNonRetriableError'],
+      ['non-retriable', 'returning true', true, 'KafkaJSNonRetriableError'],
+      ['non-retriable', 'returning false', false, 'KafkaJSNonRetriableError'],
+    ])(
+      'a %s error with restartOnFailure %s reports restart %s, asks the callback after cleanup and restarts 300 ms after CRASH only then',
+      async (retriability, policyName, restart, wrapper) => {
+        const error = failure(retriability === 'retriable')
+        const seen = {}
+        const policy = POLICIES[policyName] && jest.fn(POLICIES[policyName])
+        const run = await begin({
+          retry: {
+            ...RETRY,
+            ...(policy && {
+              restartOnFailure: async (crash) => {
+                seen.atPolicy = trail(seen.run)
+                return policy(crash)
+              },
+            }),
+          },
+          eachMessage: async ({ message }, _held, call) => {
+            if (message.offset === '41' && call === 2) throw error
+          },
+        })
+        seen.run = run
+        await advanceUntil(() => run.crashes.length > 0)
+
+        expect(trail(run)).toEqual([...CLEANUP, `CRASH restart ${restart}`])
+        expect(run.crashes[0].error.name).toBe(wrapper)
+        expect(run.crashes[0].error.cause).toBe(error)
+        if (policy) {
+          expect(policy).toHaveBeenCalledTimes(1)
+          expect(seen.atPolicy).toEqual(CLEANUP)
+        }
+
+        await expectRestart(run, restart)
+        if (restart) {
+          await advanceUntil(() => run.delivered.length === 3, 2000)
+          expect(run.delivered).toEqual(['0|40', '0|41', '0|41'])
+          await closeClean(run)
+        } else {
+          expect(jest.getTimerCount()).toBe(0)
+        }
+      },
+      30000
+    )
+
+    it('a crash error that carries its own retryTime restarts after it, not after initialRetryTime', async () => {
+      const run = await begin({ retry: RETRY })
+      await advanceUntil(() => run.delivered.length === 2)
+      const error = Object.assign(new KafkaJSError('a transient failure', { retriable: true }), {
+        retryTime: 700,
+      })
+
+      run.group.stopRun(error)
+      await advanceUntil(() => run.crashes.length > 0)
+
+      expect(trail(run)).toEqual(['STOP', 'DISCONNECT', 'CRASH restart true'])
+      expect(run.crashes[0].error).toBe(error)
+      await expectRestart(run, true, 700)
+      await advanceUntil(() => run.coordinator.joinGroup.mock.calls.length > 1, 1000)
+      await closeClean(run)
+    }, 30000)
+  })
+
+  describe('a handler error after another end began while the handler ran', () => {
+    it.each([
+      [
+        'stop()',
+        ['commit topic-a|0 41', 'final commit', 'leave member-1 null', 'STOP', 'DISCONNECT'],
+        [[{ preserveSetupState: true }]],
+        'CRASH restart false',
+      ],
+      [
+        'disconnect()',
+        ['commit topic-a|0 41', 'final commit', 'leave member-1 null', 'STOP', 'DISCONNECT'],
+        [[]],
+        'CRASH restart false',
+      ],
+      ['disconnect({ timeout: 500 })', ['STOP', 'DISCONNECT'], [[{ drainTimeout: 0 }]], 'none'],
+    ])(
+      'after %s it ends with this trail, and restartOnFailure returning true restarts nothing',
+      async (cause, cleanup, transport, crash) => {
+        const error = failure(false)
+        const policy = jest.fn(async () => true)
+        const run = await begin({
+          retry: { ...RETRY, restartOnFailure: policy },
+          eachMessage: async ({ message }, held) => {
+            if (message.offset !== '41') return
+            await held.promise
+            throw error
+          },
+        })
+        await advanceUntil(() => run.delivered.length === 2)
+        const ending = settled(
+          cause === 'stop()'
+            ? run.consumer.stop()
+            : run.consumer.disconnect(cause === 'disconnect()' ? undefined : { timeout: 500 })
+        )
+        await jest.advanceTimersByTimeAsync(1000)
+
+        if (crash === 'none') {
+          expect(ending).toMatchObject({ done: true, value: undefined })
+          expect(trail(run)).toEqual(cleanup)
+        } else {
+          expect(ending.done).toBe(false)
+          expect(trail(run)).toEqual([])
+        }
+
+        run.held.resolve()
+        await advanceUntil(() => ending.done && (crash === 'none' || run.crashes.length > 0), 2000)
+        await jest.advanceTimersByTimeAsync(1000)
+
+        expect(ending).toMatchObject({ done: true, value: undefined })
+        expect(trail(run)).toEqual(crash === 'none' ? cleanup : [...cleanup, crash])
+        expect(run.crashes.map(({ error: { cause } }) => cause)).toEqual(
+          crash === 'none' ? [] : [error]
+        )
+        expect(policy).toHaveBeenCalledTimes(crash === 'none' ? 0 : 1)
+        expect(run.cluster.disconnect.mock.calls).toEqual(transport)
+        expect(run.cluster.connect).toHaveBeenCalledTimes(1)
+        expect(jest.getTimerCount()).toBe(0)
+      },
+      30000
+    )
+  })
+
+  describe("another cause while a crash's close callback runs", () => {
+    it.each([
+      [
+        'nothing else',
+        [
+          'commit topic-a|0 41',
+          'revoked callback',
+          'final commit',
+          'leave member-1 null',
+          'STOP',
+          'DISCONNECT',
+          'CRASH restart true',
+        ],
+        [[{ preserveSetupState: true }]],
+      ],
+      [
+        'stop()',
+        [
+          'commit topic-a|0 41',
+          'revoked callback',
+          'final commit',
+          'leave member-1 null',
+          'STOP',
+          'DISCONNECT',
+          'CRASH restart false',
+        ],
+        [[{ preserveSetupState: true }]],
+      ],
+      [
+        'disconnect()',
+        [
+          'commit topic-a|0 41',
+          'revoked callback',
+          'final commit',
+          'leave member-1 null',
+          'STOP',
+          'DISCONNECT',
+          'CRASH restart false',
+        ],
+        [[]],
+      ],
+      [
+        'disconnect({ timeout: 500 })',
+        ['commit topic-a|0 41', 'revoked callback', 'STOP', 'DISCONNECT', 'CRASH restart false'],
+        [[{ drainTimeout: 0 }]],
+      ],
+      [
+        'a topic recreation',
+        ['commit topic-a|0 41', 'revoked callback', 'STOP', 'DISCONNECT', 'CRASH restart true'],
+        [[{ preserveSetupState: true }]],
+      ],
+    ])(
+      'with %s arriving, a retriable handler error ends with this trail and reports the handler error',
+      async (second, expected, transport) => {
+        const error = failure(true)
+        const callback = deferred()
+        const run = await begin({
+          retry: RETRY,
+          closeCallback: () => callback.promise,
+          eachMessage: async ({ message }, _held, call) => {
+            if (message.offset === '41' && call === 2) throw error
+          },
+        })
+        await advanceUntil(() => trail(run).includes('revoked callback'))
+        expect(trail(run)).toEqual(['commit topic-a|0 41', 'revoked callback'])
+
+        let ending = null
+        if (second === 'stop()') ending = settled(run.consumer.stop())
+        if (second === 'disconnect()') ending = settled(run.consumer.disconnect())
+        if (second === 'disconnect({ timeout: 500 })')
+          ending = settled(run.consumer.disconnect({ timeout: 500 }))
+        if (second === 'a topic recreation') run.group.stopRun(recreated())
+        await advanceUntil(() => run.crashes.length > 0, 1000)
+        callback.resolve()
+        await advanceUntil(() => run.crashes.length > 0 && (ending === null || ending.done), 2000)
+
+        expect(trail(run)).toEqual(expected)
+        if (ending) expect(ending).toMatchObject({ done: true, value: undefined })
+        expect(run.crashes).toHaveLength(1)
+        expect(run.crashes[0].error.name).toBe('KafkaJSNumberOfRetriesExceeded')
+        expect(run.crashes[0].error.cause).toBe(error)
+        expect(run.cluster.disconnect.mock.calls).toEqual(transport)
+
+        const restart = run.crashes[0].restart
+        await expectRestart(run, restart)
+        if (restart) {
+          await advanceUntil(() => run.coordinator.joinGroup.mock.calls.length > 1, 2000)
+          await closeClean(run)
+        } else {
+          expect(jest.getTimerCount()).toBe(0)
+        }
+      },
+      30000
+    )
+  })
+
+  describe('a poll-interval expiry while the handler is stuck', () => {
+    /**
+     * Starts a member whose first handler call parks on `held` (and then throws `error`, if
+     * given), and waits for the expiry.
+     * @param {object} [options]
+     * @param {(run: object) => void} [options.beforeExpiry] runs once the member is started
+     */
+    const expire = async ({ instance = false, error, beforeExpiry } = {}) => {
+      const run = await begin({
+        instance,
+        config: { maxPollInterval: 4000, heartbeatInterval: 500 },
+        records: { 'topic-a|0': [40] },
+        eachMessage: async (_payload, held, call) => {
+          if (call !== 1) return
+          await held.promise
+          if (error) throw error
+        },
+      })
+      beforeExpiry?.(run)
+      await advanceUntil(() => trail(run).includes('POLL_INTERVAL_EXCEEDED'), 10000)
+      return run
+    }
+
+    it.each([
+      ['a dynamic', false, ['POLL_INTERVAL_EXCEEDED', 'leave member-1 null']],
+      ['a static', true, ['POLL_INTERVAL_EXCEEDED']],
+    ])(
+      'alone, %s member leaves at once as this row says, commits nothing and rejoins once the handler returns',
+      async (_kind, instance, expected) => {
+        const run = await expire({ instance })
+        await jest.advanceTimersByTimeAsync(1000)
+
+        expect(trail(run)).toEqual(expected)
+        expect(run.log.find(({ kind }) => kind === 'POLL').isStatic).toBe(instance)
+        expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(1)
+
+        run.held.resolve()
+        await advanceUntil(() => run.delivered.length === 2, 5000)
+        await jest.advanceTimersByTimeAsync(200)
+
+        expect(trail(run)).toEqual(expected)
+        expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(2)
+        expect(run.delivered).toEqual(['0|40', '0|40'])
+        expect(run.crashes).toEqual([])
+        await closeClean(run)
+      },
+      30000
+    )
+
+    it('then a failure of that handler is taken by the rejoin: no CRASH, no commit, one LeaveGroup', async () => {
+      const run = await expire({ error: failure(false) })
+      await jest.advanceTimersByTimeAsync(1000)
+      expect(trail(run)).toEqual(['POLL_INTERVAL_EXCEEDED', 'leave member-1 null'])
+
+      run.held.resolve()
+      await advanceUntil(() => run.delivered.length === 2, 5000)
+      await jest.advanceTimersByTimeAsync(1000)
+
+      expect(trail(run)).toEqual(['POLL_INTERVAL_EXCEEDED', 'leave member-1 null'])
+      expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(2)
+      expect(run.delivered).toEqual(['0|40', '0|40'])
+      expect(run.crashes).toEqual([])
+      await closeClean(run)
+    }, 30000)
+
+    /**
+     * Parks the expiry's LeaveGroup at its coordinator lookup, before its write.
+     * @returns {{ parked: () => boolean, release: () => void }}
+     */
+    const parkPollLeave = (run) => {
+      const membership = run.group.groupMembership
+      const live = membership.liveCoordinator.bind(membership)
+      const gate = deferred()
+      const state = { armed: false, parked: false }
+      run.consumer.on(run.consumer.events.POLL_INTERVAL_EXCEEDED, () => {
+        state.armed = true
+      })
+      jest.spyOn(membership, 'liveCoordinator').mockImplementation(async (operation) => {
+        if (state.armed && !state.parked) {
+          state.parked = true
+          await gate.promise
+        }
+        return live(operation)
+      })
+      return { parked: () => state.parked, release: () => gate.resolve() }
+    }
+
+    it.each([
+      [
+        'stop()',
+        'after',
+        ['POLL_INTERVAL_EXCEEDED', 'leave member-1 null', 'final commit', 'STOP'],
+        1,
+      ],
+      [
+        'stop()',
+        'before',
+        [
+          'POLL_INTERVAL_EXCEEDED',
+          'final commit',
+          'leave member-1 null',
+          'STOP',
+          'leave member-1 null',
+        ],
+        2,
+      ],
+      [
+        'disconnect({ timeout: 500 })',
+        'after',
+        ['POLL_INTERVAL_EXCEEDED', 'leave member-1 null', 'STOP', 'DISCONNECT'],
+        1,
+      ],
+      [
+        'disconnect({ timeout: 500 })',
+        'before',
+        ['POLL_INTERVAL_EXCEEDED', 'STOP', 'DISCONNECT'],
+        0,
+      ],
+    ])(
+      'then %s, arriving %s the expiry LeaveGroup is written, ends with this trail and that many LeaveGroups',
+      async (cause, when, expected, leaves) => {
+        let park = null
+        const run = await expire({
+          beforeExpiry: (started) => {
+            if (when === 'before') park = parkPollLeave(started)
+          },
+        })
+        if (park) await advanceUntil(park.parked, 1000)
+        await jest.advanceTimersByTimeAsync(200)
+        expect(park?.parked() ?? true).toBe(true)
+        expect(trail(run)).toEqual(
+          when === 'before'
+            ? ['POLL_INTERVAL_EXCEEDED']
+            : ['POLL_INTERVAL_EXCEEDED', 'leave member-1 null']
+        )
+
+        const ending = settled(
+          cause === 'stop()' ? run.consumer.stop() : run.consumer.disconnect({ timeout: 500 })
+        )
+        await jest.advanceTimersByTimeAsync(1000)
+        run.held.resolve()
+        await advanceUntil(() => ending.done, 2000)
+        park?.release()
+        await jest.advanceTimersByTimeAsync(1000)
+
+        expect(ending).toMatchObject({ done: true, value: undefined })
+        expect(trail(run)).toEqual(expected)
+        expect(run.coordinator.leaveGroup).toHaveBeenCalledTimes(leaves)
+        expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(1)
+        expect(run.crashes).toEqual([])
+        expect(jest.getTimerCount()).toBe(0)
+      },
+      30000
+    )
+  })
+
+  describe('a FENCED_INSTANCE_ID heartbeat answer to a static member', () => {
+    it('alone, while idle, drops the resolved offset, sends no LeaveGroup and reports CRASH with restart false although restartOnFailure says true', async () => {
+      const policy = jest.fn(async () => true)
+      const run = await begin({
+        instance: true,
+        config: { heartbeatInterval: 500 },
+        retry: { ...RETRY, restartOnFailure: policy },
+      })
+      await advanceUntil(() => run.delivered.length === 2)
+      await jest.advanceTimersByTimeAsync(200)
+      run.coordinator.heartbeat.mockImplementation(async () => {
+        throw protocolError(FENCED_INSTANCE_ID)
+      })
+      await advanceUntil(() => run.crashes.length > 0, 5000)
+      await jest.advanceTimersByTimeAsync(1000)
+
+      expect(trail(run)).toEqual(['final commit', 'STOP', 'DISCONNECT', 'CRASH restart false'])
+      expect(run.crashes).toHaveLength(1)
+      expect(run.crashes[0].error.code).toBe(FENCED_INSTANCE_ID)
+      expect(policy).toHaveBeenCalledTimes(1)
+      expect(run.group.memberId).toBeNull()
+      expect(run.cluster.connect).toHaveBeenCalledTimes(1)
+      expect(jest.getTimerCount()).toBe(0)
+    }, 30000)
+
+    it('then stop() while the handler runs drops the verdict: the run ends with STOP alone, no commit and no CRASH', async () => {
+      const policy = jest.fn(async () => true)
+      const { logger, lines } = recordingLogger()
+      const run = await begin({
+        instance: true,
+        config: { heartbeatInterval: 500, logger },
+        retry: { ...RETRY, restartOnFailure: policy },
+        eachMessage: async ({ message }, held) => {
+          if (message.offset === '41') await held.promise
+        },
+      })
+      await advanceUntil(() => run.delivered.length === 2)
+      const sent = run.coordinator.heartbeat.mock.calls.length
+      run.coordinator.heartbeat.mockImplementation(async () => {
+        throw protocolError(FENCED_INSTANCE_ID)
+      })
+      await advanceUntil(() => run.coordinator.heartbeat.mock.calls.length > sent, 2000)
+      await jest.advanceTimersByTimeAsync(100)
+      expect(run.coordinator.heartbeat.mock.calls.length).toBeGreaterThan(sent)
+      expect(trail(run)).toEqual([])
+
+      const stopping = settled(run.consumer.stop())
+      await jest.advanceTimersByTimeAsync(1000)
+      expect(stopping.done).toBe(false)
+
+      run.held.resolve()
+      await advanceUntil(() => stopping.done, 2000)
+      await jest.advanceTimersByTimeAsync(1000)
+
+      expect(stopping).toMatchObject({ done: true, value: undefined })
+      expect(trail(run)).toEqual(['final commit', 'STOP'])
+      expect(run.crashes).toEqual([])
+      expect(policy).not.toHaveBeenCalled()
+      expect(lines.filter((line) => line.startsWith('Crash: '))).toEqual([])
+      expect(jest.getTimerCount()).toBe(0)
+    }, 30000)
+  })
+})
