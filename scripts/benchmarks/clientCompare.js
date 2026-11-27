@@ -10,19 +10,28 @@
  *          [--duration-ms N] [--size N] [--partitions N] [--compression none|lz4|gzip]
  *          [--settings defaults|same] [--passes N] [--batch N] [--unawaited N] [--keys index]
  *          [--headers N] [--partitioner default|custom] [--value-type buffer|string]
- *          [--brokers host:port,...]
+ *          [--probe on] [--brokers host:port,...]
  * `--client` is an npm install prefix that holds `node_modules/<package>`. Defaults: 20000 messages
  * for `produce-latency`, 200000 for the others, 200 bytes per message, 3 partitions, no
  * compression, each package's own consumer defaults, the three brokers of docker-compose.yml.
  * Shape flags of `produce-throughput`: `--batch N` puts N records in each send (500 by default);
  * `--unawaited N` instead issues N one-record sends without awaiting any, then awaits them all (it
  * excludes `--batch`), so a producer that batches sends over time joins them; `--keys index` gives
- * record `n` the key `String(n)` so the partitioner places it by key, and without it records have
- * no key; `--headers N` gives every record N string headers. `--partitioner custom` (with the
- * default settings only) gives both packages the same plain function that places record `n` in
- * partition `n % partitions`. `--value-type string` (both produce workloads) sends each value as a
- * string instead of a Buffer. A produce run reports the shape flags it was given as `shape`.
- * `--compression gzip` uses the built-in codec both packages ship (`node:zlib`).
+ * record `n` of the measured window a key that is `n` written in seven digits, so the partitioner
+ * places it by key and every key is as long as every other, and without it records have no key;
+ * `--headers N` gives every record, the first send included, N string headers. `--partitioner
+ * custom` (with the default settings only) gives both packages the same plain function that places
+ * record `n` in partition `n % partitions`. `--value-type string` (both produce workloads) sends
+ * each value as a string instead of a Buffer. A produce run reports the shape flags it was given as
+ * `shape`. A run with none of them and a `--duration-ms` window sends the first values of the
+ * corpus on every send, as the produce rows always did, so their figures stay comparable over time;
+ * every other produce-throughput run walks the corpus, the walk starting again at the first record
+ * when the measured window starts. `--compression gzip` uses the built-in codec both packages ship
+ * (`node:zlib`).
+ * `--probe on` (produce-throughput only) adds what costs the run something to measure: the time of
+ * each `send()` call, the peak memory and the garbage collections of the measured window. A run
+ * without it reads no clock per send and starts no timer or observer beyond the rate and CPU
+ * measurement.
  * `--duration-ms` (produce workloads only, never with `--messages`) sends for a fixed measured
  * window after a 5-second warm-up that is not measured. A consume run excludes the first tenth of
  * the corpus as its warm-up; `--passes N` (consume only) reads the corpus N times, seeking each
@@ -41,10 +50,12 @@
  * the wrong client.
  * Metrics: `produce-latency` p50, p90, p99 (ms) of one awaited single-message send and
  * messagesPerSecond; `produce-throughput` messagesPerSecond and cpuMicrosPerMessage of sends of 500
- * messages (or the shape's), and over the measured window `sendCallMicrosP50` and `P99` (the
- * synchronous time of the `send()` call, before its promise is awaited), `peakRssBytes` and
- * `peakArrayBuffers` (sampled every 100 ms) and the garbage collections of any kind that started
- * in it, as a count and a total pause (ms) per 10,000 messages; `consume-throughput` messagesPerSecond, cpuMicrosPerMessage (user plus system),
+ * messages (or the shape's), and with `--probe on` also, over the measured window,
+ * `sendCallMicrosP50` and `P99` (the time from calling `send()` to its return of a promise, with
+ * the request already built and the promise not awaited), `peakRssBytes` and `peakArrayBuffers`
+ * (the largest of the readings taken every 100 ms and at the window's two ends) and the garbage
+ * collections of any kind that started in the window, as a count and a total pause (ms) per
+ * 10,000 messages; `consume-throughput` messagesPerSecond, cpuMicrosPerMessage (user plus system),
  * event-loop delay p50, p99 and max (ms), Fetch requests, bytes and messages per Fetch, all over the
  * measured window, plus the Fetch version, the passes and the LZ4 codec. A consume run also
  * reports mainThreadCpuMicrosPerMessage (the JavaScript thread only, from `process.threadCpuUsage`;
@@ -86,6 +97,9 @@ const SETTINGS = ['defaults', 'same']
 const VALUE_TYPES = ['buffer', 'string']
 const KEY_MODES = ['index']
 const PARTITIONERS = ['default', 'custom']
+const PROBE_MODES = ['on']
+/** Digits of a `--keys index` key, so every key has the same length. */
+const KEY_DIGITS = 7
 /** The `CompressionTypes` member each compression names, for the codecs a send can ask for. */
 const COMPRESSION_TYPE = { lz4: 'LZ4', gzip: 'GZIP' }
 const BATCH = 500
@@ -116,6 +130,7 @@ const FLAGS = [
   '--headers',
   '--partitioner',
   '--value-type',
+  '--probe',
   '--brokers',
 ]
 /** The workloads each optional flag applies to; the flag is a usage error on any other. */
@@ -126,9 +141,10 @@ const APPLIES_TO = {
   '--headers': ['produce-throughput'],
   '--partitioner': ['produce-throughput'],
   '--value-type': ['produce-latency', 'produce-throughput'],
+  '--probe': ['produce-throughput'],
 }
 const USAGE =
-  'usage: node scripts/benchmarks/clientCompare.js --client <dir> --package <name> --workload <produce-latency|produce-throughput|consume-throughput> [--messages N] [--duration-ms N] [--size N] [--partitions N] [--compression none|lz4|gzip] [--settings defaults|same] [--passes N] [--batch N] [--unawaited N] [--keys index] [--headers N] [--partitioner default|custom] [--value-type buffer|string] [--brokers host:port,...]'
+  'usage: node scripts/benchmarks/clientCompare.js --client <dir> --package <name> --workload <produce-latency|produce-throughput|consume-throughput> [--messages N] [--duration-ms N] [--size N] [--partitions N] [--compression none|lz4|gzip] [--settings defaults|same] [--passes N] [--batch N] [--unawaited N] [--keys index] [--headers N] [--partitioner default|custom] [--value-type buffer|string] [--probe on] [--brokers host:port,...]'
 
 /**
  * The one explicit consumer configuration of `--settings same`: kafkajs 2.2.4's defaults, with the
@@ -275,10 +291,10 @@ const positive = (text) => {
  *   durationMs: number|null, size: number, partitions: number, compression: 'none'|'lz4'|'gzip',
  *   settings: 'defaults'|'same', passes: number, batch?: number, unawaited?: number,
  *   keys?: 'index', headers?: number, partitioner?: 'default'|'custom',
- *   valueType?: 'buffer'|'string', brokers: string[] }} the optional fields are absent unless
- *   their flag was given
+ *   valueType?: 'buffer'|'string', probe?: 'on', brokers: string[] }} the optional fields are
+ *   absent unless their flag was given
  * @throws {UsageError} for a missing, repeated or unknown flag, an unknown workload, compression,
- *   settings, key mode, partitioner or value type, a count that is not a positive integer,
+ *   settings, key mode, partitioner, value type or probe mode, a count that is not a positive integer,
  *   `--duration-ms` with `--messages`, a flag on a workload it does not apply to, `--batch` with
  *   `--unawaited`, or `--partitioner custom` with `--settings same`
  */
@@ -297,6 +313,7 @@ const parseArgs = (argv) => {
   const valueType = flags['--value-type']
   const keys = flags['--keys']
   const partitioner = flags['--partitioner']
+  const probe = flags['--probe']
   const oneOf = (choices, value) => value === undefined || choices.includes(value)
   const known =
     WORKLOADS.includes(workload) &&
@@ -304,7 +321,8 @@ const parseArgs = (argv) => {
     SETTINGS.includes(settings) &&
     oneOf(VALUE_TYPES, valueType) &&
     oneOf(KEY_MODES, keys) &&
-    oneOf(PARTITIONERS, partitioner)
+    oneOf(PARTITIONERS, partitioner) &&
+    oneOf(PROBE_MODES, probe)
   if (!flags['--client'] || !flags['--package'] || !known) throw new UsageError(USAGE)
   const durationMs = positive(flags['--duration-ms']) ?? null
   const consume = workload === 'consume-throughput'
@@ -342,6 +360,7 @@ const parseArgs = (argv) => {
     headers: positive(flags['--headers']),
     partitioner,
     valueType,
+    probe,
     brokers: (flags['--brokers'] ?? DEFAULT_BROKERS).split(','),
   }
 }
@@ -515,11 +534,13 @@ const countFullGcs = ({
 /**
  * Starts recording every garbage collection (any kind) through a `gc` PerformanceObserver, by the
  * entries' start on the performance clock: a collection counts when it started between this call
- * and `result()`, even if Node delivers its entry later, during `result()`'s drain.
+ * and `stop()`, even if Node delivers its entry later, during `result()`'s drain. Only the count
+ * and the total pause are kept, so a window with many collections holds no entries.
  * @param {{ Observer?: Function, now?: () => number, drain?: () => Promise<void> }} [seams] the
  *   observer class, the performance clock and the wait for late entries, replaced in tests
- * @returns {{ result: () => Promise<{ count: number, pauseMs: number }>, close: () => void }}
- *   `result` ends the window, drains late entries, closes the observer and returns the window's
+ * @returns {{ stop: () => void, result: () => Promise<{ count: number, pauseMs: number }>,
+ *   close: () => void }} `stop` ends the window (the first call counts, and `result` calls it when
+ *   it was not); `result` drains late entries, closes the observer and returns the window's
  *   collections and their total duration in ms; `close` disconnects the observer once, without a
  *   result
  */
@@ -528,30 +549,37 @@ const trackGcs = ({
   now = () => performance.now(),
   drain = drainGcEntries,
 } = {}) => {
-  const seen = []
+  const from = now()
+  let to = null
+  let count = 0
+  let pauseMs = 0
   const keep = (entries) => {
-    for (const { startTime, duration } of entries) seen.push({ startTime, duration })
+    for (const { startTime, duration } of entries) {
+      if (startTime >= from && (to === null || startTime <= to)) {
+        count++
+        pauseMs += duration
+      }
+    }
   }
   const observer = new Observer((list) => keep(list.getEntries()))
   observer.observe({ entryTypes: ['gc'] })
-  const from = now()
   let closed = false
   const close = () => {
     if (closed) return
     closed = true
     observer.disconnect()
   }
+  const stop = () => {
+    to ??= now()
+  }
   return {
+    stop,
     result: async () => {
-      const to = now()
+      stop()
       await drain()
       if (!closed) keep(observer.takeRecords())
       close()
-      const inWindow = seen.filter(({ startTime }) => startTime >= from && startTime <= to)
-      return {
-        count: inWindow.length,
-        pauseMs: inWindow.reduce((total, { duration }) => total + duration, 0),
-      }
+      return { count, pauseMs }
     },
     close,
   }
@@ -565,7 +593,8 @@ const trackGcs = ({
  *   threadCpuUsage: ((previous?: object) => { user: number, system: number })|null,
  *   memoryUsage: () => { rss: number, arrayBuffers: number },
  *   countFullGcs: () => { stop: () => void, count: () => Promise<number>, close: () => void },
- *   trackGcs: () => { result: () => Promise<{ count: number, pauseMs: number }>, close: () => void },
+ *   trackGcs: () => { stop: () => void, result: () => Promise<{ count: number, pauseMs: number }>,
+ *     close: () => void },
  *   eventLoopDelay: () => { enable: Function, disable: Function, percentile: (p: number) => number,
  *     max: number } }} Timing clocks, timers, process CPU, the JavaScript thread's CPU (null on a
  *   Node without `process.threadCpuUsage`), the resident and `ArrayBuffer` memory in bytes, a
@@ -578,10 +607,10 @@ const DEFAULT_TIMING = {
   setInterval,
   clearInterval,
   sleep: (ms) => sleep(ms),
-  memoryUsage: () => ({
-    rss: process.memoryUsage.rss(),
-    arrayBuffers: process.memoryUsage().arrayBuffers,
-  }),
+  memoryUsage: () => {
+    const { rss, arrayBuffers } = process.memoryUsage()
+    return { rss, arrayBuffers }
+  },
   trackGcs,
   cpuUsage: (previous) => process.cpuUsage(previous),
   threadCpuUsage:
@@ -638,11 +667,18 @@ const headerPool = (count) =>
   Object.fromEntries(Array.from({ length: count }, (_, i) => [`h${i}`, `v${i}`]))
 
 /**
+ * @param {number} n a message's number in the window
+ * @returns {string} `n` in `KEY_DIGITS` digits (counting again from 0 after 10^`KEY_DIGITS`
+ *   messages), so every key is as long as every other
+ */
+const keyOf = (n) => String(n % 10 ** KEY_DIGITS).padStart(KEY_DIGITS, '0')
+
+/**
  * @param {(Buffer|string)[]} values the corpus values
- * @param {number} from index of the first message
+ * @param {number} from number of the first message in the window
  * @param {number} count
  * @param {{ keyed: boolean, headers?: Record<string, string> }} shape whether message `n` carries
- *   the key `String(n)`, and the headers every message carries
+ *   the key `keyOf(n)`, and the headers every message carries
  * @returns {{ value: Buffer|string, key?: string, headers?: object }[]} `count` messages cycling
  *   through `values`
  */
@@ -650,7 +686,7 @@ const shapedMessagesOf = (values, from, count, { keyed, headers }) =>
   Array.from({ length: count }, (_, i) => {
     const n = from + i
     const message = { value: values[n % values.length] }
-    if (keyed) message.key = String(n)
+    if (keyed) message.key = keyOf(n)
     if (headers) message.headers = headers
     return message
   })
@@ -712,10 +748,12 @@ const sendFor = async (clock, started, ms, send) => {
 }
 
 /**
- * What a produce run measures beside its rate: the synchronous time of each `send()` call, the peak
- * memory, and the garbage collections, all over the window between `start()` and `finish()`.
- * Nothing is kept per call (the times go into a fixed-size histogram) and `close()` releases the
- * sampling timer and the collection observer when a run fails before `finish()`.
+ * What a `--probe on` run measures beside its rate: the time of each `send()` call, the peak
+ * memory, and the garbage collections, all over one window. `start()` and `stop()` are called
+ * next to the reads of the rate clock, so the window is the one the rate is measured over; the
+ * collection observer takes its start last in `start()` and its end first in `stop()`. Nothing is
+ * kept per call (the times go into a fixed-size histogram) and `close()` releases the sampling
+ * timer and the collection observer when a run fails before `finish()`.
  */
 class ProduceProbe {
   #timing
@@ -731,27 +769,38 @@ class ProduceProbe {
     this.#timing = timing
   }
 
-  /** Begins the window: reads the memory now and every `MEMORY_SAMPLE_MS`, and records the GCs. */
-  start() {
-    this.#measuring = true
-    this.#gcs = this.#timing.trackGcs()
-    this.#sample()
-    this.#timer = this.#timing.setInterval(() => this.#sample(), MEMORY_SAMPLE_MS)
+  /** @returns {boolean} whether the window is open: only then is a call worth timing */
+  get measuring() {
+    return this.#measuring
   }
 
-  /** @param {bigint} ns how long one `send()` call ran before returning its promise */
+  /** Opens the window: reads the memory now and every `MEMORY_SAMPLE_MS`, and records the GCs. */
+  start() {
+    this.#sample()
+    this.#timer = this.#timing.setInterval(() => this.#sample(), MEMORY_SAMPLE_MS)
+    this.#gcs = this.#timing.trackGcs()
+    this.#measuring = true
+  }
+
+  /** @param {bigint} ns how long one `send()` call ran before it returned its promise */
   recordCall(ns) {
-    if (this.#measuring) this.#calls.record(Math.max(1, Number(ns)))
+    this.#calls.record(Math.max(1, Number(ns)))
+  }
+
+  /** Closes the window: no call is timed after this, and a collection that starts later is not counted. */
+  stop() {
+    this.#measuring = false
+    this.#gcs.stop()
   }
 
   /**
-   * Ends the window.
+   * Reads the memory once more, stops the sampling and waits for the window's late collection
+   * entries; the window itself ended at `stop()`.
    * @param {number} messages the messages sent in the window
    * @returns {Promise<{ sendCallMicrosP50: number, sendCallMicrosP99: number, peakRssBytes: number,
    *   peakArrayBuffers: number, gcCountPer10kMessages: number, gcPauseMsPer10kMessages: number }>}
    */
   async finish(messages) {
-    this.#measuring = false
     this.#stopSampling()
     this.#sample()
     const { count, pauseMs } = await this.#gcs.result()
@@ -838,17 +887,22 @@ const produceLatency = (
  * rounds of that many one-record sends issued without awaiting any and then all awaited, after an
  * untimed warm-up: one send that pays for metadata, or `WARMUP_MS` of batches with `durationMs`.
  * With `durationMs` the measured window is that long; otherwise it is `messages` messages. With
- * `keys` message `n` of the run carries the key `String(n)`, and with `headers` every message
- * carries that many string headers. Over the window it also reports the synchronous time of each
- * `send()` call, the peak memory and the garbage collections (`ProduceProbe`).
+ * `keys` message `n` of the window carries the key `keyOf(n)`, and with `headers` every message,
+ * the first send included, carries that many string headers; the numbering starts at 0 when the
+ * window starts, so both packages send the same records in the window whatever their warm-up
+ * managed. A run with none of the shape flags and a `durationMs` window sends the first values of
+ * the corpus on every send, as it always did; any other run walks the corpus. With `probe` the
+ * window also reports the time of each `send()` call, the peak memory and the garbage collections
+ * (`ProduceProbe`); without it the run reads no clock beyond the rate's and CPU's.
  * @param {object} kafka
  * @param {object} target topic and codec of every send
  * @param {{ messages: number, durationMs: number|null, values: (Buffer|string)[],
  *   producerSettings: object, batch?: number, unawaited?: number, keys?: 'index',
- *   headers?: number }} options
+ *   headers?: number, partitioner?: 'default'|'custom', valueType?: 'buffer'|'string',
+ *   probe?: 'on' }} options
  * @param {Timing} timing
  * @returns {Promise<object>} messagesPerSecond, cpuMicrosPerMessage, measuredMessages, elapsedMs
- *   and the probe's metrics
+ *   and, with `probe`, the probe's metrics
  */
 const produceThroughput = (kafka, target, options, timing) =>
   withProducer(
@@ -861,16 +915,29 @@ const produceThroughput = (kafka, target, options, timing) =>
         headers: options.headers === undefined ? undefined : headerPool(options.headers),
       }
       const shaped = shape.keyed || shape.headers !== undefined
-      let built = 0
+      const flagged = [
+        options.batch,
+        options.unawaited,
+        options.keys,
+        options.headers,
+        options.partitioner,
+        options.valueType,
+      ].some((flag) => flag !== undefined)
+      const repeatsFirstValues = durationMs !== null && !flagged
+      let issued = 0
       const nextMessages = (count) => {
-        if (!shaped) return messagesOf(values, 0, count)
-        built += count
-        return shapedMessagesOf(values, built - count, count, shape)
+        const from = issued
+        issued += count
+        return shaped
+          ? shapedMessagesOf(values, from, count, shape)
+          : messagesOf(values, repeatsFirstValues ? 0 : from, count)
       }
-      const probe = new ProduceProbe(timing)
+      const probe = options.probe === undefined ? null : new ProduceProbe(timing)
       const call = (count) => {
+        const request = { ...target, messages: nextMessages(count) }
+        if (!probe?.measuring) return producer.send(request)
         const calledAt = now()
-        const sending = producer.send({ ...target, messages: nextMessages(count) })
+        const sending = producer.send(request)
         probe.recordCall(now() - calledAt)
         return sending
       }
@@ -882,9 +949,10 @@ const produceThroughput = (kafka, target, options, timing) =>
         return count
       }
       try {
-        await producer.send({ ...target, messages: messagesOf(values, 0, 1) })
+        await call(1)
         if (durationMs !== null) await sendFor(now, now(), WARMUP_MS, send)
-        probe.start()
+        issued = 0
+        probe?.start()
         const started = now()
         const cpu = cpuUsage()
         let measuredMessages = messages
@@ -895,16 +963,17 @@ const produceThroughput = (kafka, target, options, timing) =>
           while (left > 0) left -= await send(left)
         }
         const elapsedMs = Number(now() - started) / 1e6
+        probe?.stop()
         const { user, system } = cpuUsage(cpu)
         return {
           messagesPerSecond: (measuredMessages / elapsedMs) * 1000,
           cpuMicrosPerMessage: (user + system) / measuredMessages,
           measuredMessages,
           elapsedMs,
-          ...(await probe.finish(measuredMessages)),
+          ...(await probe?.finish(measuredMessages)),
         }
       } finally {
-        probe.close()
+        probe?.close()
       }
     },
     options.producerSettings
@@ -1109,7 +1178,8 @@ const RUNNERS = {
  * @param {{ messages: number, durationMs?: number|null, size: number, partitions?: number,
  *   compression?: 'none'|'lz4'|'gzip', settings?: 'defaults'|'same', passes?: number,
  *   batch?: number, unawaited?: number, keys?: 'index', headers?: number,
- *   partitioner?: 'default'|'custom', valueType?: 'buffer'|'string', brokers: string[] }} options
+ *   partitioner?: 'default'|'custom', valueType?: 'buffer'|'string', probe?: 'on',
+ *   brokers: string[] }} options
  * @param {Partial<Timing>} [timing]
  * @returns {Promise<object>} the workload's metrics, with the consumer (consume) or producer
  *   (produce) `settings` in force, an LZ4 or gzip run's `codec`, and, when any of `batch`,

@@ -1,7 +1,7 @@
 /**
  * The benchmark workflow's row plan and report collector (`.github/workflows/bench.yml`).
  *
- * A dispatch names manifest rows (empty: every row). `plan` gives each selected row exactly one
+ * A dispatch names manifest rows (empty: every row not marked `namedOnly`). `plan` gives each selected row exactly one
  * owning job, from the script its manifest command runs: the consumer controller (one row per job,
  * and the audit after them), the share throughput session (one job per row and Node version), the
  * Snappy session, the telemetry adapter (one row per job), or the ordinary report job for every
@@ -257,7 +257,7 @@ const collect = (
       })
   const joined = {
     ...meta,
-    selection: input?.trim() ? input.trim() : 'every row',
+    selection: input?.trim() ? input.trim() : 'every row not marked namedOnly',
     jobs: `${units.filter((u) => u.reported).length} of ${units.length} reported`,
   }
   return { meta: joined, units, rows, details }

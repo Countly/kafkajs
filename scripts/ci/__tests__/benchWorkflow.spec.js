@@ -159,7 +159,7 @@ describe('bench.yml', () => {
     )
   })
 
-  test('runs only the rows named by the optional rows input, every row when it is empty', () => {
+  test('runs only the rows named by the optional rows input, every row not marked namedOnly when it is empty', () => {
     const plan = workflow.jobs.plan.steps.at(-1)
     const bench = stepIn(workflow.jobs.bench, 'report.js')
 
@@ -207,6 +207,10 @@ describe('bench.yml', () => {
       .collect(reports, { input: 'murmur2' })
       .rows.find(({ benchmark }) => benchmark === namedOnly[0])
     expect(other.reason).toBe('left out by the rows input')
+    expect(benchJobs.collect(reports, { input: '' }).meta.selection).toBe(
+      'every row not marked namedOnly'
+    )
+    expect(benchJobs.collect(reports, { input: ' murmur2 ' }).meta.selection).toBe('murmur2')
   })
 
   test('plans every selected row into exactly one owning job, and fails on an unknown row name', () => {

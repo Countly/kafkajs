@@ -69,14 +69,19 @@
       "metrics": [
         { "key": "messagesPerSecond", "unit": "msg/s" },
         { "key": "cpuMicrosPerMessage", "unit": "us" },
-        { "key": "elapsedMs", "unit": "ms" },
-        { "key": "sendCallMicrosP50", "unit": "us" },
-        { "key": "sendCallMicrosP99", "unit": "us" },
-        { "key": "peakRssBytes", "unit": "bytes" },
-        { "key": "peakArrayBuffers", "unit": "bytes" },
-        { "key": "gcCountPer10kMessages", "unit": "collections" },
-        { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        { "key": "elapsedMs", "unit": "ms" }
       ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
       "arms": ["fork", "kafkajs@2.2.4"]
     },
     {
@@ -99,14 +104,19 @@
       "metrics": [
         { "key": "messagesPerSecond", "unit": "msg/s" },
         { "key": "cpuMicrosPerMessage", "unit": "us" },
-        { "key": "elapsedMs", "unit": "ms" },
-        { "key": "sendCallMicrosP50", "unit": "us" },
-        { "key": "sendCallMicrosP99", "unit": "us" },
-        { "key": "peakRssBytes", "unit": "bytes" },
-        { "key": "peakArrayBuffers", "unit": "bytes" },
-        { "key": "gcCountPer10kMessages", "unit": "collections" },
-        { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        { "key": "elapsedMs", "unit": "ms" }
       ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
       "arms": ["fork", "kafkajs@2.2.4"],
       "profile": true
     },
@@ -130,14 +140,19 @@
       "metrics": [
         { "key": "messagesPerSecond", "unit": "msg/s" },
         { "key": "cpuMicrosPerMessage", "unit": "us" },
-        { "key": "elapsedMs", "unit": "ms" },
-        { "key": "sendCallMicrosP50", "unit": "us" },
-        { "key": "sendCallMicrosP99", "unit": "us" },
-        { "key": "peakRssBytes", "unit": "bytes" },
-        { "key": "peakArrayBuffers", "unit": "bytes" },
-        { "key": "gcCountPer10kMessages", "unit": "collections" },
-        { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        { "key": "elapsedMs", "unit": "ms" }
       ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
       "arms": ["fork", "kafkajs@2.2.4"]
     },
     {
@@ -160,14 +175,19 @@
       "metrics": [
         { "key": "messagesPerSecond", "unit": "msg/s" },
         { "key": "cpuMicrosPerMessage", "unit": "us" },
-        { "key": "elapsedMs", "unit": "ms" },
-        { "key": "sendCallMicrosP50", "unit": "us" },
-        { "key": "sendCallMicrosP99", "unit": "us" },
-        { "key": "peakRssBytes", "unit": "bytes" },
-        { "key": "peakArrayBuffers", "unit": "bytes" },
-        { "key": "gcCountPer10kMessages", "unit": "collections" },
-        { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        { "key": "elapsedMs", "unit": "ms" }
       ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
       "arms": ["fork", "kafkajs@2.2.4"]
     },
     {
@@ -190,14 +210,19 @@
       "metrics": [
         { "key": "messagesPerSecond", "unit": "msg/s" },
         { "key": "cpuMicrosPerMessage", "unit": "us" },
-        { "key": "elapsedMs", "unit": "ms" },
-        { "key": "sendCallMicrosP50", "unit": "us" },
-        { "key": "sendCallMicrosP99", "unit": "us" },
-        { "key": "peakRssBytes", "unit": "bytes" },
-        { "key": "peakArrayBuffers", "unit": "bytes" },
-        { "key": "gcCountPer10kMessages", "unit": "collections" },
-        { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        { "key": "elapsedMs", "unit": "ms" }
       ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
       "arms": ["fork", "kafkajs@2.2.4"]
     },
     {
@@ -222,14 +247,19 @@
       "metrics": [
         { "key": "messagesPerSecond", "unit": "msg/s" },
         { "key": "cpuMicrosPerMessage", "unit": "us" },
-        { "key": "elapsedMs", "unit": "ms" },
-        { "key": "sendCallMicrosP50", "unit": "us" },
-        { "key": "sendCallMicrosP99", "unit": "us" },
-        { "key": "peakRssBytes", "unit": "bytes" },
-        { "key": "peakArrayBuffers", "unit": "bytes" },
-        { "key": "gcCountPer10kMessages", "unit": "collections" },
-        { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        { "key": "elapsedMs", "unit": "ms" }
       ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
       "arms": ["fork", "kafkajs@2.2.4"],
       "namedOnly": true
     },
@@ -255,14 +285,19 @@
       "metrics": [
         { "key": "messagesPerSecond", "unit": "msg/s" },
         { "key": "cpuMicrosPerMessage", "unit": "us" },
-        { "key": "elapsedMs", "unit": "ms" },
-        { "key": "sendCallMicrosP50", "unit": "us" },
-        { "key": "sendCallMicrosP99", "unit": "us" },
-        { "key": "peakRssBytes", "unit": "bytes" },
-        { "key": "peakArrayBuffers", "unit": "bytes" },
-        { "key": "gcCountPer10kMessages", "unit": "collections" },
-        { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        { "key": "elapsedMs", "unit": "ms" }
       ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
       "arms": ["fork", "kafkajs@2.2.4"],
       "namedOnly": true
     },
@@ -288,14 +323,19 @@
       "metrics": [
         { "key": "messagesPerSecond", "unit": "msg/s" },
         { "key": "cpuMicrosPerMessage", "unit": "us" },
-        { "key": "elapsedMs", "unit": "ms" },
-        { "key": "sendCallMicrosP50", "unit": "us" },
-        { "key": "sendCallMicrosP99", "unit": "us" },
-        { "key": "peakRssBytes", "unit": "bytes" },
-        { "key": "peakArrayBuffers", "unit": "bytes" },
-        { "key": "gcCountPer10kMessages", "unit": "collections" },
-        { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        { "key": "elapsedMs", "unit": "ms" }
       ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
       "arms": ["fork", "kafkajs@2.2.4"],
       "namedOnly": true
     },
@@ -321,14 +361,19 @@
       "metrics": [
         { "key": "messagesPerSecond", "unit": "msg/s" },
         { "key": "cpuMicrosPerMessage", "unit": "us" },
-        { "key": "elapsedMs", "unit": "ms" },
-        { "key": "sendCallMicrosP50", "unit": "us" },
-        { "key": "sendCallMicrosP99", "unit": "us" },
-        { "key": "peakRssBytes", "unit": "bytes" },
-        { "key": "peakArrayBuffers", "unit": "bytes" },
-        { "key": "gcCountPer10kMessages", "unit": "collections" },
-        { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        { "key": "elapsedMs", "unit": "ms" }
       ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
       "arms": ["fork", "kafkajs@2.2.4"],
       "namedOnly": true
     },
@@ -354,14 +399,19 @@
       "metrics": [
         { "key": "messagesPerSecond", "unit": "msg/s" },
         { "key": "cpuMicrosPerMessage", "unit": "us" },
-        { "key": "elapsedMs", "unit": "ms" },
-        { "key": "sendCallMicrosP50", "unit": "us" },
-        { "key": "sendCallMicrosP99", "unit": "us" },
-        { "key": "peakRssBytes", "unit": "bytes" },
-        { "key": "peakArrayBuffers", "unit": "bytes" },
-        { "key": "gcCountPer10kMessages", "unit": "collections" },
-        { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        { "key": "elapsedMs", "unit": "ms" }
       ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
       "arms": ["fork", "kafkajs@2.2.4"],
       "namedOnly": true
     },
@@ -385,14 +435,19 @@
       "metrics": [
         { "key": "messagesPerSecond", "unit": "msg/s" },
         { "key": "cpuMicrosPerMessage", "unit": "us" },
-        { "key": "elapsedMs", "unit": "ms" },
-        { "key": "sendCallMicrosP50", "unit": "us" },
-        { "key": "sendCallMicrosP99", "unit": "us" },
-        { "key": "peakRssBytes", "unit": "bytes" },
-        { "key": "peakArrayBuffers", "unit": "bytes" },
-        { "key": "gcCountPer10kMessages", "unit": "collections" },
-        { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        { "key": "elapsedMs", "unit": "ms" }
       ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
       "arms": ["fork", "kafkajs@2.2.4"],
       "namedOnly": true
     },
@@ -418,14 +473,19 @@
       "metrics": [
         { "key": "messagesPerSecond", "unit": "msg/s" },
         { "key": "cpuMicrosPerMessage", "unit": "us" },
-        { "key": "elapsedMs", "unit": "ms" },
-        { "key": "sendCallMicrosP50", "unit": "us" },
-        { "key": "sendCallMicrosP99", "unit": "us" },
-        { "key": "peakRssBytes", "unit": "bytes" },
-        { "key": "peakArrayBuffers", "unit": "bytes" },
-        { "key": "gcCountPer10kMessages", "unit": "collections" },
-        { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        { "key": "elapsedMs", "unit": "ms" }
       ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
       "arms": ["fork", "kafkajs@2.2.4"],
       "namedOnly": true
     },
@@ -453,14 +513,59 @@
       "metrics": [
         { "key": "messagesPerSecond", "unit": "msg/s" },
         { "key": "cpuMicrosPerMessage", "unit": "us" },
-        { "key": "elapsedMs", "unit": "ms" },
-        { "key": "sendCallMicrosP50", "unit": "us" },
-        { "key": "sendCallMicrosP99", "unit": "us" },
-        { "key": "peakRssBytes", "unit": "bytes" },
-        { "key": "peakArrayBuffers", "unit": "bytes" },
-        { "key": "gcCountPer10kMessages", "unit": "collections" },
-        { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        { "key": "elapsedMs", "unit": "ms" }
       ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-100k-lz4",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--size",
+        "102400",
+        "--batch",
+        "8",
+        "--compression",
+        "lz4"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
       "arms": ["fork", "kafkajs@2.2.4"],
       "namedOnly": true
     },
@@ -486,14 +591,19 @@
       "metrics": [
         { "key": "messagesPerSecond", "unit": "msg/s" },
         { "key": "cpuMicrosPerMessage", "unit": "us" },
-        { "key": "elapsedMs", "unit": "ms" },
-        { "key": "sendCallMicrosP50", "unit": "us" },
-        { "key": "sendCallMicrosP99", "unit": "us" },
-        { "key": "peakRssBytes", "unit": "bytes" },
-        { "key": "peakArrayBuffers", "unit": "bytes" },
-        { "key": "gcCountPer10kMessages", "unit": "collections" },
-        { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        { "key": "elapsedMs", "unit": "ms" }
       ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
       "arms": ["fork", "kafkajs@2.2.4"],
       "namedOnly": true
     },
@@ -521,14 +631,19 @@
       "metrics": [
         { "key": "messagesPerSecond", "unit": "msg/s" },
         { "key": "cpuMicrosPerMessage", "unit": "us" },
-        { "key": "elapsedMs", "unit": "ms" },
-        { "key": "sendCallMicrosP50", "unit": "us" },
-        { "key": "sendCallMicrosP99", "unit": "us" },
-        { "key": "peakRssBytes", "unit": "bytes" },
-        { "key": "peakArrayBuffers", "unit": "bytes" },
-        { "key": "gcCountPer10kMessages", "unit": "collections" },
-        { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        { "key": "elapsedMs", "unit": "ms" }
       ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
       "arms": ["fork", "kafkajs@2.2.4"],
       "namedOnly": true
     },
@@ -554,14 +669,19 @@
       "metrics": [
         { "key": "messagesPerSecond", "unit": "msg/s" },
         { "key": "cpuMicrosPerMessage", "unit": "us" },
-        { "key": "elapsedMs", "unit": "ms" },
-        { "key": "sendCallMicrosP50", "unit": "us" },
-        { "key": "sendCallMicrosP99", "unit": "us" },
-        { "key": "peakRssBytes", "unit": "bytes" },
-        { "key": "peakArrayBuffers", "unit": "bytes" },
-        { "key": "gcCountPer10kMessages", "unit": "collections" },
-        { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        { "key": "elapsedMs", "unit": "ms" }
       ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
       "arms": ["fork", "kafkajs@2.2.4"],
       "namedOnly": true
     },
@@ -585,14 +705,19 @@
       "metrics": [
         { "key": "messagesPerSecond", "unit": "msg/s" },
         { "key": "cpuMicrosPerMessage", "unit": "us" },
-        { "key": "elapsedMs", "unit": "ms" },
-        { "key": "sendCallMicrosP50", "unit": "us" },
-        { "key": "sendCallMicrosP99", "unit": "us" },
-        { "key": "peakRssBytes", "unit": "bytes" },
-        { "key": "peakArrayBuffers", "unit": "bytes" },
-        { "key": "gcCountPer10kMessages", "unit": "collections" },
-        { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        { "key": "elapsedMs", "unit": "ms" }
       ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
       "arms": ["fork", "kafkajs@2.2.4"],
       "namedOnly": true
     },

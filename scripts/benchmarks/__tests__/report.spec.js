@@ -280,6 +280,67 @@ describe('Benchmarks > report', () => {
       expect(evidence.runs.map(({ run }) => run)).toEqual([1, 2, 3, 4, 5, 'profile'])
     })
 
+    test('an entry with diagnostic runs each arm that did not fail once more with its arguments added, after its measured runs, and reports that run apart from the medians', () => {
+      const diagnostic = { args: ['--probe', 'on'], metrics: [{ key: 'p', unit: 'us' }] }
+      const { spawn, calls } = stub((args, n) =>
+        valueAfter(args, '--package') === 'kafkajs'
+          ? { status: 1, stdout: '', stderr: 'boom' }
+          : json({
+              ...identityOf(args),
+              a: args.includes('--probe') ? 999 : n,
+              p: 7,
+              elapsedMs: 30000,
+            })
+      )
+
+      const { rows } = runEntry(
+        compared({ name: 'probed', adapter: 'clientCompare', diagnostic }),
+        options(spawn)
+      )
+
+      expect(calls).toHaveLength(7)
+      expect(calls[6].args.slice(-2)).toEqual(['--probe', 'on'])
+      expect(calls[6].args.slice(0, -2)).toEqual(calls[0].args)
+      expect(calls.slice(0, 6).every(({ args }) => !args.includes('--probe'))).toBe(true)
+      expect(rows.find(({ arm, metric }) => arm === 'fork' && metric === 'a')).toMatchObject({
+        runs: 5,
+        median: 4,
+        status: 'valid',
+      })
+      expect(rows.find(({ arm, metric }) => arm === 'fork' && metric === 'p')).toMatchObject({
+        runs: 1,
+        median: 7,
+        status: 'valid',
+      })
+      expect(rows.find(({ arm, metric }) => arm !== 'fork' && metric === 'p')).toMatchObject({
+        status: 'error',
+        reason: 'no diagnostic run: run 1 of 5: exit 1: boom',
+      })
+      const evidence = JSON.parse(fs.readFileSync(path.join(rawDir, 'probed', 'fork.json'), 'utf8'))
+      expect(evidence.runs.map(({ run }) => run)).toEqual([1, 2, 3, 4, 5, 'diagnostic'])
+    })
+
+    test("a diagnostic run that fails leaves the arm's measured rows valid and gives its own metrics an error row", () => {
+      const diagnostic = { args: ['--probe', 'on'], metrics: [{ key: 'p', unit: 'us' }] }
+      const { spawn } = stub((args, n) =>
+        args.includes('--probe')
+          ? { status: 1, stdout: '', stderr: 'boom' }
+          : json({ ...identityOf(args), a: n, p: 7, elapsedMs: 30000 })
+      )
+
+      const { rows } = runEntry(
+        compared({ name: 'probed-failing', adapter: 'clientCompare', diagnostic }),
+        options(spawn)
+      )
+
+      const fork = rows.filter(({ arm }) => arm === 'fork')
+      expect(fork.map(({ metric, status, runs }) => [metric, status, runs])).toEqual([
+        ['a', 'valid', 5],
+        ['p', 'error', 0],
+      ])
+      expect(fork[1].reason).toBe('diagnostic run: exit 1: boom')
+    })
+
     test('reports a missing, null, NaN or non-numeric metric as an error row', () => {
       const keys = ['good', 'missing', 'nothing', 'text', 'huge', 'nested']
       const entry = single({ metrics: keys.map((key) => ({ key, unit: 'ms' })) })
@@ -399,9 +460,9 @@ describe('Benchmarks > report', () => {
         runEntry(entry, options(spawn, 1))
 
         const adapter = entry.adapter && require(path.join(BENCHMARKS, 'adapters', entry.adapter))
-        const profiled = entry.profile ? 1 : 0
+        const extra = (entry.profile ? 1 : 0) + (entry.diagnostic ? 1 : 0)
         expect(calls).toHaveLength(
-          entry.adapter ? ((adapter.runs ?? 1) + profiled) * entry.arms.length : entry.arms.length
+          entry.adapter ? ((adapter.runs ?? 1) + extra) * entry.arms.length : entry.arms.length
         )
         for (const { args } of calls) expect(args.filter((arg) => /[{}]/.test(arg))).toEqual([])
       }
