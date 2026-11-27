@@ -1,4 +1,4 @@
-const { performance: realClock } = require('perf_hooks')
+const { setTimeout: realSetTimeout, clearTimeout: realClearTimeout } = require('timers')
 const Encoder = require('../../protocol/encoder')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const joinGroupV8 = require('../../../testHelpers/wire/joinGroupV8')
@@ -517,23 +517,23 @@ describe('Consumer > classic group answers refused until the join retries run ou
   const RESTART_DELAY = 300
   const REBALANCE_IN_PROGRESS = 27
   const consumers = []
-  /** The group of the running case, whose journal is printed when the case does not finish. */
-  let watched = null
+  let currentGroup = null
 
-  // Real setImmediate and nextTick, as for the other first-round crash cleanups: a fetcher's
-  // empty round yields through setImmediate, and a faked one runs at the same fake instant again
-  // and again, so the pump would never reach the backoff of the member being refused.
-  beforeEach(() => jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick'] }))
+  beforeEach(() =>
+    jest.useFakeTimers({ now: 0, doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] })
+  )
   afterEach(async () => {
-    if (watched && !watched.finished) {
-      console.log('Unfinished case, what the group saw:', JSON.stringify(seen(watched), null, 1))
+    const group = currentGroup
+    currentGroup = null
+    try {
+      const stopping = consumers.splice(0).map((consumer) => consumer.disconnect({ timeout: 1000 }))
+      if (stopping.length) {
+        await withJournal(group, () => settle('disconnect', Promise.all(stopping), 2000))
+      }
+    } finally {
+      jest.useRealTimers()
+      jest.restoreAllMocks()
     }
-    watched = null
-    const stopping = Promise.all(consumers.splice(0).map((c) => c.disconnect().catch(() => {})))
-    await jest.advanceTimersByTimeAsync(1000)
-    await stopping
-    jest.useRealTimers()
-    jest.restoreAllMocks()
   })
 
   /** @param {number[]} partitions @returns {Buffer} an assignment of TOPIC */
@@ -541,23 +541,22 @@ describe('Consumer > classic group answers refused until the join retries run ou
     MemberAssignment.encode({ version: 0, assignment: { [TOPIC]: partitions } })
 
   /**
-   * One classic group behind a coordinator double its members share. A JoinGroup with an empty
-   * member id is a new entry and a LeaveGroup an exit; either asks every other member to rejoin
-   * through its next heartbeat, as a coordinator rebalances a group a member enters or leaves.
-   * `events` journals each member's group requests and consumer events with the fake time, and
-   * `fetchRounds` counts each member's fetch preparations, which a spinning fetch loop inflates.
-   * @returns {{ members: string[], rejoin: Set<string>, fetches: string[], events: string[],
-   *   fetchRounds: Object<string, number>, finished: boolean }} `fetches` names the member of
-   *   every partition fetched
+   * Creates a group with a participating leader for the paired cases. In the single-member
+   * cases the coordinator scripts an external leader's assignments.
+   * @param {string} [leaderId] id of the participating leader
+   * @returns {object} coordinator state and the ordered test journal
    */
-  const createGroup = () =>
-    (watched = {
-      members: [],
-      rejoin: new Set(),
+  const createGroup = (leaderId) =>
+    (currentGroup = {
+      leaderId,
+      members: new Map(),
+      generation: 0,
+      joining: null,
+      assignments: null,
+      rejoining: false,
       fetches: [],
       events: [],
       fetchRounds: {},
-      finished: false,
     })
 
   /**
@@ -571,19 +570,37 @@ describe('Consumer > classic group answers refused until the join retries run ou
     fetches: fetches.length,
   })
 
+  /** @param {object} group @param {() => Promise<void>} work @returns {Promise<void>} */
+  const withJournal = async (group, work) => {
+    try {
+      await work()
+    } catch (error) {
+      throw new Error(`${error.message}\nGroup journal:\n${JSON.stringify(seen(group), null, 2)}`, {
+        cause: error,
+      })
+    }
+  }
+
+  /** @returns {{ promise: Promise<*>, resolve: Function }} a held coordinator answer */
+  const heldAnswer = () => {
+    let resolve
+    const promise = new Promise((answer) => (resolve = answer))
+    return { promise, resolve }
+  }
+
   /**
    * A real classic consumer of `group`, over a double of the Broker's group calls. A dynamic
    * member's first JoinGroup goes through the MEMBER_ID_REQUIRED handshake the Broker performs
    * (`onMemberIdRequired` with the new id, then the answer), a static one gets its id at once.
-   * The answers pass the Broker's own check, so an answer it refuses is refused as on the wire,
-   * and each SyncGroup answers the next of `assignment`, the last one again once they run out.
+   * The answers pass the Broker's own check. In the paired cases the leader publishes the
+   * assignments for the generation. With an external leader SyncGroup draws from `assignment`.
    * @param {object} group from `createGroup`
    * @param {string} memberId the id the coordinator gives this member
-   * @param {{ assignment: Buffer|Buffer[], join?: object, retry?: object,
+   * @param {{ assignment?: Buffer|Buffer[], join?: object, retry?: object,
    *   groupInstanceId?: string|null, maxPollInterval?: number,
    *   assigners?: Function[] }} options `join` overrides fields of the JoinGroup answer;
    *   `assigners` replaces the one assigner
-   * @returns {{ consumer: object, coordinator: object, crashes: object[] }}
+   * @returns {{ consumer: object, coordinator: object, crashes: object[], refused: string[] }}
    */
   const createMember = (
     group,
@@ -591,12 +608,12 @@ describe('Consumer > classic group answers refused until the join retries run ou
     { assignment, join = {}, retry = {}, groupInstanceId, maxPollInterval, assigners }
   ) => {
     const crashes = []
+    const refused = []
     const assignments = [].concat(assignment)
-    let generation = 0
-    const note = (event) => group.events.push(`${Date.now() % 1000000} ${memberId} ${event}`)
-    const rebalanceOthers = () => {
-      for (const other of group.members) if (other !== memberId) group.rejoin.add(other)
-    }
+    let fetchedGeneration = null
+    let heartbeatGeneration = null
+    const note = (event) => group.events.push(`${Date.now()} ${memberId} ${event}`)
+    const isLeader = memberId === group.leaderId
     const coordinator = {
       isConnected: () => true,
       nodeId: 0,
@@ -615,42 +632,90 @@ describe('Consumer > classic group answers refused until the join retries run ou
       })),
       joinGroup: jest.fn(async (request, options) => {
         note(`JoinGroup as ${request.memberId || '(no id)'}`)
-        if (request.memberId === '') {
-          if (!request.groupInstanceId) options?.onMemberIdRequired?.(memberId)
-          rebalanceOthers()
+        if (!request.memberId && !request.groupInstanceId) {
+          note(`JoinGroup answered MEMBER_ID_REQUIRED (79), id=${memberId}`)
+          options?.onMemberIdRequired?.(memberId)
+          const stopped = options?.guard?.()
+          if (stopped) throw stopped
+          note(`JoinGroup as ${memberId}`)
         }
+
+        if (group.leaderId) {
+          // Id allocation does not add a member. A confirmed new follower waits for the
+          // leader, and an unchanged follower rejoin in the stable group keeps its generation.
+          if (!group.members.has(memberId)) {
+            group.members.set(memberId, {
+              memberId,
+              groupInstanceId: request.groupInstanceId,
+              memberMetadata: request.groupProtocols[0].metadata,
+            })
+            if (!isLeader) {
+              group.rejoining = true
+              const joining = (group.joining = heldAnswer())
+              await joining.promise
+            }
+          }
+          if (isLeader) {
+            group.generation += 1
+            group.assignments = heldAnswer()
+            group.rejoining = false
+            group.joining?.resolve()
+            group.joining = null
+          }
+        } else {
+          group.generation += 1
+        }
+
         const answer = {
-          generationId: ++generation,
-          leaderId: 'someone-else',
+          generationId: group.generation,
+          leaderId: group.leaderId || 'someone-else',
           memberId,
-          members: [],
+          members: isLeader ? [...group.members.values()] : [],
           groupProtocol: PROTOCOL,
           protocolType: 'consumer',
           ...join,
         }
+        note(`JoinGroup answered generation=${answer.generationId}, id=${answer.memberId}`)
         assertJoinAnswer(answer, request.groupProtocols)
         return answer
       }),
-      syncGroup: jest.fn(async () => {
-        note('SyncGroup')
-        return {
-          memberAssignment: assignments.length > 1 ? assignments.shift() : assignments[0],
+      syncGroup: jest.fn(async ({ generationId, groupAssignment }) => {
+        note(`SyncGroup generation=${generationId}`)
+        let memberAssignment
+        if (group.leaderId) {
+          if (isLeader) group.assignments.resolve(groupAssignment)
+          const published = await group.assignments.promise
+          memberAssignment = published.find((row) => row.memberId === memberId).memberAssignment
+        } else {
+          memberAssignment = assignments.length > 1 ? assignments.shift() : assignments[0]
         }
+        note(
+          `SyncGroup answered generation=${generationId}, assignment=${memberAssignment.toString('hex')}`
+        )
+        return { memberAssignment }
       }),
-      heartbeat: jest.fn(async () => {
-        if (group.rejoin.delete(memberId)) {
-          note('Heartbeat answered REBALANCE_IN_PROGRESS')
+      heartbeat: jest.fn(async ({ generationId }) => {
+        if (group.rejoining) {
+          note(`Heartbeat generation=${generationId} answered REBALANCE_IN_PROGRESS`)
           throw new KafkaJSProtocolError(createErrorFromCode(REBALANCE_IN_PROGRESS))
+        }
+        if (generationId !== heartbeatGeneration) {
+          heartbeatGeneration = generationId
+          note(`Heartbeat generation=${generationId} answered success`)
         }
       }),
       leaveGroup: jest.fn(async () => {
         note('LeaveGroup')
-        rebalanceOthers()
+        if (group.members.delete(memberId)) group.rejoining = group.members.size > 0
       }),
     }
     const broker = {
       fetch: jest.fn(async ({ topics }) => {
         for (const { partitions } of topics) group.fetches.push(...partitions.map(() => memberId))
+        if (fetchedGeneration !== group.generation) {
+          fetchedGeneration = group.generation
+          note(`Fetch generation=${fetchedGeneration}`)
+        }
         await new Promise((resolve) => setTimeout(resolve, 50))
         return { responses: [] }
       }),
@@ -689,12 +754,20 @@ describe('Consumer > classic group answers refused until the join retries run ou
     const consumer = createConsumer({
       cluster,
       groupId: GROUP_ID,
-      logger: newLogger(),
+      logger: newLogger({
+        level: LEVELS.WARN,
+        logCreator:
+          () =>
+          ({ log }) => {
+            note(log.message)
+            if (log.message.startsWith('Refused a group answer')) refused.push(log.error)
+          },
+      }),
       instrumentationEmitter: cluster.instrumentationEmitter,
       partitionAssigners: assigners ?? [assignerNamed(PROTOCOL)],
       sessionTimeout: 30000,
       heartbeatInterval: 100,
-      retry: { initialRetryTime: RESTART_DELAY, retries: 2, ...retry },
+      retry: { initialRetryTime: RESTART_DELAY, retries: 2, factor: 0, ...retry },
       ...(groupInstanceId ? { groupInstanceId } : {}),
       ...(maxPollInterval === undefined ? {} : { maxPollInterval }),
     })
@@ -703,21 +776,25 @@ describe('Consumer > classic group answers refused until the join retries run ou
       crashes.push(payload)
     })
     consumer.on(consumer.events.GROUP_JOIN, () => note('GROUP_JOIN'))
-    group.members.push(memberId)
+    consumer.on(consumer.events.REBALANCING, () => note('REBALANCING'))
+    consumer.on(consumer.events.STOP, () => note('STOP'))
     consumers.push(consumer)
-    return { consumer, coordinator, crashes }
+    return { consumer, coordinator, crashes, refused }
   }
 
   /**
    * @param {string} name
-   * @returns {Function} the factory of an eager assigner named `name` that assigns nothing
+   * @param {Function} [assign] how the leader assigns its members
+   * @returns {Function} the factory of an eager assigner named `name`
    */
-  const assignerNamed = (name) => () => ({
-    name,
-    version: 0,
-    protocol: () => ({ name, metadata: Buffer.alloc(0) }),
-    assign: async () => [],
-  })
+  const assignerNamed =
+    (name, assign = async () => []) =>
+    () => ({
+      name,
+      version: 0,
+      protocol: ({ topics }) => ({ name, metadata: MemberMetadata.encode({ version: 0, topics }) }),
+      assign,
+    })
 
   /** @param {{ consumer: object }} member @returns {Promise<void>} */
   const start = async ({ consumer }) => {
@@ -726,23 +803,48 @@ describe('Consumer > classic group answers refused until the join retries run ou
   }
 
   /**
-   * Advances fake time in `step` ms steps until `done()` holds, for at most `budget` ms of fake
-   * time and 20 s of real time, so a case whose loop spins reaches its assertions and prints its
-   * journal instead of timing out.
-   * @param {() => boolean} done
-   * @param {number} [budget]
-   * @param {number} [step]
+   * Advances only this case's fake clock. Between ticks the native turn lets a fetcher yield
+   * and lets promises arm their next timers. A native watchdog also covers the turn itself.
+   * @param {string} stage what the case is waiting for
+   * @param {number} budget fake milliseconds to advance at most
+   * @param {() => boolean} [done] omit to observe the whole fake interval
    * @returns {Promise<void>}
    */
-  const until = async (done, budget = 2000, step = 10) => {
-    const realDeadline = realClock.now() + 20000
-    for (
-      let spent = 0;
-      !done() && spent < budget && realClock.now() < realDeadline;
-      spent += step
-    ) {
-      await jest.advanceTimersByTimeAsync(step)
+  const drive = async (stage, budget, done) => {
+    let alarm
+    const cancellation = new AbortController()
+    const watchdog = new Promise((_, reject) => {
+      alarm = realSetTimeout(() => reject(new Error(`${stage} stalled`)), 10000)
+    })
+    const driveClock = async () => {
+      const deadline = Date.now() + budget
+      await new Promise(setImmediate)
+      while (!cancellation.signal.aborted && !done?.() && Date.now() < deadline) {
+        jest.advanceTimersByTime(Math.min(25, deadline - Date.now()))
+        await new Promise(setImmediate)
+      }
+      if (!cancellation.signal.aborted && done && !done()) {
+        throw new Error(`${stage} unfinished after ${budget} fake ms`)
+      }
     }
+
+    try {
+      await Promise.race([driveClock(), watchdog])
+    } finally {
+      cancellation.abort()
+      realClearTimeout(alarm)
+    }
+  }
+
+  /** @param {string} stage @param {Promise<*>} operation @param {number} budget @returns {Promise<void>} */
+  const settle = async (stage, operation, budget) => {
+    let settled = false
+    const markSettled = () => {
+      settled = true
+    }
+    operation.then(markSettled, markSettled)
+    await drive(stage, budget, () => settled)
+    await operation
   }
 
   /** @param {object} group @param {string} memberId @returns {number} */
@@ -750,31 +852,35 @@ describe('Consumer > classic group answers refused until the join retries run ou
 
   /**
    * Starts a healthy member, lets it fetch, then starts a member whose every assignment is
-   * refused and pumps fake time until that member crashes. Every check carries the journal.
+   * refused and pumps fake time until its first run settles.
+   * @param {object} group shared coordinator state
    * @param {string|null} groupInstanceId the refused member's
    * @param {object} [options] more `createMember` options for the refused member
    * @returns {Promise<{ group: object, healthy: object, refused: object }>}
    */
-  const refusedBesideHealthy = async (groupInstanceId, options = {}) => {
-    const group = createGroup()
-    const healthy = createMember(group, HEALTHY, { assignment: assignmentOf([0]) })
+  const refusedBesideHealthy = async (group, groupInstanceId, options = {}) => {
+    const invalidAssignment = Buffer.from([0])
+    const healthy = createMember(group, HEALTHY, {
+      assigners: [
+        assignerNamed(PROTOCOL, async ({ members }) =>
+          members.map(({ memberId }) => ({
+            memberId,
+            memberAssignment: memberId === HEALTHY ? assignmentOf([0]) : invalidAssignment,
+          }))
+        ),
+      ],
+    })
     const refused = createMember(group, REFUSED, {
-      assignment: Buffer.from([0]),
       groupInstanceId,
       ...options,
     })
-    await start(healthy)
-    await until(() => fetchesOf(group, HEALTHY) > 0)
-    expect({ healthyFetched: fetchesOf(group, HEALTHY) > 0, seen: seen(group) }).toEqual({
-      healthyFetched: true,
-      seen: expect.anything(),
-    })
-    await start(refused)
-    await until(() => refused.crashes.length > 0, 20000)
-    expect({
-      crashes: refused.crashes.map(({ error, restart }) => [error.name, restart]),
-      seen: seen(group),
-    }).toEqual({ crashes: [['KafkaJSPartialMessageError', false]], seen: expect.anything() })
+    await settle('healthy run', start(healthy), 2000)
+    await drive('first healthy Fetch', 2000, () => fetchesOf(group, HEALTHY) > 0)
+    expect(fetchesOf(group, HEALTHY)).toBeGreaterThan(0)
+    await settle('refused run and crash cleanup', start(refused), 10000)
+    expect(refused.crashes.map(({ error, restart }) => [error.name, restart])).toEqual([
+      ['KafkaJSPartialMessageError', false],
+    ])
     return { group, healthy, refused }
   }
 
@@ -788,29 +894,33 @@ describe('Consumer > classic group answers refused until the join retries run ou
   const expectOneStop = async ({ group, healthy, refused }, expected) => {
     const [{ error, groupId }] = refused.crashes
     expect({
-      joins: refused.coordinator.joinGroup.mock.calls.length,
-      syncs: refused.coordinator.syncGroup.mock.calls.length,
+      joinIds: refused.coordinator.joinGroup.mock.calls.map(([request]) => request.memberId),
+      syncGenerations: refused.coordinator.syncGroup.mock.calls.map(
+        ([request]) => request.generationId
+      ),
+      refusals: refused.refused,
       // The crash cleanup leaves for a dynamic member; a static one keeps its slot.
       leaves: refused.coordinator.leaveGroup.mock.calls.length,
       groupId,
       retriable: error.retriable,
       message: error.message,
-      seen: seen(group),
     }).toEqual({
-      joins: expected.joins,
-      syncs: expected.joins,
+      joinIds: ['', ...Array(expected.joins - 1).fill(REFUSED)],
+      syncGenerations: Array(expected.joins).fill(2),
+      refusals: Array(expected.joins).fill(expected.reason),
       leaves: expected.groupInstanceId ? 0 : 1,
       groupId: GROUP_ID,
       retriable: false,
       message: `Group ${GROUP_ID} member ${REFUSED}: the join ended on a refused group answer: ${expected.reason}`,
-      seen: expect.anything(),
     })
 
-    await until(() => false, 2000)
+    // Let the leader rejoin after a dynamic member leaves. A static member keeps its slot.
+    await drive('healthy member after cleanup', 2000)
     const healthyJoins = healthy.coordinator.joinGroup.mock.calls.length
+    expect(healthyJoins).toBe(expected.groupInstanceId ? 2 : 3)
     const healthyFetches = fetchesOf(group, HEALTHY)
     const observedFrom = Date.now()
-    await until(() => false, expected.observeMs, 100)
+    await drive('observe stopped member', expected.observeMs)
 
     expect({
       observedMs: Date.now() - observedFrom,
@@ -819,7 +929,6 @@ describe('Consumer > classic group answers refused until the join retries run ou
       healthyJoins: healthy.coordinator.joinGroup.mock.calls.length,
       healthyCrashes: healthy.crashes.length,
       healthyFetchedMore: fetchesOf(group, HEALTHY) > healthyFetches,
-      seen: seen(group),
     }).toEqual({
       observedMs: expected.observeMs,
       refusedJoins: expected.joins,
@@ -827,9 +936,7 @@ describe('Consumer > classic group answers refused until the join retries run ou
       healthyJoins,
       healthyCrashes: 0,
       healthyFetchedMore: true,
-      seen: expect.anything(),
     })
-    group.finished = true
   }
 
   const SHORTER = 'SyncGroup response carries an assignment shorter than its version'
@@ -840,14 +947,16 @@ describe('Consumer > classic group answers refused until the join retries run ou
   ])(
     'a %s member whose assignment is refused on every attempt crashes once with restart false and joins no more, while a healthy member keeps fetching',
     async (_, groupInstanceId) => {
-      const members = await refusedBesideHealthy(groupInstanceId)
-
-      // retries: 2 is three attempts, each a JoinGroup and a refused SyncGroup.
-      await expectOneStop(members, {
-        joins: 3,
-        groupInstanceId,
-        reason: SHORTER,
-        observeMs: RESTART_DELAY * 10,
+      const group = createGroup(HEALTHY)
+      await withJournal(group, async () => {
+        const members = await refusedBesideHealthy(group, groupInstanceId)
+        // The Broker's dynamic id handshake is part of the first of three join attempts.
+        await expectOneStop(members, {
+          joins: 3,
+          groupInstanceId,
+          reason: SHORTER,
+          observeMs: RESTART_DELAY * 10,
+        })
       })
     }
   )
@@ -858,38 +967,41 @@ describe('Consumer > classic group answers refused until the join retries run ou
   ])(
     'a %s member whose round deadline passes in the backoff after a refused assignment crashes once with restart false and joins no more, while a healthy member keeps fetching',
     async (_, groupInstanceId) => {
-      // A 5 s round and a first backoff of 10 s +/- 20%: the round ends while retries are left.
-      const members = await refusedBesideHealthy(groupInstanceId, {
-        maxPollInterval: 5000,
-        retry: { initialRetryTime: 10000, retries: 5 },
-      })
+      const group = createGroup(HEALTHY)
+      await withJournal(group, async () => {
+        // The round ends at 5 s while the first 10 s backoff is still pending.
+        const members = await refusedBesideHealthy(group, groupInstanceId, {
+          maxPollInterval: 5000,
+          retry: { initialRetryTime: 10000, retries: 5 },
+        })
 
-      // Longer than the 10 s a restart would wait.
-      await expectOneStop(members, {
-        joins: 1,
-        groupInstanceId,
-        reason: SHORTER,
-        observeMs: 30000,
+        await expectOneStop(members, {
+          joins: 1,
+          groupInstanceId,
+          reason: SHORTER,
+          observeMs: 30000,
+        })
       })
     }
   )
 
   test('a member whose assignment is refused once and then accepted in the same join fetches and does not crash', async () => {
     const group = createGroup()
-    const member = createMember(group, REFUSED, {
-      assignment: [Buffer.from([0]), assignmentOf([1])],
-    })
-    await start(member)
-    await until(() => fetchesOf(group, REFUSED) > 0, 5000)
+    await withJournal(group, async () => {
+      const member = createMember(group, REFUSED, {
+        assignment: [Buffer.from([0]), assignmentOf([1])],
+      })
+      await settle('member run', start(member), 5000)
+      await drive('first member Fetch', 5000, () => fetchesOf(group, REFUSED) > 0)
 
-    expect({
-      joins: member.coordinator.joinGroup.mock.calls.length,
-      syncs: member.coordinator.syncGroup.mock.calls.length,
-      crashes: member.crashes.length,
-      fetched: fetchesOf(group, REFUSED) > 0,
-      seen: seen(group),
-    }).toEqual({ joins: 2, syncs: 2, crashes: 0, fetched: true, seen: expect.anything() })
-    group.finished = true
+      expect({
+        joins: member.coordinator.joinGroup.mock.calls.length,
+        syncs: member.coordinator.syncGroup.mock.calls.length,
+        refusals: member.refused,
+        crashes: member.crashes.length,
+        fetched: fetchesOf(group, REFUSED) > 0,
+      }).toEqual({ joins: 2, syncs: 2, refusals: [SHORTER], crashes: 0, fetched: true })
+    })
   })
 
   test('two assigners whose names are written as the same bytes are refused when the consumer is created, and one name listed twice is not', () => {
@@ -911,51 +1023,51 @@ describe('Consumer > classic group answers refused until the join retries run ou
         assigners: [assignerNamed('planner'), assignerNamed('planner')],
       })
     ).not.toThrow()
-    group.finished = true
   })
 
   test('a JoinGroup answer refused on every attempt crashes the member once with restart false, before any SyncGroup', async () => {
     const group = createGroup()
-    const refused = createMember(group, REFUSED, {
-      assignment: assignmentOf([0]),
-      join: { memberId: '' },
+    await withJournal(group, async () => {
+      const refused = createMember(group, REFUSED, {
+        assignment: assignmentOf([0]),
+        join: { memberId: '' },
+      })
+      await settle('refused run and crash cleanup', start(refused), 10000)
+
+      expect(refused.coordinator.joinGroup).toHaveBeenCalledTimes(3)
+      expect(refused.coordinator.syncGroup).not.toHaveBeenCalled()
+      expect(refused.crashes).toHaveLength(1)
+      const [{ error, groupId, restart }] = refused.crashes
+      expect(error).toBeInstanceOf(KafkaJSPartialMessageError)
+      expect({ groupId, restart }).toEqual({ groupId: GROUP_ID, restart: false })
+      expect(error.message).toBe(
+        `Group ${GROUP_ID} member (no id yet): the join ended on a refused group answer: JoinGroup response has no member id`
+      )
+
+      await drive('observe stopped member', RESTART_DELAY * 10)
+      expect(refused.coordinator.joinGroup).toHaveBeenCalledTimes(3)
+      expect(refused.crashes).toHaveLength(1)
     })
-    await start(refused)
-    await until(() => refused.crashes.length > 0, 10000)
-
-    expect(refused.coordinator.joinGroup).toHaveBeenCalledTimes(3)
-    expect(refused.coordinator.syncGroup).not.toHaveBeenCalled()
-    expect(refused.crashes).toHaveLength(1)
-    const [{ error, groupId, restart }] = refused.crashes
-    expect(error).toBeInstanceOf(KafkaJSPartialMessageError)
-    expect({ groupId, restart }).toEqual({ groupId: GROUP_ID, restart: false })
-    expect(error.message).toBe(
-      `Group ${GROUP_ID} member (no id yet): the join ended on a refused group answer: JoinGroup response has no member id`
-    )
-
-    await jest.advanceTimersByTimeAsync(RESTART_DELAY * 10)
-    expect(refused.coordinator.joinGroup).toHaveBeenCalledTimes(3)
-    expect(refused.crashes).toHaveLength(1)
-    group.finished = true
   })
 
   test('a restartOnFailure that returns true receives the stop and restarts the member, as for any crash it decides', async () => {
     const restartOnFailure = jest.fn(async () => true)
     const group = createGroup()
-    const refused = createMember(group, REFUSED, {
-      assignment: Buffer.from([0]),
-      retry: { restartOnFailure },
+    await withJournal(group, async () => {
+      const refused = createMember(group, REFUSED, {
+        assignment: Buffer.from([0]),
+        retry: { restartOnFailure },
+      })
+      await settle('refused run and crash cleanup', start(refused), 10000)
+
+      expect(restartOnFailure).toHaveBeenCalledTimes(1)
+      const [[error]] = restartOnFailure.mock.calls
+      expect(error).toBeInstanceOf(KafkaJSPartialMessageError)
+      expect(refused.crashes).toEqual([{ error, groupId: GROUP_ID, restart: true }])
+
+      const restarted = () => refused.coordinator.joinGroup.mock.calls.length > 3
+      await drive('member restart', RESTART_DELAY * 4, restarted)
+      expect(refused.coordinator.joinGroup.mock.calls.length).toBeGreaterThan(3)
     })
-    await start(refused)
-    await until(() => refused.crashes.length > 0, 10000)
-
-    expect(restartOnFailure).toHaveBeenCalledTimes(1)
-    const [[error]] = restartOnFailure.mock.calls
-    expect(error).toBeInstanceOf(KafkaJSPartialMessageError)
-    expect(refused.crashes).toEqual([{ error, groupId: GROUP_ID, restart: true }])
-
-    await until(() => refused.coordinator.joinGroup.mock.calls.length > 3, RESTART_DELAY * 4)
-    expect(refused.coordinator.joinGroup.mock.calls.length).toBeGreaterThan(3)
-    group.finished = true
   })
 })
