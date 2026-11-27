@@ -1,5 +1,7 @@
 const { EventEmitter } = require('events')
 const Encoder = require('../src/protocol/encoder')
+const Decoder = require('../src/protocol/decoder')
+const { requestHeaderVersion, REQUEST_HEADER_V2 } = require('../src/protocol/headers')
 
 /**
  * A socket that records everything written and lets a test push response frames back. It matches
@@ -160,8 +162,6 @@ const respondWithFrame = (state, correlationId, headerVersion, body, headerTags)
  *   byteLength: number }}
  */
 const readRequestHeader = (frame) => {
-  const Decoder = require('../src/protocol/decoder')
-  const { requestHeaderVersion, REQUEST_HEADER_V2 } = require('../src/protocol/headers')
   const decoder = new Decoder(frame)
   decoder.readInt32()
   const apiKey = decoder.readInt16()

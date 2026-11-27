@@ -598,6 +598,11 @@ const decodeOffsetForLeaderEpochRequests = (writes) =>
  * `setImmediate` later, in write order, whoever wrote it. A frame is owned by its socket and the
  * correlation id in its header, and nothing else.
  *
+ * The fake broker owns every playback it schedules. `close()` cancels the ones still queued and
+ * stops it answering: a frame written afterwards is recorded and never answered, and a withheld
+ * answer settling afterwards neither answers nor fails its request, which stays in flight until
+ * the connection closes. Close it before the test ends, so no answer runs after its test.
+ *
  * A Buffer is played back at once. A thenable is a withheld answer: it is played back when it
  * resolves, and later requests are answered meanwhile. A broker answers one connection in order;
  * overtaking here stands in for the separate connection the real pool gives Fetch. A thenable
@@ -614,12 +619,16 @@ const decodeOffsetForLeaderEpochRequests = (writes) =>
  * @param {(header: { apiKey: number, apiVersion: number, correlationId: number },
  *   frame: Buffer) => Buffer|PromiseLike<Buffer>} answer
  * @param {(frame: Buffer, header: object) => Buffer[]} [chunks] complete-frame transport chunks
- * @returns {{ broker: Broker, state: { writes: Buffer[] } }}
+ * @returns {{ broker: Broker, state: { writes: Buffer[] }, close: () => void }}
  */
 const createFakeBroker = (answer, chunks) => {
   const { factory: socketFactory, state } = createFakeSocketFactory()
+  /** @type {Set<NodeJS.Immediate>} playbacks scheduled and not yet run */
+  const playbacks = new Set()
+  let closed = false
   /**
-   * The fake socket factory, with every recorded write answered one `setImmediate` later.
+   * The fake socket factory, with every recorded write answered one `setImmediate` later while
+   * the fake broker is open.
    * @param {object} options what `Connection` passes the socket factory
    * @returns {object} the fake socket
    */
@@ -628,8 +637,14 @@ const createFakeBroker = (answer, chunks) => {
     const write = socket.write
     socket.write = (...args) => {
       const written = write(...args)
-      const frame = socket.writes[socket.writes.length - 1]
-      setImmediate(() => playBack(socket, frame))
+      if (!closed) {
+        const frame = socket.writes[socket.writes.length - 1]
+        const playback = setImmediate(() => {
+          playbacks.delete(playback)
+          playBack(socket, frame)
+        })
+        playbacks.add(playback)
+      }
       return written
     }
     return socket
@@ -702,9 +717,11 @@ const createFakeBroker = (answer, chunks) => {
    */
   const playBack = (socket, frame) => {
     const header = readRequestHeader(frame)
-    const fail = (error) => failRequest(socket, header.correlationId, error)
+    const fail = (error) => {
+      if (!closed) failRequest(socket, header.correlationId, error)
+    }
     const deliver = (body) => {
-      if (!socket.destroyed) reply({ socket }, header, body)
+      if (!closed && !socket.destroyed) reply({ socket }, header, body)
     }
     try {
       const body = answer(header, frame)
@@ -745,7 +762,17 @@ const createFakeBroker = (answer, chunks) => {
     destroy: async (options) => connection.disconnect(options),
   })
 
-  return { broker: new Broker({ connectionPool, logger: newLogger() }), state }
+  /**
+   * Stops answering: cancels every queued playback, and nothing written or settled later answers.
+   * @returns {void}
+   */
+  const close = () => {
+    closed = true
+    for (const playback of playbacks) clearImmediate(playback)
+    playbacks.clear()
+  }
+
+  return { broker: new Broker({ connectionPool, logger: newLogger() }), state, close }
 }
 
 /**
@@ -1072,11 +1099,12 @@ const createFetchGroup = async ({
     })
   }
 
-  const { broker, state } = createNodeBroker(NODE_ID)
+  const { broker, state, close } = createNodeBroker(NODE_ID)
   await broker.connect()
 
-  /** @type {Map<number, { broker: Broker, state: { writes: Buffer[] }, ready: Promise<void> }>} */
-  const nodeBrokers = new Map([[NODE_ID, { broker, state, ready: Promise.resolve() }]])
+  /** @type {Map<number, { broker: Broker, state: { writes: Buffer[] }, close: () => void,
+   *   ready: Promise<void> }>} */
+  const nodeBrokers = new Map([[NODE_ID, { broker, state, close, ready: Promise.resolve() }]])
   /** @type {Map<number, Set<{ released: Promise<void>, release: () => void }>>} */
   const heldLookups = new Map()
   let tornDown = false
@@ -1294,10 +1322,12 @@ const createFetchGroup = async ({
   /** @type {Promise<void>|null} */
   let tearingDown = null
   /**
-   * Ends the fixture: every held or later broker lookup rejects, and every node's connection
-   * closes at once, failing the requests still waiting for an answer. For `finally` and
-   * `afterEach`, so a failed assertion cannot leave a withheld answer or a held lookup pending.
-   * The cleanup runs once; every caller waits for that same cleanup.
+   * Ends the fixture: every held or later broker lookup rejects; each node's fake broker stops
+   * answering, with no answer left queued for a later turn, once the node has finished connecting
+   * (a connected node at once); and every node's connection closes at once, failing the requests
+   * still waiting for an answer. For `finally` and `afterEach`, so a failed assertion cannot leave
+   * a withheld answer or a held lookup pending, and no answer runs after the test. The cleanup
+   * runs once; every caller waits for that same cleanup.
    * @returns {Promise<void>}
    */
   const teardown = () =>
@@ -1308,7 +1338,10 @@ const createFetchGroup = async ({
       }
       await Promise.all(
         [...nodeBrokers.values()].map(async (node) => {
+          // A connecting node needs its ApiVersions answer to finish; closing it earlier would
+          // leave its connect pending.
           await node.ready.catch(() => {})
+          node.close()
           await node.broker.disconnect({ drainTimeout: 0 })
         })
       )
