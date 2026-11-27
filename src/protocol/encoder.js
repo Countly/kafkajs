@@ -66,7 +66,7 @@ module.exports = class Encoder {
   /**
    * The string a broker reads back from what `writeString` and `writeUVarIntString` wrote for
    * `name`. UTF-8 writes each lone surrogate as U+FFFD, so a broker's echo of such a name differs
-   * from `name`. A well-formed name is returned as it is, without a copy.
+   * from `name`. A well-formed name is returned as it is.
    * @param {string|null|undefined} name
    * @returns {string|null|undefined} `name`, with each lone surrogate replaced by U+FFFD
    */

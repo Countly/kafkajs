@@ -153,9 +153,15 @@ class ScramCredentials {
 
   /** Validates the whole mutation, derives once, and retries only unresolved user groups. A lone
    * surrogate in a user name is written as U+FFFD, so users are sent and matched by the written
-   * name and each result carries the name the caller gave (the first, for names written as the same
-   * bytes with different mechanisms); the same name and mechanism twice, written as the same
-   * bytes or not, is a duplicate.
+   * name; the same name and mechanism twice, written as the same bytes or not, is a duplicate.
+   *
+   * The controller answers one result per user. Entries that name one user (two mechanisms, an
+   * upsertion and a deletion, or spellings written as the same bytes such as a lone surrogate and a
+   * literal U+FFFD) are several changes to one user in one request: the controller applies none of
+   * them and reports one user-level error (`DUPLICATE_RESOURCE`) for the user, and this method
+   * returns that one result. It carries the first spelling of the user in the call (upsertions are
+   * read before deletions), even when that spelling is well formed and a later one is not; a caller
+   * finds it under that spelling only.
    * @param {object} options upsertions and deletions
    * @returns {Promise<object[]>} one caller-ordered result per affected user
    * @throws {Error} invalid input, derivation, capability, invariant or deadline refusal
@@ -171,7 +177,7 @@ class ScramCredentials {
     )
     const identities = new Set()
     const users = new Map()
-    const callerUsers = new Map()
+    let callerUsers = null
     for (const [list, upsert] of [
       [upsertions, true],
       [deletions, false],
@@ -182,8 +188,10 @@ class ScramCredentials {
         const identity = JSON.stringify([sent, entry.mechanism])
         valid(!identities.has(identity), 'duplicate credential')
         identities.add(identity)
-        users.set(sent, { user: sent })
-        if (sent !== entry.user && !callerUsers.has(sent)) callerUsers.set(sent, entry.user)
+        if (!users.has(sent)) {
+          users.set(sent, { user: sent })
+          if (sent !== entry.user) (callerUsers ||= new Map()).set(sent, entry.user)
+        }
         if (upsert) {
           valid(
             Number.isInteger(entry.iterations) &&
@@ -274,7 +282,7 @@ class ScramCredentials {
           }))
         }
       )
-      if (callerUsers.size === 0) return rows
+      if (callerUsers === null) return rows
       return rows.map((row) => {
         const user = callerUsers.get(row.user)
         return user === undefined ? row : { ...row, user }

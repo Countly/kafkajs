@@ -52,23 +52,50 @@ const doesNotSupportApiKey = (error) => {
 /**
  * Names the ids as a request writes them. A lone surrogate is written as U+FFFD, so the broker
  * answers a row for the written name, not for the id the caller gave; every id is sent, looked up,
- * retried and matched by its written name and `named` gives a row back under the caller's id. Ids
- * written as the same bytes are sent as two identical ids are, and their rows come back under the
- * first of those ids.
+ * retried and matched by its written name and `named` gives the rows back under the caller's ids.
+ *
+ * Ids written as the same bytes (a lone surrogate and a literal U+FFFD, or two different lone
+ * surrogates) are sent as two identical ids are and describe one group. `named` answers every
+ * distinct spelling the caller gave: the rows of one written name go to the caller's entries for it
+ * in order, so a spelling given twice keeps two rows where a repeated id has two; when fewer rows
+ * came back than spellings (a classic describe answers a written name once) the last row is
+ * repeated under each spelling still unanswered. A well-formed spelling is never renamed.
+ *
+ * When no id changes when written, the ids are returned as given and `named` returns the rows it is
+ * given, building no collection.
  * @param {string[]} groupIds ids as the caller gave them
- * @returns {{ ids: string[], named: (row: object) => object }} the written names, and a function
- *   that renames a row by its written name, returning a row of any other name as it is
+ * @returns {{ ids: string[], named: (rows: object[]) => object[] }} the written names, and a
+ *   function that gives rows the caller's spellings, leaving a row of any other name as it is
  */
 const sentNames = (groupIds) => {
-  const callerIds = new Map()
-  const ids = groupIds.map((groupId) => {
-    const sent = Encoder.sentForm(groupId)
-    if (!callerIds.has(sent)) callerIds.set(sent, groupId)
-    return sent
+  if (!groupIds.some((groupId) => Encoder.sentForm(groupId) !== groupId)) {
+    return { ids: groupIds, named: (rows) => rows }
+  }
+  const ids = groupIds.map((groupId) => Encoder.sentForm(groupId))
+  const entries = new Map()
+  ids.forEach((sent, index) => {
+    const callers = entries.get(sent)
+    if (callers) callers.push(groupIds[index])
+    else entries.set(sent, [groupIds[index]])
   })
-  const named = (row) => {
-    const groupId = callerIds.get(row.groupId)
-    return groupId === undefined || groupId === row.groupId ? row : { ...row, groupId }
+  const named = (rows) => {
+    const last = new Map(rows.map((row, index) => [row.groupId, index]))
+    const taken = new Map()
+    return rows.flatMap((row, index) => {
+      const callers = entries.get(row.groupId)
+      if (callers === undefined) return [row]
+      const count = taken.get(row.groupId) ?? 0
+      taken.set(row.groupId, count + 1)
+      const answered = new Set(callers.slice(0, count + 1))
+      const spellings = [callers[Math.min(count, callers.length - 1)]]
+      if (last.get(row.groupId) === index) {
+        for (const spelling of callers) {
+          if (!answered.has(spelling)) spellings.push(spelling)
+          answered.add(spelling)
+        }
+      }
+      return spellings.map((groupId) => (groupId === row.groupId ? row : { ...row, groupId }))
+    })
   }
   return { ids, named }
 }
@@ -144,7 +171,10 @@ class GroupDescriptions {
    *         id that fell back to it fails the call, because that API's own parse throws every
    *         group-level code but GROUP_ID_NOT_FOUND
    *         Each row carries the id the caller gave, whatever the broker echoed (a lone surrogate is
-   *         written as U+FFFD); ids written as the same bytes are treated like identical ids
+   *         written as U+FFFD). Ids written as the same bytes (such as a lone surrogate and a
+   *         literal U+FFFD) are sent like identical ids and describe one group: each distinct
+   *         spelling gets a row, under that exact spelling, and the rows of the one group can be
+   *         equal in all but `groupId`
    */
   async describe(groupIds, options = {}) {
     return withConsumerOperation(options.operation, async () => {
@@ -187,7 +217,7 @@ class GroupDescriptions {
     const fallbacks = described.filter(({ needsFallback }) => needsFallback)
 
     if (fallbacks.length === 0) {
-      return { groups: rows.map(named) }
+      return { groups: named(rows) }
     }
 
     const classic = this.#checked(
@@ -202,7 +232,7 @@ class GroupDescriptions {
     const stashed = new Map(fallbacks.map(({ groupId, error }) => [groupId, error]))
 
     return {
-      groups: [
+      groups: named([
         ...rows,
         ...classic.map((row) =>
           this.#shapeClassicGroup(
@@ -211,7 +241,7 @@ class GroupDescriptions {
             context.includeAuthorizedOperations
           )
         ),
-      ].map(named),
+      ]),
     }
   }
 
