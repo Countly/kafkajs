@@ -131,6 +131,106 @@ describe('fetch offsets for groups', () => {
       ).rejects.toBeInstanceOf(KafkaJSInvariantViolation)
     }
   )
+  // A lone surrogate is written as U+FFFD, so a broker echoes that and not the string that was asked.
+  describe('a group id with a lone surrogate', () => {
+    const echoOf = (id) => Buffer.from(id, 'utf8').toString('utf8')
+    const ask = (...ids) =>
+      ids.map((groupId) => ({ groupId, topics: [{ topic: 't', partitions: [0] }] }))
+    /** A coordinator that names each group as the bytes it read, with `errorCode` on each row. */
+    const echoing = (version, errorCode = 0) => {
+      const asked = []
+      const b = broker(0, version)
+      b.offsetFetch.mockImplementation(async (request) => {
+        const ids = request.groups ? request.groups.map((g) => g.groupId) : [request.groupId]
+        asked.push(...ids)
+        if (request.groups) return { groups: ids.map((id) => row(echoOf(id), errorCode)) }
+        const single = row(echoOf(ids[0]), errorCode)
+        return { ...single, responses: single.topics }
+      })
+      return { b, asked }
+    }
+    const fetchFrom = (b, ids) =>
+      createAdmin({
+        cluster: { findGroupCoordinator: jest.fn(async () => b) },
+        logger,
+        retry,
+      }).fetchOffsetsForGroups({ groups: ask(...ids) })
+
+    it.each([8, 9])(
+      'is answered under the id given when the broker echoes the bytes sent at version %i',
+      async (version) => {
+        const { b, asked } = echoing(version)
+        const result = await fetchFrom(b, ['team-\uD800', 'g1', 'other-\uDC00'])
+        expect(result.map((r) => [r.groupId, r.errorCode])).toEqual([
+          ['team-\uD800', 0],
+          ['g1', 0],
+          ['other-\uDC00', 0],
+        ])
+        expect(result[0].topics[0].partitions.map((p) => p.offset)).toEqual(['10'])
+        expect(asked.map(echoOf)).toEqual(['team-�', 'g1', 'other-�'])
+        expect(b.offsetFetch).toHaveBeenCalledTimes(1)
+      }
+    )
+
+    it.each([8, 9])(
+      'keeps the group error the broker answered under the id given at version %i',
+      async (version) => {
+        const { b } = echoing(version, 30)
+        const result = await fetchFrom(b, ['team-\uD800'])
+        expect(result.map((r) => [r.groupId, r.errorCode, r.error.code])).toEqual([
+          ['team-\uD800', 30, 30],
+        ])
+        expect(b.offsetFetch).toHaveBeenCalledTimes(1)
+      }
+    )
+
+    it('is answered under the id given at version 7, where each group is read on its own', async () => {
+      const { b } = echoing(7)
+      const result = await fetchFrom(b, ['team-\uD800', 'g1'])
+      expect(result.map((r) => [r.groupId, r.errorCode])).toEqual([
+        ['team-\uD800', 0],
+        ['g1', 0],
+      ])
+    })
+
+    it('is refused when another id in the call has the same bytes, before any lookup', async () => {
+      const { b } = echoing(9)
+      const cluster = { findGroupCoordinator: jest.fn(async () => b) }
+      await expect(
+        createAdmin({ cluster, logger, retry }).fetchOffsetsForGroups({
+          groups: ask('a\uD800', 'a\uD801'),
+        })
+      ).rejects.toBeInstanceOf(KafkaJSInvalidConfigurationError)
+      expect(cluster.findGroupCoordinator).not.toHaveBeenCalled()
+    })
+
+    it.each([['team-other'], ['team-��']])(
+      'is still refused an answer for %s',
+      async (answered) => {
+        const b = broker(0, 9)
+        b.offsetFetch.mockResolvedValue({ groups: [row(answered)] })
+        await expect(fetchFrom(b, ['team-\uD800'])).rejects.toBeInstanceOf(
+          KafkaJSInvariantViolation
+        )
+      }
+    )
+  })
+  it('answers an ordinary Unicode group id under that id', async () => {
+    const id = 'über-\u{1F600}'
+    const b = broker(0, 9)
+    b.offsetFetch.mockImplementation(async (request) => ({
+      groups: request.groups.map((g) => row(g.groupId)),
+    }))
+    const result = await createAdmin({
+      cluster: { findGroupCoordinator: async () => b },
+      logger,
+      retry,
+    }).fetchOffsetsForGroups({
+      groups: [{ groupId: id, topics: [{ topic: 't', partitions: [0] }] }],
+    })
+    expect(result.map((r) => [r.groupId, r.errorCode])).toEqual([[id, 0]])
+    expect(b.offsetFetch.mock.calls[0][0].groups.map((g) => g.groupId)).toEqual([id])
+  })
   it('refuses a nonboolean stable flag before coordinator work', async () => {
     const cluster = { findGroupCoordinator: jest.fn() }
     await expect(

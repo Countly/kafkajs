@@ -1,5 +1,6 @@
 const { createGroupDescriptions } = require('../groupDescriptions')
 const { createErrorFromCode } = require('../../protocol/error')
+const { KafkaJSNonRetriableError } = require('../../errors')
 const createAdmin = require('../index')
 const { MemberAssignment } = require('../../consumer/assignerProtocol')
 const { newLogger } = require('testHelpers')
@@ -13,6 +14,9 @@ const GROUP_AUTHORIZATION_FAILED = 30
 const COORDINATOR_LOAD_IN_PROGRESS = 14
 const COORDINATOR_NOT_AVAILABLE = 15
 const NOT_COORDINATOR = 16
+
+/** The string a broker reads back from the bytes a request carried for `id`. */
+const echoOf = (id) => Buffer.from(id, 'utf8').toString('utf8')
 
 const consumerGroupRow = (groupId) => ({
   errorCode: 0,
@@ -799,6 +803,120 @@ describe('Admin > describeGroups > routing', () => {
     expect(groups[0].members[0].assignment).toEqual([])
     expect(groups[0].members[0].memberAssignment).toEqual(Buffer.from([0xff, 0xff]))
     expect(groups[0].members[1].assignment).toEqual([])
+  })
+
+  // A lone surrogate is written as U+FFFD, so a broker echoes that and not the string that was asked.
+  describe('a group id with a lone surrogate', () => {
+    const notConsumerGroup = ({ groupIds }) => ({
+      groups: groupIds.map((groupId) => ({
+        ...consumerGroupRow(echoOf(groupId)),
+        errorCode: GROUP_ID_NOT_FOUND,
+        errorMessage: null,
+      })),
+    })
+    const classicEcho = ({ groupIds }) => ({
+      groups: groupIds.map((groupId) => classicGroupRow(echoOf(groupId))),
+    })
+
+    it('is described from the consumer-protocol row the broker echoes, under the id asked and without a fallback', async () => {
+      const describeGroups = jest.fn()
+      const consumerGroupDescribe = jest.fn(async ({ groupIds }) => ({
+        groups: groupIds.map((groupId) => consumerGroupRow(echoOf(groupId))),
+      }))
+      const cluster = stubCluster({ consumerGroupDescribe, describeGroups })
+      const admin = createAdmin({ logger: newLogger(), retry, cluster })
+
+      const { groups } = await admin.describeGroups(['team-\uD800'])
+
+      expect(
+        groups.map(({ groupId, groupType, errorCode }) => ({ groupId, groupType, errorCode }))
+      ).toEqual([{ groupId: 'team-\uD800', groupType: 'consumer', errorCode: 0 }])
+      expect(describeGroups).not.toHaveBeenCalled()
+      expect(consumerGroupDescribe).toHaveBeenCalledTimes(1)
+    })
+
+    it('is described once through DescribeGroups when the broker echoes both answers, under the id asked', async () => {
+      const describeGroups = jest.fn(classicEcho)
+      const cluster = stubCluster({ consumerGroupDescribe: notConsumerGroup, describeGroups })
+      const admin = createAdmin({ logger: newLogger(), retry, cluster })
+
+      const { groups } = await admin.describeGroups(['team-\uD800'])
+
+      expect(groups.map(({ groupId, groupType }) => [groupId, groupType])).toEqual([
+        ['team-\uD800', 'classic'],
+      ])
+      expect(describeGroups).toHaveBeenCalledTimes(1)
+      expect(describeGroups.mock.calls[0][0].groupIds.map(echoOf)).toEqual(['team-�'])
+    })
+
+    it('is not asked again after its coordinator answered while a sibling coordinator moves', async () => {
+      let moved = false
+      const describeGroups = jest.fn(async (request) => {
+        if (request.groupIds.includes('team-b') && !moved) {
+          moved = true
+          throw createErrorFromCode(NOT_COORDINATOR)
+        }
+        return classicEcho(request)
+      })
+      const cluster = stubCluster({
+        consumerGroupDescribe: notConsumerGroup,
+        describeGroups,
+        nodeIdFor: (groupId) => (groupId === 'team-b' ? 1 : 0),
+      })
+      const admin = createAdmin({ logger: newLogger(), retry, cluster })
+
+      const { groups } = await admin.describeGroups(['team-\uD800', 'team-b'])
+
+      expect(groups.map(({ groupId }) => groupId).sort()).toEqual(['team-b', 'team-\uD800'])
+      expect(describeGroups.mock.calls.map(([request]) => request.groupIds.map(echoOf))).toEqual([
+        ['team-�'],
+        ['team-b'],
+        ['team-b'],
+      ])
+    })
+
+    it('is still described through DescribeGroups when the consumer-protocol answer is for another id', async () => {
+      const describeGroups = jest.fn(classicEcho)
+      const cluster = stubCluster({
+        consumerGroupDescribe: async () => ({ groups: [consumerGroupRow('team-��')] }),
+        describeGroups,
+      })
+      const admin = createAdmin({ logger: newLogger(), retry, cluster })
+
+      const { groups } = await admin.describeGroups(['team-\uD800'])
+
+      expect(describeGroups.mock.calls.map(([request]) => request.groupIds.map(echoOf))).toEqual([
+        ['team-�'],
+      ])
+      expect(groups.find(({ groupId }) => groupId === 'team-\uD800')).toMatchObject({
+        groupType: 'classic',
+      })
+    })
+
+    it('is refused when another id in the call has the same bytes, before any request', async () => {
+      const consumerGroupDescribe = jest.fn()
+      const cluster = stubCluster({ consumerGroupDescribe, describeGroups: jest.fn() })
+      const admin = createAdmin({ logger: newLogger(), retry, cluster })
+
+      await expect(admin.describeGroups(['a\uD800', 'a\uD801'])).rejects.toBeInstanceOf(
+        KafkaJSNonRetriableError
+      )
+      expect(consumerGroupDescribe).not.toHaveBeenCalled()
+    })
+  })
+
+  it('describes an ordinary Unicode group id with the id sent and returned unchanged', async () => {
+    const id = 'über-\u{1F600}'
+    const consumerGroupDescribe = jest.fn(async ({ groupIds }) => ({
+      groups: groupIds.map((groupId) => consumerGroupRow(echoOf(groupId))),
+    }))
+    const cluster = stubCluster({ consumerGroupDescribe, describeGroups: jest.fn() })
+    const admin = createAdmin({ logger: newLogger(), retry, cluster })
+
+    const { groups } = await admin.describeGroups([id])
+
+    expect(consumerGroupDescribe.mock.calls[0][0].groupIds).toEqual([id])
+    expect(groups.map(({ groupId }) => groupId)).toEqual([id])
   })
 })
 

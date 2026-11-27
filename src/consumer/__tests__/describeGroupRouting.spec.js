@@ -164,4 +164,92 @@ describe('Consumer > describeGroup > routing', () => {
     ;({ consumer, harness } = build(GROUP_ID_NOT_FOUND.hex))
     await expect(consumer.describeGroup()).resolves.toMatchObject({ authorizedOperations: null })
   })
+
+  // A lone surrogate is written as U+FFFD, so a broker echoes that and not the string that was asked.
+  describe('with a group id the broker echoes as the bytes it read', () => {
+    const echoOf = (id) => Buffer.from(id, 'utf8').toString('utf8')
+    const consumerRow = (groupId, errorCode = 0) => ({
+      errorCode,
+      errorMessage: null,
+      groupId,
+      groupState: 'Stable',
+      groupEpoch: 7,
+      assignmentEpoch: 7,
+      assignorName: 'uniform',
+      members: [],
+      authorizedOperations: -2147483648,
+    })
+    const classicRow = (groupId) => ({
+      errorCode: 0,
+      errorMessage: null,
+      groupId,
+      state: 'Stable',
+      protocolType: 'consumer',
+      protocol: 'RoundRobinAssigner',
+      members: [],
+      authorizedOperations: -2147483648,
+    })
+
+    /**
+     * @param {string} groupId the consumer's group
+     * @param {object} coordinator the stubbed ConsumerGroupDescribe and DescribeGroups
+     * @returns {object} a consumer whose coordinator is `coordinator`
+     */
+    const echoing = (groupId, coordinator) =>
+      createConsumer({
+        cluster: {
+          refreshMetadata: async () => {},
+          findGroupCoordinator: async () => coordinator,
+          onTopicRecreated: () => () => {},
+        },
+        groupId,
+        logger: newLogger(),
+        retry: { retries: 1, initialRetryTime: 1, maxRetryTime: 2 },
+      })
+
+    it.each([
+      ['lone surrogate', 'team-\uD800'],
+      ['ordinary Unicode', 'über-\u{1F600}'],
+    ])('describes a %s group id through ConsumerGroupDescribe under its own id', async (_, id) => {
+      const coordinator = {
+        nodeId: 0,
+        consumerGroupDescribe: jest.fn(async ({ groupIds }) => ({
+          groups: groupIds.map((groupId) => consumerRow(echoOf(groupId))),
+        })),
+        describeGroups: jest.fn(),
+      }
+
+      const description = await echoing(id, coordinator).describeGroup()
+
+      expect(description).toMatchObject({ groupId: id, groupType: 'consumer', errorCode: 0 })
+      expect(coordinator.describeGroups).not.toHaveBeenCalled()
+    })
+
+    it('describes a lone-surrogate group id through DescribeGroups under its own id when it is not a consumer-protocol group', async () => {
+      const coordinator = {
+        nodeId: 0,
+        consumerGroupDescribe: async ({ groupIds }) => ({
+          groups: groupIds.map((groupId) => consumerRow(echoOf(groupId), 69)),
+        }),
+        describeGroups: jest.fn(async ({ groupIds }) => ({
+          groups: groupIds.map((groupId) => classicRow(echoOf(groupId))),
+        })),
+      }
+
+      const description = await echoing('team-\uD800', coordinator).describeGroup()
+
+      expect(description).toMatchObject({ groupId: 'team-\uD800', groupType: 'classic' })
+      expect(coordinator.describeGroups).toHaveBeenCalledTimes(1)
+    })
+
+    it('resolves undefined for a group id when both answers are for another id', async () => {
+      const coordinator = {
+        nodeId: 0,
+        consumerGroupDescribe: async () => ({ groups: [consumerRow('team-��')] }),
+        describeGroups: async () => ({ groups: [classicRow('team-��')] }),
+      }
+
+      await expect(echoing('team-\uD800', coordinator).describeGroup()).resolves.toBeUndefined()
+    })
+  })
 })

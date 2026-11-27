@@ -160,6 +160,86 @@ test.each(['missing', 'duplicate', 'foreign'])(
   }
 )
 
+// A lone surrogate is written as U+FFFD, so a broker echoes that and not the string that was asked.
+const echoOf = (id) => Buffer.from(id, 'utf8').toString('utf8')
+
+test('a transactional id with a lone surrogate is answered under the id given when the broker echoes the bytes sent', async () => {
+  const f = fixture()
+  const asked = []
+  f.broker.describeTransactions = jest.fn(async ({ transactionalIds }) => {
+    asked.push(...transactionalIds)
+    return { transactions: transactionalIds.map((id) => row(echoOf(id))) }
+  })
+  const result = await f.admin.describeTransactions({ transactionalIds: ['txn-\uDC00', 'plain'] })
+  expect(result.map((x) => [x.transactionalId, x.errorCode])).toEqual([
+    ['txn-\uDC00', 0],
+    ['plain', 0],
+  ])
+  expect(result[0].producerId).toBe('9007199254740993')
+  expect(asked.map(echoOf)).toEqual(['txn-�', 'plain'])
+})
+
+test('a transactional id with a lone surrogate keeps the error row the broker answered, under the id given', async () => {
+  const f = fixture()
+  f.broker.describeTransactions = jest.fn(async ({ transactionalIds }) => ({
+    transactions: transactionalIds.map((id) => row(echoOf(id), 53)),
+  }))
+  const result = await f.admin.describeTransactions({ transactionalIds: ['txn-\uDC00'] })
+  expect(result.map((x) => [x.transactionalId, x.errorCode, x.error.code])).toEqual([
+    ['txn-\uDC00', 53, 53],
+  ])
+  expect(f.broker.describeTransactions).toHaveBeenCalledTimes(1)
+})
+
+test('a transactional id with a lone surrogate is routed again after its coordinator moved', async () => {
+  const f = fixture()
+  const moved = {
+    describeTransactions: jest.fn(async ({ transactionalIds }) => ({
+      transactions: transactionalIds.map((id) => row(echoOf(id))),
+    })),
+  }
+  let relocated = false
+  f.cluster.findGroupCoordinator.mockImplementation(async () => (relocated ? moved : f.broker))
+  f.broker.describeTransactions = jest.fn(async ({ transactionalIds }) => {
+    relocated = true
+    return { transactions: transactionalIds.map((id) => row(echoOf(id), 16)) }
+  })
+  const result = await f.admin.describeTransactions({ transactionalIds: ['txn-\uDC00'] })
+  expect(result.map((x) => [x.transactionalId, x.errorCode])).toEqual([['txn-\uDC00', 0]])
+  expect(f.cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
+  expect(moved.describeTransactions).toHaveBeenCalledTimes(1)
+})
+
+test('two transactional ids with the same bytes are refused before any lookup', async () => {
+  const f = fixture()
+  await expect(
+    f.admin.describeTransactions({ transactionalIds: ['a\uD800', 'a\uD801'] })
+  ).rejects.toBeInstanceOf(KafkaJSInvalidConfigurationError)
+  expect(f.cluster.findGroupCoordinator).not.toHaveBeenCalled()
+})
+
+test.each([['txn-other'], ['txn-��']])(
+  'a transactional id with a lone surrogate is still refused an answer row for %s',
+  async (answered) => {
+    const f = fixture()
+    f.broker.describeTransactions = jest.fn(async () => ({ transactions: [row(answered)] }))
+    await expect(
+      f.admin.describeTransactions({ transactionalIds: ['txn-\uDC00'] })
+    ).rejects.toBeInstanceOf(KafkaJSInvariantViolation)
+  }
+)
+
+test('an ordinary Unicode transactional id is sent and answered unchanged', async () => {
+  const f = fixture()
+  const id = 'über-\u{1F600}'
+  f.broker.describeTransactions = jest.fn(async ({ transactionalIds }) => ({
+    transactions: transactionalIds.map((txn) => row(echoOf(txn))),
+  }))
+  const result = await f.admin.describeTransactions({ transactionalIds: [id] })
+  expect(result.map((x) => x.transactionalId)).toEqual([id])
+  expect(f.broker.describeTransactions).toHaveBeenCalledWith({ transactionalIds: [id] })
+})
+
 test('describe producer retries a moved leader and preserves completed partitions', async () => {
   const f = fixture()
   f.broker.describeProducers = jest

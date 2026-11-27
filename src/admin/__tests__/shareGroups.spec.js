@@ -24,6 +24,9 @@ jest.setTimeout(3000)
 
 const retry = { retries: 2, initialRetryTime: 1, maxRetryTime: 1, multiplier: 1, factor: 0 }
 
+/** The string a broker reads back from the bytes a request carried for `id`. */
+const echoOf = (id) => Buffer.from(id, 'utf8').toString('utf8')
+
 /** Broker method, API name, API key and the one released version of every share API. */
 const APIS = [
   ['shareGroupHeartbeat', 'ShareGroupHeartbeat', 76, 1],
@@ -595,6 +598,74 @@ describe('share administration', () => {
         KafkaJSInvariantViolation
       )
     })
+
+    // A lone surrogate is written as U+FFFD, so a broker echoes that and not the string that was asked.
+    describe('a group id with a lone surrogate', () => {
+      /** @returns {{broker: object, asked: string[]}} a coordinator that echoes the bytes it was sent */
+      const echoing = (errorCode = 0) => {
+        const asked = []
+        const broker = coordinator()
+        broker.shareGroupDescribe.mockImplementation(async ({ groupIds }) => {
+          asked.push(...groupIds)
+          return { groups: groupIds.map((id) => group(echoOf(id), errorCode)) }
+        })
+        return { broker, asked }
+      }
+
+      test('is answered under the id the caller gave when the broker echoes the bytes sent', async () => {
+        const { broker, asked } = echoing()
+        f = fixture([broker])
+        const result = await f.admin.describeShareGroups(['team-\uD800', 'plain'])
+        expect(result.groups.map((r) => [r.groupId, r.errorCode])).toEqual([
+          ['team-\uD800', 0],
+          ['plain', 0],
+        ])
+        expect(asked.map(echoOf)).toEqual(['team-�', 'plain'])
+        expect(broker.shareGroupDescribe).toHaveBeenCalledTimes(1)
+      })
+
+      test('keeps its own error row as data under the id the caller gave', async () => {
+        const { broker } = echoing(30)
+        f = fixture([broker])
+        const result = await f.admin.describeShareGroups(['team-\uD800'])
+        expect(result.groups.map((r) => [r.groupId, r.errorCode])).toEqual([['team-\uD800', 30]])
+        expect(broker.shareGroupDescribe).toHaveBeenCalledTimes(1)
+      })
+
+      test('is sent once for two spellings of the same bytes and answered under each spelling', async () => {
+        const { broker, asked } = echoing()
+        f = fixture([broker])
+        const result = await f.admin.describeShareGroups(['a\uD800', 'a\uD801'])
+        expect(result.groups.map((r) => r.groupId)).toEqual(['a\uD800', 'a\uD801'])
+        expect(asked.map(echoOf)).toEqual(['a�'])
+      })
+
+      test.each([['team-other'], ['team-��']])(
+        'is still refused an answer row for %s',
+        async (answered) => {
+          const broker = coordinator()
+          broker.shareGroupDescribe.mockResolvedValueOnce({ groups: [group(answered)] })
+          f = fixture([broker])
+          await expect(f.admin.describeShareGroups(['team-\uD800'])).rejects.toBeInstanceOf(
+            KafkaJSInvariantViolation
+          )
+        }
+      )
+    })
+
+    test('sends and answers an ordinary Unicode group id unchanged', async () => {
+      const id = 'über-\u{1F600}'
+      const asked = []
+      const broker = coordinator()
+      broker.shareGroupDescribe.mockImplementation(async ({ groupIds }) => {
+        asked.push(...groupIds)
+        return { groups: groupIds.map((groupId) => group(echoOf(groupId))) }
+      })
+      f = fixture([broker])
+      const result = await f.admin.describeShareGroups([id])
+      expect(asked).toEqual([id])
+      expect(result.groups.map((r) => r.groupId)).toEqual([id])
+    })
   })
 
   describe('offset operations', () => {
@@ -736,6 +807,69 @@ describe('share administration', () => {
         expect(broker[wire]).toHaveBeenCalledTimes(1)
       }
     )
+
+    // A lone surrogate is written as U+FFFD, so a broker echoes that and not the string that was asked.
+    describe('a group id with a lone surrogate', () => {
+      const listRow = expected.describeShareGroupOffsetsV1.response.groups[0]
+      /** @returns {object} a coordinator answering the list with `row`, named as the bytes it read */
+      const echoing = (row) => {
+        const broker = coordinator()
+        broker.describeShareGroupOffsets.mockImplementation(async ({ groups }) => ({
+          groups: [{ ...row, groupId: echoOf(groups[0].groupId) }],
+        }))
+        return broker
+      }
+
+      test('is listed when the broker echoes the bytes sent', async () => {
+        f = fixture([echoing(listRow)])
+        const [topic] = await f.admin.listShareGroupOffsets({ groupId: 'team-\uD800' })
+        expect(topic.topic).toBe('alpha')
+        expect(topic.partitions[0].startOffset).toBe('9007199254740993')
+      })
+
+      test('throws the group error the broker answered rather than a foreign-group refusal', async () => {
+        f = fixture([echoing({ ...listRow, errorCode: 30, topics: [] })])
+        const error = await f.admin
+          .listShareGroupOffsets({ groupId: 'team-\uD800' })
+          .catch((e) => e)
+        expect(error).toBeInstanceOf(KafkaJSProtocolError)
+        expect(error.code).toBe(30)
+      })
+
+      test.each([['team-other'], ['team-��']])(
+        'is still refused an answer for %s',
+        async (answered) => {
+          const broker = coordinator()
+          broker.describeShareGroupOffsets.mockResolvedValue({
+            groups: [{ ...listRow, groupId: answered }],
+          })
+          f = fixture([broker])
+          const error = await f.admin
+            .listShareGroupOffsets({ groupId: 'team-\uD800' })
+            .catch((e) => e)
+          expect([error, error.cause].some((e) => e instanceof KafkaJSInvariantViolation)).toBe(
+            true
+          )
+          expect(broker.describeShareGroupOffsets).toHaveBeenCalledTimes(1)
+        }
+      )
+    })
+
+    test('lists an ordinary Unicode group id unchanged', async () => {
+      const id = 'über-\u{1F600}'
+      const asked = []
+      const broker = coordinator()
+      broker.describeShareGroupOffsets.mockImplementation(async ({ groups }) => {
+        asked.push(groups[0].groupId)
+        return {
+          groups: [{ ...expected.describeShareGroupOffsetsV1.response.groups[0], groupId: id }],
+        }
+      })
+      f = fixture([broker])
+      const [topic] = await f.admin.listShareGroupOffsets({ groupId: id })
+      expect(topic.topic).toBe('alpha')
+      expect(asked).toEqual([id])
+    })
 
     test.each(OFFSET_CALLS)(
       '%s rethrows a Broker-rejected protocol error as the same object after one attempt',
