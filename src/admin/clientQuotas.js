@@ -3,6 +3,7 @@ const {
   KafkaJSServerDoesNotSupportApiKey,
   KafkaJSInvariantViolation,
 } = require('../errors')
+const Encoder = require('../protocol/encoder')
 const { retrierOf, checked, waitOf, currentDeadline } = require('./deadline')
 const { itemRetry } = require('./itemRetry')
 
@@ -97,7 +98,10 @@ class ClientQuotas {
     })
   }
 
-  /** Validates every quota operation before discovery; only unresolved entries are retried.
+  /** Validates every quota operation before discovery; only unresolved entries are retried. A
+   * lone surrogate in an entity name is written as U+FFFD, so entities are sent and matched by the
+   * written name and each result carries the entity the caller gave; two entities written as the
+   * same bytes are a duplicate.
    * @param {object} options entries and validateOnly
    * @returns {Promise<object[]>} caller-ordered entity results with typed errors as data
    * @throws {Error} invalid input, unsupported capability, invariant or API deadline
@@ -109,16 +113,24 @@ class ClientQuotas {
     valid(typeof validateOnly === 'boolean', 'validateOnly')
     const seen = new Set()
     const wire = new Map()
+    const callerEntities = new Map()
     for (const entry of entries) {
       valid(entry && Array.isArray(entry.entity) && entry.entity.length > 0, 'entity')
       const types = new Set()
-      const entity = Array.from(entry.entity, (part) => {
+      const named = Array.from(entry.entity, (part) => {
         valid(part && ['user', 'client-id', 'ip'].includes(part.entityType), 'entityType')
         valid(!types.has(part.entityType), 'duplicate entityType')
         types.add(part.entityType)
         valid(part.entityName === null || typeof part.entityName === 'string', 'entityName')
         return { entityType: part.entityType, entityName: part.entityName }
       })
+      const written = named.some(({ entityName }) => Encoder.sentForm(entityName) !== entityName)
+      const entity = written
+        ? named.map(({ entityType, entityName }) => ({
+            entityType,
+            entityName: Encoder.sentForm(entityName),
+          }))
+        : named
       valid(Array.isArray(entry.ops) && entry.ops.length > 0, 'ops')
       const keys = new Set()
       const ops = Array.from(entry.ops, (op) => {
@@ -140,8 +152,9 @@ class ClientQuotas {
       valid(!seen.has(key), 'duplicate entity')
       seen.add(key)
       wire.set(key, { entity, ops })
+      if (written) callerEntities.set(key, named)
     }
-    return itemRetry(
+    const rows = await itemRetry(
       {
         items: [...wire.values()].map(({ entity }) => ({ entity })),
         keyOf,
@@ -163,6 +176,11 @@ class ClientQuotas {
         return result.entries
       }
     )
+    if (callerEntities.size === 0) return rows
+    return rows.map((row) => {
+      const entity = callerEntities.get(keyOf(row))
+      return entity === undefined ? row : { ...row, entity }
+    })
   }
 }
 

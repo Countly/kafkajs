@@ -1,7 +1,6 @@
 const { MemberAssignment } = require('../consumer/assignerProtocol')
 const Encoder = require('../protocol/encoder')
 const { createErrorFromCode } = require('../protocol/error')
-const { KafkaJSNonRetriableError } = require('../errors')
 const { retrierOf, currentDeadline, withConsumerOperation } = require('./deadline')
 
 /** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
@@ -53,20 +52,18 @@ const doesNotSupportApiKey = (error) => {
 /**
  * Names the ids as a request writes them. A lone surrogate is written as U+FFFD, so the broker
  * answers a row for the written name, not for the id the caller gave; every id is sent, looked up,
- * retried and matched by its written name and `named` gives a row back under the caller's id.
+ * retried and matched by its written name and `named` gives a row back under the caller's id. Ids
+ * written as the same bytes are sent as two identical ids are, and their rows come back under the
+ * first of those ids.
  * @param {string[]} groupIds ids as the caller gave them
  * @returns {{ ids: string[], named: (row: object) => object }} the written names, and a function
  *   that renames a row by its written name, returning a row of any other name as it is
- * @throws {KafkaJSNonRetriableError} when two different ids are written as the same bytes
  */
 const sentNames = (groupIds) => {
   const callerIds = new Map()
   const ids = groupIds.map((groupId) => {
     const sent = Encoder.sentForm(groupId)
-    if (callerIds.has(sent) && callerIds.get(sent) !== groupId) {
-      throw new KafkaJSNonRetriableError('Two group ids are the same name on the wire')
-    }
-    callerIds.set(sent, groupId)
+    if (!callerIds.has(sent)) callerIds.set(sent, groupId)
     return sent
   })
   const named = (row) => {
@@ -146,9 +143,8 @@ class GroupDescriptions {
    *         newer API reports stays on that group's row instead; one DescribeGroups reports for an
    *         id that fell back to it fails the call, because that API's own parse throws every
    *         group-level code but GROUP_ID_NOT_FOUND
-   * @throws {KafkaJSNonRetriableError} before any request, when two different ids are written as
-   *         the same bytes (a lone surrogate is written as U+FFFD). Each row carries the id the
-   *         caller gave, whatever the broker echoed
+   *         Each row carries the id the caller gave, whatever the broker echoed (a lone surrogate is
+   *         written as U+FFFD); ids written as the same bytes are treated like identical ids
    */
   async describe(groupIds, options = {}) {
     return withConsumerOperation(options.operation, async () => {

@@ -8,6 +8,7 @@ const {
   KafkaJSNonRetriableError,
 } = require('../errors')
 const { itemRetry } = require('./itemRetry')
+const Encoder = require('../protocol/encoder')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { responseSourceOf } = require('../broker/failureSource')
 const { retrierOf, currentDeadline, checked, waitOf } = require('./deadline')
@@ -48,7 +49,10 @@ class ScramCredentials {
     this.retry = retry
   }
 
-  /** Describes credentials without password, salt or derived bytes in returned diagnostics.
+  /** Describes credentials without password, salt or derived bytes in returned diagnostics. A lone
+   * surrogate in a user name is written as U+FFFD, so users are sent and matched by the written
+   * name and each result carries the name the caller gave; two names written as the same bytes are
+   * a repeated name.
    * @param {object} [options] users omitted/null selects all; [] returns no work
    * @returns {Promise<object[]>} per-user results, sanitized messages and supported mechanisms
    * @throws {Error} invalid filter, capability, message-level error or deadline
@@ -57,11 +61,18 @@ class ScramCredentials {
     valid(options != null && typeof options === 'object' && !Array.isArray(options), 'options')
     const { users } = options
     valid(users === undefined || users === null || Array.isArray(users), 'users')
+    let sentUsers = null
+    let callerUsers = null
     if (users != null) {
       const seen = new Set()
+      sentUsers = []
       for (const user of users) {
-        valid(name(user) && !seen.has(user), 'user')
-        seen.add(user)
+        valid(name(user), 'user')
+        const sent = Encoder.sentForm(user)
+        valid(!seen.has(sent), 'user')
+        seen.add(sent)
+        sentUsers.push(sent)
+        if (sent !== user) (callerUsers ||= new Map()).set(sent, user)
       }
       if (users.length === 0) return []
     }
@@ -99,11 +110,11 @@ class ScramCredentials {
         throw new KafkaJSInvariantViolation('Invalid SCRAM result identity')
       if (initial.length === 0) return []
     }
-    const items = (users ?? initial.map(({ user }) => user)).map((user) => ({
+    const items = (sentUsers ?? initial.map(({ user }) => user)).map((user) => ({
       user,
       credentials: [],
     }))
-    return itemRetry(
+    const described = await itemRetry(
       {
         items,
         keyOf: ({ user }) => user,
@@ -133,9 +144,18 @@ class ScramCredentials {
         })
       }
     )
+    if (callerUsers === null) return described
+    return described.map((row) => {
+      const user = callerUsers.get(row.user)
+      return user === undefined ? row : { ...row, user }
+    })
   }
 
-  /** Validates the whole mutation, derives once, and retries only unresolved user groups.
+  /** Validates the whole mutation, derives once, and retries only unresolved user groups. A lone
+   * surrogate in a user name is written as U+FFFD, so users are sent and matched by the written
+   * name and each result carries the name the caller gave (the first, for names written as the same
+   * bytes with different mechanisms); the same name and mechanism twice, written as the same
+   * bytes or not, is a duplicate.
    * @param {object} options upsertions and deletions
    * @returns {Promise<object[]>} one caller-ordered result per affected user
    * @throws {Error} invalid input, derivation, capability, invariant or deadline refusal
@@ -151,16 +171,19 @@ class ScramCredentials {
     )
     const identities = new Set()
     const users = new Map()
+    const callerUsers = new Map()
     for (const [list, upsert] of [
       [upsertions, true],
       [deletions, false],
     ]) {
       for (const entry of list) {
         valid(entry && name(entry.user) && Object.hasOwn(MECHANISMS, entry.mechanism), 'credential')
-        const identity = JSON.stringify([entry.user, entry.mechanism])
+        const sent = Encoder.sentForm(entry.user)
+        const identity = JSON.stringify([sent, entry.mechanism])
         valid(!identities.has(identity), 'duplicate credential')
         identities.add(identity)
-        users.set(entry.user, { user: entry.user })
+        users.set(sent, { user: sent })
+        if (sent !== entry.user && !callerUsers.has(sent)) callerUsers.set(sent, entry.user)
         if (upsert) {
           valid(
             Number.isInteger(entry.iterations) &&
@@ -212,7 +235,7 @@ class ScramCredentials {
           })
         )
         wireUpsertions.push({
-          name: user,
+          name: Encoder.sentForm(user),
           mechanism: MECHANISMS[mechanism],
           iterations,
           salt,
@@ -220,10 +243,10 @@ class ScramCredentials {
         })
       }
       const wireDeletions = deletions.map(({ user, mechanism }) => ({
-        name: user,
+        name: Encoder.sentForm(user),
         mechanism: MECHANISMS[mechanism],
       }))
-      return await itemRetry(
+      const rows = await itemRetry(
         {
           items: [...users.values()],
           keyOf: ({ user }) => user,
@@ -251,6 +274,11 @@ class ScramCredentials {
           }))
         }
       )
+      if (callerUsers.size === 0) return rows
+      return rows.map((row) => {
+        const user = callerUsers.get(row.user)
+        return user === undefined ? row : { ...row, user }
+      })
     } finally {
       unown?.()
       erase()
