@@ -223,6 +223,26 @@ describe('Consumer > Batch', () => {
       expect(fetched.leaderEpochAt(122)).toBe(-1)
       expect(fetched.leaderEpochAt('not a number')).toBe(-1)
     })
+
+    // Record 0 is in the batch and is not its last record, so reading the value as 0 would answer 3.
+    it.each([
+      ['the string NaN', 'NaN'],
+      ['the number NaN', NaN],
+      ['the string Infinity', 'Infinity'],
+      ['the number Infinity', Infinity],
+    ])('answers -1 for %s, not the epoch of record 0', (_label, offset) => {
+      const fromZero = new Batch(topic, '0', {
+        partition: 0,
+        highWatermark: '200',
+        messages: [
+          { offset: '0', batchContext: { partitionLeaderEpoch: 3 } },
+          { offset: '1', batchContext: { partitionLeaderEpoch: 4 } },
+        ],
+      })
+
+      expect(fromZero.leaderEpochAt('0')).toBe(3)
+      expect(fromZero.leaderEpochAt(offset)).toBe(-1)
+    })
   })
 
   describe('the end of the last complete batch', () => {

@@ -380,6 +380,28 @@ describe('Consumer > PositionValidator', () => {
         validator.request(TOPIC, 0, { offset: '10', trackedEpoch: 4, currentLeaderEpoch: 5 }).action
       ).toEqual('unchanged')
     })
+
+    it('is true at the same epoch under another routing stamp, and request() then asks again under the new stamp', () => {
+      const validator = create()
+      validator.markValidated(TOPIC, 0, 5, undefined, 1)
+
+      expect(validator.needsValidation(TOPIC, 0, 5, 1)).toBe(false)
+      expect(validator.needsValidation(TOPIC, 0, 5, 3)).toBe(true)
+      expect(
+        validator.request(TOPIC, 0, {
+          offset: '10',
+          trackedEpoch: 4,
+          currentLeaderEpoch: 5,
+          routing: 3,
+        }).action
+      ).toEqual('awaiting')
+      expect(validator.entryOf(TOPIC, 0).pending).toEqual({
+        offset: '10',
+        trackedEpoch: 4,
+        currentLeaderEpoch: 5,
+        routing: 3,
+      })
+    })
   })
 
   describe('lifetime', () => {

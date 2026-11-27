@@ -351,7 +351,9 @@ function oracleReadReplicas(topic, partitions, routing) {
 
 /**
  * The request builder this client shipped before, with its whole-assignment active set, kept as
- * the oracle; only its validation filter follows the current rule (`admissionEntry`).
+ * the oracle. Its validation filter is the admission rule written out from its definition, not a
+ * call to the group's own: an entry validated at the cached leader epoch under the cached routing
+ * stamp.
  * @this {ConsumerGroup}
  * @param {{topic: string, partitions: number[]}[]} topicPartitions
  * @returns {object[]}
@@ -369,7 +371,13 @@ function oracleBuildFetchRequests(topicPartitions) {
       partitions: partitions.reduce((requests, partition) => {
         const baseline = manager.heldOffsetAt(topic, partition)
         const currentLeaderEpoch = this.cluster.leaderEpoch(topic, partition)
-        const admittedUnder = this.admissionEntry(topic, partition, currentLeaderEpoch)
+        const entry = this.positionValidator.entryOf(topic, partition)
+        const admittedUnder =
+          entry !== undefined &&
+          entry.validatedAgainst === currentLeaderEpoch &&
+          entry.routing === this.cluster.routingStamp?.(topic, partition)
+            ? entry
+            : undefined
         if (
           baseline != null &&
           activeTopicPartitions[topic].has(partition) &&
@@ -496,17 +504,24 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
           nextOffset: (topic, partition, baseline) => BigInt(baseline) + BigInt(partition),
         },
         obligations: { current: (topic) => (topic === 't5' ? null : {}) },
-        // Unvalidated, validated at the cached epoch, or validated at an older one.
+        // Unvalidated, validated at the cached epoch, or validated at an older one; under the
+        // cached routing stamp or an earlier one.
         positionValidator: {
           entryOf: (topic, partition) =>
             coin(2)(topic, partition)
               ? undefined
-              : { validatedAgainst: (partition % 3) - (coin(4)(topic, partition) ? 1 : 0) },
+              : {
+                  validatedAgainst: (partition % 3) - (coin(4)(topic, partition) ? 1 : 0),
+                  routing: (partition % 2) - (coin(5)(topic, partition) ? 1 : 0),
+                },
         },
         haltedPartitions: new Set(random() < 0.5 ? ['t0|2', 't1|0'] : []),
         hasSeekGates: () => true,
         isSeekGated: coin(3),
-        cluster: { leaderEpoch: (topic, partition) => partition % 3 },
+        cluster: {
+          leaderEpoch: (topic, partition) => partition % 3,
+          routingStamp: (topic, partition) => partition % 2,
+        },
       })
       // Node-filtered parts as a round sees them: every topic, a subset of its partitions.
       const parts = state.assigned().map(({ topic, partitions }) => ({

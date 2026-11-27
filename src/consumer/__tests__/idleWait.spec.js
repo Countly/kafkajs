@@ -410,7 +410,7 @@ describe('idle wait on a real fetch round', () => {
       await finish(pending)
     })
 
-    it('re-filtering only before the build admits a partition it never prepared', async () => {
+    it('re-filtering only before the build hands it a partition no step prepared, and the validation rule keeps that partition out of the frame', async () => {
       await destination()
       const held = gate()
       const events = instrument(h, {
@@ -426,8 +426,17 @@ describe('idle wait on a real fetch round', () => {
       await drain()
       await moves[1][1](h)
       held.release()
+      await drain()
+      // The broken preparation sought and validated nothing on node 1, then built partition 0.
+      expect(events.filter(([label]) => label !== 'frame')).toEqual([
+        ['seek', [[]]],
+        ['validate', [[]]],
+        ['build', [[0]]],
+      ])
+      expect(h.group.positionValidator.validatedAgainst(TOPIC, 0)).toBeUndefined()
+      expect(events.some(([label]) => label === 'frame')).toBe(false)
+      h.group.onStopRequested()
       await finish(pending)
-      expect(() => expectPreparedBeforeSend(events)).toThrow()
     })
 
     it('a preferred replica dropped during the held await moves the partition back to its leader', async () => {

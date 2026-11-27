@@ -861,6 +861,77 @@ describe('Cluster > MetadataCache', () => {
     })
   })
 
+  describe('routingStamp', () => {
+    const stamp = () => cache.routingStamp('test-topic', 0)
+
+    test('a refresh that repeats the cached pair, a stale refresh and a rejected hint keep the stamp', () => {
+      cache.update(response({ leader: 1, leaderEpoch: 5 }))
+      const first = stamp()
+      expect(first).toBeGreaterThan(0)
+
+      cache.update(response({ leader: 1, leaderEpoch: 5 }))
+      expect(stamp()).toBe(first)
+
+      // Node 1 is still advertised, so the older epoch is rejected.
+      cache.update(response({ leader: 2, leaderEpoch: 4 }))
+      expect(cache.leaderEpoch('test-topic', 0)).toBe(5)
+      expect(stamp()).toBe(first)
+
+      expect(cache.applyLeaderHint('test-topic', 0, { leaderId: 2, leaderEpoch: 5 })).toBe(false)
+      expect(stamp()).toBe(first)
+    })
+
+    test('an epoch bump on the same leader, an accepted hint and a forget each give a new stamp', () => {
+      cache.update(response({ leader: 1, leaderEpoch: 5 }))
+      const stamps = [stamp()]
+
+      cache.update(response({ leader: 1, leaderEpoch: 6 }))
+      stamps.push(stamp())
+      expect(cache.applyLeaderHint('test-topic', 0, { leaderId: 2, leaderEpoch: 7 })).toBe(true)
+      stamps.push(stamp())
+      expect(cache.forgetLeaderEpoch('test-topic', 0)).toBe(true)
+      stamps.push(stamp())
+
+      expect(new Set(stamps).size).toBe(4)
+    })
+
+    test('a leader that moves away and back to the same epoch does not get its earlier stamp back', () => {
+      cache.update(response({ leader: 1, leaderEpoch: 5 }))
+      const before = stamp()
+
+      expect(cache.applyLeaderHint('test-topic', 0, { leaderId: 2, leaderEpoch: 6 })).toBe(true)
+      // An older image that no longer advertises node 2 is accepted: node 2 is not defended.
+      cache.update(response({ leader: 1, leaderEpoch: 5, brokers: [0, 1] }))
+
+      expect(cache.leader('test-topic', 0)).toBe(1)
+      expect(cache.leaderEpoch('test-topic', 0)).toBe(5)
+      expect(stamp()).not.toBe(before)
+    })
+
+    test('a by-ID write-through gives a new stamp only when it changes the pair', () => {
+      cache.update(response({ leader: 1, leaderEpoch: 5 }))
+      const first = stamp()
+
+      cache.updateTopicsById(response({ leader: 1, leaderEpoch: 5 }))
+      expect(stamp()).toBe(first)
+      cache.updateTopicsById(response({ leader: 1, leaderEpoch: 6 }))
+      expect(stamp()).not.toBe(first)
+    })
+
+    test('is 0 for a partition the cache does not hold, and a partition learned again gets a new stamp', () => {
+      expect(stamp()).toBe(0)
+      cache.update(response())
+      const first = stamp()
+
+      cache.clear()
+      expect(stamp()).toBe(0)
+      cache.update(response())
+
+      expect(stamp()).toBeGreaterThan(0)
+      expect(stamp()).not.toBe(first)
+    })
+  })
+
   describe('node membership across the string/number boundary', () => {
     it('BrokerPool#hasNode answers for a numeric node id even though the map is keyed by string', () => {
       const pool = new BrokerPool({

@@ -587,8 +587,12 @@ const createFakeBroker = (answer, chunks) => {
       await connection.connect()
       return connection
     },
-    send: async (protocolRequest) => {
-      const promise = connection.send(protocolRequest)
+    // As the real pool does, a request's pre-write guard reaches the connection, which asks it
+    // again at the instant of transmission.
+    send: async (protocolRequest, _connection, options) => {
+      const promise = connection.send(
+        options?.guard ? { ...protocolRequest, guard: options.guard } : protocolRequest
+      )
       await new Promise(setImmediate)
       await pump()
       return promise
@@ -786,7 +790,8 @@ const buildConsumerGroup = ({
  * @param {number} [options.leaderEpoch] what `cluster.leaderEpoch` answers, and the epoch the
  *   metadata cache starts at
  * @param {boolean} [options.liveRouting] when true, the metadata cache is the one routing source:
- *   `cluster.leaderEpoch`, `findLeaderForPartitions` and `findTopicPartitionMetadata` read it, so
+ *   `cluster.leaderEpoch`, `cluster.routingStamp`, `findLeaderForPartitions` and
+ *   `findTopicPartitionMetadata` read it, so
  *   `installRouting` and an accepted leader hint move the leader and epoch the group sees;
  *   `cluster.applyLeaderHint` resolves to the cache's verdict (the two hint options are unused)
  *   and `cluster.forgetLeaderEpoch` forgets the epoch there. By default the epoch stays
@@ -1038,6 +1043,10 @@ const createFetchGroup = async ({
     leaderEpoch: liveRouting
       ? (topic, partition) => metadataCache.leaderEpoch(topic, partition)
       : () => leaderEpoch,
+    // Only live routing moves: a fixed epoch has no routing changes to stamp.
+    routingStamp: liveRouting
+      ? (topic, partition) => metadataCache.routingStamp(topic, partition)
+      : undefined,
     cachedLeader: (topic, partition) => metadataCache.leader(topic, partition),
     forgetLeaderEpoch: jest.fn(
       liveRouting

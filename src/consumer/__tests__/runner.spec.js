@@ -1711,9 +1711,12 @@ describe('Consumer > Runner', () => {
 
   describe('a batch fetched before a leader epoch change', () => {
     const FETCH_EPOCH = 5
-    let epochs, handled, gate, events
+    let epochs, stamps, positionValidator, handled, gate, events
 
-    /** A batch of `offsets` fetched at `FETCH_EPOCH`, as `ConsumerGroup#fetch` builds one. */
+    /**
+     * A batch of `offsets` fetched at `FETCH_EPOCH` under the partition's current validation entry,
+     * as `ConsumerGroup#fetch` builds one.
+     */
     const batchOf = (partitionId, offsets) =>
       new Batch(
         topicName,
@@ -1723,14 +1726,29 @@ describe('Consumer > Runner', () => {
           highWatermark: 100,
           messages: offsets.map((offset) => ({ offset: String(offset), key: 'k', value: 'v' })),
         },
-        FETCH_EPOCH
+        FETCH_EPOCH,
+        positionValidator.entryOf(topicName, partitionId)
       )
 
-    /** What the metadata cache does on a new epoch: the epoch changes and routing moves on. */
+    /**
+     * What the metadata cache does on an accepted leader or epoch change: the epoch is set, the
+     * partition gets a new routing stamp and routing moves on.
+     */
     const moveEpoch = (partitionId, epoch) => {
       epochs[partitionId] = epoch
+      stamps[partitionId] = Math.max(...Object.values(stamps)) + 1
       consumerGroup.routingVersion += 1
     }
+
+    /** A validation redone at the partition's current epoch and stamp: a new entry object. */
+    const validateAgain = (partitionId) =>
+      positionValidator.markValidated(
+        topicName,
+        partitionId,
+        epochs[partitionId],
+        undefined,
+        stamps[partitionId]
+      )
 
     /** A handler that records what it is given and holds partition 0 until `gate` opens. */
     const recordingHandler = () =>
@@ -1772,15 +1790,19 @@ describe('Consumer > Runner', () => {
 
     beforeEach(() => {
       epochs = { 0: FETCH_EPOCH, 1: FETCH_EPOCH }
+      stamps = { 0: 1, 1: 2 }
       handled = []
       events = []
       let open
       gate = { promise: new Promise((resolve) => (open = resolve)), open: () => open() }
       // The group's own predicate over a real validator and a cache stand-in, both at epoch 5.
-      const positionValidator = new PositionValidator({ logger: newLogger() })
-      for (const id of [0, 1]) positionValidator.markValidated(topicName, id, FETCH_EPOCH)
+      positionValidator = new PositionValidator({ logger: newLogger() })
+      for (const id of [0, 1]) validateAgain(id)
       Object.assign(consumerGroup, {
-        cluster: { leaderEpoch: (_topic, id) => epochs[id] },
+        cluster: {
+          leaderEpoch: (_topic, id) => epochs[id],
+          routingStamp: (_topic, id) => stamps[id],
+        },
         positionValidator,
         routingVersion: 0,
         admissionEntry: ConsumerGroup.prototype.admissionEntry,
@@ -1849,6 +1871,81 @@ describe('Consumer > Runner', () => {
       }
     )
 
+    it('a queued batch is not handed over after its partition was validated again at the same leader epoch, and end_batch_process pairs with start', async () => {
+      await start({ eachBatch: undefined, eachMessage: recordingHandler() })
+      const done = queueWith(1).push(batchOf(0, [4, 5]), batchOf(1, [4, 5]))
+      await until(() => handled.length === 1)
+
+      validateAgain(1)
+      gate.open()
+      await done
+
+      // Same epoch and stamp, but a new validation entry: the batch's admission ended.
+      expect(epochs[1]).toBe(FETCH_EPOCH)
+      expect(handled.filter(({ partition: id }) => id === 1)).toEqual([])
+      expect(resolvedOf(1)).toEqual([])
+      // Dropped before START, so neither event: nothing to pair.
+      expect(eventsOf(1)).toEqual([])
+      expect(eventsOf(0)).toEqual(['start', 'end'])
+    })
+
+    it.each([['classic'], ['consumer']])(
+      '%s: eachMessage stops before the next message when the partition is validated again at the same leader epoch',
+      async (kind) => {
+        consumerGroup.kind = kind
+        if (kind === 'consumer') {
+          consumerGroup.rebalanceProtocol = jest.fn(() => 'cooperative')
+          consumerGroup.heartbeatInterval = jest.fn(() => 500)
+        }
+        const eachMessage = jest.fn(async ({ message }) => {
+          handled.push(message.offset)
+          if (message.offset === '10') validateAgain(0)
+        })
+        runner = createTestRunner({ eachBatch: undefined, eachMessage })
+        runner.running = true
+
+        await runner.handleBatch(batchOf(0, [10, 11]))
+
+        expect(epochs[0]).toBe(FETCH_EPOCH)
+        expect(handled).toEqual(['10'])
+        expect(eventsOf(0)).toEqual(['start', 'end'])
+      }
+    )
+
+    it('a queued batch is not handed over after its leader moved away and back to the same leader epoch', async () => {
+      await start({ eachBatch: undefined, eachMessage: recordingHandler() })
+      const done = queueWith(1).push(batchOf(0, [4, 5]), batchOf(1, [4, 5]))
+      await until(() => handled.length === 1)
+
+      moveEpoch(1, 6)
+      moveEpoch(1, FETCH_EPOCH)
+      gate.open()
+      await done
+
+      expect(handled.filter(({ partition: id }) => id === 1)).toEqual([])
+      expect(resolvedOf(1)).toEqual([])
+      expect(eventsOf(1)).toEqual([])
+      expect(eventsOf(0)).toEqual(['start', 'end'])
+    })
+
+    it('a preferred read replica change alone keeps a queued batch admissible', async () => {
+      await start({ eachBatch: undefined, eachMessage: recordingHandler() })
+      const done = queueWith(1).push(batchOf(0, [4, 5]), batchOf(1, [4, 5]))
+      await until(() => handled.length === 1)
+
+      // What a new preferred replica publishes: routing moves, the leader, epoch and entry do not.
+      consumerGroup.routingVersion += 1
+      gate.open()
+      await done
+
+      expect(handled.filter(({ partition: id }) => id === 1)).toEqual([
+        { partition: 1, offset: '4' },
+        { partition: 1, offset: '5' },
+      ])
+      expect(resolvedOf(1)).toEqual(['4', '5'])
+      expect(eventsOf(1)).toEqual(['start', 'end'])
+    })
+
     it('a filtered-only batch whose start_batch_process listener moves the epoch resolves nothing and commits nothing', async () => {
       await start()
       instrumentationEmitter.addListener(START_BATCH_PROCESS, ({ payload }) =>
@@ -1858,7 +1955,8 @@ describe('Consumer > Runner', () => {
         topicName,
         '5',
         { partition: 1, highWatermark: 100, messages: [{ offset: '5', isControlRecord: true }] },
-        FETCH_EPOCH
+        FETCH_EPOCH,
+        positionValidator.entryOf(topicName, 1)
       )
       consumerGroup.commitOffsetsIfNecessary.mockClear()
 
