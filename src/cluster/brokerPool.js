@@ -273,6 +273,11 @@ module.exports = class BrokerPool {
     this.recoveries = 0
     /** Counts the responses published to `this.metadata`, so a refresh can tell it was superseded. */
     this.metadataPublications = 0
+    /**
+     * Advances with every published Metadata response and every learned endpoint installed, so an
+     * endpoint answer requested before either cannot move a known node back.
+     */
+    this.endpointRevision = 0
     /** @type {import('../consumer/subscription')|null} default scope of a client-pattern consumer */
     this.consumerMetadataScope = null
     /** Advances when the default scope is registered or released, fencing earlier unscoped work. */
@@ -517,8 +522,8 @@ module.exports = class BrokerPool {
    *
    * An unknown node id at the seed broker's address adopts the seed, as `refreshMetadata`'s reduce
    * does, so the seed's address is not connected twice; a seed the table already holds under
-   * another id is never adopted again. `Cluster#findGroupCoordinator` adds a coordinator it
-   * reached through FindCoordinator this way too.
+   * another id is never adopted again. Each endpoint goes through `applyNodeEndpoint`, which
+   * `Cluster#findGroupCoordinator` also calls for the coordinator a FindCoordinator answer names.
    *
    * Three cases never build a bare replacement:
    * - **The seed broker.** `refreshMetadata` can adopt `this.seedBroker` into `this.brokers` under
@@ -560,63 +565,109 @@ module.exports = class BrokerPool {
       return
     }
 
-    for (const { nodeId, host, port, rack } of nodeEndpoints) {
-      if (
-        !Number.isInteger(nodeId) ||
-        nodeId < 0 ||
-        !host ||
-        !Number.isInteger(port) ||
-        port <= 0
-      ) {
-        continue
-      }
+    const options = { fence }
+    for (const endpoint of nodeEndpoints) {
+      const replacing = this.applyNodeEndpoint(endpoint, options)
+      if (replacing) await replacing
+    }
+  }
 
-      const broker = this.brokers[nodeId]
+  /**
+   * Reconciles one endpoint a response other than Metadata named for a node, whether or not the
+   * table holds that node, under the rules `applyNodeEndpoints` describes. An endpoint equal to the
+   * table's costs nothing but an in-place rack write, and returns synchronously.
+   *
+   * A known node moves only through a replacement whose in-flight requests drain in the
+   * background. With `since`, it moves only while `endpointRevision` still equals it, before and
+   * after the pool is built: a Metadata response published, or another learned endpoint installed,
+   * after the answer was requested is at least as new, so the table keeps it.
+   * @public
+   * @param {{ nodeId: number, host: string, port: number, rack?: string|null }} endpoint a
+   *   missing `rack` (FindCoordinator carries none) keeps the rack the table holds
+   * @param {object} [options]
+   * @param {import('../producer/generation')} [options.fence] captured producer lifecycle; a pool
+   *   completed after its close is retired unused and changes no routing state
+   * @param {number} [options.since] `endpointRevision` read before the answer was requested
+   * @returns {Promise<void>|undefined} a promise only while a replacement pool is built
+   * @throws {Error} the lifecycle's close error
+   */
+  applyNodeEndpoint({ nodeId, host, port, rack }, { fence, since } = {}) {
+    if (!Number.isInteger(nodeId) || nodeId < 0 || !host || !Number.isInteger(port) || port <= 0) {
+      return
+    }
 
-      if (broker && !hasBrokerMoved(broker, { host, port })) {
-        broker.connectionPool.rack = rack
-        continue
-      }
+    const broker = this.brokers[nodeId]
 
-      if (
-        !broker &&
-        this.seedBroker &&
-        !values(this.brokers).includes(this.seedBroker) &&
-        !hasBrokerMoved(this.seedBroker, { host, port })
-      ) {
-        this.seedBroker.nodeId = nodeId
-        this.bindTelemetryNode(this.seedBroker)
-        this.seedBroker.connectionPool.rack = rack
-        this.brokers[nodeId] = this.seedBroker
-        continue
-      }
+    if (broker && !hasBrokerMoved(broker, { host, port })) {
+      if (rack !== undefined) broker.connectionPool.rack = rack
+      return
+    }
 
-      const isSeed = broker !== undefined && broker === this.seedBroker
-      const isCurrent = () =>
-        this.brokers[nodeId] === broker && (!isSeed || this.seedBroker === broker)
-      const connectionPool = await this.buildConnectionPool(
-        { host, port, rack },
-        { fence, isCurrent }
-      )
-      if (!connectionPool) continue
-      if (fence?.closed || currentDeadline()?.guard()) {
-        this.closePool(connectionPool)
-        fence?.check()
-        checked(null)
-      }
+    if (broker && since !== undefined && since !== this.endpointRevision) return
 
-      if (this.brokers[nodeId] !== broker || (isSeed && this.seedBroker !== broker)) {
-        this.closePool(connectionPool)
-        continue
-      }
+    if (
+      !broker &&
+      this.seedBroker &&
+      !values(this.brokers).includes(this.seedBroker) &&
+      !hasBrokerMoved(this.seedBroker, { host, port })
+    ) {
+      this.seedBroker.nodeId = nodeId
+      this.bindTelemetryNode(this.seedBroker)
+      this.seedBroker.connectionPool.rack = rack ?? null
+      this.brokers[nodeId] = this.seedBroker
+      return
+    }
 
-      if (isSeed) {
-        this.replacePool(broker, connectionPool)
-        this.setupMetadataEndpoints.set(String(nodeId), `${host}:${port}`)
-        this.retainSetupEndpoints()
-        continue
-      }
+    return this.replaceNodeEndpoint(nodeId, broker, {
+      host,
+      port,
+      rack: rack === undefined ? (broker?.connectionPool.rack ?? null) : rack,
+      fence,
+      since: broker === undefined ? undefined : since,
+    })
+  }
 
+  /**
+   * Builds the pool for a node's new endpoint and installs it while the table still holds the
+   * broker it was built to replace, then retires that broker in the background.
+   * @private
+   * @param {number} nodeId the node
+   * @param {Broker|undefined} broker the table's broker for the node, if any
+   * @param {object} target
+   * @param {string} target.host
+   * @param {number} target.port
+   * @param {string|null} target.rack
+   * @param {import('../producer/generation')} [target.fence] captured producer lifecycle
+   * @param {number} [target.since] revision the table must still be at
+   * @returns {Promise<void>}
+   * @throws {Error} the lifecycle's close error
+   */
+  async replaceNodeEndpoint(nodeId, broker, { host, port, rack, fence, since }) {
+    const isSeed = broker !== undefined && broker === this.seedBroker
+    const isCurrent = () =>
+      this.brokers[nodeId] === broker &&
+      (!isSeed || this.seedBroker === broker) &&
+      (since === undefined || this.endpointRevision === since)
+    const connectionPool = await this.buildConnectionPool(
+      { host, port, rack },
+      { fence, isCurrent }
+    )
+    if (!connectionPool) return
+    if (fence?.closed || currentDeadline()?.guard()) {
+      this.closePool(connectionPool)
+      fence?.check()
+      checked(null)
+    }
+
+    if (!isCurrent()) {
+      this.closePool(connectionPool)
+      return
+    }
+
+    this.endpointRevision++
+    if (isSeed) {
+      this.replacePool(broker, connectionPool)
+    } else {
       this.brokers[nodeId] = this.createBroker({
         logger: this.rootLogger,
         versions: this.versions,
@@ -624,9 +675,9 @@ module.exports = class BrokerPool {
         nodeId,
       })
       this.closeObsolete(broker)
-      this.setupMetadataEndpoints.set(String(nodeId), `${host}:${port}`)
-      this.retainSetupEndpoints()
     }
+    this.setupMetadataEndpoints.set(String(nodeId), `${host}:${port}`)
+    this.retainSetupEndpoints()
   }
 
   /**
@@ -1236,6 +1287,7 @@ module.exports = class BrokerPool {
           // unavailability. Everything below reads this local instead.
           const metadata = this.metadata
           const publication = ++this.metadataPublications
+          this.endpointRevision++
           const isLatest = () =>
             applicable() &&
             this.metadataPublications === publication &&

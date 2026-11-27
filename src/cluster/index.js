@@ -1701,10 +1701,12 @@ module.exports = class Cluster {
   }
 
   /**
-   * The broker coordinating a group or a transactional id. A coordinator the broker table does
-   * not hold yet is reached at the address FindCoordinator answered with, as the Java client
-   * reaches it, so no Metadata response is needed first. A coordinator the table holds is
-   * reached through its cached broker.
+   * The broker coordinating a group or a transactional id, reached at the address FindCoordinator
+   * answered with, as the Java client reaches it, so no Metadata response is needed first. The
+   * answer goes through `BrokerPool#applyNodeEndpoint`: a node the table does not hold is added,
+   * and a known node at another address is replaced (keeping its rack) unless a Metadata response
+   * or another learned endpoint changed the table after this lookup asked. A coordinator the table
+   * holds at that address is its cached broker.
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
    * @public
    * @param {object} params
@@ -1718,6 +1720,7 @@ module.exports = class Cluster {
   async findGroupCoordinator({ groupId, coordinatorType = COORDINATOR_TYPES.GROUP, fence }) {
     return this.retryFor(fence)(async (bail, retryCount, retryTime) => {
       try {
+        const since = this.brokerPool.endpointRevision
         const { coordinator } = await this.findGroupCoordinatorMetadata({
           groupId,
           coordinatorType,
@@ -1726,11 +1729,9 @@ module.exports = class Cluster {
         fence?.check()
         checked(null)
 
-        if (!this.brokerPool.hasNode(coordinator.nodeId)) {
-          await this.brokerPool.applyNodeEndpoints(
-            [{ ...coordinator, rack: null }],
-            ...fenceArgs(fence)
-          )
+        const installing = this.brokerPool.applyNodeEndpoint(coordinator, { fence, since })
+        if (installing) {
+          await installing
           fence?.check()
           checked(null)
         }
