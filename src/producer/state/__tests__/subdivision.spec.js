@@ -117,6 +117,22 @@ describe('Producer > Accumulator.cut', () => {
 
       expect(seen).toEqual({ resolved: [], rejected: [failure] })
     })
+
+    test.each([null, undefined])(
+      'rejects an outside settler with %p when the first half failed with it, though the second fails with an error',
+      (first) => {
+        const { seen, settler } = outside()
+        const [head, tail] = Accumulator.cut(
+          { messages: [record(0), record(1)], settlers: [settler] },
+          1
+        )
+
+        head.settlers[0].reject(first)
+        tail.settlers[0].reject(new Error('tail failed'))
+
+        expect(seen).toStrictEqual({ resolved: [], rejected: [first] })
+      }
+    )
   })
 
   describe('a batch of several sends', () => {

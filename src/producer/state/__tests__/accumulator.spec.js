@@ -4046,16 +4046,57 @@ describe('Producer > the accumulator > a join publishes all of a send or nothing
     countersOf,
     quiescent,
     bufferedProducer,
+    transactionalProducer,
   } = require('../../__tests__/fixtures/bufferHarness')
-  const { wire } = require('../recordSize')
+  const { wire, BATCH_DEBIT } = require('../recordSize')
   const { KafkaJSProducerClosedError } = require('../../../errors')
 
-  beforeEach(() => {
-    jest.useFakeTimers({ now: 0, doNotFake: ['queueMicrotask', 'nextTick', 'setImmediate'] })
-  })
   afterEach(() => {
     jest.useRealTimers()
   })
+
+  /** Fakes the clock from 0 for a case that moves or counts timers; microtasks stay real. */
+  const clock = () =>
+    jest.useFakeTimers({ now: 0, doNotFake: ['queueMicrotask', 'nextTick', 'setImmediate'] })
+
+  /**
+   * Runs `body` while every `setTimeout` call first calls `before()`, as a timer's creation can
+   * call an application's hook before it returns; the clock in use stays in use.
+   * @param {() => void} before
+   * @param {() => Promise<void>} body
+   * @returns {Promise<void>}
+   */
+  const onTimerSet = async (before, body) => {
+    const set = global.setTimeout
+    const watched = (...args) => {
+      before()
+      return set(...args)
+    }
+    watched.clock = set.clock
+    global.setTimeout = watched
+    try {
+      await body()
+    } finally {
+      global.setTimeout = set
+    }
+  }
+
+  /** A partitioner that gives every record of value `poisoned` a `value` accessor that throws. */
+  const poisoning = (failure) => async (send) => {
+    const entries = await byMessage(send)
+    for (const { messages } of entries) {
+      for (const message of messages) {
+        if (message.value === 'poisoned') {
+          Object.defineProperty(message, 'value', {
+            get() {
+              throw failure
+            },
+          })
+        }
+      }
+    }
+    return entries
+  }
 
   /**
    * An accumulator over a 1 MiB buffer and a lifecycle of its own, whose send path calls `handOff`
@@ -4069,6 +4110,7 @@ describe('Producer > the accumulator > a join publishes all of a send or nothing
     lingers,
     leaderOf,
     budget,
+    deadline,
     getGeneration,
     handOff = () => {},
   } = {}) => {
@@ -4102,9 +4144,25 @@ describe('Producer > the accumulator > a join publishes all of a send or nothing
       leaderOf,
       admission,
       budget,
+      deadline,
       getGeneration: getGeneration ?? (() => generation),
     })
     return { accumulator, admission, generation, requests, sendPartitioned }
+  }
+
+  /** Closes `fixture`'s lifecycle and forces its accumulator closed, as `disconnect()` may. */
+  const forceClosed = (fixture) => {
+    fixture.generation.close(
+      new KafkaJSProducerClosedError('The producer was closed', { outcome: 'unknown' })
+    )
+    fixture.accumulator.forceClose()
+  }
+
+  /** The error a batch refused by a forced close rejects its sends with. */
+  const refusedUnsent = {
+    name: 'KafkaJSProducerClosedError',
+    message: 'The producer was closed before sending',
+    outcome: 'unsent',
   }
 
   /** The metadata a send to partition `partition` of the topic resolves with. */
@@ -4131,27 +4189,12 @@ describe('Producer > the accumulator > a join publishes all of a send or nothing
     ],
     [
       'reading a record of the second partition throws',
-      (failure) => ({
-        partition: async (send) => {
-          const entries = await byMessage(send)
-          for (const { messages } of entries) {
-            for (const message of messages) {
-              if (message.value === 'poisoned') {
-                Object.defineProperty(message, 'value', {
-                  get() {
-                    throw failure
-                  },
-                })
-              }
-            }
-          }
-          return entries
-        },
-      }),
+      (failure) => ({ partition: poisoning(failure) }),
     ],
   ])(
     'when %s, the send rejects and every batch, charge and the next send are as they were before it',
     async (_, failing) => {
+      clock()
       const failure = new Error('join failure')
       const { accumulator, admission, requests } = joining(failing(failure))
       const earlier = watch(append(accumulator, records(0, 'earlier')))
@@ -4182,6 +4225,75 @@ describe('Producer > the accumulator > a join publishes all of a send or nothing
     }
   )
 
+  test('a hundred sends refused at their join leave no batch, charge or timer, and the next send goes out', async () => {
+    clock()
+    const failure = new Error('join failure')
+    const { accumulator, admission, requests } = joining({ partition: poisoning(failure) })
+
+    const refused = Array.from({ length: 100 }, () =>
+      watch(append(accumulator, [{ partition: 0, value: 'poisoned' }]))
+    )
+    await flushAll()
+
+    expect(refused.map(({ state, value }) => [state, value])).toEqual(
+      refused.map(() => ['rejected', failure])
+    )
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    expect(accumulator.depthOf(TOPIC, 0)).toBe(0)
+    expect(jest.getTimerCount()).toBe(0)
+    const later = watch(append(accumulator, records(0, 'later')))
+    await jest.advanceTimersByTimeAsync(LINGER)
+    await flushAll()
+    expect(requests).toEqual([[{ [`${TOPIC}/0`]: ['later-0'] }]])
+    expect(later.value).toEqual([metadataOf(0, '100')])
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+  })
+
+  test.each([
+    ['third', 3],
+    ['fourth', 4],
+  ])(
+    'when the request plan throws at its %s call, the send of two topics rejects and leaves no batch, charge or timer',
+    async (_, failing) => {
+      clock()
+      const failure = new Error('plan failure')
+      let calls = 0
+      const { accumulator, admission, sendPartitioned } = joining({
+        budget: {
+          maxRequestSize: 1000,
+          chunkCapacity: () => {
+            calls += 1
+            if (calls === failing) throw failure
+            return 1000
+          },
+        },
+      })
+
+      const sent = watch(
+        accumulator.append({
+          acks: -1,
+          timeout: 30000,
+          compression: 0,
+          topicMessages: [
+            { topic: TOPIC, messages: records(0, 'a') },
+            { topic: OTHER_TOPIC, messages: records(0, 'b') },
+          ],
+        })
+      )
+      await flushAll()
+
+      expect(calls).toBe(failing)
+      expect(sent.state).toBe('rejected')
+      expect(sent.value).toBe(failure)
+      expect([accumulator.depthOf(TOPIC, 0), accumulator.depthOf(OTHER_TOPIC, 0)]).toEqual([0, 0])
+      expect(jest.getTimerCount()).toBe(0)
+      expect(countersOf(admission)).toEqual(quiescent(admission))
+      await jest.advanceTimersByTimeAsync(LINGER)
+      await flushAll()
+      expect(sendPartitioned).not.toHaveBeenCalled()
+    }
+  )
+
   test.each([
     ['a lingers()', 'closes the producer', 'lingers', false],
     ['a lingers()', 'closes the producer with a fatal error', 'lingers', true],
@@ -4190,6 +4302,7 @@ describe('Producer > the accumulator > a join publishes all of a send or nothing
   ])(
     '%s that %s while a send joins sees none of it published, and the send is refused with nothing handed on, charged or left to fire',
     async (_, __, callback, fatal) => {
+      clock()
       const armed = new KafkaJSApplicationRecoverableError('fenced', {
         cause: createErrorFromCode(47),
       })
@@ -4253,6 +4366,7 @@ describe('Producer > the accumulator > a join publishes all of a send or nothing
   )
 
   test('lingers() and leaderOf() run before the lifecycle fence, and nothing runs between the fence and the last batch the send links', async () => {
+    clock()
     const events = []
     const lifecycle = {
       get closed() {
@@ -4280,8 +4394,14 @@ describe('Producer > the accumulator > a join publishes all of a send or nothing
       debit.call(admission, bytes)
     }
 
-    const sent = watch(append(accumulator, [...records(0, 'a'), ...records(1, 'b')]))
-    await flushAll()
+    let sent
+    await onTimerSet(
+      () => events.push('timer'),
+      async () => {
+        sent = watch(append(accumulator, [...records(0, 'a'), ...records(1, 'b')]))
+        await flushAll()
+      }
+    )
 
     expect(events).toEqual([
       'lingers',
@@ -4291,14 +4411,120 @@ describe('Producer > the accumulator > a join publishes all of a send or nothing
       'fence',
       'link',
       'link',
+      'timer',
+      'timer',
     ])
     await jest.advanceTimersByTimeAsync(LINGER)
     await flushAll()
-    expect(events.slice(7)).toEqual(['hand-off'])
+    expect(events.slice(9)).toEqual(['hand-off'])
     expect(sent.value).toEqual([metadataOf(0, '100'), metadataOf(1, '100')])
   })
 
+  test('closing the producer while the timer of a batch the send formed is set refuses the send unsent and leaves no timer, batch or charge', async () => {
+    clock()
+    let closing = false
+    const fixture = joining({
+      leaderOf: () => {
+        closing = true
+        return 1
+      },
+    })
+    const { accumulator, admission, sendPartitioned } = fixture
+
+    let sent
+    await onTimerSet(
+      () => {
+        if (!closing) return
+        closing = false
+        forceClosed(fixture)
+      },
+      async () => {
+        sent = watch(append(accumulator, [...records(0, 'a'), ...records(1, 'b')]))
+        await flushAll()
+      }
+    )
+
+    expect(jest.getTimerCount()).toBe(0)
+    expect(sent.state).toBe('rejected')
+    expect(sent.value).toMatchObject(refusedUnsent)
+    expect([accumulator.depthOf(TOPIC, 0), accumulator.depthOf(TOPIC, 1)]).toEqual([0, 0])
+    await jest.advanceTimersByTimeAsync(LINGER)
+    await flushAll()
+    expect(sendPartitioned).not.toHaveBeenCalled()
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+  })
+
+  /**
+   * A send of `y` to partition 0 at 100 ms, then an older send, begun at 50 ms, of `x` to partition
+   * 0 and `z` to partition 1: the older send moves the pending batch's timer to its own deadline.
+   * `atTimer` runs at the first timer set after the older send asked for partition 1's leader.
+   */
+  const olderSendJoins = async (atTimer) => {
+    clock()
+    jest.setSystemTime(100)
+    let armed = false
+    const fixture = joining({
+      deadline: 1000,
+      leaderOf: (topic, partition) => {
+        armed ||= partition === 1
+        return 1
+      },
+    })
+    const { accumulator } = fixture
+    const newer = watch(append(accumulator, records(0, 'y')))
+    await flushAll()
+    expect(jest.getTimerCount()).toBe(1)
+
+    let older
+    await onTimerSet(
+      () => {
+        if (!armed) return
+        armed = false
+        atTimer(fixture)
+      },
+      async () => {
+        older = watch(
+          append(accumulator, [...records(0, 'x'), ...records(1, 'z')], { startedAt: 50 })
+        )
+        await flushAll()
+      }
+    )
+    return { ...fixture, newer, older }
+  }
+
+  test('closing the producer while the timer of a batch an older send joined is moved refuses both sends unsent and leaves no timer, batch or charge', async () => {
+    const { accumulator, admission, sendPartitioned, newer, older } =
+      await olderSendJoins(forceClosed)
+
+    expect(older.state).toBe('rejected')
+    expect(older.value).toMatchObject(refusedUnsent)
+    expect(newer.state).toBe('rejected')
+    expect(newer.value).toMatchObject(refusedUnsent)
+    expect(jest.getTimerCount()).toBe(0)
+    expect([accumulator.depthOf(TOPIC, 0), accumulator.depthOf(TOPIC, 1)]).toEqual([0, 0])
+    await jest.advanceTimersByTimeAsync(1000)
+    await flushAll()
+    expect(sendPartitioned).not.toHaveBeenCalled()
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+  })
+
+  test('a flush made while the timer of a batch an older send joined is moved hands on every record and settler of that send, in one request', async () => {
+    const { admission, requests, newer, older } = await olderSendJoins(({ accumulator }) =>
+      accumulator.flush()
+    )
+
+    expect(requests).toEqual([[{ [`${TOPIC}/0`]: ['y-0', 'x-0'] }, { [`${TOPIC}/1`]: ['z-0'] }]])
+    expect(jest.getTimerCount()).toBe(0)
+    expect(older.value).toEqual([metadataOf(0, '101'), metadataOf(1, '100')])
+    expect(newer.value).toEqual([metadataOf(0, '100')])
+    await jest.advanceTimersByTimeAsync(1000)
+    await flushAll()
+    expect(requests).toHaveLength(1)
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+  })
+
   test('a batch the send displaces is handed on only after every batch of the send is linked', async () => {
+    clock()
     /** At each hand-off: its batches' values, then how many batches wait for partitions 0 and 1. */
     const seen = []
     const fixture = joining({
@@ -4328,6 +4554,7 @@ describe('Producer > the accumulator > a join publishes all of a send or nothing
   })
 
   test('a hand-off that closes the producer at once finds every batch of the joining send linked, so the send is refused unsent and none of it is handed on', async () => {
+    clock()
     let closing = true
     const fixture = joining({
       handOff: () => {
@@ -4362,6 +4589,7 @@ describe('Producer > the accumulator > a join publishes all of a send or nothing
   })
 
   test("a send path that throws while a displaced batch is handed on rejects that batch's sends, and the joining send goes out on its linger", async () => {
+    clock()
     const { accumulator, admission, requests, sendPartitioned } = joining()
     const failure = new Error('send path failure')
     sendPartitioned.mockImplementationOnce(() => {
@@ -4385,7 +4613,150 @@ describe('Producer > the accumulator > a join publishes all of a send or nothing
     expect(countersOf(admission)).toEqual(quiescent(admission))
   })
 
+  /** One record each for partitions 0 and 1, small enough to linger under a `batchSize` of 3. */
+  const seeds = [
+    { partition: 0, value: 'e' },
+    { partition: 1, value: 'f' },
+  ]
+
+  test('a hand-off that closes the producer while further displaced and full batches of the join wait refuses them all unsent and hands none of them on', async () => {
+    clock()
+    let closing = true
+    const fixture = joining({
+      batchSize: 3,
+      handOff: () => {
+        if (!closing) return
+        closing = false
+        forceClosed(fixture)
+      },
+    })
+    const { accumulator, admission, requests, sendPartitioned } = fixture
+    const seeded = watch(append(accumulator, seeds))
+    await flushAll()
+
+    const sent = watch(
+      append(
+        accumulator,
+        [
+          { partition: 0, value: 'a' },
+          { partition: 1, value: 'b' },
+          { partition: 2, value: 'ccc' },
+        ],
+        { acks: 1 }
+      )
+    )
+    await flushAll()
+
+    expect(requests).toEqual([[{ [`${TOPIC}/0`]: ['e'] }]])
+    expect(sent.state).toBe('rejected')
+    expect(sent.value).toMatchObject(refusedUnsent)
+    expect(seeded.state).toBe('rejected')
+    expect(seeded.value).toMatchObject({ name: 'KafkaJSProducerClosedError', outcome: 'unknown' })
+    expect(jest.getTimerCount()).toBe(0)
+    await jest.advanceTimersByTimeAsync(LINGER)
+    await flushAll()
+    expect(sendPartitioned).toHaveBeenCalledTimes(1)
+    expect([0, 1, 2].map((partition) => accumulator.depthOf(TOPIC, partition))).toEqual([0, 0, 0])
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+  })
+
+  test('a hand-off that flushes while a further displaced batch of the join waits hands that batch on first, so each partition keeps its order', async () => {
+    clock()
+    /** Each hand-off's batches, as their values. */
+    const handed = []
+    const fixture = joining({
+      handOff: (batches) => {
+        handed.push(batches.map(({ messages }) => messages.map(({ value }) => value)))
+        if (handed.length === 1) fixture.accumulator.flush()
+      },
+    })
+    const { accumulator, admission } = fixture
+    const seeded = watch(append(accumulator, seeds))
+    await flushAll()
+
+    const sent = watch(
+      append(
+        accumulator,
+        [
+          { partition: 0, value: 'a' },
+          { partition: 1, value: 'b' },
+        ],
+        { acks: 1 }
+      )
+    )
+    await flushAll()
+
+    expect(handed).toEqual([[['e']], [['f']], [['a'], ['b']]])
+    expect(jest.getTimerCount()).toBe(0)
+    expect(seeded.value).toEqual([metadataOf(0, '100'), metadataOf(1, '100')])
+    expect(sent.value).toEqual([metadataOf(0, '100'), metadataOf(1, '100')])
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+  })
+
+  test.each([null, undefined, 0, '', false])(
+    "a send path that throws %p at the join's hand-off rejects the send with that value and leaves nothing charged",
+    async (thrown) => {
+      clock()
+      const { accumulator, admission, sendPartitioned } = joining({ batchSize: 1 })
+      sendPartitioned.mockImplementationOnce(() => {
+        throw thrown
+      })
+
+      const sent = watch(append(accumulator, records(0, 'a')))
+      await flushAll()
+
+      expect(sendPartitioned).toHaveBeenCalledTimes(1)
+      expect(sent.state).toBe('rejected')
+      expect(sent.value).toBe(thrown)
+      expect(jest.getTimerCount()).toBe(0)
+      expect(countersOf(admission)).toEqual(quiescent(admission))
+    }
+  )
+
+  test.each([null, undefined, 0, '', false])(
+    'a send whose first failed share fails with %p rejects with that value, though a later share fails with an error',
+    async (first) => {
+      clock()
+      const { accumulator, admission, sendPartitioned } = joining({ batchSize: 1 })
+      sendPartitioned.mockImplementationOnce(async ({ batches }) => {
+        batches[0].settlers.forEach((settler) => settler.reject(first))
+        batches[1].settlers.forEach((settler) => settler.reject(new Error('later')))
+        batches.forEach((batch) => batch.retire())
+      })
+
+      const sent = watch(append(accumulator, [...records(0, 'a'), ...records(1, 'b')]))
+      await flushAll()
+
+      expect(sendPartitioned.mock.calls[0][0].batches).toHaveLength(2)
+      expect(sent.state).toBe('rejected')
+      expect(sent.value).toBe(first)
+      expect(countersOf(admission)).toEqual(quiescent(admission))
+    }
+  )
+
+  test('a send path that rejects later owns the batches it took: the send rejects with its failure and their charge stays until it retires them', async () => {
+    clock()
+    const failure = new Error('rejected later')
+    const { accumulator, admission, sendPartitioned } = joining({ batchSize: 1 })
+    let taken = []
+    sendPartitioned.mockImplementationOnce(async ({ batches }) => {
+      taken = batches
+      throw failure
+    })
+
+    const sent = watch(append(accumulator, records(0, 'a')))
+    await flushAll()
+
+    expect(sent.state).toBe('rejected')
+    expect(sent.value).toBe(failure)
+    expect(taken).toHaveLength(1)
+    expect(admission.debts).toBe(BATCH_DEBIT)
+    taken.forEach((batch) => batch.retire())
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+  })
+
   test('records keep their order in each partition across sends, through a displaced batch and runs cut at the chunk capacity', async () => {
+    clock()
     const capacity = 2 * wire({ value: 'a-0' })
     const { accumulator, admission, requests } = joining({
       budget: { maxRequestSize: 1000, chunkCapacity: () => capacity },
@@ -4426,6 +4797,7 @@ describe('Producer > the accumulator > a join publishes all of a send or nothing
   ])(
     'a send with two runs for one partition whose second %s leaves one batch waiting, and reads its leader once',
     async (_, batchSize, expected) => {
+      clock()
       const leaderOf = jest.fn(() => 1)
       const { accumulator, admission, requests } = joining({ batchSize, leaderOf })
 
@@ -4453,6 +4825,7 @@ describe('Producer > the accumulator > a join publishes all of a send or nothing
   )
 
   test('a send that joins a due batch held behind its partition’s batch in flight reads no leader and leaves it held until that batch settles', async () => {
+    clock()
     const answer = deferred()
     const handed = []
     const sendPartitioned = async ({ batches }) => {
@@ -4561,5 +4934,79 @@ describe('Producer > the accumulator > a join publishes all of a send or nothing
     expect(cluster.broker.produce).not.toHaveBeenCalled()
     expect(countersOf(admission)).toEqual(quiescent(admission))
     expect([...pins]).toEqual([])
+  })
+
+  /**
+   * A transactional producer inside a transaction whose custom partitioner gives its one record a
+   * timestamp accessor that calls `end(transaction)` once, on the accessor's first read; its
+   * cluster counts the topic pins it holds.
+   */
+  const endingTransaction = async (end) => {
+    const cluster = createFakeCluster({ partitions: 1 })
+    const pins = new Map()
+    cluster.holdTopic = (topic) => pins.set(topic, (pins.get(topic) ?? 0) + 1)
+    cluster.releaseTopic = (topic) =>
+      pins.get(topic) === 1 ? pins.delete(topic) : pins.set(topic, pins.get(topic) - 1)
+    let ended = null
+    const fixture = await transactionalProducer({
+      cluster,
+      createPartitioner:
+        () =>
+        ({ message }) => {
+          Object.defineProperty(message, 'timestamp', {
+            get() {
+              ended ??= end(fixture.transaction)
+              return 1
+            },
+          })
+          return 0
+        },
+    })
+    return { ...fixture, pins, ended: () => ended }
+  }
+
+  test("a timestamp accessor that aborts the send's own transaction while the send joins drops the send with the transaction's queued batches: nothing is written and nothing stays charged or pinned", async () => {
+    clock()
+    const { producer, cluster, admission, transaction, pins, ended } = await endingTransaction(
+      (transaction) => transaction.abort()
+    )
+
+    const sent = watch(transaction.send({ topic: TOPIC, messages: [{ value: 'a' }] }))
+    await flushAll()
+
+    expect(ended()).toBeInstanceOf(Promise)
+    expect(sent.state).toBe('rejected')
+    expect(sent.value).toBeInstanceOf(KafkaJSTransactionAbortableError)
+    expect(sent.value.message).toBe(
+      'The transaction was aborted while this batch was waiting to be sent'
+    )
+    await ended()
+    expect(cluster.broker.produce).not.toHaveBeenCalled()
+    expect(transaction.isActive()).toBe(false)
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    expect([...pins]).toEqual([])
+    await producer.disconnect()
+  })
+
+  test("a timestamp accessor that commits the send's own transaction while the send joins: the commit waits for the send, which is written and committed", async () => {
+    clock()
+    const { producer, cluster, admission, transaction, release, pins, ended } =
+      await endingTransaction((transaction) => transaction.commit())
+
+    const sent = watch(transaction.send({ topic: TOPIC, messages: [{ value: 'a' }] }))
+    await flushAll()
+
+    expect(ended()).toBeInstanceOf(Promise)
+    expect(sent.state).toBe('pending')
+    expect(cluster.broker.endTxn).not.toHaveBeenCalled()
+    await release()
+    await ended()
+    expect(sent.state).toBe('fulfilled')
+    expect(cluster.broker.produce).toHaveBeenCalledTimes(1)
+    expect(cluster.broker.endTxn).toHaveBeenCalledTimes(1)
+    expect(cluster.broker.endTxn.mock.calls[0][0]).toMatchObject({ transactionResult: true })
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    expect([...pins]).toEqual([])
+    await producer.disconnect()
   })
 })
