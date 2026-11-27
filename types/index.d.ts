@@ -592,7 +592,12 @@ export type Assigner = {
   supportedProtocols?(): Array<'eager' | 'cooperative'>
   /** Optional bytes for the subscription. An assigner that defines `protocol()` calls this itself. */
   subscriptionUserData?(topics: string[]): Buffer | null
-  /** Invoked after every successful sync, and with `null` when the member leaves or resets. */
+  /**
+   * Invoked when a classic assignment is applied. Receives `null` once for the stop of a running
+   * classic consumer, including a static member that stays in the group, and when a poll-interval
+   * expiry resets the generation. If a bounded close prevents the stop-time clear, it runs during
+   * the next classic startup, before JoinGroup.
+   */
   onAssignment?(
     assignment: {
       partitions: Array<{ topic: string; partitions: number[] }>

@@ -451,7 +451,8 @@ class KafkaJSInvariantViolation extends KafkaJSNonRetriableError {
     this.name = 'KafkaJSInvariantViolation'
 
     if (issueUrl !== null) {
-      const issueTitle = encodeURIComponent(`Invariant violation: ${message}`)
+      // encodeURIComponent throws on a lone surrogate, which a message can carry from a caller's name
+      const issueTitle = encodeURIComponent(`Invariant violation: ${message}`.toWellFormed())
       this.helpUrl = `${issueUrl}/new?assignees=&labels=bug&template=bug_report.md&title=${issueTitle}`
     }
   }
