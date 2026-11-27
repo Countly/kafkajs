@@ -10,6 +10,7 @@ const {
 const { Deadline, ExpiryTimer } = require('../deadline')
 const { Admission } = require('./admission')
 const JoinOrder = require('./joinOrder')
+const { projectionsOf } = require('./recordErrors')
 const {
   chargeOf,
   share,
@@ -941,6 +942,8 @@ class PendingSend {
  * @property {(PendingSend|number)[]|null} owners each send whose records it carries, followed by
  *   the bytes of their shares still charged; null once it has retired
  * @property {BatchOwnership} ownership transfers the payload and debit when a guard subdivides it
+ * @property {object|null} [token] set by the first answer that reports an error for it; a cut
+ *   clears it, so an answer to the uncut batch names no record of a half
  * @property {() => void} retire releases its shares and repays its debt, once; the send path calls
  *   it when nothing holds the batch any more
  * @property {() => void} detach drops its records and gives back the bytes of their shares, once;
@@ -1135,6 +1138,7 @@ class Accumulator {
         recordCount: child.messages.length,
         wire: recordsBytes(child.messages),
         settlers: index === 0 ? first : second,
+        token: null,
       }))
     }
     const retires = bothOf(retire)
@@ -1146,6 +1150,7 @@ class Accumulator {
       recordCount: payload.length,
       wire: recordsBytes(payload),
       settlers: index === 0 ? first : second,
+      token: null,
       retire: () => {
         payload.length = 0
         retires[index]?.()
@@ -1155,6 +1160,22 @@ class Accumulator {
         detaches[index]?.()
       },
     }))
+  }
+
+  /**
+   * Each accumulator send's own error for a batch that fails with `delivered`, from the answer
+   * occurrence its settlement received (see `recordErrors.projectionsOf`). A send's records are
+   * the range from its settler's index to the next settler's; a send that owns none of the
+   * reported indices still gets its own copy, with the shared raw entries. Called before the
+   * batch detaches. Other settlers are not in the map and get `delivered` itself.
+   * @param {{ settlers: object[], messages: object[], token?: object|null }} batch
+   * @param {Error} delivered
+   * @param {{ error: Error, token: object }} occurrence
+   * @returns {Map<Settler, Error>|null} null when every settler gets `delivered`
+   */
+  static projectionsFor(batch, delivered, occurrence) {
+    const owners = batch.settlers.filter((settler) => settler instanceof Settler)
+    return projectionsOf(batch, delivered, occurrence, owners)
   }
 
   /**

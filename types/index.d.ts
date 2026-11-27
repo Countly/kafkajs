@@ -1795,7 +1795,7 @@ type Sender = {
    * Sends a produce request for one topic's messages. Rejects with a `KafkaJSProtocolError`
    * (`topic`, `partition`, `errorMessage` set) when the broker fails the whole batch; when it
    * rejected individual records (KIP-467), the error also carries
-   * `recordErrors: ProduceRecordError[]`.
+   * `recordErrors: ProduceRecordError[]`, on an error of this send's own.
    */
   send(record: ProducerRecord): Promise<RecordMetadata[]>
   sendBatch(batch: ProducerBatch): Promise<RecordMetadata[]>
@@ -2957,13 +2957,26 @@ export class KafkaJSProtocolError extends KafkaJSError {
 
 /**
  * A single record the broker rejected out of an otherwise-failed produce batch (KIP-467).
- * `batchIndex` is the record's position as sent to that partition; `record` is the corresponding
- * entry from the `messages` array passed to `Producer#send`/`sendBatch`, when the client could
- * resolve it.
+ * Several sends can share one batch: each send whose records the broker rejected gets its own
+ * error, and only its own entries carry `record`; an entry for another send's record has
+ * `batchIndex` and `errorMessage` alone. There is no index into your `messages` yet.
  */
 export type ProduceRecordError = {
+  /** Position of the record inside the rejected batch, not an index into your `messages`. */
   batchIndex: number
-  record?: Message
+  /**
+   * A copy of the record as the producer wrote it, in a store of its own: `key`, `value` and the
+   * header values as `Buffer`s (strings UTF-8 encoded), none of your other fields. `timestamp` is
+   * the decimal string of the timestamp you gave; absent when you gave none (the send time was
+   * written) or gave an object other than a `Date` or a `Long`. Set only on your own records of a broker
+   * answer, never on an error thrown for a whole request.
+   */
+  record?: {
+    key: Buffer | null
+    value: Buffer | null
+    headers: { [key: string]: Buffer | Buffer[] }
+    timestamp?: string
+  }
   errorMessage: string | null
 }
 
