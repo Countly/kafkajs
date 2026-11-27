@@ -7711,6 +7711,8 @@
         "src/consumer/__tests__/scriptedEpochLog.spec.js \u203a Test harness > fetch group routing a lookup held twice on one node waits for both releases",
         "src/consumer/__tests__/scriptedEpochLog.spec.js \u203a Test harness > fetch group teardown teardown fails a validation request whose answer is withheld",
         "src/consumer/__tests__/scriptedEpochLog.spec.js \u203a Test harness > fetch group teardown teardown ends a held broker lookup with an error",
+        "src/consumer/__tests__/scriptedEpochLog.spec.js \u203a Test harness > fetch group teardown teardown cancels the answer of a frame written in the same turn, so no answer runs after it",
+        "src/consumer/__tests__/scriptedEpochLog.spec.js \u203a Test harness > withheld broker answers a closed fake broker answers nothing: not a frame queued before the close, a frame written after it, or a withheld answer released after it",
         "src/consumer/__tests__/incarnationStaleBatch.spec.js \u203a an old-incarnation batch, classic protocol eachBatch an explicit commit from the old handler is refused, and so is the commit at close",
         "src/consumer/__tests__/incarnationStaleBatch.spec.js \u203a an old-incarnation batch, classic protocol eachBatch records fetched before the recreation commit nothing into the new incarnation",
         "src/consumer/__tests__/incarnationStaleBatch.spec.js \u203a an old-incarnation batch, classic protocol eachBatch the new incarnation commits only its own records",

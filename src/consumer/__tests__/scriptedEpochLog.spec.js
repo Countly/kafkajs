@@ -538,6 +538,38 @@ describe('Test harness > withheld broker answers', () => {
       await broker.disconnect({ drainTimeout: 0 })
     }
   })
+
+  test('a closed fake broker answers nothing: not a frame queued before the close, a frame written after it, or a withheld answer released after it', async () => {
+    const withheld = withheldAnswer()
+    const asked = []
+    const { broker, state, close } = createFakeBroker((header) => {
+      if (header.apiKey === apiKeys.ApiVersions) return apiVersionsBody(18)
+      asked.push(header.correlationId)
+      return withheld.promise
+    })
+    await broker.connect()
+
+    try {
+      const first = jest.fn()
+      broker.offsetForLeaderEpoch(validationRequest(0, 4)).then(first, first)
+      while (asked.length === 0) await nextTurn()
+      const [frame] = state.writes.slice(-1)
+
+      // Written in the same turn as the close: its answer is queued for a later turn.
+      state.socket.write(frame)
+      close()
+      state.socket.write(frame)
+      withheld.resolve(offsetForLeaderEpochResponse([{ partition: 0 }]))
+      await nextTurn()
+      await nextTurn()
+
+      expect(asked).toHaveLength(1)
+      expect(state.writes.slice(-3)).toEqual([frame, frame, frame])
+      expect(first).not.toHaveBeenCalled()
+    } finally {
+      await broker.disconnect({ drainTimeout: 0 })
+    }
+  })
 })
 
 describe('Test harness > fetch group routing', () => {
@@ -728,6 +760,27 @@ describe('Test harness > fetch group teardown', () => {
     await teardown()
 
     expect(await outcome).toBe('KafkaJSConnectionClosedError')
+  })
+
+  test('teardown cancels the answer of a frame written in the same turn, so no answer runs after it', async () => {
+    const { broker, setValidationResponse, validationRequests, teardown } = await fetchGroup()
+    await broker.offsetForLeaderEpoch(validationRequest(0, 4))
+    const answer = jest.fn(() => new Promise(() => {}))
+    setValidationResponse(answer)
+    const { socket } = await broker.connectionPool.getConnection()
+    const [frame] = socket.writes.slice(-1)
+
+    // Written just before the test ends, as by a request the test stops right after: its answer
+    // is queued for a later turn.
+    socket.write(frame)
+    expect(validationRequests()).toHaveLength(2)
+    await teardown()
+    socket.write(frame)
+    await nextTurn()
+    await nextTurn()
+
+    expect(validationRequests()).toHaveLength(3)
+    expect(answer).not.toHaveBeenCalled()
   })
 
   test('teardown ends a held broker lookup with an error', async () => {
