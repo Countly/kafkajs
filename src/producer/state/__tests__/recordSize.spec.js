@@ -1058,7 +1058,7 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     await producer.disconnect()
   })
 
-  test('an error that names a failing record names the copy: equal in its fields, not the same object', async () => {
+  test("an error that names a failing record carries a copy of its bytes, not the caller's object", async () => {
     const { producer, cluster } = bufferedProducer()
     cluster.broker.produce.mockImplementation(async () => {
       const error = createErrorFromCode(87)
@@ -1073,7 +1073,11 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     const error = sent.value
 
     expect(sent.state).toBe('rejected')
-    expect(error.recordErrors[0].record).toEqual(record)
+    expect(error.recordErrors[0].record).toEqual({
+      key: Buffer.from('k'),
+      value: Buffer.from('refused'),
+      headers: {},
+    })
     expect(error.recordErrors[0].record).not.toBe(record)
     await producer.disconnect()
   })

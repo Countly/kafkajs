@@ -702,8 +702,8 @@ describe('Producer > sendMessages', () => {
   })
 
   test("leaves recordErrors unresolved when the reported partition is not in this broker's topicData", async () => {
-    // A malformed or unexpected `partition` on the thrown error (KIP-467) must not throw out of
-    // attachFailingRecords - it should just leave recordErrors as the broker sent them.
+    // A thrown error (KIP-467) with an unexpected `partition` must not throw out of the send
+    // path, and its recordErrors stay as the broker sent them.
     const send = sendThrough(
       createSendMessages({
         retrier: retry({ retries: 0 }),
