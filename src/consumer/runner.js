@@ -489,7 +489,7 @@ module.exports = class Runner extends EventEmitter {
             await this.handleRebalanceError(verdict, { retryCount, retryTime })
             return !this.running || this.stopRequested
           } catch (error) {
-            if (this.stopRequested || this.retirement) return true
+            if (error?.type === 'CONSUMER_STOPPING' && this.stopRequested) return true
             if (!isHeartbeatFatal(error) && this.rebalanceCoordinator.hasFatalVerdict()) {
               verdict = this.rebalanceCoordinator.takeVerdict()
               continue

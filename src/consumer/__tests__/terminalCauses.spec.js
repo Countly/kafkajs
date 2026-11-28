@@ -2770,7 +2770,7 @@ describe('Consumer > how a consumer-protocol run ends', () => {
       expect(
         run.coordinator.offsetCommit.mock.calls.map(([{ groupGenerationId, topics }]) => [
           groupGenerationId,
-          topics[0].partitions[0].offset,
+          String(topics[0].partitions[0].offset),
         ])
       ).toEqual(
         replace
@@ -2783,7 +2783,7 @@ describe('Consumer > how a consumer-protocol run ends', () => {
       expect(
         published.mock.calls.map(([{ payload }]) => [
           payload.groupGenerationId,
-          payload.topics[0].partitions[0].offset,
+          String(payload.topics[0].partitions[0].offset),
         ])
       ).toEqual(replace ? [[2, '41']] : [])
       if (replace) {
