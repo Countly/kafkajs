@@ -1340,6 +1340,162 @@ describe('Consumer > how a classic run ends', () => {
       expect(jest.getTimerCount()).toBe(0)
     }, 30000)
 
+    it('keeps the failed record retry spent when a replayed prefix returns during another loss', async () => {
+      const error = failure(true)
+      const prefix = deferred()
+      const run = await begin({
+        config: { heartbeatInterval: 500 },
+        retry: { ...RETRY, retries: 1, restartOnFailure: async () => false },
+        run: { autoCommit: false },
+        eachMessage: async ({ message }, held, call) => {
+          if (call === 3) await prefix.promise
+          if (message.offset !== '41') return
+          if (call === 2) await held.promise
+          throw error
+        },
+      })
+      await advanceUntil(() => run.delivered.length === 2)
+      traceRejoins(run).resolve()
+      await answerNextHeartbeat(run, REBALANCE_IN_PROGRESS)
+      run.held.resolve()
+
+      await advanceUntil(() => run.delivered.length === 3)
+      expect(run.delivered).toEqual(['0|40', '0|41', '0|40'])
+      await answerNextHeartbeat(run, ILLEGAL_GENERATION)
+      expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(2)
+      prefix.resolve()
+      await advanceUntil(() => run.crashes.length > 0)
+
+      expect(run.delivered).toEqual(['0|40', '0|41', '0|40', '0|40', '0|41'])
+      expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(3)
+      expect(run.crashes).toHaveLength(1)
+      expect(run.crashes[0].error).toMatchObject({
+        name: 'KafkaJSNumberOfRetriesExceeded',
+        cause: error,
+        retryCount: 1,
+      })
+    }, 30000)
+
+    it('keeps the failed partition retry spent when a sibling succeeds during another rebalance', async () => {
+      const error = failure(true)
+      const sibling = deferred()
+      const run = await begin({
+        config: { heartbeatInterval: 500 },
+        retry: { ...RETRY, retries: 1, restartOnFailure: async () => false },
+        partitions: [0, 1],
+        records: { 'topic-a|0': [40] },
+        run: { autoCommit: false, partitionsConsumedConcurrently: 2 },
+        eachMessage: async ({ partition }, held, call) => {
+          if (partition === 1) return sibling.promise
+          if (call === 1) await held.promise
+          throw error
+        },
+      })
+      await advanceUntil(() => run.delivered.length === 1)
+      traceRejoins(run).resolve()
+      const failedPartition = [{ topic: 'topic-a', partitions: [0] }]
+      run.consumer.pause(failedPartition)
+      run.state.queue['topic-a|1'] = [40]
+      run.held.resolve()
+      await advanceUntil(() => run.delivered.includes('1|40'))
+      expect(run.delivered).toEqual(['0|40', '1|40'])
+
+      await answerNextHeartbeat(run, REBALANCE_IN_PROGRESS)
+      expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(1)
+      sibling.resolve()
+      await advanceUntil(() => rejoinTrail(run).includes('GROUP_JOIN member-2'))
+      run.consumer.resume(failedPartition)
+      await advanceUntil(() => run.crashes.length > 0)
+
+      expect(run.delivered.filter((entry) => entry === '0|40')).toHaveLength(2)
+      expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(2)
+      expect(run.crashes).toHaveLength(1)
+      expect(run.crashes[0].error).toMatchObject({
+        name: 'KafkaJSNumberOfRetriesExceeded',
+        cause: error,
+        retryCount: 1,
+      })
+    }, 30000)
+
+    it('starts a fresh Fetch retry budget after an idle rejoin', async () => {
+      const policy = jest.fn(async () => false)
+      const run = await begin({
+        records: {},
+        retry: { ...RETRY, retries: 1, restartOnFailure: policy },
+      })
+      traceRejoins(run).resolve()
+      const broker = await run.cluster.findBroker(0)
+      broker.fetch
+        .mockRejectedValueOnce(protocolError(7))
+        .mockRejectedValueOnce(protocolError(REBALANCE_IN_PROGRESS))
+      await advanceUntil(() => rejoinTrail(run).includes('GROUP_JOIN member-2'))
+      expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(2)
+      await jest.advanceTimersByTimeAsync(150)
+
+      const again = jest.fn(async () => {
+        throw protocolError(7)
+      })
+      broker.fetch.mockImplementationOnce(again)
+      await advanceUntil(() => again.mock.calls.length > 0)
+      expect(again).toHaveBeenCalledTimes(1)
+      const fetches = () => run.log.filter(({ kind }) => kind === 'fetch').length
+      const afterFailure = fetches()
+      await advanceUntil(() => fetches() > afterFailure)
+      expect(fetches()).toBeGreaterThan(afterFailure)
+      expect(run.delivered).toEqual([])
+      expect(run.crashes).toEqual([])
+      expect(policy).not.toHaveBeenCalled()
+      await closeClean(run)
+    }, 30000)
+
+    it.each([
+      ['inside the join retrier', REBALANCE_IN_PROGRESS],
+      ['after escaping the join retrier', 7],
+    ])(
+      'keeps the handler failure pending while a transient rejoin error is retried %s',
+      async (_kind, code) => {
+        const error = failure(false)
+        const policy = jest.fn(async () => false)
+        const run = await viaEachMessage({
+          retry: { ...RETRY, retries: 1, restartOnFailure: policy },
+          handle: async (held) => {
+            await held.promise
+            throw error
+          },
+        })
+        await answerNextHeartbeat(run, REBALANCE_IN_PROGRESS)
+        const rejoin = traceRejoins(run)
+        const refused = jest.fn(async () => {
+          throw protocolError(code)
+        })
+        run.coordinator.joinGroup.mockImplementationOnce(refused)
+        run.held.resolve()
+        await advanceUntil(() => refused.mock.calls.length > 0)
+        expect(refused).toHaveBeenCalledTimes(1)
+        expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(2)
+        await advanceUntil(() => rejoinTrail(run).includes('join member-2'))
+        expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(3)
+        expect(rejoinTrail(run)).toEqual(['join member-2'])
+        expect(run.delivered).toEqual(['0|40'])
+        expect(run.crashes).toEqual([])
+        expect(policy).not.toHaveBeenCalled()
+
+        rejoin.resolve()
+        await advanceUntil(() => run.crashes.length > 0)
+        expect(rejoinTrail(run)).toEqual([
+          'join member-2',
+          'GROUP_JOIN member-2',
+          'leave member-2 null',
+          'CRASH restart false',
+        ])
+        expect(run.delivered).toEqual(['0|40'])
+        expect(run.crashes).toHaveLength(1)
+        expect(run.crashes[0].error.cause).toBe(error)
+        expect(policy).toHaveBeenCalledTimes(1)
+      },
+      30000
+    )
+
     /**
      * Starts an eager member whose first handler call, once released, commits offset 41 and
      * rethrows what the commit rejects with; releases it and holds that OffsetCommit until
@@ -1495,6 +1651,106 @@ describe('Consumer > how a classic run ends', () => {
           await closeClean(run)
         } else {
           expect(jest.getTimerCount()).toBe(0)
+        }
+      },
+      30000
+    )
+  })
+
+  describe('a cooperative membership replacement during an explicit commit', () => {
+    it.each([
+      ['refuses an old membership reply without another rejoin', false],
+      ['reports a saved authorization failure after the background join', true],
+    ])(
+      '%s',
+      async (_title, independent) => {
+        const ref = {}
+        const reply = deferred()
+        const commit = deferred()
+        const policy = jest.fn(async () => false)
+        const denied = protocolError(29)
+        let refused
+        const run = await begin({
+          config: {
+            heartbeatInterval: 500,
+            partitionAssigners: [
+              () => ({
+                name: 'eager',
+                version: 0,
+                supportedProtocols: () => ['cooperative'],
+                protocol: () => ({ name: 'eager', metadata: Buffer.alloc(0) }),
+                assign: async () => [],
+              }),
+            ],
+          },
+          retry: { ...RETRY, restartOnFailure: policy },
+          records: { 'topic-a|0': [40] },
+          run: { autoCommit: false },
+          eachMessage: async (_payload, held, call) => {
+            if (call > 1) return
+            await commit.promise
+            try {
+              await ref.run.consumer.commitOffsets([
+                { topic: 'topic-a', partition: 0, offset: '41' },
+              ])
+            } catch (error) {
+              refused = error
+              await held.promise
+              throw new TypeError('the handler rethrew the commit reply', { cause: error })
+            }
+          },
+        })
+        ref.run = run
+        const commitEvents = jest.fn()
+        const joined = jest.fn()
+        const rebalancing = jest.fn()
+        run.consumer.on(run.consumer.events.COMMIT_OFFSETS, commitEvents)
+        run.consumer.on(run.consumer.events.GROUP_JOIN, joined)
+        run.consumer.on(run.consumer.events.REBALANCING, rebalancing)
+        run.coordinator.offsetCommit.mockImplementationOnce(async () => {
+          if (independent) throw denied
+          await reply.promise
+          throw protocolError(22)
+        })
+        commit.resolve()
+        await advanceUntil(() => run.coordinator.offsetCommit.mock.calls.length > 0)
+        expect(run.coordinator.offsetCommit.mock.calls[0][0].groupGenerationId).toBe(1)
+        if (independent) {
+          await advanceUntil(() => refused != null)
+          expect(inCauseChain(refused, denied)).toBe(true)
+        }
+
+        const join = run.coordinator.joinGroup.getMockImplementation()
+        run.coordinator.joinGroup.mockImplementationOnce(async (...args) => ({
+          ...(await join(...args)),
+          generationId: 2,
+        }))
+        run.coordinator.heartbeat.mockRejectedValueOnce(protocolError(REBALANCE_IN_PROGRESS))
+        await advanceUntil(() => joined.mock.calls.length > 0)
+        expect(joined).toHaveBeenCalledTimes(1)
+        expect(run.group.generationId).toBe(2)
+        expect(run.crashes).toEqual([])
+        expect(policy).not.toHaveBeenCalled()
+
+        reply.resolve()
+        await advanceUntil(() => refused != null)
+        expect(refused?.name).toBe(
+          independent ? 'KafkaJSNonRetriableError' : 'KafkaJSCommitFailedError'
+        )
+        run.held.resolve()
+        if (independent) await advanceUntil(() => run.crashes.length > 0)
+        await jest.advanceTimersByTimeAsync(1000)
+
+        expect(run.coordinator.offsetCommit).toHaveBeenCalledTimes(1)
+        expect(commitEvents).not.toHaveBeenCalled()
+        expect(rebalancing).toHaveBeenCalledTimes(1)
+        expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(2)
+        expect(run.crashes).toHaveLength(Number(independent))
+        expect(policy).toHaveBeenCalledTimes(Number(independent))
+        if (independent) {
+          expect(inCauseChain(run.crashes[0].error, denied)).toBe(true)
+        } else {
+          await closeClean(run)
         }
       },
       30000
@@ -1849,12 +2105,12 @@ describe('Consumer > how a consumer-protocol run ends', () => {
       }
     )
     const joins = beats(run, false)
-    /** @returns {number} when the member sent its `index`-th epoch-zero heartbeat */
-    const joinedAt = (index) =>
-      run.log.filter(({ kind, epoch }) => kind === 'heartbeat' && epoch === 0)[index].at
+    const accepted = []
+    run.consumer.on(run.consumer.events.GROUP_JOIN, () => accepted.push(Date.now()))
     await advanceUntil(() => leaves(run).length === 1, 10000)
     run.held.resolve()
-    await advanceUntil(() => beats(run, false) === joins + 1, 5000)
+    await advanceUntil(() => accepted.length === 1, 5000)
+    expect(accepted).toHaveLength(1)
     expect(run.crashes).toEqual([])
 
     run.arm()
@@ -1867,8 +2123,9 @@ describe('Consumer > how a consumer-protocol run ends', () => {
     await jest.advanceTimersByTimeAsync(1000)
 
     expect(run.calls).toEqual(['40', '40'])
-    expect(joinedAt(joins + 1) - joinedAt(joins)).toBeGreaterThanOrEqual(2000)
-    expect(calledAt[1]).toBeGreaterThanOrEqual(joinedAt(joins + 1))
+    expect(accepted).toHaveLength(2)
+    expect(accepted[1] - accepted[0]).toBeGreaterThanOrEqual(2000)
+    expect(calledAt[1]).toBeGreaterThanOrEqual(accepted[1])
     expect(beats(run, false)).toBe(joins + 2)
     expect(
       run.crashes.map(({ error, restart }) => [error.name, error.cause === failed, restart])
@@ -1877,6 +2134,140 @@ describe('Consumer > how a consumer-protocol run ends', () => {
     expect(policy).toHaveBeenCalledTimes(1)
     expect(jest.getTimerCount()).toBe(0)
   }, 60000)
+
+  it.each([
+    ['reports the refusal while its epoch is current', false],
+    ['drops the saved refusal after replacing its epoch', true],
+  ])(
+    'a handler rethrowing STALE_MEMBER_EPOCH %s',
+    async (_title, replace) => {
+      const ref = {}
+      const commit = deferred()
+      const denied = protocolError(113)
+      let refused
+      const policy = jest.fn(async () => false)
+      const run = await begin(
+        async (_payload, held, call) => {
+          if (call > 1) return
+          await commit.promise
+          try {
+            await ref.run.consumer.commitOffsets([{ topic: 'topic-a', partition: 0, offset: '41' }])
+          } catch (error) {
+            refused = error
+            await held.promise
+            throw error
+          }
+        },
+        { retry: { ...RETRY, restartOnFailure: policy }, fault: fenced }
+      )
+      ref.run = run
+      const joined = jest.fn()
+      const published = jest.fn()
+      run.consumer.on(run.consumer.events.GROUP_JOIN, joined)
+      run.consumer.on(run.consumer.events.COMMIT_OFFSETS, published)
+      run.coordinator.offsetCommit.mockRejectedValueOnce(denied)
+      commit.resolve()
+      await advanceUntil(() => refused != null)
+      expect(refused).toMatchObject({ name: 'KafkaJSNonRetriableError', retriable: false })
+      expect(inCauseChain(refused, denied)).toBe(true)
+      expect(run.coordinator.offsetCommit.mock.calls[0][0].groupGenerationId).toBe(1)
+
+      if (replace) {
+        run.arm()
+        await advanceUntil(() => run.coordinators[0].hasVerdict())
+        expect(run.coordinators[0].hasVerdict()).toBe(true)
+        expect(run.crashes).toEqual([])
+        expect(policy).not.toHaveBeenCalled()
+      }
+      run.held.resolve()
+      if (replace) {
+        await advanceUntil(() => run.calls.length === 2)
+        expect(run.calls).toEqual(['40', '40'])
+      } else {
+        await advanceUntil(() => run.crashes.length > 0)
+      }
+      await jest.advanceTimersByTimeAsync(500)
+      expect(joined).toHaveBeenCalledTimes(Number(replace))
+      expect(run.crashes).toHaveLength(Number(!replace))
+      expect(policy).toHaveBeenCalledTimes(Number(!replace))
+      expect(published).not.toHaveBeenCalled()
+      expect(run.coordinator.offsetCommit).toHaveBeenCalledTimes(1)
+      if (replace) {
+        await closeClean(run)
+      } else {
+        expect(inCauseChain(run.crashes[0].error, denied)).toBe(true)
+      }
+    },
+    30000
+  )
+
+  it.each([
+    ['reports an unrelated INVALID_REQUEST from another operation', false],
+    ['folds the refusal from this member’s fenced OffsetCommit', true],
+  ])(
+    'a wrapped protocol error during recovery %s',
+    async (_title, membership) => {
+      const ref = {}
+      const request = deferred()
+      const protocol = protocolError(membership ? 110 : 42)
+      const policy = jest.fn(async () => true)
+      let wrapped
+      const run = await begin(
+        async (_payload, held, call) => {
+          if (call > 1) return
+          await request.promise
+          try {
+            if (membership) {
+              await ref.run.consumer.commitOffsets([
+                { topic: 'topic-a', partition: 0, offset: '41' },
+              ])
+            } else {
+              await ref.run.cluster.fetchTopicsOffset([{ topic: 'topic-a', partitions: [0] }])
+            }
+          } catch (error) {
+            wrapped = new Error('the operation failed', { cause: error })
+            await held.promise
+            throw wrapped
+          }
+        },
+        { retry: { ...RETRY, restartOnFailure: policy }, fault: fenced }
+      )
+      ref.run = run
+      const joined = jest.fn()
+      run.consumer.on(run.consumer.events.GROUP_JOIN, joined)
+      if (membership) {
+        run.coordinator.offsetCommit.mockRejectedValueOnce(protocol)
+      } else {
+        run.cluster.fetchTopicsOffset.mockRejectedValueOnce(protocol)
+      }
+      request.resolve()
+      await advanceUntil(() => wrapped != null)
+      expect(inCauseChain(wrapped, protocol)).toBe(true)
+      if (!membership) run.arm()
+      await advanceUntil(() => run.coordinators[0].hasVerdict())
+      expect(run.coordinators[0].hasVerdict()).toBe(true)
+      expect(run.crashes).toEqual([])
+      run.held.resolve()
+      if (membership) {
+        await advanceUntil(() => run.calls.length === 2)
+        expect(run.calls).toEqual(['40', '40'])
+      } else {
+        await advanceUntil(() => run.crashes.length > 0)
+      }
+      expect(joined).toHaveBeenCalledTimes(1)
+      expect(run.crashes).toHaveLength(Number(!membership))
+      expect(policy).toHaveBeenCalledTimes(Number(!membership))
+      if (membership) {
+        await closeClean(run)
+      } else {
+        expect(run.crashes[0].error.name).toBe('KafkaJSNumberOfRetriesExceeded')
+        expect(inCauseChain(run.crashes[0].error, wrapped)).toBe(true)
+        expect(run.crashes[0].restart).toBe(true)
+        await closeClean(run)
+      }
+    },
+    30000
+  )
 
   it('a poll expiry, then the stuck handler rethrowing the refusal of its own commit: the refusal stays part of the rejoin, nothing is sent or reported and the record is redelivered', async () => {
     const ref = {}

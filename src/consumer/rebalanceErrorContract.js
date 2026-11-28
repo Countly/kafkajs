@@ -31,6 +31,7 @@ const GROUP_AUTHORIZATION_FAILED = 30
 const INVALID_REQUEST = 42
 const UNKNOWN_MEMBER_ID = 25
 const FENCED_MEMBER_EPOCH = 110
+const STALE_MEMBER_EPOCH = 113
 const GROUP_ID_NOT_FOUND = 69
 const MAX_CAUSE_DEPTH = 8
 
@@ -61,15 +62,69 @@ const carried = (error, stamp) => {
  * so the request that drew it has to be recorded on the error itself.
  */
 const OFFSET_COMMIT_ORIGIN = Symbol('rebalance:offsetCommit')
+const HEARTBEAT_ORIGIN = Symbol('rebalance:heartbeat')
+const COMMIT_REFUSAL_ORIGIN = Symbol('rebalance:commitRefusal')
+const requestOwners = new WeakMap()
+const handlerCrashes = new WeakSet()
+
+/**
+ * Records the result of handling an independent application failure. The retry error can copy
+ * a protocol code from its cause, so crash policy needs the disposition as well as the code.
+ * @param {Error} error the final retry outcome
+ * @returns {Error} the same error
+ */
+const markHandlerCrash = (error) => {
+  handlerCrashes.add(error)
+  return error
+}
+
+/** @param {Error} error the crash outcome @returns {boolean} whether a handler failure caused it */
+const isHandlerCrash = (error) => handlerCrashes.has(error)
+
+/**
+ * Names this consumer run without keeping its ownership object alive on a public error.
+ * @param {object|undefined} ownership the request's own membership fence
+ * @returns {symbol|true} the run identity or an unscoped request stamp
+ */
+const requestOwner = (ownership) => {
+  if (!ownership) return true
+  if (!requestOwners.has(ownership)) requestOwners.set(ownership, Symbol('consumer request owner'))
+  return requestOwners.get(ownership)
+}
+
+/**
+ * @param {Error} error a heartbeat failure exposed to a handler
+ * @param {object} ownership the membership fence of the consumer that sent it
+ * @returns {Error} the same error
+ */
+const stampHeartbeat = (error, ownership) => {
+  if (error && typeof error === 'object') error[HEARTBEAT_ORIGIN] = requestOwner(ownership)
+  return error
+}
+
+/**
+ * @param {KafkaJSCommitFailedError} error a refusal made by the consumer before transmission
+ * @param {object} ownership the membership fence that refused
+ * @param {number} token the membership the caller captured
+ * @returns {KafkaJSCommitFailedError} the same refusal
+ */
+const stampCommitRefusal = (error, ownership, token) => {
+  error[COMMIT_REFUSAL_ORIGIN] = requestOwner(ownership)
+  stampOwnership(error, token)
+  return error
+}
 
 /**
  * Records that this error answered an OffsetCommit.
  * @param {Error} error
+ * @param {object} [ownership] the membership fence of the consumer that sent it
  * @returns {Error} the same error
  */
-const stampOffsetCommit = (error) => {
+const stampOffsetCommit = (error, ownership) => {
   if (error) {
-    error[OFFSET_COMMIT_ORIGIN] = true
+    error[OFFSET_COMMIT_ORIGIN] = ownership
+      ? requestOwner(ownership)
+      : (error[OFFSET_COMMIT_ORIGIN] ?? true)
   }
 
   return error
@@ -241,33 +296,57 @@ const rebalanceAction = (error, path, { kind = 'classic' } = {}) => {
 }
 
 /**
- * Whether a failure a handler propagated was caused by a rebalance, its own membership's or an
- * earlier one's, rather than meeting it by chance. It was when it is, or wraps:
- * - the waiting verdict's own error;
- * - a commit refused because its membership authority was gone (`KafkaJSCommitFailedError`);
- * - an answer that is itself a rebalance: `rebalanceAction` says lost or revoked, on the
- *   OffsetCommit path for an error an OffsetCommit raised and on the fetch path otherwise.
- *
- * Request provenance alone is not causality: an OffsetCommit answered with any other error, such
- * as `TOPIC_AUTHORIZATION_FAILED`, is the handler's own failure, even when a verdict is waiting
- * and even when the membership the commit was sent for has been replaced since.
+ * Finds the consumer operation behind a handler failure, including through application wrappers.
+ * Status and scope both matter: an error for another operation can carry the same status code.
  * @param {unknown} error what the handler threw
  * @param {{ error: Error }|null} verdict the rebalance verdict the failure met, if any
- * @param {{ kind?: 'classic' | 'consumer' | 'manual' }} [membership] the membership protocol
- * @returns {boolean}
+ * @param {object} group the current group and its membership authority
+ * @returns {{ error: Error, path: string }|'fold'|'stale'|null} a membership result, a consumed
+ *   refusal, an obsolete answer, or an independent failure
  */
-const isCausedByRebalance = (error, verdict, { kind = 'classic' } = {}) => {
+const handlerRebalanceDisposition = (error, verdict, group) => {
+  const { ownership } = group
+  const owner = ownership && requestOwners.get(ownership)
   for (
     let cause = error, depth = 0;
     cause && typeof cause === 'object' && depth < MAX_CAUSE_DEPTH;
     cause = cause.cause, depth++
   ) {
-    if (cause === verdict?.error || cause instanceof KafkaJSCommitFailedError) return true
-    const path = cause[OFFSET_COMMIT_ORIGIN] ? REBALANCE_PATHS.OFFSET_COMMIT : REBALANCE_PATHS.FETCH
+    if (cause === verdict?.error) return 'fold'
+    if (!owner) continue
+    const offsetCommit = cause[OFFSET_COMMIT_ORIGIN] === owner
+    if (
+      cause instanceof KafkaJSCommitFailedError &&
+      (offsetCommit || cause[COMMIT_REFUSAL_ORIGIN] === owner)
+    ) {
+      if (obsoleteOwnership(ownership, cause)) return 'stale'
+      if (verdict) return 'fold'
+    }
+    const path = offsetCommit
+      ? REBALANCE_PATHS.OFFSET_COMMIT
+      : cause[HEARTBEAT_ORIGIN] === owner
+        ? REBALANCE_PATHS.HEARTBEAT
+        : null
+    if (!path) continue
+    const { kind } = group
+    if (kind === 'consumer' && offsetCommit && cause.code === STALE_MEMBER_EPOCH) {
+      const epoch = sentGeneration(cause)
+      const current = group.generationId
+      if (
+        obsoleteOwnership(ownership, cause) ||
+        (epoch != null && current != null && Number(epoch) !== Number(current))
+      ) {
+        return 'stale'
+      }
+      continue
+    }
     const { action } = rebalanceAction(cause, path, { kind })
-    if (action === 'lost' || action === 'revoked') return true
+    if (action === 'lost' || action === 'revoked') {
+      if (obsoleteOwnership(ownership, cause)) return 'stale'
+      return { error: cause, path }
+    }
   }
-  return false
+  return null
 }
 
 /**
@@ -523,7 +602,11 @@ module.exports = {
   REBALANCE_PATHS,
   rebalanceAction,
   rebalanceReason,
-  isCausedByRebalance,
+  handlerRebalanceDisposition,
+  markHandlerCrash,
+  isHandlerCrash,
+  stampCommitRefusal,
+  stampHeartbeat,
   isConsumerProtocolFatal,
   stampHeartbeatFatal,
   isHeartbeatFatal,

@@ -108,6 +108,7 @@ module.exports = class RebalanceCoordinator {
    * @param {() => void} [options.onJoinComplete] called once per completed round, immediately
    *   before `GROUP_JOIN` is delivered, so state it records is visible to every observer of that
    *   event whatever the order public instrumentation reaches them in
+   * @param {import('../retry').Retrier} [options.retryJoin] retries for foreground recovery
    */
   constructor({
     runner,
@@ -119,6 +120,7 @@ module.exports = class RebalanceCoordinator {
     logger,
     groupId,
     onJoinComplete = () => {},
+    retryJoin,
   }) {
     this.runner = runner
     this.consumerGroup = consumerGroup
@@ -129,6 +131,7 @@ module.exports = class RebalanceCoordinator {
     this.logger = logger.namespace('RebalanceCoordinator')
     this.groupId = groupId
     this.onJoinComplete = onJoinComplete
+    this.retryJoin = retryJoin
 
     /** @type {Promise<void>|null} the running chain; also the single-flight marker */
     this.inFlight = null
@@ -216,9 +219,10 @@ module.exports = class RebalanceCoordinator {
    * @param {string|null} reason null only for the first round of a run, which emits no
    *   `REBALANCING`
    * @param {'lost'|'revoked'|'initial'} kind
+   * @param {boolean} [retryJoin] whether to retry transient join failures during recovery
    * @returns {Promise<void>} the chain; the same promise for a re-entrant call
    */
-  runRound(reason, kind) {
+  runRound(reason, kind, retryJoin = false) {
     if (this.inFlight) {
       if (kind === 'lost') {
         this.pendingKind = 'lost'
@@ -231,7 +235,7 @@ module.exports = class RebalanceCoordinator {
       return this.inFlight
     }
 
-    this.inFlight = this.runChain(reason, kind).finally(() => {
+    this.inFlight = this.runChain(reason, kind, retryJoin).finally(() => {
       this.inFlight = null
       this.rounds = 0
       this.pendingKind = null
@@ -257,12 +261,13 @@ module.exports = class RebalanceCoordinator {
    * @private
    * @param {string|null} reason
    * @param {'lost'|'revoked'|'initial'} kind
+   * @param {boolean} retryJoin whether to retry transient join failures during recovery
    * @returns {Promise<void>}
    * @throws {KafkaJSRebalanceNotConvergedError} when a classic cooperative chain does not converge
    */
-  async runChain(reason, kind) {
+  async runChain(reason, kind, retryJoin) {
     try {
-      await this.runRounds(reason, kind)
+      await this.runRounds(reason, kind, retryJoin)
     } catch (error) {
       if (
         this.consumerGroup.kind === 'consumer' &&
@@ -293,10 +298,11 @@ module.exports = class RebalanceCoordinator {
    * @private
    * @param {string|null} reason
    * @param {'lost'|'revoked'|'initial'} kind
+   * @param {boolean} retryJoin whether to retry transient join failures during recovery
    * @returns {Promise<void>}
    * @throws {KafkaJSRebalanceNotConvergedError} when a classic cooperative chain does not converge
    */
-  async runRounds(reason, kind) {
+  async runRounds(reason, kind, retryJoin) {
     do {
       if (this.runner.stopRequested) {
         return
@@ -347,7 +353,9 @@ module.exports = class RebalanceCoordinator {
         }
 
         const roundStartedAt = Date.now()
-        const result = await this.consumerGroup.joinAndSync(round)
+        const result = await (retryJoin
+          ? this.joinWithRecovery(round)
+          : this.consumerGroup.joinAndSync(round))
         const applyResult = () =>
           this.consumerGroup.applyRebalanceResult(result, {
             rebuildOffsets,
@@ -426,6 +434,29 @@ module.exports = class RebalanceCoordinator {
         round.retire()
       }
     } while (reason)
+  }
+
+  /**
+   * Retries an error that escaped the join's own retry policy. The existing round keeps its
+   * deadline, assignment pin and listener state throughout the backoff.
+   * @param {object} round the active round and its cancellation scope
+   * @returns {Promise<object>} the join result for this round to apply
+   */
+  joinWithRecovery(round) {
+    return this.retryJoin(async (bail) => {
+      try {
+        return await this.consumerGroup.joinAndSync(round)
+      } catch (error) {
+        if (
+          round.guard() ||
+          error?.retriable !== true ||
+          (this.consumerGroup.kind === 'consumer' && isConsumerProtocolFatal(error))
+        ) {
+          return bail(error)
+        }
+        throw error
+      }
+    }, round)
   }
 
   /**

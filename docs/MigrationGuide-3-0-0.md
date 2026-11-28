@@ -724,14 +724,22 @@ says so, `groupProtocol: 'consumer'`.
   overrunning handler. A single stuck handler does not trip it while another broker's fetcher keeps
   polling or another partition keeps flowing — in practice that means a single-broker assignment
   with `partitionsConsumedConcurrently: 1`. The batch the overrunning handler finally returns is
-  dropped, so that work is redelivered after the rejoin. If that handler fails, the failure still
-  counts against `retry.retries` as in 2.2.4, or crashes the consumer when it is non-retriable,
-  but only after the rejoin, so the crash cleanup of a dynamic member then leaves the group a second
-  time. Unlike 2.2.4, that rejoin, or any other rebalance, does not refill `retry.retries`: they
-  refill only once a handler call has returned, so a record that fails on every delivery gets
-  exactly `retry.retries` more deliveries however many rebalances land between them.
+  dropped, so that work can be redelivered after the rejoin.
   In kafkajs 2.2.4 a long handler was never evicted as long as it called `heartbeat()`. If you have
   handlers that legitimately run for a long time, set `maxPollInterval` to cover them.
+- When a recoverable loss or an eager `REBALANCE_IN_PROGRESS` is already queued as a handler
+  fails, the consumer recovers its assignment before handling an independent failure. The
+  handler's error stays pending through transient rejoin failures. A terminal membership failure
+  takes precedence, and stopping ends the run. A handler that fails before the poll-expiry leave
+  queues the loss can be handled first. The crash cleanup leaves the membership just rejoined.
+  A retriable handler failure keeps its own retry budget across subsequent rebalances, even when
+  a replayed prefix or a sibling partition succeeds. Exhaustion reports
+  `KafkaJSNumberOfRetriesExceeded` through the ordinary restart policy. See
+  [Consuming](Consuming.md#options) for the non-retriable error categories.
+- A rethrown commit refusal for a replaced membership, including `STALE_MEMBER_EPOCH` once its
+  epoch is obsolete, does not act on the replacement membership. A current-epoch refusal keeps
+  its ordinary treatment. Independent failures such as a commit's topic authorization error
+  still reach the handler error path, including after a cooperative background rejoin.
 - An error thrown by your `POLL_INTERVAL_EXCEEDED` listener is logged and no longer stops cleanup or the rejoin. There is no option to restore a listener’s ability to strand the consumer.
 - Late accepted consumer-protocol joins are counted and obsolete stored loss notifications are compared with the ownership that sent them, including when the broker reuses a numeric generation. A consumer-protocol rejoin waits for the leave of its current membership to settle. No application change is required; current rejoin obligations remain honored.
 

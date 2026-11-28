@@ -526,11 +526,14 @@ module.exports = class OffsetManager {
       settle(false)
       const stampRefusal = (refusal) =>
         stampOwnership(
-          stampGeneration(stampOffsetCommit(refusal), payload.groupGenerationId),
+          stampGeneration(stampOffsetCommit(refusal, this.ownership), payload.groupGenerationId),
           token
         )
       const stamped = stampMembership(
-        stampOwnership(stampGeneration(stampOffsetCommit(error), payload.groupGenerationId), token),
+        stampOwnership(
+          stampGeneration(stampOffsetCommit(error, this.ownership), payload.groupGenerationId),
+          token
+        ),
         revision
       )
       const callerRefusal = guard?.()
