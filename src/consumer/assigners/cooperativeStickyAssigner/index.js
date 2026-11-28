@@ -10,6 +10,7 @@ const {
   partitionOf,
 } = require('../stickyAssigner/stickyCore')
 const dictionary = require('../../../utils/dictionary')
+const { guaranteeCooperativeOwnership } = require('../cooperativeGuarantee')
 
 /**
  * @param {Buffer|null} userData
@@ -68,7 +69,7 @@ const flatten = (byTopic) =>
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-429%3A+Kafka+Consumer+Incremental+Rebalance+Protocol
  * @type {import('types').PartitionAssigner}
  */
-module.exports = ({ cluster }) => ({
+const createCooperativeSticky = ({ cluster }) => ({
   name: 'cooperative-sticky',
   version: 3,
 
@@ -219,3 +220,11 @@ module.exports = ({ cluster }) => ({
     this.generationId = assignment == null ? DEFAULT_GENERATION : generationId
   },
 })
+
+/**
+ * The built-in assigner, recorded as one whose plans keep the cooperative ownership rule, so the
+ * leader does not check them again.
+ * @param {{ cluster: object }} options
+ * @returns {import('types').PartitionAssigner}
+ */
+module.exports = (options) => guaranteeCooperativeOwnership(createCooperativeSticky(options))

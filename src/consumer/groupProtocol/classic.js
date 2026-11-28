@@ -14,6 +14,7 @@ const {
 } = require('../instrumentationEvents')
 const { EAGER, COOPERATIVE } = require('./interface')
 const AssignerOffers = require('./assignerOffers')
+const { guaranteesCooperativeOwnership } = require('../assigners/cooperativeGuarantee')
 const LeaderUnionWatch = require('../leaderUnionWatch')
 const CoordinatorLookup = require('../coordinatorLookup')
 const {
@@ -466,10 +467,9 @@ module.exports = class ClassicGroupProtocol {
         this.heartbeatManager.disable()
       }
 
-      const groupProtocols = this.assigners.map((assigner) =>
+      offers = AssignerOffers.collect(this.assigners, (assigner) =>
         this.subscriptionFor(assigner, topicsSubscribed)
       )
-      offers = new AssignerOffers(this.assigners, groupProtocols)
 
       groupData = await this.coordinator.joinGroup(
         {
@@ -479,7 +479,7 @@ module.exports = class ClassicGroupProtocol {
           memberId: this.memberId || this.pendingMemberId || '',
           groupInstanceId,
           protocolType: PROTOCOL_TYPE,
-          groupProtocols,
+          groupProtocols: offers.rows,
         },
         {
           guard: joinRefusal,
@@ -510,14 +510,27 @@ module.exports = class ClassicGroupProtocol {
     }
 
     this.joinCount += 1
+    this.installJoined(groupData, offers)
+    // JoinGroup v5's response carries no group_instance_id for this member: it only appears
+    // per-entry in `members`, populated for the leader. `this.groupInstanceId` is the value the
+    // caller configured and must not be overwritten with undefined here.
+  }
+
+  /**
+   * Keeps what a JoinGroup answer decided about the joined membership: who leads, the members the
+   * leader will assign, the protocol the coordinator selected and the offers that selection is
+   * resolved against. They are set together so a leader's SyncGroup never reads a selection
+   * without the offers that were sent.
+   * @param {{ leaderId: string, members: object[], groupProtocol: string, protocolType: string }} groupData
+   * @param {AssignerOffers} offers the offers the JoinGroup sent
+   * @returns {void}
+   */
+  installJoined(groupData, offers) {
     this.leaderId = groupData.leaderId
     this.members = groupData.members
     this.groupProtocol = groupData.groupProtocol
     this.offers = offers
     this.protocolType = groupData.protocolType
-    // JoinGroup v5's response carries no group_instance_id for this member: it only appears
-    // per-entry in `members`, populated for the leader. `this.groupInstanceId` is the value the
-    // caller configured and must not be overwritten with undefined here.
   }
 
   /**
@@ -650,9 +663,7 @@ module.exports = class ClassicGroupProtocol {
         memberId,
         topics,
       })
-      const assigner = (this.offers ?? AssignerOffers.declared(this.assigners)).assignerFor(
-        groupProtocol
-      )
+      const assigner = this.offers?.assignerFor(groupProtocol)
 
       if (!assigner) {
         throw new KafkaJSNonRetriableError(
@@ -682,10 +693,11 @@ module.exports = class ClassicGroupProtocol {
 
       // An incremental rebalance must never hand a partition to a member while another member
       // still owns it: the new owner would fetch it while the old one is still delivering.
-      // `cooperative-sticky` guarantees this through its own withhold rule, so it is exempt; any
-      // other assignor configured under this mode has to be checked.
+      // The built-in `cooperative-sticky` assigner guarantees this through its own withhold rule,
+      // so that object is exempt; any other assigner under this mode, whatever name it offers,
+      // has to be checked.
       // @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-429%3A+Kafka+Consumer+Incremental+Rebalance+Protocol
-      if (this.mode === COOPERATIVE && groupProtocol !== 'cooperative-sticky') {
+      if (this.mode === COOPERATIVE && !guaranteesCooperativeOwnership(assigner)) {
         this.assertNoDoubleAssignment({ members, assignment })
       }
 
@@ -928,6 +940,7 @@ module.exports = class ClassicGroupProtocol {
     this.leaderId = null
     this.members = null
     this.groupProtocol = null
+    this.offers = null
     this.protocolType = null
     this.ownedPartitions = []
 

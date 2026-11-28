@@ -5,6 +5,9 @@ const Encoder = require('../../protocol/encoder')
 const { MemberMetadata, MemberAssignment } = require('../assignerProtocol')
 const { createFakeCoordinator } = require('./fixtures/fetchHarness')
 const ClassicGroupProtocol = require('../groupProtocol/classic')
+const AssignerOffers = require('../groupProtocol/assignerOffers')
+const { COOPERATIVE } = require('../groupProtocol/interface')
+const cooperativeSticky = require('../assigners/cooperativeStickyAssigner')
 const ConsumerGroup = require('../consumerGroup')
 const IdleWait = require('../idleWait')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
@@ -54,20 +57,40 @@ const MEMBER_ASSIGNMENT = MemberAssignment.encode({
   assignment: { 'golden-topic-a': [0, 1], 'golden-topic-b': [0] },
 })
 
-const joinGroupResponse = (protocolName = 'RoundRobinAssigner') =>
+/**
+ * A JoinGroup v5 answer.
+ * @param {object} [fields]
+ * @param {number} [fields.errorCode]
+ * @param {string} [fields.protocolName] the protocol the coordinator selected
+ * @param {string} [fields.leaderId]
+ * @param {string} [fields.memberId] the id the answer gives this member
+ * @param {{ memberId: string, metadata: Buffer }[]} [fields.members] the leader's member list
+ * @returns {Buffer}
+ */
+const joinResponse = ({
+  errorCode = 0,
+  protocolName = 'RoundRobinAssigner',
+  leaderId = MEMBER_ID,
+  memberId = MEMBER_ID,
+  members = [{ memberId: MEMBER_ID, metadata: PROTOCOL_METADATA }],
+} = {}) =>
   new Encoder()
     .writeInt32(0)
-    .writeInt16(0)
+    .writeInt16(errorCode)
     .writeInt32(GENERATION_ID)
     .writeString(protocolName)
-    .writeString(MEMBER_ID)
-    .writeString(MEMBER_ID)
-    .writeArray([
-      new Encoder()
-        .writeString(MEMBER_ID)
-        .writeString(GROUP_INSTANCE_ID)
-        .writeBytes(PROTOCOL_METADATA),
-    ]).buffer
+    .writeString(leaderId)
+    .writeString(memberId)
+    .writeArray(
+      members.map((member) =>
+        new Encoder()
+          .writeString(member.memberId)
+          .writeString(GROUP_INSTANCE_ID)
+          .writeBytes(member.metadata)
+      )
+    ).buffer
+
+const joinGroupResponse = (protocolName = 'RoundRobinAssigner') => joinResponse({ protocolName })
 
 const syncGroupResponse = () =>
   new Encoder().writeInt32(0).writeInt16(0).writeBytes(MEMBER_ASSIGNMENT).buffer
@@ -451,6 +474,7 @@ describe('Consumer > classic group protocol > the leader round guards', () => {
       leaderId: 'm1',
       memberId: 'm1',
       groupProtocol: 'custom',
+      offers: AssignerOffers.declared(protocol.assigners),
       members: [],
     })
     return protocol
@@ -520,6 +544,17 @@ describe('Consumer > classic group protocol > the leader round guards', () => {
         round: fakeRound(),
       })
     ).rejects.toThrow('Unsupported partition assigner "custom"')
+  })
+
+  it('drops the offers of the joined membership with its leader and selected protocol when the generation is reset', () => {
+    const protocol = leader({ assigners: [{ name: 'custom', assign: async () => [] }] })
+    expect(protocol.offers.assignerFor('custom')).toBe(protocol.assigners[0])
+
+    protocol.resetGeneration()
+
+    expect(protocol.leaderId).toBeNull()
+    expect(protocol.groupProtocol).toBeNull()
+    expect(protocol.offers).toBeNull()
   })
 
   it('does not upload an assignment once the round retired during the assign window', async () => {
@@ -934,12 +969,21 @@ describe('Consumer > classic group protocol > the protocols a join offers', () =
    * One classic round, over a real broker and socket, against a coordinator that selects `selected`.
    * @param {object[]} assigners
    * @param {string} selected the protocol name the JoinGroup answer carries
+   * @param {object} [options]
+   * @param {string} [options.mode] the rebalance protocol of the member
+   * @param {(joinNumber: number) => Buffer} [options.joinAnswers] the answer to the nth JoinGroup,
+   *   counted from 1; the plain selection of `selected` when absent
    * @returns {Promise<{ outcome: Promise<object>, bodyOf: Function }>} the round's result and the
    *   reader of the frames written
    */
-  const roundSelecting = async (assigners, selected) => {
+  const roundSelecting = async (
+    assigners,
+    selected,
+    { mode, joinAnswers = () => joinGroupResponse(selected) } = {}
+  ) => {
+    let joins = 0
     const { broker, bodyOf } = await createFakeCoordinator((header) =>
-      header.apiKey === apiKeys.JoinGroup ? joinGroupResponse(selected) : answer(header)
+      header.apiKey === apiKeys.JoinGroup ? joinAnswers((joins += 1)) : answer(header)
     )
     const protocol = new ClassicGroupProtocol({
       cluster: {
@@ -952,6 +996,7 @@ describe('Consumer > classic group protocol > the protocols a join offers', () =
       sessionTimeout: SESSION_TIMEOUT,
       rebalanceTimeout: REBALANCE_TIMEOUT,
       assigners,
+      mode,
       instrumentationEmitter: new InstrumentationEventEmitter(),
       logger: newLogger(),
     })
@@ -1017,5 +1062,97 @@ describe('Consumer > classic group protocol > the protocols a join offers', () =
     await expect(outcome).rejects.toThrow(
       'Unsupported partition assigner "unknown", the assigner wasn\'t found in the assigners list'
     )
+  })
+
+  it('sends and resolves the offers as the assigners made them when one changes its reused offer during the member-id handshake', async () => {
+    const metadata = MemberMetadata.encode({ version: 0, topics: [TOPICS[0]] })
+    const offered = Buffer.from(metadata)
+    const reused = { name: 'offered-name', metadata }
+    const chosen = { name: 'declared-name', protocol: () => reused, assign: assigns() }
+    const other = assigner('other-declared', 'other-offered')
+
+    const { outcome, bodyOf } = await roundSelecting([other, chosen], 'offered-name', {
+      joinAnswers: (joinNumber) => {
+        if (joinNumber > 1) return joinGroupResponse('offered-name')
+        reused.name = 'changed-name'
+        metadata.fill(0)
+        return joinResponse({ errorCode: 79, leaderId: '', memberId: 'assigned-id', members: [] })
+      },
+    })
+
+    await expect(outcome).resolves.toMatchObject({ assignment: expect.any(Object) })
+    const { body } = bodyOf(apiKeys.JoinGroup)
+    expect(body.includes('assigned-id')).toBe(true)
+    expect(body.includes('offered-name')).toBe(true)
+    expect(body.includes(offered)).toBe(true)
+    expect(body.includes('changed-name')).toBe(false)
+    expect(chosen.assign).toHaveBeenCalledTimes(1)
+    expect(other.assign).not.toHaveBeenCalled()
+  })
+
+  describe('under the cooperative rebalance protocol', () => {
+    const OTHER_ID = 'golden-member-2'
+    const owning = (partitions) =>
+      MemberMetadata.encode({
+        version: 1,
+        topics: TOPICS,
+        ownedPartitions: [{ topic: TOPICS[0], partitions }],
+      })
+    const planFor = (assignments) =>
+      Object.entries(assignments).map(([memberId, partitions]) => ({
+        memberId,
+        memberAssignment: MemberAssignment.encode({
+          version: 1,
+          assignment: { [TOPICS[0]]: partitions },
+        }),
+      }))
+    const selecting = (protocolName) => ({
+      mode: COOPERATIVE,
+      joinAnswers: () =>
+        joinResponse({
+          protocolName,
+          members: [
+            { memberId: MEMBER_ID, metadata: owning([0]) },
+            { memberId: OTHER_ID, metadata: owning([1]) },
+          ],
+        }),
+    })
+    const conflicting = () => planFor({ [MEMBER_ID]: [0, 1], [OTHER_ID]: [] })
+
+    it('refuses a plan that moves an owned partition from a custom assigner that offers the name cooperative-sticky, and writes no SyncGroup', async () => {
+      const custom = {
+        name: 'custom',
+        protocol: () => ({ name: 'cooperative-sticky', metadata: PROTOCOL_METADATA }),
+        supportedProtocols: () => ['cooperative'],
+        assign: jest.fn(async () => conflicting()),
+      }
+
+      const { outcome, bodyOf } = await roundSelecting(
+        [custom],
+        'cooperative-sticky',
+        selecting('cooperative-sticky')
+      )
+
+      await expect(outcome).rejects.toThrow(
+        `Cooperative rebalance would assign ${TOPICS[0]}-1 to ${MEMBER_ID} while ${OTHER_ID} still owns it`
+      )
+      expect(custom.assign).toHaveBeenCalledTimes(1)
+      expect(() => bodyOf(apiKeys.SyncGroup)).toThrow('no request written')
+    })
+
+    it('does not check the plan of the built-in cooperative-sticky assigner, which withholds moved partitions itself', async () => {
+      const builtIn = cooperativeSticky({ cluster: {} })
+      builtIn.assign = jest.fn(async () => conflicting())
+
+      const { outcome, bodyOf } = await roundSelecting(
+        [builtIn],
+        'cooperative-sticky',
+        selecting('cooperative-sticky')
+      )
+
+      await expect(outcome).resolves.toMatchObject({ assignment: expect.any(Object) })
+      expect(builtIn.assign).toHaveBeenCalledTimes(1)
+      expect(bodyOf(apiKeys.SyncGroup).body.includes(OTHER_ID)).toBe(true)
+    })
   })
 })

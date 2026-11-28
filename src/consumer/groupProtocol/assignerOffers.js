@@ -7,18 +7,25 @@ const { KafkaJSNonRetriableError } = require('../../errors')
  * sees and echoes that form, so it is the one identity that can tell two offers apart and name the
  * assigner the coordinator chose. The same name offered twice is one offer, as before: the first
  * assigner wins.
+ *
+ * One instance is the single snapshot of a join: the rows the request writes, the collision check
+ * and the lookup of the selected assigner all read the same captured values. An assigner hands its
+ * offer over once, and nothing it keeps and changes afterwards can reach any of the three.
  */
 class AssignerOffers {
   /**
    * @param {import('../../../types').Assigner[]} assigners
-   * @param {{ name: string }[]} offers what each assigner offers, in the same order; a name that is
-   *   not a string is left for the request writer to refuse
+   * @param {{ name: string, metadata?: Buffer }[]} rows what each assigner offered, in the same
+   *   order and already captured; a name that is not a string is left for the request writer to
+   *   refuse
    * @throws {KafkaJSNonRetriableError} when two different names are written as the same bytes
    */
-  constructor(assigners, offers) {
+  constructor(assigners, rows) {
+    /** @type {ReadonlyArray<{ name: string, metadata?: Buffer }>} */
+    this.rows = Object.freeze([...rows])
     /** @type {Map<string, { name: string, assigner: import('../../../types').Assigner }>} */
     this.bySentForm = new Map()
-    offers.forEach(({ name }, at) => {
+    this.rows.forEach(({ name }, at) => {
       if (typeof name !== 'string') return
       const sent = Encoder.sentForm(name)
       const held = this.bySentForm.get(sent)
@@ -33,15 +40,40 @@ class AssignerOffers {
   }
 
   /**
+   * Asks each assigner for its offer and takes ownership of what it returns: the name is read and
+   * the metadata copied the moment the assigner returns, before anything else runs, so an assigner
+   * that reuses its offer object or its metadata buffer cannot change an offer already taken.
+   * @param {import('../../../types').Assigner[]} assigners
+   * @param {(assigner: import('../../../types').Assigner) => { name: string, metadata?: Buffer }} offerOf
+   *   one assigner's offer for this join
+   * @returns {AssignerOffers}
+   * @throws {KafkaJSNonRetriableError} when two different names are written as the same bytes
+   */
+  static collect(assigners, offerOf) {
+    const rows = assigners.map((assigner) => {
+      const { name, metadata } = offerOf(assigner)
+      return Object.freeze({
+        name,
+        metadata: Buffer.isBuffer(metadata) ? Buffer.from(metadata) : metadata,
+      })
+    })
+    return new AssignerOffers(assigners, rows)
+  }
+
+  /**
    * The offers as configured, before any JoinGroup has asked the assigners for theirs: each
    * assigner stands for the name it declares. Refuses a configuration whose declared names
-   * collide, so the mistake surfaces when the consumer is created.
+   * collide, so the mistake surfaces when the consumer is created. Its rows are names only and are
+   * never sent.
    * @param {import('../../../types').Assigner[]} assigners
    * @returns {AssignerOffers}
    * @throws {KafkaJSNonRetriableError} when two different names are written as the same bytes
    */
   static declared(assigners) {
-    return new AssignerOffers(assigners, assigners)
+    return new AssignerOffers(
+      assigners,
+      assigners.map(({ name }) => ({ name }))
+    )
   }
 
   /**

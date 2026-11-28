@@ -4,6 +4,8 @@ const Cluster = require('../../cluster')
 const Runner = require('../runner')
 const Batch = require('../batch')
 const ClassicGroupProtocol = require('../groupProtocol/classic')
+const AssignerOffers = require('../groupProtocol/assignerOffers')
+const cooperativeSticky = require('../assigners/cooperativeStickyAssigner')
 const RebalanceCoordinator = require('../rebalanceCoordinator')
 const IdleWait = require('../idleWait')
 const PollTimer = require('../pollTimer')
@@ -1255,8 +1257,12 @@ describe('Consumer > cooperative rebalance apply', () => {
 
     const encodeAssignment = (assignment) => MemberAssignment.encode({ version: 1, assignment })
 
-    const buildProtocol = ({ mode, groupProtocol, assignment }) => {
-      const assigner = { name: groupProtocol, assign: jest.fn(async () => assignment) }
+    const buildProtocol = ({
+      mode,
+      groupProtocol,
+      assignment,
+      assigner = { name: groupProtocol, assign: jest.fn(async () => assignment) },
+    }) => {
       const protocol = new ClassicGroupProtocol({
         cluster: {
           refreshMetadata: jest.fn(async () => {}),
@@ -1275,6 +1281,7 @@ describe('Consumer > cooperative rebalance apply', () => {
       protocol.leaderId = 'member-1'
       protocol.generationId = 1
       protocol.groupProtocol = groupProtocol
+      protocol.offers = AssignerOffers.declared(protocol.assigners)
       protocol.members = [
         {
           memberId: 'member-1',
@@ -1339,7 +1346,27 @@ describe('Consumer > cooperative rebalance apply', () => {
       expect(error.message).toContain('member-2')
     })
 
-    it('exempts cooperative-sticky, whose own withhold rule guarantees it', async () => {
+    it('exempts the built-in cooperative-sticky assigner, whose own withhold rule guarantees it', async () => {
+      const builtIn = cooperativeSticky({ cluster: {} })
+      builtIn.assign = jest.fn(async () => movesAnOwnedPartition)
+      const protocol = buildProtocol({
+        mode: COOPERATIVE,
+        groupProtocol: 'cooperative-sticky',
+        assigner: builtIn,
+      })
+
+      await expect(
+        protocol.sync({
+          topics: [TOPIC_A],
+          topicsSubscribed: [TOPIC_A],
+          beforeSync: () => {},
+          round: realRound(),
+        })
+      ).resolves.toMatchObject({ assignment: {} })
+      expect(protocol.coordinator.syncGroup).toHaveBeenCalledTimes(1)
+    })
+
+    it('checks a custom assigner that offers the name cooperative-sticky', async () => {
       const protocol = buildProtocol({
         mode: COOPERATIVE,
         groupProtocol: 'cooperative-sticky',
@@ -1353,7 +1380,8 @@ describe('Consumer > cooperative rebalance apply', () => {
           beforeSync: () => {},
           round: realRound(),
         })
-      ).resolves.toMatchObject({ assignment: {} })
+      ).rejects.toThrow(/topic-a-1.*member-1/)
+      expect(protocol.coordinator.syncGroup).not.toHaveBeenCalled()
     })
 
     it('does not check under eager, where every member revoked everything first', async () => {

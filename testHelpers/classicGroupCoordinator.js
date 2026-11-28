@@ -80,6 +80,19 @@ const syncAnswer = (fields) => ({
 const copyProtocols = (protocols) =>
   protocols.map(({ name, metadata }) => ({ name, metadata: Buffer.from(metadata) }))
 
+/**
+ * @param {*} value a decoded request, or a part of one
+ * @returns {*} an independent copy: arrays and plain objects rebuilt, buffers copied
+ */
+const copyOf = (value) => {
+  if (Buffer.isBuffer(value)) return Buffer.from(value)
+  if (Array.isArray(value)) return value.map(copyOf)
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, part]) => [key, copyOf(part)]))
+  }
+  return value
+}
+
 /** @returns {{ promise: Promise<*>, resolve: Function }} */
 const deferred = () => {
   let resolve
@@ -148,9 +161,12 @@ const readRequest = (apiKey, body) => {
  * and the reply is released. A test can hold a step (`hold`), so a client that gives up after
  * acceptance never undoes what the coordinator did. As Kafka does, one connection is served one
  * request at a time: a parked JoinGroup or SyncGroup holds back what was written after it.
- * The coordinator owns the bytes it stores: it copies a request's protocol metadata and
- * assignments when it takes them, and every answer, `describe()` snapshot and recorded request
- * holds copies, so a test that edits one in place cannot change what the group later answers.
+ * The coordinator owns the bytes it stores and the request it is serving: it decodes each request
+ * privately and hands every observer (`requests`, `accepted`, a `hold` gate, `whenAccepted`, a
+ * `faultNextReply` transform) its own deep copy, and it copies a request's protocol metadata and
+ * assignments when it takes them. Every answer and `describe()` snapshot holds copies too, so a
+ * test that edits any of them in place, even while a request is held, cannot change what the
+ * group stores or later answers.
  * `faultNextReply` changes one delivered reply without touching what the group stored.
  * `unload()` answers everything parked with NOT_COORDINATOR (16), as Kafka does when the
  * coordinator moves; `close()` also closes every connection. A spec calls `close()` after each
@@ -289,8 +305,8 @@ class ClassicGroupCoordinator {
    * (`'acceptance'`), or after it accepted it and before its reply is sent (`'reply'`).
    * @param {'JoinGroup'|'SyncGroup'|'Heartbeat'|'LeaveGroup'} api
    * @param {'acceptance'|'reply'} stage
-   * @returns {{ reached: Promise<object>, release: () => void }} `reached` resolves with the
-   *   decoded request once it is held
+   * @returns {{ reached: Promise<object>, release: () => void }} `reached` resolves with a copy of
+   *   the decoded request once it is held
    */
   hold(api, stage) {
     const reached = deferred()
@@ -319,8 +335,8 @@ class ClassicGroupCoordinator {
    * @returns {Promise<object>} the decoded request
    */
   whenAccepted(api, match = () => true) {
-    const done = this.accepted.find((each) => each.api === api && match(each.request))
-    if (done) return Promise.resolve(done.request)
+    const done = this.accepted.find((each) => each.api === api && match(copyOf(each.request)))
+    if (done) return Promise.resolve(copyOf(done.request))
     return new Promise((resolve) => this.acceptWaiters.push({ api, match, resolve }))
   }
 
@@ -430,15 +446,15 @@ class ClassicGroupCoordinator {
       throw error
     }
 
-    this.requests.push({ api: wire.api, connection, request })
+    this.requests.push({ api: wire.api, connection, request: copyOf(request) })
     await this.passGate(wire.api, 'acceptance', request)
     if (socket.destroyed) return
 
     const answered = this.accept(header.apiKey, request)
-    this.accepted.push({ api: wire.api, request })
+    this.accepted.push({ api: wire.api, request: copyOf(request) })
     this.acceptWaiters = this.acceptWaiters.filter((waiter) => {
-      if (waiter.api !== wire.api || !waiter.match(request)) return true
-      waiter.resolve(request)
+      if (waiter.api !== wire.api || !waiter.match(copyOf(request))) return true
+      waiter.resolve(copyOf(request))
       return false
     })
     let answer = await answered
@@ -447,7 +463,9 @@ class ClassicGroupCoordinator {
       ({ api, memberId }) =>
         api === wire.api && (memberId === undefined || memberId === request.memberId)
     )
-    if (fault !== -1) answer = this.faults.splice(fault, 1)[0].transform(answer, request)
+    if (fault !== -1) {
+      answer = this.faults.splice(fault, 1)[0].transform(answer, copyOf(request))
+    }
     if (socket.destroyed) return
 
     respondWithFrame(
@@ -470,7 +488,7 @@ class ClassicGroupCoordinator {
     if (at === -1) return
     const [gate] = this.gates.splice(at, 1)
     this.held.add(gate)
-    gate.reached.resolve(request)
+    gate.reached.resolve(copyOf(request))
     await gate.released.promise
     this.held.delete(gate)
   }

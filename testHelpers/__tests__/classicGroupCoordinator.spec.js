@@ -679,6 +679,62 @@ describe('ClassicGroupCoordinator', () => {
         sync(a.broker, { memberId: a.memberId, generationId: 1, groupInstanceId: 'a' })
       ).resolves.toMatchObject({ memberAssignment: PLAN_A })
     })
+
+    test("a SyncGroup request edited in place while its acceptance is held leaves the leader's plan and identity as the client sent them", async () => {
+      const broker = client()
+      const { memberId, generationId } = await join(broker, { groupInstanceId: 'a' })
+      const held = coordinator.hold('SyncGroup', 'acceptance')
+      const leaderSync = sync(broker, {
+        memberId,
+        generationId,
+        groupInstanceId: 'a',
+        groupAssignment: [{ memberId, memberAssignment: PLAN_A }],
+      })
+
+      const request = await held.reached
+      request.groupAssignment[0].memberAssignment.fill(0)
+      request.groupAssignment[0].memberId = 'nobody'
+      request.memberId = 'nobody'
+      request.generationId = 99
+      held.release()
+
+      await expect(leaderSync).resolves.toMatchObject({ memberAssignment: PLAN_A })
+      expect(coordinator.describe().members[0].assignment).toEqual(PLAN_A)
+      await expect(
+        sync(broker, { memberId, generationId, groupInstanceId: 'a' })
+      ).resolves.toMatchObject({ memberAssignment: PLAN_A })
+    })
+
+    test("a JoinGroup request edited in place while its acceptance is held leaves the member's protocol metadata and instance as the client sent them", async () => {
+      const broker = client()
+      const held = coordinator.hold('JoinGroup', 'acceptance')
+      const joining = join(broker, { groupInstanceId: 'a' })
+
+      const request = await held.reached
+      request.groupProtocols[0].metadata.fill(0)
+      request.groupProtocols[0].name = 'Other'
+      request.groupInstanceId = 'z'
+      held.release()
+
+      const answer = await joining
+      expect(answer.groupProtocol).toBe(PROTOCOL)
+      expect(answer.members[0]).toMatchObject({ groupInstanceId: 'a', memberMetadata: METADATA })
+      expect(coordinator.describe().members[0].groupInstanceId).toBe('a')
+    })
+
+    test('a request handed to whenAccepted, or to its match function, edited in place leaves what the next observer sees alone', async () => {
+      const broker = client()
+      const joining = join(broker, { groupInstanceId: 'a' })
+      const seen = await coordinator.whenAccepted('JoinGroup', (request) => {
+        request.groupProtocols[0].metadata.fill(0)
+        return true
+      })
+      seen.groupProtocols[0].name = 'Other'
+      await joining
+
+      const again = await coordinator.whenAccepted('JoinGroup')
+      expect(again.groupProtocols[0]).toEqual({ name: PROTOCOL, metadata: METADATA })
+    })
   })
 
   describe('unload, as GroupMetadataManager 4.4.0 onUnloaded', () => {

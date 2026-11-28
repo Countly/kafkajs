@@ -1,4 +1,5 @@
 const ClassicGroupProtocol = require('../groupProtocol/classic')
+const AssignerOffers = require('../groupProtocol/assignerOffers')
 const ConsumerGroup = require('../consumerGroup')
 const { MemberMetadata } = require('../assignerProtocol')
 
@@ -165,19 +166,21 @@ describe('round deadline ownership', () => {
 /** @param {Function} assign @returns {object} real classic sync with counted, non-network boundaries */
 const leader = (assign) => {
   const protocol = Object.create(ClassicGroupProtocol.prototype)
+  const assigners = [{ name: 'custom', assign }]
   Object.assign(protocol, {
     groupId: 'group',
     memberId: 'a',
     leaderId: 'a',
     generationId: 1,
     groupProtocol: 'custom',
+    offers: AssignerOffers.declared(assigners),
     protocolType: 'consumer',
     mode: 'eager',
     members: [
       { memberId: 'a', ...member(['A']) },
       { memberId: 'b', ...member(['B']) },
     ],
-    assigners: [{ name: 'custom', assign }],
+    assigners,
     logger: { debug() {}, warn() {} },
     cluster: {
       refreshMetadata: jest.fn(async () => {}),
