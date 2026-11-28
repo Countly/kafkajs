@@ -686,6 +686,133 @@ describe('Test harness > fake broker close', () => {
     }
   })
 
+  test('a frame whose size prefix disagrees with its length closes its connection without an answer and fails the request in flight on it', async () => {
+    const asked = []
+    const { broker, state, close } = createFakeBroker((header) => {
+      if (header.apiKey === apiKeys.ApiVersions) return apiVersionsBody(18)
+      asked.push(header.correlationId)
+      return new Promise(() => {})
+    })
+    await broker.connect()
+
+    try {
+      const outcome = jest.fn()
+      broker.offsetForLeaderEpoch(validationRequest(0, 4)).then(
+        () => outcome('answered'),
+        (error) => outcome(error.name, error.message)
+      )
+      while (asked.length === 0) await nextTurn()
+      const [socket] = state.sockets
+      const malformed = Buffer.from(socket.writes[socket.writes.length - 1])
+      malformed.writeInt32BE(0, 0)
+      // The header alone still reads: only the envelope is wrong.
+      expect(readRequestHeader(malformed).correlationId).toBe(asked[0])
+
+      socket.write(malformed)
+      await nextTurn()
+      await nextTurn()
+
+      expect(asked).toHaveLength(1)
+      expect(socket.destroyed).toBe(true)
+      expect(outcome.mock.calls).toEqual([
+        [
+          'KafkaJSConnectionError',
+          'Connection error: The fake broker could not read a request frame',
+        ],
+      ])
+    } finally {
+      await close()
+    }
+  })
+
+  /**
+   * A fake broker whose OffsetForLeaderEpoch playback closes it from the callback `closeIn` names,
+   * with its splitter, iterator and data events recorded after connecting.
+   * @param {'answer'|'answerThrows'|'destroy'|'chunks'|'chunkIterator'|'data'} closeIn
+   * @returns {Promise<{ broker: object, socket: object, data: Buffer[], closing: () => Promise<void>,
+   *   close: () => Promise<void>, playback: string[] }>}
+   */
+  const closingFrom = async (closeIn) => {
+    let closing = null
+    const playback = []
+    const closeNow = () => {
+      closing = fake.close()
+    }
+    const fake = createFakeBroker(
+      (header) => {
+        if (header.apiKey === apiKeys.ApiVersions) return apiVersionsBody(18)
+        if (closeIn === 'answer') closeNow()
+        if (closeIn === 'destroy') fake.state.sockets[0].destroy()
+        if (closeIn === 'answerThrows') {
+          closeNow()
+          throw new Error('the answer closed the fake broker, then threw')
+        }
+        return offsetForLeaderEpochResponse([{ partition: 0 }])
+      },
+      (frame, header) => {
+        if (header.apiKey !== apiKeys.OffsetForLeaderEpoch) return [frame]
+        playback.push('split')
+        if (closeIn === 'chunks') closeNow()
+        return {
+          *[Symbol.iterator]() {
+            try {
+              playback.push('first chunk')
+              yield frame.subarray(0, 6)
+              playback.push('second chunk')
+              if (closeIn === 'chunkIterator') closeNow()
+              yield frame.subarray(6)
+            } finally {
+              playback.push('iterator cleanup')
+            }
+          },
+        }
+      }
+    )
+    await fake.broker.connect()
+    const [socket] = fake.state.sockets
+    const data = []
+    socket.on('data', (chunk) => {
+      data.push(chunk)
+      if (closeIn === 'data') closeNow()
+    })
+    return { broker: fake.broker, socket, data, closing: () => closing, close: fake.close, playback }
+  }
+
+  test.each([
+    ['an answer that returns a body', 'answer', 0, []],
+    ['an answer that throws', 'answerThrows', 0, []],
+    ['an answer that destroys the socket', 'destroy', 0, []],
+    ['the chunks callback', 'chunks', 0, ['split']],
+    [
+      'a chunk iterator between two chunks',
+      'chunkIterator',
+      1,
+      ['split', 'first chunk', 'second chunk', 'iterator cleanup'],
+    ],
+    ['a data listener', 'data', 1, ['split', 'first chunk', 'iterator cleanup']],
+  ])(
+    'close from %s stops playback and rejects the request through shutdown',
+    async (_where, closeIn, chunksBeforeClose, expectedPlayback) => {
+      const { broker, socket, data, closing, close, playback } = await closingFrom(closeIn)
+
+      try {
+        const outcome = jest.fn()
+        await broker.offsetForLeaderEpoch(validationRequest(0, 4)).then(
+          () => outcome('answered'),
+          (error) => outcome(error.name)
+        )
+        await closing()
+
+        expect(outcome.mock.calls).toEqual([['KafkaJSConnectionClosedError']])
+        expect(data).toHaveLength(chunksBeforeClose)
+        expect(playback).toEqual(expectedPlayback)
+        expect(socket.destroyed).toBe(true)
+      } finally {
+        await close()
+      }
+    }
+  )
+
   test('close aborts a connect still waiting for its socket and refuses the connect queued behind it, with the clock frozen', async () => {
     freezeClock()
     const answer = jest.fn(() => apiVersionsBody(18))
