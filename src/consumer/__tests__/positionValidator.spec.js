@@ -303,7 +303,8 @@ describe('Consumer > PositionValidator', () => {
       it.each([
         ['validated', {}, position('10', 4)],
         ['truncated', { endOffset: '5' }, position('10', 4)],
-        ['reset', { endOffset: '-1' }, position('10', 4)],
+        // A broker's undefined answer is -1 with -1; an error row is -1 with -1 as well.
+        ['reset', { endOffset: '-1', leaderEpoch: -1 }, position('10', 4)],
         ['discarded', {}, position('55', 4)],
       ])('%s is an exit complete performs itself', (action, overrides, currentPosition) => {
         const { validator, generation } = awaiting(create())
@@ -315,8 +316,8 @@ describe('Consumer > PositionValidator', () => {
       })
 
       it.each([
-        ['retry', { errorCode: 6 }],
-        ['fatal', { errorCode: 29 }],
+        ['retry', { errorCode: 6, endOffset: '-1', leaderEpoch: -1 }],
+        ['fatal', { errorCode: 29, endOffset: '-1', leaderEpoch: -1 }],
       ])(
         '%s keeps the request in flight, and every caller-side exit ends it',
         (action, overrides) => {
@@ -379,6 +380,112 @@ describe('Consumer > PositionValidator', () => {
       expect(
         validator.request(TOPIC, 0, { offset: '10', trackedEpoch: 4, currentLeaderEpoch: 5 }).action
       ).toEqual('unchanged')
+    })
+
+    it('an entry admits from markValidated until it is replaced or dropped, and a pending one never does', () => {
+      const validator = create()
+      validator.markValidated(TOPIC, 0, 5)
+      const first = validator.entryOf(TOPIC, 0)
+      expect(first.admitted).toBe(true)
+
+      validator.markValidated(TOPIC, 0, 5)
+      const second = validator.entryOf(TOPIC, 0)
+      expect([first.admitted, second.admitted]).toEqual([false, true])
+
+      validator.request(TOPIC, 0, { offset: '10', trackedEpoch: 4, currentLeaderEpoch: 6 })
+      const pending = validator.entryOf(TOPIC, 0)
+      expect([second.admitted, pending.admitted]).toEqual([false, false])
+
+      validator.release([{ topic: TOPIC, partition: 0, entry: pending }])
+      expect(validator.entryOf(TOPIC, 0)).toBeUndefined()
+    })
+
+    it('revoke drops one partition, every partition of a topic, or everything, and each dropped entry stops admitting', () => {
+      const validator = create()
+      for (const [topic, partition] of [
+        [TOPIC, 0],
+        [TOPIC, 1],
+        ['other', 0],
+      ]) {
+        validator.markValidated(topic, partition, 5)
+      }
+      const [a, b, c] = [
+        validator.entryOf(TOPIC, 0),
+        validator.entryOf(TOPIC, 1),
+        validator.entryOf('other', 0),
+      ]
+
+      validator.revoke(TOPIC, 0)
+      expect([a.admitted, b.admitted, c.admitted]).toEqual([false, true, true])
+      expect(validator.entryOf(TOPIC, 0)).toBeUndefined()
+
+      validator.revoke(TOPIC)
+      expect([b.admitted, c.admitted]).toEqual([false, true])
+
+      validator.revoke()
+      expect(c.admitted).toBe(false)
+      expect(validator.entryOf('other', 0)).toBeUndefined()
+    })
+
+    it('revision advances once for each admitting entry that stops admitting, and for nothing else', () => {
+      const validator = create()
+      const at = []
+      const step = (action) => {
+        action()
+        at.push(validator.revision)
+      }
+
+      step(() => validator.revoke(TOPIC, 0)) // nothing to drop
+      step(() =>
+        validator.request(TOPIC, 0, { offset: '10', trackedEpoch: 4, currentLeaderEpoch: 5 })
+      ) // nothing admitted yet
+      step(() => validator.markValidated(TOPIC, 0, 5)) // replaces a pending entry
+      step(() => validator.markValidated(TOPIC, 0, 5)) // replaces an admitting entry
+      step(() => validator.markValidated(TOPIC, 1, 5))
+      step(() => validator.revoke(TOPIC, 0)) // drops an admitting entry
+      step(() => validator.revoke(TOPIC, 0)) // already gone
+      step(() =>
+        validator.request(TOPIC, 2, { offset: '10', trackedEpoch: 4, currentLeaderEpoch: 5 })
+      )
+      step(() => validator.clear()) // one admitting entry (partition 1) and one pending
+
+      expect(at).toEqual([0, 0, 0, 1, 1, 2, 2, 2, 3])
+    })
+
+    it('revision still changes on every revocation past the largest safe integer', () => {
+      const validator = create()
+      validator.revision = Number.MAX_SAFE_INTEGER - 1
+      const at = [validator.revision]
+      for (let i = 0; i < 3; i++) {
+        validator.markValidated(TOPIC, 0, 5)
+        validator.revoke(TOPIC, 0)
+        at.push(validator.revision)
+      }
+
+      expect(at).toEqual([
+        Number.MAX_SAFE_INTEGER - 1,
+        Number.MAX_SAFE_INTEGER,
+        Number.MIN_SAFE_INTEGER,
+        Number.MIN_SAFE_INTEGER + 1,
+      ])
+    })
+
+    it('is true at the same epoch once revoke() dropped the entry, and request() then asks again', () => {
+      const validator = create()
+      validator.markValidated(TOPIC, 0, 5)
+      expect(validator.needsValidation(TOPIC, 0, 5)).toBe(false)
+
+      validator.revoke(TOPIC, 0)
+
+      expect(validator.needsValidation(TOPIC, 0, 5)).toBe(true)
+      expect(
+        validator.request(TOPIC, 0, { offset: '10', trackedEpoch: 4, currentLeaderEpoch: 5 }).action
+      ).toEqual('awaiting')
+      expect(validator.entryOf(TOPIC, 0).pending).toEqual({
+        offset: '10',
+        trackedEpoch: 4,
+        currentLeaderEpoch: 5,
+      })
     })
   })
 

@@ -400,22 +400,38 @@ describe('Producer > options: the idempotent default and the settings that confl
       ['an idempotent producer', {}],
       ['an idempotent: false producer', { idempotent: false }],
     ])(
-      '%s from kafka.producer() holds a lone send for linger, 5 ms by default',
+      '%s from kafka.producer() writes a lone send at once, linger being 0 by default',
       async (_, options) => {
-        jest.useFakeTimers({ now: 0 })
+        jest.useFakeTimers({ now: 0, doNotFake: ['queueMicrotask'] })
         const producer = createKafka().producer(options)
         await producer.connect()
         const { produce } = lastCluster().broker
 
         const sent = producer.send({ topic: TOPIC, messages: MESSAGES })
-        await jest.advanceTimersByTimeAsync(4)
-        expect(produce).not.toHaveBeenCalled()
-        await jest.advanceTimersByTimeAsync(1)
+        await jest.advanceTimersByTimeAsync(0)
 
         expect(produce).toHaveBeenCalledTimes(1)
         await expect(sent).resolves.toEqual([expect.objectContaining({ topicName: TOPIC })])
       }
     )
+
+    test.each([
+      ['an idempotent producer', {}],
+      ['an idempotent: false producer', { idempotent: false }],
+    ])('%s from kafka.producer() holds a lone send for an explicit linger', async (_, options) => {
+      jest.useFakeTimers({ now: 0 })
+      const producer = createKafka().producer({ ...options, linger: 5 })
+      await producer.connect()
+      const { produce } = lastCluster().broker
+
+      const sent = producer.send({ topic: TOPIC, messages: MESSAGES })
+      await jest.advanceTimersByTimeAsync(4)
+      expect(produce).not.toHaveBeenCalled()
+      await jest.advanceTimersByTimeAsync(1)
+
+      expect(produce).toHaveBeenCalledTimes(1)
+      await expect(sent).resolves.toEqual([expect.objectContaining({ topicName: TOPIC })])
+    })
   })
 
   describe('created directly', () => {

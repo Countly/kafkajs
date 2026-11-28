@@ -1442,6 +1442,45 @@ describe('Producer > the idempotent drain loop', () => {
       )
     })
 
+    test.each([
+      ['an idempotent', false],
+      ['a transactional', true],
+    ])(
+      'the leader hint of %s request carries the topic id the request was sent for, not the one the topic has when the answer arrives',
+      async (_label, transactional) => {
+        const ids = { [TOPIC]: 'id-at-send' }
+        let calls = 0
+        const harness = createHarness({
+          layout: { [TOPIC]: { 0: 1 } },
+          transactional,
+          answer: (request, nodeId) => {
+            calls += 1
+            if (calls > 1) {
+              return respond(request, nodeId)
+            }
+            // The topic is recreated while the request is in flight.
+            ids[TOPIC] = 'id-after-recreation'
+            const results = respond(request, nodeId, { 'topic-a/0': NOT_LEADER_OR_FOLLOWER })
+            results[0].error.currentLeader = { leaderId: 2, leaderEpoch: 6 }
+            return results
+          },
+        })
+        harness.cluster.topicId = (topic) => ids[topic]
+        await harness.start()
+
+        await harness.send([{ topic: TOPIC, messages: records(0) }])
+
+        expect(harness.cluster.applyLeaderHint).toHaveBeenCalledTimes(1)
+        expect(harness.cluster.applyLeaderHint.mock.calls[0][0]).toMatchObject({
+          topic: TOPIC,
+          partition: 0,
+          leaderId: 2,
+          leaderEpoch: 6,
+          topicId: 'id-at-send',
+        })
+      }
+    )
+
     test('a hint that fails to apply and a refresh that fails leave the re-send to the retry', async () => {
       let calls = 0
       const harness = createHarness({

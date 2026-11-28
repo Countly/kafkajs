@@ -1,8 +1,16 @@
 const Cluster = require('../../cluster')
 const createConsumer = require('../index')
 const { requests } = require('../../protocol/requests')
-const { NODE_ID, TOPIC, createFetchGroup, fetchResponse } = require('./fixtures/fetchHarness')
+const {
+  NODE_ID,
+  TOPIC,
+  createFetchGroup,
+  fetchResponse,
+  trackFixtures,
+} = require('./fixtures/fetchHarness')
 const { connectionOpts, newLogger } = require('testHelpers')
+
+trackFixtures()
 
 const LEADER_NOT_AVAILABLE = 5
 const NODES = [1, 2].map((nodeId) => ({ nodeId, host: `kafka${nodeId}`, port: 9092, rack: null }))

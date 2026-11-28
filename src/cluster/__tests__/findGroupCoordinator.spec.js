@@ -38,12 +38,12 @@ describe('Cluster > findGroupCoordinator', () => {
     const broker = await cluster.findGroupCoordinator({
       groupId,
       coordinatorType: COORDINATOR_TYPES.TRANSACTION,
-      [ON_WRITE]: expect.any(Function),
     })
 
     expect(Broker.prototype.findGroupCoordinator).toHaveBeenCalledWith({
       groupId,
       coordinatorType: COORDINATOR_TYPES.TRANSACTION,
+      [ON_WRITE]: expect.any(Function),
     })
     expect(broker).not.toBeFalsy()
   })

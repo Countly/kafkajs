@@ -78,7 +78,7 @@ const createCluster = () => {
     destroy: async () => {},
   })
 
-  pool.createBroker = ({ connectionPool, nodeId }) => {
+  pool.createBroker = ({ connectionPool, nodeId = null }) => {
     let connected = false
     const failure = () => control.findCoordinatorFailure
     const answer = async (api, request, response) => {

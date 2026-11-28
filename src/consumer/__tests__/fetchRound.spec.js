@@ -6,10 +6,13 @@ const {
   createFetchGroup,
   prepareRecordBatches,
   fetchResponse,
+  trackFixtures,
 } = require('./fixtures/fetchHarness')
 const { mulberry32 } = require('../../../testHelpers/fuzz')
 const ConsumerGroup = require('../consumerGroup')
+const PositionValidator = require('../positionValidator')
 const SubscriptionState = require('../subscriptionState')
+const { newLogger } = require('../../../testHelpers')
 const { KafkaJSError } = require('../../errors')
 
 /** Hand-built magic 2 batch at offset 0, one record `A`, correct CRC32C. */
@@ -30,11 +33,11 @@ const TWO_RECORDS = Buffer.from(
 
 let harness
 let CORRUPTED_RECORD_BATCH
+trackFixtures()
 beforeAll(async () => {
   ;({ CORRUPTED_RECORD_BATCH } = await prepareRecordBatches())
 })
-afterEach(async () => {
-  if (harness) await harness.broker.disconnect()
+afterEach(() => {
   harness = null
 })
 
@@ -181,22 +184,16 @@ describe('decoder limits of concurrent consumers', () => {
    */
   const fetchAll = async (settings, records, version = 18) => {
     const consumers = []
-    try {
-      for (const options of settings) {
-        consumers.push(await createFetchGroup({ fetchMaxVersion: version, ...options }))
-      }
-      for (const consumer of consumers) {
-        consumer.setResponse(
-          fetchResponse([{ partition: 0, errorCode: 0, records }], { apiVersion: version })
-        )
-      }
-      const batches = await Promise.all(consumers.map(({ group }) => group.fetch(NODE_ID)))
-      return { batches, consumers }
-    } finally {
-      harness = {
-        broker: { disconnect: () => Promise.all(consumers.map((c) => c.broker.disconnect())) },
-      }
+    for (const options of settings) {
+      consumers.push(await createFetchGroup({ fetchMaxVersion: version, ...options }))
     }
+    for (const consumer of consumers) {
+      consumer.setResponse(
+        fetchResponse([{ partition: 0, errorCode: 0, records }], { apiVersion: version })
+      )
+    }
+    const batches = await Promise.all(consumers.map(({ group }) => group.fetch(NODE_ID)))
+    return { batches, consumers }
   }
 
   it.each([
@@ -350,13 +347,19 @@ function oracleReadReplicas(topic, partitions, routing) {
 }
 
 /**
- * The request builder this client shipped before, with its whole-assignment active set, kept
- * verbatim as the oracle.
+ * The request builder this client shipped before, with its whole-assignment active set, kept as
+ * the oracle. Its validation filter reads nothing of the group's validator: the test's own record
+ * of each partition's validation and routing events says whether, and at which epoch, the
+ * partition stands validated, and the expected request entry carries a validated entry of that
+ * epoch.
  * @this {ConsumerGroup}
  * @param {{topic: string, partitions: number[]}[]} topicPartitions
+ * @param {(topic: string, partition: number) => number|undefined} admittedAt the epoch the
+ *   partition was last validated against when no routing change or new check has ended that since,
+ *   `undefined` otherwise
  * @returns {object[]}
  */
-function oracleBuildFetchRequests(topicPartitions) {
+function oracleBuildFetchRequests(topicPartitions, admittedAt) {
   const manager = this.offsetManager
   const activeTopicPartitions = {}
   this.subscriptionState.active().forEach(({ topic, partitions }) => {
@@ -368,10 +371,11 @@ function oracleBuildFetchRequests(topicPartitions) {
       topic,
       partitions: partitions.reduce((requests, partition) => {
         const baseline = manager.heldOffsetAt(topic, partition)
+        const epoch = admittedAt(topic, partition)
         if (
           baseline != null &&
           activeTopicPartitions[topic].has(partition) &&
-          !this.positionValidator.isAwaiting(topic, partition) &&
+          epoch !== undefined &&
           (this.haltedPartitions.size === 0 ||
             !this.haltedPartitions.has(`${topic}|${partition}`)) &&
           !(this.hasSeekGates() && this.isSeekGated(topic, partition))
@@ -379,8 +383,9 @@ function oracleBuildFetchRequests(topicPartitions) {
           requests.push({
             partition,
             fetchOffset: manager.nextOffset(topic, partition, baseline).toString(),
-            currentLeaderEpoch: this.cluster.leaderEpoch(topic, partition),
+            currentLeaderEpoch: epoch,
             maxBytes: this.maxBytesPerPartition,
+            admittedUnder: { validatedAgainst: epoch, admitted: true, pending: null },
           })
         }
         return requests
@@ -486,6 +491,35 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
       if (random() < 0.3) state.hold([{ topic: topics[0], partitions: [0, 1] }], {})
       const coin = (salt) => (topic, partition) =>
         mulberry32(seed * 1000 + salt + partition)() < 0.15
+      // Each partition's history, applied to a real validator and recorded in the test's own
+      // model: never validated; validated and standing; validated, then dropped by a routing change
+      // (a leader that moved away and back to the same epoch); validated, dropped and validated
+      // again at the same epoch; or validated, then checked again and awaiting the answer.
+      const validator = new PositionValidator({ logger: newLogger() })
+      const standing = new Map()
+      for (const { topic, partitions } of assignment) {
+        for (const partition of partitions) {
+          if (coin(2)(topic, partition)) continue
+          const epoch = partition % 3
+          validator.markValidated(topic, partition, epoch)
+          standing.set(`${topic}|${partition}`, epoch)
+          if (coin(4)(topic, partition)) {
+            validator.revoke(topic, partition)
+            standing.delete(`${topic}|${partition}`)
+            if (coin(6)(topic, partition)) {
+              validator.markValidated(topic, partition, epoch)
+              standing.set(`${topic}|${partition}`, epoch)
+            }
+          } else if (coin(5)(topic, partition)) {
+            validator.request(topic, partition, {
+              offset: '4',
+              trackedEpoch: 1,
+              currentLeaderEpoch: epoch + 1,
+            })
+            standing.delete(`${topic}|${partition}`)
+          }
+        }
+      }
       const group = derivationGroup({
         subscriptionState: state,
         offsetManager: {
@@ -493,7 +527,7 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
           nextOffset: (topic, partition, baseline) => BigInt(baseline) + BigInt(partition),
         },
         obligations: { current: (topic) => (topic === 't5' ? null : {}) },
-        positionValidator: { isAwaiting: coin(2) },
+        positionValidator: validator,
         haltedPartitions: new Set(random() < 0.5 ? ['t0|2', 't1|0'] : []),
         hasSeekGates: () => true,
         isSeekGated: coin(3),
@@ -504,8 +538,11 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
         topic,
         partitions: partitions.filter(() => random() < 0.6),
       }))
+      const admittedAt = (topic, partition) => standing.get(`${topic}|${partition}`)
       try {
-        expect(group.buildFetchRequests(parts)).toEqual(oracleBuildFetchRequests.call(group, parts))
+        expect(group.buildFetchRequests(parts)).toEqual(
+          oracleBuildFetchRequests.call(group, parts, admittedAt)
+        )
       } catch (error) {
         error.message += ` seed=${seed}`
         throw error
@@ -518,12 +555,13 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
     const cluster = { findTopicPartitionMetadata: () => rows, leaderEpoch: () => 0 }
     const state = new SubscriptionState()
     state.assign([{ topic: 't', partitions: [0, 1, 2] }])
+    const validated = { validatedAgainst: 0, admitted: true }
     const group = derivationGroup({
       cluster,
       subscriptionState: state,
       offsetManager: { heldOffsetAt: () => '0', nextOffset: () => 0n },
       obligations: { current: () => ({}) },
-      positionValidator: { isAwaiting: () => false },
+      positionValidator: { entryOf: () => validated },
     })
     const route = () => group.filterPartitionsByNode(1, state.assigned())[0].partitions
     const fetched = () =>
@@ -551,7 +589,15 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
     expect(group.buildFetchRequests([{ topic: 't', partitions: [0, 1] }])).toEqual([
       {
         topic: 't',
-        partitions: [{ partition: 1, fetchOffset: '0', currentLeaderEpoch: 0, maxBytes: 1024 }],
+        partitions: [
+          {
+            partition: 1,
+            fetchOffset: '0',
+            currentLeaderEpoch: 0,
+            maxBytes: 1024,
+            admittedUnder: validated,
+          },
+        ],
       },
     ])
   })
@@ -590,7 +636,7 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
       subscriptionState: state,
       offsetManager: { heldOffsetAt: () => '0', nextOffset: () => 0n },
       obligations: { current: () => ({}) },
-      positionValidator: { isAwaiting: () => false },
+      positionValidator: { entryOf: () => ({ validatedAgainst: 0, admitted: true }) },
       cluster: { leaderEpoch: () => 0 },
     })
     const parts = assignment.map(({ topic }) => ({
@@ -605,11 +651,6 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
 })
 
 describe('Consumer > ConsumerGroup > fetch round over the wire', () => {
-  afterEach(async () => {
-    for (const rig of rigs.splice(0)) await rig.broker.disconnect()
-  })
-  const rigs = []
-
   /**
    * Runs one round over generated leaders and pauses; the answer lists the requested partitions
    * in reverse order.
@@ -627,10 +668,14 @@ describe('Consumer > ConsumerGroup > fetch round over the wire', () => {
       partitions.map((p) => [p, p === 0 || random() < 0.6 ? NODE_ID : 1 + Math.floor(random() * 2)])
     )
     const rig = await createFetchGroup({ partitions, partitionLeaders, knownNodes: [0, 1, 2] })
-    rigs.push(rig)
     if (oracle) {
       rig.group.findReadReplicaForPartitions = oracleReadReplicas
-      rig.group.buildFetchRequests = oracleBuildFetchRequests
+      // No routing changes here: each partition of the round stands validated against the cached
+      // epoch, which the round's own preparation checked it against.
+      rig.group.buildFetchRequests = (parts) =>
+        oracleBuildFetchRequests.call(rig.group, parts, (topic, partition) =>
+          rig.cluster.leaderEpoch(topic, partition)
+        )
     }
     rig.group.pause([
       { topic: TOPIC, partitions: partitions.filter((p) => p !== 0 && random() < 0.2) },
@@ -669,7 +714,6 @@ describe('Consumer > ConsumerGroup > fetch round over the wire', () => {
   it('looks up each answered partition in its request once', async () => {
     const partitions = Array.from({ length: 300 }, (_, i) => i)
     const rig = await createFetchGroup({ partitions })
-    rigs.push(rig)
     const reads = { count: 0 }
     const build = rig.group.buildFetchRequests.bind(rig.group)
     rig.group.buildFetchRequests = (parts) =>
@@ -686,13 +730,23 @@ describe('Consumer > ConsumerGroup > fetch round over the wire', () => {
           })
         }),
       }))
-    rig.setResponse(
-      fetchResponse(partitions.map((partition) => ({ partition, errorCode: 0, records: true })))
+    // Answered in the reverse of the frame's (shuffled) order, so the in-order coverage check
+    // fails on its first row and the counted check runs.
+    rig.setResponse(() =>
+      fetchResponse(
+        rig
+          .fetchRequestPartitions()
+          .reverse()
+          .map((partition) => ({ partition, errorCode: 0, records: true }))
+      )
     )
 
     const batches = await rig.group.fetch(NODE_ID)
 
     expect(batches).toHaveLength(300)
-    expect(reads.count).toBeLessThanOrEqual(5 * partitions.length)
+    // Per request entry: the encoder, the counted coverage check and the one index the answer's
+    // rows are looked up in; plus the in-order coverage check's first comparison. The admission
+    // checks at the write and at receipt read the entry's validation token, not its partition.
+    expect(reads.count).toBe(3 * partitions.length + 1)
   })
 })

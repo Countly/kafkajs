@@ -23,14 +23,17 @@ const { failure, createErrorFromCode } = require('../../error')
  * flat message list; the producer resolves each index to its record. `currentLeader` and
  * `nodeEndpoints` are internal: they let the producer route its next attempt to the new leader
  * without waiting for a metadata refresh, and are not part of the error's documented surface.
+ * With them comes `topicId` when the answer keys its topic by id (v13), so the hint is refused
+ * for a topic recreated since.
  * @param {{ nodeEndpoints?: object[] }} data the decoded response
  * @param {string|null} topicName
  * @param {object} partition a decoded partition response whose error code is a failure
+ * @param {string} [topicId] the topic id the answer names (v13)
  * @returns {import('../../../errors').KafkaJSProtocolError}
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-467%3A+Augment+ProduceResponse+error+messaging+for+specific+culprit+records
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-951%3A+Leader+discovery+optimisations+for+the+client
  */
-const partitionError = (data, topicName, partition) => {
+const partitionError = (data, topicName, partition, topicId) => {
   const error = createErrorFromCode(partition.errorCode)
   error.topic = topicName
   error.partition = partition.partition
@@ -49,6 +52,7 @@ const partitionError = (data, topicName, partition) => {
   if (partition.currentLeader) {
     error.currentLeader = partition.currentLeader
     error.nodeEndpoints = data.nodeEndpoints
+    if (topicId !== undefined) error.topicId = topicId
   }
 
   return error
@@ -63,10 +67,10 @@ const partitionError = (data, topicName, partition) => {
  * @throws {import('../../../errors').KafkaJSProtocolError}
  */
 const parse = async (data) => {
-  for (const { topicName, partitions } of data.topics) {
+  for (const { topicName, topicId, partitions } of data.topics) {
     for (const partition of partitions) {
       if (failure(partition.errorCode)) {
-        throw partitionError(data, topicName, partition)
+        throw partitionError(data, topicName, partition, topicId)
       }
     }
   }
@@ -80,10 +84,11 @@ const parse = async (data) => {
  * in destructured, so a malformed entry fails with the message the callback of `flatMap` gave.
  * @param {PartitionResult[]} results
  * @param {object} data decoded response
- * @param {{ topicName: string|null, partitions: object[] }} topic
+ * @param {{ topicName: string|null, topicId?: string, partitions: object[] }} topic `topicId` from
+ *   v13
  * @returns {void}
  */
-const appendTopicResults = (results, data, { topicName, partitions }) => {
+const appendTopicResults = (results, data, { topicName, topicId, partitions }) => {
   for (let p = 0, count = partitions.length; p < count; p++) {
     if (!(p in partitions)) {
       continue
@@ -96,7 +101,9 @@ const appendTopicResults = (results, data, { topicName, partitions }) => {
       baseOffset: partition.baseOffset,
       logAppendTime: partition.logAppendTime,
       logStartOffset: partition.logStartOffset === undefined ? '-1' : partition.logStartOffset,
-      error: failure(partition.errorCode) ? partitionError(data, topicName, partition) : null,
+      error: failure(partition.errorCode)
+        ? partitionError(data, topicName, partition, topicId)
+        : null,
     })
   }
 }

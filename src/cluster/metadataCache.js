@@ -72,6 +72,41 @@ module.exports = class MetadataCache {
     this.generation = 0
     /** @type {Set<() => void>} synchronous internal listeners, independent of instrumentation */
     this.routingListeners = new Set()
+    /** @type {Set<(topic?: string, partition?: number) => void>} see `onPartitionRouted` */
+    this.partitionListeners = new Set()
+  }
+
+  /**
+   * Subscribes to the routing of single partitions: the handler is called synchronously, after
+   * the change is visible, each time the cache accepts a different leader or leader epoch for a
+   * partition, first learns a partition, or forgets it; with no `partition` for every partition of
+   * `topic` (a topic forgotten, pruned or recreated), and with no arguments for everything (`clear`).
+   * A refresh that repeats the cached pair, or one the monotonic rule rejects, calls nothing. It
+   * must only record: a handler that throws is logged and skipped.
+   * @param {(topic?: string, partition?: number) => void} handler
+   * @returns {() => void} idempotent unsubscribe
+   */
+  onPartitionRouted(handler) {
+    this.partitionListeners.add(handler)
+    return () => this.partitionListeners.delete(handler)
+  }
+
+  /**
+   * @private
+   * @param {string} [topic]
+   * @param {number} [partition]
+   * @returns {void}
+   */
+  publishPartitionRouted(topic, partition) {
+    for (const listener of this.partitionListeners) {
+      try {
+        listener(topic, partition)
+      } catch (e) {
+        this.logger.error('Partition routing listener threw, ignoring it', {
+          error: describeThrown(e),
+        })
+      }
+    }
   }
 
   /**
@@ -138,6 +173,7 @@ module.exports = class MetadataCache {
       if (recreation) {
         recreations = recreations || []
         recreations.push(recreation)
+        this.publishPartitionRouted(name)
       }
 
       // The all-zero uuid is "no id", not an id: a broker answers with it while a topic is deleted
@@ -152,11 +188,7 @@ module.exports = class MetadataCache {
         const cached = entry.partitions.get(partition.partitionId)
 
         if (!cached) {
-          entry.partitions.set(partition.partitionId, {
-            leader: partition.leader,
-            leaderEpoch: partition.leaderEpoch,
-            decoded: partition,
-          })
+          this.learn(entry, name, partition, partition)
           continue
         }
 
@@ -171,13 +203,11 @@ module.exports = class MetadataCache {
           })
           partition.leader = cached.leader
           partition.leaderEpoch = cached.leaderEpoch
-        } else {
-          cached.leader = partition.leader
-          cached.leaderEpoch = partition.leaderEpoch
         }
 
-        // Re-seated in both branches: the previous response's object is about to be discarded.
+        // The previous response's object is about to be discarded.
         cached.decoded = partition
+        this.route(name, partition.partitionId, cached, partition.leader, partition.leaderEpoch)
       }
 
       if (entry.topicId != null) {
@@ -236,7 +266,10 @@ module.exports = class MetadataCache {
     if (entry?.topicId != null) this.topicIds.delete(entry.topicId)
     this.topics.delete(topic)
     this.pendingTopics.delete(topic)
-    if (entry) this.publishRoutingChange()
+    if (entry) {
+      this.publishPartitionRouted(topic)
+      this.publishRoutingChange()
+    }
   }
 
   /**
@@ -282,6 +315,7 @@ module.exports = class MetadataCache {
         this.topics.delete(name)
         this.pendingTopics.delete(name)
         entry.topicId != null && this.topicIds.delete(entry.topicId)
+        this.publishPartitionRouted(name)
         continue
       }
 
@@ -338,6 +372,7 @@ module.exports = class MetadataCache {
       if (recreation) {
         recreations = recreations || []
         recreations.push(recreation)
+        this.publishPartitionRouted(name)
       }
 
       const usableId = this.usableTopicId(topicMetadata.topicId)
@@ -349,11 +384,7 @@ module.exports = class MetadataCache {
         const cached = entry.partitions.get(partition.partitionId)
 
         if (!cached) {
-          entry.partitions.set(partition.partitionId, {
-            leader: partition.leader,
-            leaderEpoch: partition.leaderEpoch,
-            decoded: null,
-          })
+          this.learn(entry, name, partition, null)
           changed = true
           continue
         }
@@ -363,16 +394,13 @@ module.exports = class MetadataCache {
         }
 
         changed =
-          changed ||
-          cached.leader !== partition.leader ||
-          cached.leaderEpoch !== partition.leaderEpoch
-        cached.leader = partition.leader
-        cached.leaderEpoch = partition.leaderEpoch
-
-        if (cached.decoded) {
-          cached.decoded.leader = partition.leader
-          cached.decoded.leaderEpoch = partition.leaderEpoch
-        }
+          this.route(
+            name,
+            partition.partitionId,
+            cached,
+            partition.leader,
+            partition.leaderEpoch
+          ) || changed
       }
 
       if (entry.topicId != null) {
@@ -482,12 +510,40 @@ module.exports = class MetadataCache {
    * from the last response) still updates the cached pair; the next refresh that carries the
    * topic re-seats `decoded` and the routing structure catches up there.
    *
+   * A hint that names the topic id of the answer it came with is refused when the cache knows the
+   * topic under another id: it describes a previous incarnation, whose epochs say nothing about
+   * the current one.
+   *
    * @param {string} topic
    * @param {number} partition
-   * @param {{ leaderId: number, leaderEpoch: number }} hint
+   * @param {{ leaderId: number, leaderEpoch: number, topicId?: string }} hint
    * @returns {boolean} true when the hint advanced the epoch and was applied
    */
-  applyLeaderHint(topic, partition, { leaderId, leaderEpoch }) {
+  applyLeaderHint(topic, partition, hint) {
+    if (!this.admitsLeaderHint(topic, partition, hint)) {
+      return false
+    }
+
+    const { leaderId, leaderEpoch } = hint
+    const cached = this.topics.get(topic).partitions.get(partition)
+    this.route(topic, partition, cached, leaderId, leaderEpoch)
+
+    this.publishRoutingChange()
+    return true
+  }
+
+  /**
+   * Whether `applyLeaderHint` would apply this hint now: it names a leader, the partition is
+   * cached, the topic is not known under another id than the hint's, and the hint's epoch advances
+   * the cached one (an unknown cached epoch, -1, never rejects). The one rule for a leader hint, so
+   * work that must happen before the cache write (`Cluster#applyLeaderHint`'s endpoint install)
+   * can ask it again at the moment it publishes.
+   * @param {string} topic
+   * @param {number} partition
+   * @param {{ leaderId: number, leaderEpoch: number, topicId?: string }} hint
+   * @returns {boolean}
+   */
+  admitsLeaderHint(topic, partition, { leaderId, leaderEpoch, topicId }) {
     // ProduceResponse's CurrentLeader defaults to { LeaderId: -1, LeaderEpoch: -1 } when the
     // broker has no hint to offer - never a real leader, regardless of the cached epoch.
     if (leaderId === NO_LEADER_ID) {
@@ -497,24 +553,11 @@ module.exports = class MetadataCache {
     const entry = this.topics.get(topic)
     const cached = entry && entry.partitions.get(partition)
 
-    if (!cached) {
-      return false
-    }
-
-    if (cached.leaderEpoch > UNKNOWN_EPOCH && leaderEpoch <= cached.leaderEpoch) {
-      return false
-    }
-
-    cached.leader = leaderId
-    cached.leaderEpoch = leaderEpoch
-
-    if (cached.decoded) {
-      cached.decoded.leader = leaderId
-      cached.decoded.leaderEpoch = leaderEpoch
-    }
-
-    this.publishRoutingChange()
-    return true
+    return (
+      cached !== undefined &&
+      !(topicId !== undefined && entry.topicId != null && entry.topicId !== topicId) &&
+      !(cached.leaderEpoch > UNKNOWN_EPOCH && leaderEpoch <= cached.leaderEpoch)
+    )
   }
 
   /**
@@ -541,16 +584,50 @@ module.exports = class MetadataCache {
       return false
     }
 
-    cached.leaderEpoch = UNKNOWN_EPOCH
-
-    // `decoded` is null for a topic released by `releaseTopicsAbsentFrom`; guarded exactly as
-    // `applyLeaderHint` guards it.
-    if (cached.decoded) {
-      cached.decoded.leaderEpoch = UNKNOWN_EPOCH
-    }
+    this.route(topic, partition, cached, cached.leader, UNKNOWN_EPOCH)
 
     this.publishRoutingChange()
     return true
+  }
+
+  /**
+   * Writes a leader/epoch pair to both views of a partition before reporting a change to listeners.
+   * @private
+   * @param {string} topic
+   * @param {number} partition
+   * @param {{ leader: number, leaderEpoch: number }} cached
+   * @param {number} leader
+   * @param {number} leaderEpoch
+   * @returns {boolean} whether the pair changed
+   */
+  route(topic, partition, cached, leader, leaderEpoch) {
+    const changed = cached.leader !== leader || cached.leaderEpoch !== leaderEpoch
+    cached.leader = leader
+    cached.leaderEpoch = leaderEpoch
+    if (cached.decoded) {
+      cached.decoded.leader = leader
+      cached.decoded.leaderEpoch = leaderEpoch
+    }
+    if (changed) this.publishPartitionRouted(topic, partition)
+    return changed
+  }
+
+  /**
+   * Records a partition the topic's entry does not hold yet, and tells the partition listeners.
+   * @private
+   * @param {{ partitions: Map<number, object> }} entry the topic's entry
+   * @param {string} topic
+   * @param {{ partitionId: number, leader: number, leaderEpoch: number }} partition the decoded row
+   * @param {object|null} decoded the write-through object, `null` when nothing routes through it
+   * @returns {void}
+   */
+  learn(entry, topic, partition, decoded) {
+    entry.partitions.set(partition.partitionId, {
+      leader: partition.leader,
+      leaderEpoch: partition.leaderEpoch,
+      decoded,
+    })
+    this.publishPartitionRouted(topic, partition.partitionId)
   }
 
   /**
@@ -598,6 +675,7 @@ module.exports = class MetadataCache {
     this.topics.clear()
     this.topicIds.clear()
     this.pendingTopics.clear()
+    this.publishPartitionRouted()
     this.publishRoutingChange()
   }
 

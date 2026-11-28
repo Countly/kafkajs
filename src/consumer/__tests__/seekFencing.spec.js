@@ -1512,6 +1512,8 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       const asked = gate()
       const answered = gate()
       const reply = gate()
+      // The leader at epoch 6 says the tracked epoch 5 ended at offset 1, below the position: the
+      // answer would rewind the partition if it still applied.
       scenario.rig.cluster.answer('OffsetForLeaderEpoch', async ({ topics }) => {
         asked.resolve()
         await reply.promise
@@ -1519,11 +1521,17 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
           partitions: topics[0].partitions.map(({ partition }) => ({
             partition,
             errorCode: 0,
-            leaderEpoch: 6,
-            endOffset: '100',
+            leaderEpoch: 5,
+            endOffset: '1',
           })),
         }
       })
+      const truncations = []
+      scenario.consumer.on(scenario.consumer.events.LOG_TRUNCATION, ({ payload }) =>
+        truncations.push(payload)
+      )
+      expect(await scenario.position()).toBe('5')
+      expect(group.offsetManager.lastConsumedEpoch(TOPIC, 0)).toBe(5)
       const apply = group.applyValidationResponse
       const epoch = jest.spyOn(group.cluster, 'leaderEpoch').mockReturnValue(6)
       const applying = jest
@@ -1555,6 +1563,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
 
       expect(group.isSeekGated(TOPIC, 0)).toBe(true)
       expect(group.offsetManager.resolvedOffsetAt(TOPIC, 0)).toBe('5')
+      expect(truncations).toEqual([])
       await scenario.consumer.commitOffsets([{ topic: TOPIC, partition: 0, offset: '8' }])
       accepted.release()
       expect(await seeking).toBe('8')

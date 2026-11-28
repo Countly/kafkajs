@@ -62,6 +62,7 @@ const {
   createFetchGroup,
   fetchResponse,
   prepareRecordBatches,
+  trackFixtures,
 } = require('./fixtures/fetchHarness')
 const { KafkaJSRequestTimeoutError } = require('../../errors')
 const {
@@ -75,11 +76,12 @@ const createWorkerQueue = require('../workerQueue')
 
 let harness
 beforeAll(() => prepareRecordBatches())
-afterEach(async () => {
+afterEach(() => {
   jest.useRealTimers()
-  if (harness) await harness.broker.disconnect()
   harness = null
 })
+// After the hook that restores real timers, so a teardown never runs under fake ones.
+trackFixtures()
 
 /** @returns {Promise<void>} yields one event-loop turn without arming a timer */
 const turn = () => new Promise(setImmediate)

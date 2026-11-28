@@ -135,7 +135,7 @@ notice and what, if anything, to do.
   `bufferMemory` until sends reject with `KafkaJSBufferExhaustedError`. If one hot partition
   needs more, raise `batchSize` (and `bufferMemory`), pass arrays of messages per `send()`, or
   spread the records over more partitions: see "Running at high throughput" in the producing guide.
-  At `linger: 0`, an awaited single `send()` of an idempotent producer takes about 2 % longer
+  At the default `linger` of 0, an awaited single `send()` of an idempotent producer takes about 2 % longer
   (about 30 µs on a 1.5 ms send) than with `idempotent: false`, which removes that cost and gives
   up the protection against duplicates and reordering on retry.
 
@@ -231,20 +231,20 @@ notice and what, if anything, to do.
   *What to do:* match results by `topicName`/`partition` rather than by array index. A
   single-partition send is unaffected; so is any caller that already reads the fields.
 
-- **Every producer gathers sends into batches, so a `send()` may wait up to 5 ms before its
-  request leaves.** The accumulator is on for every producer, idempotent or not, with the Java
-  client's defaults: `linger` 5 ms (Java's `linger.ms` moved from 0 to 5 in Kafka 4.0) and
+- **Sends made in the same turn of the event loop are merged into one request.** The accumulator
+  is on for every producer, idempotent or not, with `linger` 0 (the Java client's is 5 ms) and
   `batchSize` 16384 bytes of keys and values. In 2.2.4 every `send()` and `sendBatch()` was its own
-  request; now the records of sends made within `linger` of each other to one topic-partition
-  share a batch, a batch goes out once it reaches `batchSize`, and one `send()` or `sendBatch()`
-  usually makes one Produce request per broker: its records that join a batch an earlier send
-  began leave with that batch, so one call can reach a broker in two requests. On an idempotent
-  producer a partition's next batch also keeps gathering sends while the batch before it waits for
-  its answer.
-  *What to do:* nothing for code that sends without awaiting each send. Code that awaits every
-  `send()` before the next one waits up to `linger` each time: pass `linger: 0`, which sends at
-  once, with no timer, and on an idempotent producer still merges the sends that queue behind a
-  partition's batch in flight.
+  request; now a lone `send()` leaves at once, with no timer, but the records of sends made in the
+  same turn to one topic-partition share a batch, a batch goes out once it reaches `batchSize`, and
+  one `send()` or `sendBatch()` usually makes one Produce request per broker: its records that
+  join a batch an earlier send began leave with that batch, so one call can reach a broker in two
+  requests. On an idempotent producer a partition's next batch also keeps gathering sends while
+  the batch before it waits for its answer.
+  *What to do:* nothing for most code; an awaited `send()` takes one round trip, as in 2.2.4. To
+  batch more under many independent callers that send to the same partitions, pass a `linger`
+  above 0 (for example `linger: 5`): a batch then waits up to that long for more records, so a lone
+  send takes up to `linger` ms longer, and an explicit `deliveryTimeout` must be at least
+  `linger + requestTimeout`.
   No setting restores one request per `send()`; the Java client has none either.
 
 - **Sends to one topic-partition can share a batch, and then succeed or fail together.** A batch
@@ -281,14 +281,14 @@ notice and what, if anything, to do.
 - **`deliveryTimeout` counts the wait for `linger` and for the producer id.** A send's deadline
   starts when the send is made, as the Java client's does, so the `linger` wait - and on an
   idempotent producer the `InitProducerId` wait - count against it. An explicit
-  `deliveryTimeout` must be at least `linger + requestTimeout`: 30005 ms with both defaults.
+  `deliveryTimeout` must be at least `linger + requestTimeout`: 30000 ms with both defaults.
   When `deliveryTimeout` is unset, an explicit `retry.maxTotalTime` may be below that sum.
   *What to do:* nothing unless you set `deliveryTimeout`, new in 3.0.0: give it at least
   `linger + requestTimeout`.
 
 - **One opt-in, off by default**: `leaderEpoch` on the partitions given to `sendOffsets`.
   *What to do:* nothing; leaving it unset changes nothing beyond what the other items describe.
-- **A broker's waiting batches leave together.** When one batch's `linger` runs out, the other
+- **A broker's waiting batches leave together (with a `linger` above 0).** When one batch's `linger` runs out, the other
   waiting batches for the same broker (same `acks`, `timeout` and `compression`) leave with it,
   possibly before their own `linger`, so sends made a few milliseconds apart to partitions of one
   broker are one request. Pulling a batch forward adds no batching delay, but `linger` sets when a
@@ -603,7 +603,10 @@ says so, `groupProtocol: 'consumer'`.
 - **A leader move during consumption is handled by a hint instead of a rebalance.** When the broker
   tells the client which node now leads a partition (KIP-951), the consumer routes the next fetch
   there directly; consumption of the other partitions is not interrupted and no group rebalance
-  happens. Where the broker also sends the new leader's address, the client uses it. If the hint
+  happens. Where the broker also sends the new leader's address, the client uses it, but only while
+  its cached metadata would still accept the hint (for a producer hint as well): a newer leader
+  epoch or a recreation of the topic learned while the connection to that address is prepared
+  keeps the existing broker and its connection. If the hint
   names a broker the client has never heard of and carries no address for it, the client ignores the
   hint and refreshes metadata instead — a hint is never trusted far enough to invent a connection.
 

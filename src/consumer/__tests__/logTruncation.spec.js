@@ -1,16 +1,28 @@
 const apiKeys = require('../../protocol/requests/apiKeys')
+const RecordEncoder = require('../../protocol/recordBatch/record/v0')
+const InstrumentationEventEmitter = require('../../instrumentation/emitter')
+const Runner = require('../runner')
+const { createLogger, LEVELS } = require('../../loggers')
+const { newLogger } = require('testHelpers')
 const {
   events: { LOG_TRUNCATION },
 } = require('../instrumentationEvents')
 const {
   NODE_ID,
   TOPIC,
+  TOPIC_ID,
   prepareRecordBatches,
+  buildRecordBatch,
+  decodeFetchRequest,
   fetchResponse,
   offsetForLeaderEpochResponse,
+  scriptedEpochLog,
+  withheldAnswer,
   createFetchGroup,
+  trackFixtures,
 } = require('./fixtures/fetchHarness')
 
+trackFixtures()
 beforeAll(prepareRecordBatches)
 
 /**
@@ -252,6 +264,38 @@ describe('Consumer > position validation', () => {
 
     setResponse(fetchResponse([{ partition: 0, errorCode: 0, records: true }]))
     expect(await group.fetch(NODE_ID)).toHaveLength(1)
+  })
+
+  test('a reply discarded because the position moved under it validates nothing: no request is built until a fresh answer applies', async () => {
+    const { group, offsetManager, requests, setValidationResponse } = await createGroup()
+    let answers = 0
+    setValidationResponse((partitions) => {
+      answers += 1
+      // A handler publishes a new position while the first check is being answered.
+      if (answers === 1) {
+        offsetManager.resolveOffset({ topic: TOPIC, partition: 0, offset: '14', leaderEpoch: 4 })
+      }
+      return offsetForLeaderEpochResponse(
+        partitions.map((partition) => ({ partition, endOffset: '20' }))
+      )
+    })
+
+    await group.validatePositions([{ topic: TOPIC, partitions: [0] }])
+
+    expect(group.positionValidator.isAwaiting(TOPIC, 0)).toBe(false)
+    expect(group.positionValidator.validatedAgainst(TOPIC, 0)).toBeUndefined()
+    expect(group.admissionEntry(TOPIC, 0)).toBeUndefined()
+    expect(group.buildFetchRequests([{ topic: TOPIC, partitions: [0] }])).toEqual([])
+
+    await group.fetch(NODE_ID)
+
+    // The round checks the moved position again, and only then fetches.
+    const order = apiKeysOf(requests)
+    expect(validationCount(requests)).toBe(2)
+    expect(order.lastIndexOf(apiKeys.OffsetForLeaderEpoch)).toBeLessThan(
+      order.indexOf(apiKeys.Fetch)
+    )
+    expect(group.positionValidator.validatedAgainst(TOPIC, 0)).toBe(5)
   })
 
   describe('outcomes', () => {
@@ -517,31 +561,36 @@ describe('Consumer > position validation', () => {
 
   test('a partition another fetcher is validating is not in this round request', async () => {
     // Two fetchers can compute the leader map at different moments and both claim a partition, so
-    // a partition can be awaiting a reply this fetch round never asked for. That is the state
-    // stubbed here: a single-fetcher round cannot produce it, because the gate blocks first.
+    // a partition can be awaiting a reply this fetch round never asked for. That is the state put
+    // in place here: a single-fetcher round cannot produce it, because the gate blocks first.
     const { group, setResponse, fetchRequestPartitions } = await createGroup({
       partitions: [0, 1],
     })
-    jest
-      .spyOn(group.positionValidator, 'isAwaiting')
-      .mockImplementation((topic, partition) => partition === 0)
+    group.positionValidator.request(TOPIC, 0, {
+      offset: '10',
+      trackedEpoch: 4,
+      currentLeaderEpoch: 5,
+    })
     // A broker answers only the partitions a full request carried.
     setResponse(fetchResponse([{ partition: 1, errorCode: 0 }]))
 
     await group.fetch(NODE_ID)
 
+    expect(group.positionValidator.isAwaiting(TOPIC, 0)).toBe(true)
     expect(fetchRequestPartitions()).toEqual([1])
   })
 
   test('a fetched partition that entered validation meanwhile is dropped, not delivered', async () => {
     const { group, setResponse } = await createGroup({ committedEpoch: -1 })
-    let awaiting = false
-    jest.spyOn(group.positionValidator, 'isAwaiting').mockImplementation(() => awaiting)
 
     // The body is written after the request went out, which is the only window in which a
     // partition can enter validation between its own request and its own response.
     setResponse(() => {
-      awaiting = true
+      group.positionValidator.request(TOPIC, 0, {
+        offset: '10',
+        trackedEpoch: 4,
+        currentLeaderEpoch: 6,
+      })
       return fetchResponse([{ partition: 0, errorCode: 0, records: true }])
     })
 
@@ -676,5 +725,1445 @@ describe('Consumer > position validation', () => {
 
     expect(request).not.toHaveBeenCalled()
     expect(nextOffset).not.toHaveBeenCalled()
+  })
+})
+
+describe('Consumer > answers from before a leader epoch change', () => {
+  /** One partition-0 row per effect an answer can have besides a batch. */
+  const ROWS = {
+    records: { partition: 0, errorCode: 0, records: true },
+    'offset out of range': { partition: 0, errorCode: 1 },
+  }
+  const SESSIONS = [
+    ['off', false],
+    ['on', true],
+  ]
+  /** Partition 1 shares the node and its epoch never moves: it is delivered as before. */
+  const HEALTHY = { partition: 1, errorCode: 0, records: true }
+  /** Partition 1 with nothing new. */
+  const IDLE = { partition: 1, errorCode: 0 }
+  /** The id a broker gives a new Fetch session. */
+  const SESSION_ID = 77
+
+  /** @returns {number[]} the partitions of the batches one round returned */
+  const partitionsOf = (batches) => batches.map(({ partition }) => partition)
+
+  /** @returns {[number, string[]][]} the partitions and offsets one round handed out records for */
+  const deliveredOf = (batches) =>
+    batches
+      .filter((batch) => !batch.isEmpty())
+      .map(({ partition, messages }) => [partition, messages.map(({ offset }) => offset)])
+
+  /**
+   * @param {{topics: {partitions: object[]}[]}} frame a decoded Fetch frame
+   * @returns {[number, string, number][]} its partitions with fetch offset and current epoch, in
+   *   partition order: a sessionless request lists them in a random order, as kafkajs 2.2.4 did
+   */
+  const cursorsOf = (frame) =>
+    frame.topics
+      .flatMap(({ partitions }) => partitions)
+      .map(({ partition, fetchOffset, currentLeaderEpoch }) => [
+        partition,
+        fetchOffset,
+        currentLeaderEpoch,
+      ])
+      .sort(([a], [b]) => a - b)
+
+  /** Lets queued work run until `condition` holds, or fails the test. */
+  const until = async (condition) => {
+    for (let turns = 0; turns < 500 && !condition(); turns++) {
+      await new Promise(setImmediate)
+    }
+    if (!condition()) throw new Error('the schedule never reached its hold point')
+  }
+
+  /**
+   * Two partitions on node 0 at cached epoch 5, read live from the metadata cache so a hint moves
+   * the epoch the group sees. A reset is recorded and never committed.
+   * @param {object} [options] harness overrides
+   * @returns {Promise<object>} the harness, plus `reset`, the `setDefaultOffset` spy
+   */
+  const createGroup = async (options) => {
+    const harness = await createFetchGroup({ partitions: [0, 1], liveRouting: true, ...options })
+    const reset = jest.spyOn(harness.offsetManager, 'setDefaultOffset').mockResolvedValue()
+    return { ...harness, reset }
+  }
+
+  /**
+   * The first round of a group: a full request, answered with nothing new and, with sessions on,
+   * a session id, so the next request is incremental.
+   * @param {object} h the harness
+   * @param {boolean} fetchSessions
+   * @returns {Promise<void>}
+   */
+  const openRound = async (h, fetchSessions) => {
+    h.setResponse(
+      fetchResponse([{ partition: 0, errorCode: 0 }, IDLE], {
+        sessionId: fetchSessions ? SESSION_ID : 0,
+      })
+    )
+    expect(deliveredOf(await h.group.fetch(NODE_ID))).toEqual([])
+  }
+
+  /**
+   * Partition 0's leader moves to node 1 at epoch 6, then an older image that no longer lists
+   * node 1 names node 0 at epoch 5 again, and the cache accepts it: the pair the group was
+   * validated against is back, but the routing changed twice.
+   * @param {object} h the harness
+   * @returns {void}
+   */
+  const awayAndBack = (h) => {
+    h.metadataCache.applyLeaderHint(TOPIC, 0, { leaderId: 1, leaderEpoch: 6 })
+    h.metadataCache.update({
+      brokers: [{ nodeId: NODE_ID, host: 'kafka0', port: 9092 }],
+      topicMetadata: [
+        {
+          topic: TOPIC,
+          topicId: TOPIC_ID,
+          partitionMetadata: [{ partitionId: 0, leader: NODE_ID, leaderEpoch: 5 }],
+        },
+      ],
+    })
+  }
+
+  /** Routing changes of partition 0 the cache accepts. */
+  const MOVES = [
+    [
+      'the same leader moved to epoch 6',
+      (h) => h.metadataCache.applyLeaderHint(TOPIC, 0, { leaderId: NODE_ID, leaderEpoch: 6 }),
+    ],
+    ['the leader moved away and back to epoch 5', awayAndBack],
+  ]
+
+  /**
+   * Virtual time from here on; the fake broker's playback, `until` and the producer and socket
+   * hand-offs keep their real immediates, ticks and microtasks.
+   * @returns {void}
+   */
+  const onFakeTime = () =>
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] })
+
+  /**
+   * The OffsetForLeaderEpoch and Fetch frames written, decoded, in write order.
+   * @param {object} h the harness
+   * @returns {({check: object}|{fetch: object})[]}
+   */
+  const timelineOf = (h) => {
+    const fetches = h.fetchFrames()
+    const checks = h.validationRequests()
+    return h.requests().flatMap(({ apiKey }) => {
+      if (apiKey === apiKeys.Fetch) return [{ fetch: fetches.shift() }]
+      if (apiKey === apiKeys.OffsetForLeaderEpoch) return [{ check: checks.shift() }]
+      return []
+    })
+  }
+
+  /**
+   * The first Fetch frame that carried partition 0, and every check written before it.
+   * @param {object} h the harness
+   * @returns {{cursor: [number, string, number]|undefined, checksBefore: object[][]}} partition
+   *   0's cursor in that frame, and the partitions each earlier check asked about
+   */
+  const firstFetchOfPartition0 = (h) => {
+    const timeline = timelineOf(h)
+    const at = timeline.findIndex(
+      ({ fetch }) => fetch && cursorsOf(fetch).some(([partition]) => partition === 0)
+    )
+    return {
+      cursor: at === -1 ? undefined : cursorsOf(timeline[at].fetch).find(([p]) => p === 0),
+      checksBefore: timeline
+        .slice(0, at === -1 ? timeline.length : at)
+        .filter(({ check }) => check)
+        .map(({ check }) => check.topics[0].partitions),
+    }
+  }
+
+  test.each(Object.keys(ROWS).flatMap((name) => SESSIONS.map(([label, on]) => [name, label, on])))(
+    '%s: an answer to a Fetch built at epoch 5 that arrives after metadata moved to 6 makes no batch, no reset and no leader hint, with fetch sessions %s',
+    async (name, _label, fetchSessions) => {
+      const { group, cluster, metadataCache, reset, setResponse, lastFetchRequest } =
+        await createGroup({ fetchSessions })
+      setResponse(() => {
+        // The answer reaches the client after the cache learned epoch 6 for partition 0 alone.
+        metadataCache.applyLeaderHint(TOPIC, 0, { leaderId: NODE_ID, leaderEpoch: 6 })
+        return fetchResponse([ROWS[name], HEALTHY])
+      })
+
+      const batches = await group.fetch(NODE_ID)
+
+      // A sessionless request lists its partitions in a random order, as kafkajs 2.2.4 did.
+      expect(
+        lastFetchRequest()
+          .map(({ partition, currentLeaderEpoch }) => [partition, currentLeaderEpoch])
+          .sort(([a], [b]) => a - b)
+      ).toEqual([
+        [0, 5],
+        [1, 5],
+      ])
+      expect(partitionsOf(batches)).toEqual([1])
+      expect(reset).not.toHaveBeenCalled()
+      expect(cluster.applyLeaderHint).not.toHaveBeenCalled()
+    }
+  )
+
+  test.each([['records'], ['offset out of range']])(
+    '%s: an answer built before the partition was validated again at the same epoch and offset makes no batch and no reset',
+    async (name) => {
+      const { group, offsetManager, reset, setResponse, validationRequests } = await createGroup({
+        committedEpoch: 4,
+        position: '120',
+        endOffset: '500',
+      })
+      // Withheld while partition 0 leaves validation and is validated again at the same epoch and
+      // position: the same verdict, under a new validation entry.
+      setResponse(() =>
+        (async () => {
+          group.positionValidator.forgetTopic(TOPIC, [0])
+          await group.validatePositions([{ topic: TOPIC, partitions: [0] }])
+          return fetchResponse([ROWS[name], HEALTHY])
+        })()
+      )
+
+      const batches = await group.fetch(NODE_ID)
+
+      expect(validationRequests()).toHaveLength(2)
+      expect(group.positionValidator.validatedAgainst(TOPIC, 0)).toBe(5)
+      expect(offsetManager.positionOf(TOPIC, 0)).toBe('120')
+      expect(partitionsOf(batches)).toEqual([1])
+      expect(reset).not.toHaveBeenCalled()
+    }
+  )
+
+  /** Partition 1 is led by node 1, so node 0's request carries partition 0 alone. */
+  const splitLeaders = { knownNodes: [NODE_ID, 1], partitionLeaders: { 0: NODE_ID, 1: 1 } }
+  /** An answer that also names partition 1, which node 0's request did not carry. */
+  const answerNamingPartition1 = (sessionId = 0) =>
+    fetchResponse(
+      [
+        { partition: 1, errorCode: 1 },
+        { partition: 0, errorCode: 0, records: true },
+      ],
+      { sessionId }
+    )
+
+  test('a sessionless answer naming a partition the request did not carry fails the round before any row is used', async () => {
+    const { group, reset, setResponse, fetchRequestPartitions } = await createGroup(splitLeaders)
+    setResponse(answerNamingPartition1())
+
+    await expect(group.fetch(NODE_ID)).rejects.toThrow(
+      'Fetch response names partition 1 of topic test-topic that the request did not carry'
+    )
+    expect(fetchRequestPartitions()).toEqual([0])
+    expect(reset).not.toHaveBeenCalled()
+  })
+
+  test('an incremental session answer naming a partition the request did not carry is refused whole before any row is used', async () => {
+    const { group, reset, setResponse, fetchFrames } = await createGroup({
+      ...splitLeaders,
+      fetchSessions: true,
+    })
+    setResponse(fetchResponse([{ partition: 0, errorCode: 0 }], { sessionId: SESSION_ID }))
+    expect(deliveredOf(await group.fetch(NODE_ID))).toEqual([])
+    setResponse(answerNamingPartition1(SESSION_ID))
+
+    await expect(group.fetch(NODE_ID)).resolves.toEqual([])
+    expect(fetchFrames().map(({ sessionId, sessionEpoch }) => [sessionId, sessionEpoch])).toEqual([
+      [0, 0],
+      [SESSION_ID, 1],
+    ])
+    expect(reset).not.toHaveBeenCalled()
+  })
+
+  test.each(SESSIONS)(
+    "a partition whose cached epoch moves after the round's validation answered is left out of that round's Fetch frame, with fetch sessions %s",
+    async (_label, fetchSessions) => {
+      // The leader's state for each check: at epoch 5 for the first, at epoch 6 (entered at its
+      // log end) for the second. It answers, then its epoch moves on.
+      const brokerAt = {
+        5: scriptedEpochLog({
+          epochs: [
+            [4, '0'],
+            [5, '300'],
+          ],
+          logEnd: '500',
+        }),
+        6: scriptedEpochLog({
+          epochs: [
+            [4, '0'],
+            [5, '300'],
+            [6, '500'],
+          ],
+          logEnd: '500',
+        }),
+      }
+      const {
+        group,
+        metadataCache,
+        setResponse,
+        setValidationResponse,
+        fetchRequestPartitions,
+        validationRequests,
+      } = await createGroup({ fetchSessions, committedEpoch: 4, position: '10' })
+      // Every validation answer for partition 0 is overtaken by a newer epoch for it before the
+      // client applies it, so even the round's second preparation ends with no validation of
+      // partition 0 standing: an answer asked under older routing applies nothing.
+      setValidationResponse((partitions, request) => {
+        const answer = brokerAt[metadataCache.leaderEpoch(TOPIC, 0)].answer(partitions, request)
+        if (partitions.includes(0)) {
+          const next = metadataCache.leaderEpoch(TOPIC, 0) + 1
+          metadataCache.applyLeaderHint(TOPIC, 0, { leaderId: NODE_ID, leaderEpoch: next })
+        }
+        return answer
+      })
+      setResponse(fetchResponse([HEALTHY]))
+
+      const batches = await group.fetch(NODE_ID)
+
+      expect(
+        validationRequests().map(({ topics }) =>
+          topics[0].partitions.map(({ partition, currentLeaderEpoch }) => [
+            partition,
+            currentLeaderEpoch,
+          ])
+        )
+      ).toEqual([
+        [
+          [0, 5],
+          [1, 5],
+        ],
+        [[0, 6]],
+      ])
+      expect(group.positionValidator.entryOf(TOPIC, 0)).toBeUndefined()
+      expect(metadataCache.leaderEpoch(TOPIC, 0)).toBe(7)
+      expect(fetchRequestPartitions()).toEqual([1])
+      expect(partitionsOf(batches)).toEqual([1])
+    }
+  )
+
+  describe('the routing a dropped row carries', () => {
+    /**
+     * Answers node 0's Fetch, built at epoch 5, with `row` for partition 0 and records for
+     * partition 1, after the cache learned `cachedEpoch` for partition 0 from elsewhere.
+     */
+    const answerAfterEpoch = (h, cachedEpoch, row, options) =>
+      h.setResponse(() => {
+        h.metadataCache.applyLeaderHint(TOPIC, 0, { leaderId: NODE_ID, leaderEpoch: cachedEpoch })
+        return fetchResponse([{ partition: 0, ...row }, HEALTHY], options)
+      })
+
+    test('a dropped FENCED_LEADER_EPOCH row carrying a leader at epoch 7 moves the cached leader there and makes no batch, reset or error count', async () => {
+      const h = await createGroup({ knownNodes: [NODE_ID, 1] })
+      // Node 0 fences the request at epoch 5: the partition moved to node 1 at epoch 7.
+      answerAfterEpoch(
+        h,
+        6,
+        { errorCode: 74, currentLeader: { leaderId: 1, leaderEpoch: 7 } },
+        { nodeEndpoints: [{ nodeId: 1, host: 'kafka1', port: 9092, rack: null }] }
+      )
+
+      const batches = await h.group.fetch(NODE_ID)
+
+      expect(h.cluster.applyLeaderHint).toHaveBeenCalledTimes(1)
+      // The cache write checks the answer's topic incarnation.
+      expect(h.cluster.applyLeaderHint.mock.calls[0][0].topicId).toBe(TOPIC_ID)
+      expect([h.metadataCache.leader(TOPIC, 0), h.metadataCache.leaderEpoch(TOPIC, 0)]).toEqual([
+        1, 7,
+      ])
+      expect(partitionsOf(batches)).toEqual([1])
+      expect(h.reset).not.toHaveBeenCalled()
+      expect(h.group.consecutiveFetchErrors.has(`${TOPIC}|0`)).toBe(false)
+      expect(h.cluster.refreshMetadata).not.toHaveBeenCalled()
+    })
+
+    test('a dropped NOT_LEADER_OR_FOLLOWER row with no usable hint starts the paced metadata refresh without holding back the healthy batch', async () => {
+      const h = await createGroup()
+      let refreshed
+      h.cluster.refreshMetadata.mockImplementation(
+        () => new Promise((resolve) => (refreshed = resolve))
+      )
+      // The broker knows no leader for the partition: its hint names none.
+      answerAfterEpoch(h, 6, { errorCode: 6, currentLeader: { leaderId: -1, leaderEpoch: -1 } })
+      try {
+        let batches
+        h.group.fetch(NODE_ID).then(
+          (round) => (batches = round),
+          (error) => (batches = error)
+        )
+
+        // The round returns while the refresh it started is still unanswered.
+        await until(() => batches !== undefined)
+        await until(() => h.cluster.refreshMetadata.mock.calls.length > 0)
+
+        expect(partitionsOf(batches)).toEqual([1])
+        expect(h.cluster.refreshMetadata).toHaveBeenCalledTimes(1)
+        expect(h.cluster.applyLeaderHint).not.toHaveBeenCalled()
+        expect(h.reset).not.toHaveBeenCalled()
+        expect(h.group.consecutiveFetchErrors.has(`${TOPIC}|0`)).toBe(false)
+      } finally {
+        refreshed?.()
+        await h.teardown()
+      }
+    })
+
+    test('a dropped row whose leader hint fails while the run is open starts the paced metadata refresh without holding back the healthy batch', async () => {
+      const h = await createGroup({ knownNodes: [NODE_ID, 1] })
+      h.cluster.applyLeaderHint.mockRejectedValueOnce(new Error('endpoint preparation failed'))
+      answerAfterEpoch(
+        h,
+        6,
+        { errorCode: 74, currentLeader: { leaderId: 1, leaderEpoch: 7 } },
+        { nodeEndpoints: [{ nodeId: 1, host: 'kafka1', port: 9092, rack: null }] }
+      )
+      try {
+        const batches = await h.group.fetch(NODE_ID)
+        await until(() => h.cluster.refreshMetadata.mock.calls.length > 0)
+
+        expect(partitionsOf(batches)).toEqual([1])
+        expect(h.cluster.applyLeaderHint).toHaveBeenCalledTimes(1)
+        expect(h.cluster.refreshMetadata).toHaveBeenCalledTimes(1)
+        expect(h.reset).not.toHaveBeenCalled()
+      } finally {
+        await h.teardown()
+      }
+    })
+
+    test('a dropped row whose hint is older than the cached epoch leaves the cached leader and epoch alone', async () => {
+      const h = await createGroup({ knownNodes: [NODE_ID, 1] })
+      // The hint names the leader at epoch 6; the cache already holds epoch 7.
+      answerAfterEpoch(
+        h,
+        7,
+        { errorCode: 74, currentLeader: { leaderId: 1, leaderEpoch: 6 } },
+        { nodeEndpoints: [{ nodeId: 1, host: 'kafka1', port: 9092, rack: null }] }
+      )
+
+      const batches = await h.group.fetch(NODE_ID)
+
+      expect(h.cluster.applyLeaderHint).toHaveBeenCalledTimes(1)
+      await expect(h.cluster.applyLeaderHint.mock.results[0].value).resolves.toBe(false)
+      expect([h.metadataCache.leader(TOPIC, 0), h.metadataCache.leaderEpoch(TOPIC, 0)]).toEqual([
+        NODE_ID,
+        7,
+      ])
+      expect(partitionsOf(batches)).toEqual([1])
+      expect(h.reset).not.toHaveBeenCalled()
+    })
+
+    test('a dropped row of a recreated topic applies no hint', async () => {
+      const h = await createGroup({ knownNodes: [NODE_ID, 1] })
+      h.setResponse(() => {
+        h.metadataCache.applyLeaderHint(TOPIC, 0, { leaderId: NODE_ID, leaderEpoch: 6 })
+        // The cache now holds another incarnation of the topic name.
+        h.cluster.topicId = () => '11121314-1516-1718-191a-1b1c1d1e1f20'
+        return fetchResponse(
+          [
+            { partition: 0, errorCode: 74, currentLeader: { leaderId: 1, leaderEpoch: 7 } },
+            HEALTHY,
+          ],
+          { nodeEndpoints: [{ nodeId: 1, host: 'kafka1', port: 9092, rack: null }] }
+        )
+      })
+
+      const batches = await h.group.fetch(NODE_ID)
+
+      expect(h.cluster.applyLeaderHint).not.toHaveBeenCalled()
+      expect(h.cluster.refreshMetadata).not.toHaveBeenCalled()
+      expect([h.metadataCache.leader(TOPIC, 0), h.metadataCache.leaderEpoch(TOPIC, 0)]).toEqual([
+        NODE_ID,
+        6,
+      ])
+      expect(partitionsOf(batches)).toEqual([1])
+    })
+  })
+
+  describe('replay from the last published offset', () => {
+    const SESSION_ROWS = [
+      ['sessions off', false],
+      ['sessions on', true],
+    ]
+    /** @returns {object} the answer options for a group with or without a session */
+    const answering = (fetchSessions, sessionId = SESSION_ID) => ({
+      sessionId: fetchSessions ? sessionId : 0,
+    })
+    /**
+     * The rows of an answer: a full answer names every partition its request carried, an
+     * incremental one only those with something new (the watermarks never change here).
+     * @param {boolean} incremental
+     * @param {object[]} withData rows that carry records or an error
+     * @param {object[]} idle rows with nothing new
+     * @returns {object[]}
+     */
+    const rowsOf = (incremental, withData, idle) =>
+      incremental ? withData : [...withData, ...idle]
+    /** @returns {[number, number][]} each Fetch frame's session id and session epoch */
+    const sessionsOf = (frames) =>
+      frames.map(({ sessionId, sessionEpoch }) => [sessionId, sessionEpoch])
+    /** @returns {[number, string, number]} partition 0's cursor in the last Fetch frame */
+    const lastCursorOf0 = (h) => {
+      const frames = h.fetchFrames()
+      return cursorsOf(frames[frames.length - 1]).find(([partition]) => partition === 0)
+    }
+
+    /**
+     * A real Runner over the harness group, handing each message to `eachMessage`; its heartbeat
+     * is a no-op, as no coordinator answers here.
+     * @param {object} h the harness
+     * @param {Function} eachMessage
+     * @returns {Runner}
+     */
+    const runnerOver = (h, eachMessage) => {
+      const runner = new Runner({
+        logger: newLogger(),
+        consumerGroup: h.group,
+        instrumentationEmitter: new InstrumentationEventEmitter(),
+        concurrency: 1,
+        eachBatch: undefined,
+        eachMessage,
+        heartbeatInterval: 3000,
+        maxPollInterval: 300000,
+        autoCommit: false,
+        onCrash: (error) => {
+          throw error
+        },
+      })
+      runner.heartbeat = async () => {}
+      runner.running = true
+      return runner
+    }
+
+    /** Hands a round's batches to the runner one after another, as one worker would. */
+    const handOver = async (runner, batches) => {
+      for (const batch of batches) await runner.handleBatch(batch)
+    }
+
+    /** @returns {void} */
+    const stop = (runner) => {
+      runner.running = false
+      runner.heartbeatManager.shutdown()
+      runner.pollTimer.stop()
+    }
+
+    test.each(SESSION_ROWS)(
+      '%s: an answer dropped because the leader epoch moved is fetched again from the last published offset and handed to eachMessage once',
+      async (_label, fetchSessions) => {
+        const h = await createGroup({ fetchSessions })
+        const calls = []
+        const runner = runnerOver(h, async ({ partition, message }) => {
+          calls.push([partition, message.offset])
+        })
+        try {
+          await openRound(h, fetchSessions)
+          // The same leader moves to epoch 6 while the answer, with records for both, is on its way.
+          h.setResponse(() => {
+            h.metadataCache.applyLeaderHint(TOPIC, 0, { leaderId: NODE_ID, leaderEpoch: 6 })
+            return fetchResponse([ROWS.records, HEALTHY], answering(fetchSessions))
+          })
+          await handOver(runner, await h.group.fetch(NODE_ID))
+          expect(calls).toEqual([[1, '0']])
+
+          h.setResponse(
+            fetchResponse(rowsOf(fetchSessions, [ROWS.records], [IDLE]), answering(fetchSessions))
+          )
+          await handOver(runner, await h.group.fetch(NODE_ID))
+
+          const frames = h.fetchFrames()
+          expect(sessionsOf(frames)).toEqual(
+            fetchSessions
+              ? [
+                  [0, 0],
+                  [SESSION_ID, 1],
+                  [SESSION_ID, 2],
+                ]
+              : [
+                  [0, -1],
+                  [0, -1],
+                  [0, -1],
+                ]
+          )
+          // With a session both partitions were unchanged, so the dropped answer's request
+          // carried them without sending them.
+          expect(cursorsOf(frames[1])).toEqual(
+            fetchSessions
+              ? []
+              : [
+                  [0, '0', 5],
+                  [1, '0', 5],
+                ]
+          )
+          // Partition 0 from its last published offset at the new epoch; partition 1 from the
+          // offset after the record the runner resolved.
+          expect(cursorsOf(frames[2])).toEqual([
+            [0, '0', 6],
+            [1, '1', 5],
+          ])
+          expect(calls).toEqual([
+            [1, '0'],
+            [0, '0'],
+          ])
+          expect([
+            h.offsetManager.positionOf(TOPIC, 0),
+            h.offsetManager.positionOf(TOPIC, 1),
+          ]).toEqual(['1', '1'])
+        } finally {
+          stop(runner)
+          await h.teardown()
+        }
+      }
+    )
+
+    test.each(SESSION_ROWS)(
+      '%s: a queued batch released after a leader epoch change is not handed to eachMessage, and the next request fetches it again from the last published offset',
+      async (_label, fetchSessions) => {
+        const h = await createGroup({ fetchSessions })
+        const calls = []
+        const runner = runnerOver(h, async ({ partition, message }) => {
+          calls.push([partition, message.offset])
+        })
+        try {
+          await openRound(h, fetchSessions)
+          h.setResponse(
+            fetchResponse(rowsOf(fetchSessions, [ROWS.records], [IDLE]), answering(fetchSessions))
+          )
+          const queued = await h.group.fetch(NODE_ID)
+          expect(deliveredOf(queued)).toEqual([[0, ['0']]])
+
+          // The epoch moves while the batches wait in the queue; then the worker takes them.
+          h.metadataCache.applyLeaderHint(TOPIC, 0, { leaderId: NODE_ID, leaderEpoch: 6 })
+          await handOver(runner, queued)
+          expect(calls).toEqual([])
+          expect(h.offsetManager.positionOf(TOPIC, 0)).toBe('0')
+
+          h.setResponse(
+            fetchResponse(rowsOf(fetchSessions, [ROWS.records], [IDLE]), answering(fetchSessions))
+          )
+          await handOver(runner, await h.group.fetch(NODE_ID))
+
+          const frames = h.fetchFrames()
+          expect(sessionsOf(frames)).toEqual(
+            fetchSessions
+              ? [
+                  [0, 0],
+                  [SESSION_ID, 1],
+                  [SESSION_ID, 2],
+                ]
+              : [
+                  [0, -1],
+                  [0, -1],
+                  [0, -1],
+                ]
+          )
+          // With a session, partition 1 is unchanged and carried without being sent.
+          expect(cursorsOf(frames[2])).toEqual(
+            fetchSessions
+              ? [[0, '0', 6]]
+              : [
+                  [0, '0', 6],
+                  [1, '0', 5],
+                ]
+          )
+          expect(calls).toEqual([[0, '0']])
+          expect(h.offsetManager.positionOf(TOPIC, 0)).toBe('1')
+        } finally {
+          stop(runner)
+          await h.teardown()
+        }
+      }
+    )
+
+    test.each(SESSION_ROWS)(
+      '%s: an eachMessage batch whose leader epoch moved while message 10 was handled stops before message 11 and resumes there',
+      async (_label, fetchSessions) => {
+        const h = await createGroup({ fetchSessions, position: '10' })
+        // Records 10 to 12 were written at epoch 5; the leader entered epoch 6 at its log end, 100.
+        h.setValidationResponse(
+          scriptedEpochLog({
+            epochs: [
+              [5, '0'],
+              [6, '100'],
+            ],
+            logEnd: '100',
+          }).answer
+        )
+        const records = await buildRecordBatch({
+          firstOffset: '10',
+          lastOffsetDelta: 2,
+          partitionLeaderEpoch: 5,
+          records: [0, 1, 2].map((offsetDelta) =>
+            RecordEncoder({ offsetDelta, key: Buffer.from('k'), value: Buffer.from('v') })
+          ),
+        })
+        const answer = () =>
+          fetchResponse(
+            rowsOf(fetchSessions, [{ partition: 0, errorCode: 0, records }], [IDLE]),
+            answering(fetchSessions)
+          )
+        let release
+        const held = new Promise((resolve) => (release = resolve))
+        const calls = []
+        const runner = runnerOver(h, async ({ partition, message }) => {
+          calls.push([partition, message.offset])
+          if (message.offset === '10') await held
+        })
+        try {
+          await openRound(h, fetchSessions)
+          h.setResponse(answer())
+          const handing = handOver(runner, await h.group.fetch(NODE_ID))
+          await until(() => calls.length === 1)
+
+          // The same leader moves to epoch 6 while message 10 is being handled.
+          h.metadataCache.applyLeaderHint(TOPIC, 0, { leaderId: NODE_ID, leaderEpoch: 6 })
+          release()
+          await handing
+          expect(calls).toEqual([[0, '10']])
+          expect(h.offsetManager.positionOf(TOPIC, 0)).toBe('11')
+
+          h.setResponse(answer())
+          await handOver(runner, await h.group.fetch(NODE_ID))
+
+          expect(h.validationRequests().map(({ topics }) => topics[0].partitions)).toEqual([
+            [{ partition: 0, currentLeaderEpoch: 6, leaderEpoch: 5 }],
+          ])
+          expect(lastCursorOf0(h)).toEqual([0, '11', 6])
+          expect(calls).toEqual([
+            [0, '10'],
+            [0, '11'],
+            [0, '12'],
+          ])
+          expect(h.offsetManager.positionOf(TOPIC, 0)).toBe('13')
+        } finally {
+          release()
+          stop(runner)
+          await h.teardown()
+        }
+      }
+    )
+
+    test.each(SESSION_ROWS)(
+      '%s: a partition whose admission lapses before every write costs only itself: the healthy partition on its node and a partition on another node are fetched and advance every round',
+      async (_label, fetchSessions) => {
+        // Partitions 0 and 1 are led by node 0, partition 2 by node 1, each node on its own
+        // connection.
+        const h = await createGroup({
+          fetchSessions,
+          partitions: [0, 1, 2],
+          partitionLeaders: { 0: NODE_ID, 1: NODE_ID, 2: 1 },
+          knownNodes: [NODE_ID, 1],
+          validationBrokers: true,
+        })
+        const calls = []
+        const runner = runnerOver(h, async ({ partition, message }) => {
+          calls.push([partition, message.offset])
+        })
+        const recordsAt = await Promise.all(
+          [0, 1, 2].map((offset) => buildRecordBatch({ firstOffset: String(offset) }))
+        )
+        const node1Cursors = []
+        try {
+          for (let round = 0; round < 3; round++) {
+            const lookups = h.findBrokerCalls.length
+            const release = h.holdBrokerLookup(NODE_ID)
+            // A broker answers only what was written: partition 1.
+            h.setResponse(
+              fetchResponse(
+                [{ partition: 1, errorCode: 0, records: recordsAt[round] }],
+                answering(fetchSessions)
+              )
+            )
+            const fetching = h.group.fetch(NODE_ID)
+            await until(() => h.findBrokerCalls.length > lookups)
+            // Built with partition 0 admitted; its leader epoch moves before the frame is written.
+            h.metadataCache.applyLeaderHint(TOPIC, 0, {
+              leaderId: NODE_ID,
+              leaderEpoch: 6 + round,
+            })
+            release()
+            const fromNode0 = await fetching
+
+            h.setResponse(
+              fetchResponse(
+                [{ partition: 2, errorCode: 0, records: recordsAt[round] }],
+                answering(fetchSessions, SESSION_ID + 1)
+              )
+            )
+            const fromNode1 = await h.group.fetch(1)
+            node1Cursors.push(cursorsOf(decodeFetchRequest(h.writesTo(1))))
+
+            await handOver(runner, [...fromNode0, ...fromNode1])
+          }
+
+          // One frame per round on node 0, each carrying partition 1 alone at its next offset.
+          const frames = h.fetchFrames()
+          expect(frames.map(cursorsOf)).toEqual([[[1, '0', 5]], [[1, '1', 5]], [[1, '2', 5]]])
+          // The broker's session advanced once per written frame and never for a refused one.
+          expect(sessionsOf(frames)).toEqual(
+            fetchSessions
+              ? [
+                  [0, 0],
+                  [SESSION_ID, 1],
+                  [SESSION_ID, 2],
+                ]
+              : [
+                  [0, -1],
+                  [0, -1],
+                  [0, -1],
+                ]
+          )
+          expect(node1Cursors).toEqual([[[2, '0', 5]], [[2, '1', 5]], [[2, '2', 5]]])
+          expect(calls).toEqual([
+            [1, '0'],
+            [2, '0'],
+            [1, '1'],
+            [2, '1'],
+            [1, '2'],
+            [2, '2'],
+          ])
+        } finally {
+          stop(runner)
+          await h.teardown()
+        }
+      }
+    )
+
+    test.each(SESSION_ROWS)(
+      '%s: an eachMessage batch whose leader moved away and back to epoch 5 while message 10 was handled stops before message 11, and resumes there once its position is checked again',
+      async (_label, fetchSessions) => {
+        const h = await createGroup({ fetchSessions, position: '10' })
+        onFakeTime()
+        // Records 10 to 12 were written at epoch 5, the leader's latest epoch, which ends at 100.
+        h.setValidationResponse(scriptedEpochLog({ epochs: [[5, '0']], logEnd: '100' }).answer)
+        const records = await buildRecordBatch({
+          firstOffset: '10',
+          lastOffsetDelta: 2,
+          partitionLeaderEpoch: 5,
+          records: [0, 1, 2].map((offsetDelta) =>
+            RecordEncoder({ offsetDelta, key: Buffer.from('k'), value: Buffer.from('v') })
+          ),
+        })
+        const answer = () =>
+          fetchResponse(
+            rowsOf(fetchSessions, [{ partition: 0, errorCode: 0, records }], [IDLE]),
+            answering(fetchSessions)
+          )
+        let release
+        const held = new Promise((resolve) => (release = resolve))
+        const calls = []
+        const runner = runnerOver(h, async ({ partition, message }) => {
+          calls.push([partition, message.offset])
+          if (message.offset === '10') await held
+        })
+        try {
+          await openRound(h, fetchSessions)
+          h.setResponse(answer())
+          const handing = handOver(runner, await h.group.fetch(NODE_ID))
+          await until(() => calls.length === 1)
+
+          awayAndBack(h)
+          expect([h.metadataCache.leader(TOPIC, 0), h.metadataCache.leaderEpoch(TOPIC, 0)]).toEqual(
+            [NODE_ID, 5]
+          )
+          release()
+          await handing
+          expect(calls).toEqual([[0, '10']])
+          expect(h.offsetManager.positionOf(TOPIC, 0)).toBe('11')
+
+          h.setResponse(answer())
+          await handOver(runner, await h.group.fetch(NODE_ID))
+
+          expect(h.validationRequests().map(({ topics }) => topics[0].partitions)).toEqual([
+            [{ partition: 0, currentLeaderEpoch: 5, leaderEpoch: 5 }],
+          ])
+          expect(lastCursorOf0(h)).toEqual([0, '11', 5])
+          expect(calls).toEqual([
+            [0, '10'],
+            [0, '11'],
+            [0, '12'],
+          ])
+          expect(h.offsetManager.positionOf(TOPIC, 0)).toBe('13')
+        } finally {
+          release()
+          stop(runner)
+          jest.useRealTimers()
+          await h.teardown()
+        }
+      }
+    )
+  })
+
+  test.each([
+    [
+      'the leader moved away and back to epoch 5',
+      (h) => {
+        // Node 1 leads at epoch 6; then an older image that no longer lists node 1 names node 0
+        // at epoch 5 again, and the cache accepts it.
+        h.metadataCache.applyLeaderHint(TOPIC, 0, { leaderId: 1, leaderEpoch: 6 })
+        h.metadataCache.update({
+          brokers: [{ nodeId: NODE_ID, host: 'kafka0', port: 9092 }],
+          topicMetadata: [
+            {
+              topic: TOPIC,
+              topicId: TOPIC_ID,
+              partitionMetadata: [{ partitionId: 0, leader: NODE_ID, leaderEpoch: 5 }],
+            },
+          ],
+        })
+      },
+      5,
+    ],
+    [
+      'the same leader moved to epoch 6',
+      (h) => h.metadataCache.applyLeaderHint(TOPIC, 0, { leaderId: NODE_ID, leaderEpoch: 6 }),
+      6,
+    ],
+  ])(
+    'a validation answer that would rewind, applied after %s, changes nothing: no rewind or event, and the partition is checked again before it is fetched',
+    async (_label, move, epochAfter) => {
+      const h = await createGroup({
+        partitions: [0],
+        committedEpoch: 4,
+        position: '10',
+        knownNodes: [NODE_ID, 1],
+      })
+      // Asked of node 0 at epoch 5 about epoch 4, which it ended at offset 8: below the position.
+      const atEpoch5 = scriptedEpochLog({
+        epochs: [
+          [4, '0'],
+          [5, '8'],
+        ],
+        logEnd: '500',
+      })
+      const truncations = []
+      h.group.instrumentationEmitter.addListener(LOG_TRUNCATION, (e) => truncations.push(e.payload))
+      // The first check is answered once released; a later one is still unanswered when the test
+      // stops the run.
+      let release
+      const released = new Promise((resolve) => (release = resolve))
+      let checks = 0
+      h.setValidationResponse((partitions, request) => {
+        checks += 1
+        return checks === 1
+          ? released.then(() => atEpoch5.answer(partitions, request))
+          : new Promise(() => {})
+      })
+      try {
+        const round = h.group.fetch(NODE_ID)
+        await until(() => h.validationRequests().length === 1)
+
+        move(h)
+        expect(h.metadataCache.leaderEpoch(TOPIC, 0)).toBe(epochAfter)
+        release()
+        await until(() => h.validationRequests().length === 2 || h.fetchFrames().length > 0)
+
+        expect(truncations).toEqual([])
+        expect(h.offsetManager.positionOf(TOPIC, 0)).toBe('10')
+        expect(h.fetchFrames()).toEqual([])
+        expect(h.validationRequests().map(({ topics }) => topics[0].partitions)).toEqual([
+          [{ partition: 0, currentLeaderEpoch: 5, leaderEpoch: 4 }],
+          [{ partition: 0, currentLeaderEpoch: epochAfter, leaderEpoch: 4 }],
+        ])
+
+        h.group.onStopRequested()
+        await expect(round).resolves.toEqual([])
+      } finally {
+        await h.teardown()
+      }
+    }
+  )
+
+  describe('routing changes the metadata cache publishes through Cluster#onPartitionRouted', () => {
+    afterEach(() => {
+      jest.clearAllTimers()
+      jest.useRealTimers()
+    })
+
+    test.each(Object.keys(ROWS))(
+      '%s: an answer to a Fetch built at epoch 5 that arrives after the leader moved away and back to epoch 5 makes no batch, no reset and no leader hint',
+      async (name) => {
+        const h = await createGroup()
+        onFakeTime()
+        try {
+          h.setResponse(() => {
+            awayAndBack(h)
+            return fetchResponse([ROWS[name], HEALTHY])
+          })
+
+          const batches = await h.group.fetch(NODE_ID)
+
+          const { lastFetchRequest } = h
+          expect(
+            lastFetchRequest()
+              .map(({ partition, currentLeaderEpoch }) => [partition, currentLeaderEpoch])
+              .sort(([a], [b]) => a - b)
+          ).toEqual([
+            [0, 5],
+            [1, 5],
+          ])
+          expect([h.metadataCache.leader(TOPIC, 0), h.metadataCache.leaderEpoch(TOPIC, 0)]).toEqual(
+            [NODE_ID, 5]
+          )
+          expect(partitionsOf(batches)).toEqual([1])
+          expect(h.reset).not.toHaveBeenCalled()
+          expect(h.cluster.applyLeaderHint).not.toHaveBeenCalled()
+          expect(h.group.positionValidator.entryOf(TOPIC, 0)).toBeUndefined()
+        } finally {
+          jest.useRealTimers()
+          await h.teardown()
+        }
+      }
+    )
+
+    /** Each routing change, with fetch sessions off and on. */
+    const QUEUED = MOVES.flatMap(([move, apply]) =>
+      SESSIONS.map(([label, on]) => [move, label, on, apply])
+    )
+
+    test.each(QUEUED)(
+      '%s while the Fetch frame waited in the connection queue, with fetch sessions %s: that frame is not written, and the same round writes partition 1 alone',
+      async (_move, _label, fetchSessions, move) => {
+        const h = await createGroup({ fetchSessions })
+        onFakeTime()
+        const blocker = withheldAnswer()
+        try {
+          const connection = await h.broker.connectionPool.getConnection()
+          connection.requestQueue.maxInFlightRequests = 1
+          // An unanswered request on the same connection holds its one in-flight slot.
+          h.setValidationResponse(() => blocker.promise)
+          const blocking = h.broker.offsetForLeaderEpoch({
+            topics: [
+              {
+                topic: TOPIC,
+                partitions: [{ partition: 1, currentLeaderEpoch: 5, leaderEpoch: 4 }],
+              },
+            ],
+          })
+          await until(() => h.validationRequests().length === 1)
+          h.setResponse(fetchResponse([HEALTHY], { sessionId: fetchSessions ? SESSION_ID : 0 }))
+
+          const fetching = h.group.fetch(NODE_ID)
+          await until(() => connection.requestQueue.pending.length === 1)
+          expect(h.fetchFrames()).toEqual([])
+
+          move(h)
+          blocker.resolve(
+            offsetForLeaderEpochResponse([{ partition: 1, leaderEpoch: 4, endOffset: '20' }])
+          )
+          await blocking
+          const batches = await fetching
+
+          const frames = h.fetchFrames()
+          expect(frames.map(cursorsOf)).toEqual([[[1, '0', 5]]])
+          expect(frames.map(({ sessionId, sessionEpoch }) => [sessionId, sessionEpoch])).toEqual([
+            fetchSessions ? [0, 0] : [0, -1],
+          ])
+          expect(partitionsOf(batches)).toEqual([1])
+          expect(h.group.positionValidator.entryOf(TOPIC, 0)).toBeUndefined()
+        } finally {
+          jest.useRealTimers()
+          await h.teardown()
+        }
+      }
+    )
+
+    test('a non-retriable answer whose partition moved while a sibling reset was applied switches validation off nowhere, and both partitions settle on their own', async () => {
+      const h = await createGroup({ committedEpoch: 4, position: '120' })
+      onFakeTime()
+      const truncations = []
+      h.group.instrumentationEmitter.addListener(LOG_TRUNCATION, (e) => truncations.push(e.payload))
+      let applyReset
+      h.reset.mockImplementationOnce(() => new Promise((resolve) => (applyReset = resolve)))
+      // First check: partition 0 is refused for good, partition 1's leader no longer knows its
+      // epoch (a reset). Any later check: partition 0's epoch 4 ends at 500, past its position.
+      let checks = 0
+      const rowFor = (partition) => {
+        if (checks > 1) return { partition, leaderEpoch: 4, endOffset: '500' }
+        return partition === 0
+          ? { partition, errorCode: 29 }
+          : { partition, leaderEpoch: -1, endOffset: '-1' }
+      }
+      h.setValidationResponse((partitions) => {
+        checks += 1
+        return offsetForLeaderEpochResponse(partitions.map(rowFor))
+      })
+      try {
+        const round = h.group.fetch(NODE_ID)
+        await until(() => applyReset !== undefined)
+
+        // Partition 0's answer was classified while it was current; it moves before the switch.
+        h.metadataCache.applyLeaderHint(TOPIC, 0, { leaderId: NODE_ID, leaderEpoch: 6 })
+        applyReset()
+        await round
+
+        expect(h.group.positionValidator.isDisabled()).toBe(false)
+        expect(h.validationRequests().map(({ topics }) => topics[0].partitions)).toEqual([
+          [
+            { partition: 0, currentLeaderEpoch: 5, leaderEpoch: 4 },
+            { partition: 1, currentLeaderEpoch: 5, leaderEpoch: 4 },
+          ],
+          [{ partition: 0, currentLeaderEpoch: 6, leaderEpoch: 4 }],
+        ])
+        expect(h.group.positionValidator.validatedAgainst(TOPIC, 0)).toBe(6)
+        expect(h.reset).toHaveBeenCalledTimes(1)
+        expect(h.reset.mock.calls[0][0]).toEqual({ topic: TOPIC, partition: 1 })
+        expect(truncations.map(({ partition }) => partition)).toEqual([1])
+      } finally {
+        jest.useRealTimers()
+        await h.teardown()
+      }
+    })
+
+    test.each([
+      [
+        'a seek of that partition',
+        (h) => h.group.seek({ topic: TOPIC, partition: 0, offset: '300' }),
+        // Partition 0 is fetched first from the seek's offset.
+        ({ cursor }) => expect(cursor).toEqual([0, '300', 5]),
+      ],
+      [
+        'a new tracked epoch at the same position',
+        (h) =>
+          h.offsetManager.resolveOffset({
+            topic: TOPIC,
+            partition: 0,
+            offset: '119',
+            leaderEpoch: 6,
+          }),
+        // Partition 0 is fetched first after a check of its new tracked epoch.
+        ({ cursor, checksBefore }) => {
+          expect(cursor).toEqual([0, '120', 5])
+          expect(checksBefore).toContainEqual([
+            { partition: 0, currentLeaderEpoch: 5, leaderEpoch: 6 },
+          ])
+        },
+      ],
+    ])(
+      'a non-retriable answer superseded by %s while a sibling reset was applied switches validation off nowhere and lets only its own check go',
+      async (_label, supersede, expectFirstFetch) => {
+        const h = await createGroup({ committedEpoch: 4, position: '120' })
+        onFakeTime()
+        const warn = jest.spyOn(h.logger, 'warn')
+        let applyReset
+        h.reset.mockImplementationOnce(() => new Promise((resolve) => (applyReset = resolve)))
+        // First check: partition 0 is refused for good, partition 1's leader no longer knows its
+        // epoch (a reset). Any later check: partition 0's epoch 4 ends at 500, past its position.
+        let checks = 0
+        const rowFor = (partition) => {
+          if (checks > 1) return { partition, leaderEpoch: 4, endOffset: '500' }
+          return partition === 0
+            ? { partition, errorCode: 29 }
+            : { partition, leaderEpoch: -1, endOffset: '-1' }
+        }
+        h.setValidationResponse((partitions) => {
+          checks += 1
+          return offsetForLeaderEpochResponse(partitions.map(rowFor))
+        })
+        // A broker answers exactly the partitions the frame carried.
+        h.setResponse(() =>
+          fetchResponse(
+            h.fetchRequestPartitions().map((partition) => ({ partition, errorCode: 0 }))
+          )
+        )
+        try {
+          const round = h.group.fetch(NODE_ID)
+          await until(() => applyReset !== undefined)
+          // Partition 0's answer was classified while its check was current, and still awaits.
+          const check = h.group.positionValidator.entryOf(TOPIC, 0)
+          expect(h.group.positionValidator.isAwaitingWith(TOPIC, 0, check)).toBe(true)
+
+          supersede(h)
+          applyReset()
+          await round
+
+          expect(h.group.positionValidator.isDisabled()).toBe(false)
+          expect(warn.mock.calls.map(([message]) => message)).not.toContain(
+            'Positions cannot be validated, continuing without validation'
+          )
+          expect(h.group.positionValidator.isAwaitingWith(TOPIC, 0, check)).toBe(false)
+          expect(h.reset).toHaveBeenCalledTimes(1)
+          expect(h.reset.mock.calls[0][0]).toEqual({ topic: TOPIC, partition: 1 })
+
+          // The check it let go never admits, and is no longer the partition's.
+          expect(check.admitted).toBe(false)
+          expect(h.group.positionValidator.entryOf(TOPIC, 0)).not.toBe(check)
+          await h.group.fetch(NODE_ID)
+          expectFirstFetch(firstFetchOfPartition0(h))
+        } finally {
+          jest.useRealTimers()
+          await h.teardown()
+        }
+      }
+    )
+
+    test('a check the answer leaves out, whose partition took a new tracked epoch while it was asked, is let go unvalidated, and partition 0 is fetched only after a check of the new epoch', async () => {
+      const h = await createGroup({ committedEpoch: 4, position: '120' })
+      let check
+      let checks = 0
+      h.setValidationResponse((partitions) => {
+        checks += 1
+        if (checks === 1) {
+          check = h.group.positionValidator.entryOf(TOPIC, 0)
+          h.offsetManager.resolveOffset({
+            topic: TOPIC,
+            partition: 0,
+            offset: '119',
+            leaderEpoch: 6,
+          })
+        }
+        return offsetForLeaderEpochResponse(
+          partitions
+            .filter((partition) => checks > 1 || partition !== 0)
+            .map((partition) => ({ partition, leaderEpoch: 4, endOffset: '500' }))
+        )
+      })
+      // A broker answers exactly the partitions the frame carried.
+      h.setResponse(() =>
+        fetchResponse(h.fetchRequestPartitions().map((partition) => ({ partition, errorCode: 0 })))
+      )
+      try {
+        await h.group.fetch(NODE_ID)
+
+        expect(check.admitted).toBe(false)
+        expect(h.group.positionValidator.entryOf(TOPIC, 0)).not.toBe(check)
+        expect(h.offsetManager.lastConsumedEpoch(TOPIC, 0)).toBe(6)
+
+        await h.group.fetch(NODE_ID)
+
+        const { cursor, checksBefore } = firstFetchOfPartition0(h)
+        expect(cursor).toEqual([0, '120', 5])
+        expect(checksBefore).toContainEqual([
+          { partition: 0, currentLeaderEpoch: 5, leaderEpoch: 6 },
+        ])
+      } finally {
+        await h.teardown()
+      }
+    })
+
+    test('a check whose retries run out after its partition took a new tracked epoch leaves that epoch alone, and partition 0 is fetched only after a check of the new epoch', async () => {
+      const h = await createGroup({ committedEpoch: 4, position: '120' })
+      const validator = h.group.positionValidator
+      const complete = validator.complete.bind(validator)
+      let retries = 0
+      // The new epoch arrives after the last attempt's answer was classified as retriable, so the
+      // attempt is spent, not discarded.
+      jest.spyOn(validator, 'complete').mockImplementation((...args) => {
+        const outcome = complete(...args)
+        if (args[1] === 0 && outcome.action === 'retry' && ++retries === 3) {
+          h.offsetManager.resolveOffset({
+            topic: TOPIC,
+            partition: 0,
+            offset: '119',
+            leaderEpoch: 6,
+          })
+        }
+        return outcome
+      })
+      let checks = 0
+      h.setValidationResponse((partitions) => {
+        checks += 1
+        return offsetForLeaderEpochResponse(
+          partitions.map((partition) =>
+            partition === 0 && checks <= 3
+              ? { partition, errorCode: 6 }
+              : { partition, leaderEpoch: 4, endOffset: '500' }
+          )
+        )
+      })
+      // A broker answers exactly the partitions the frame carried.
+      h.setResponse(() =>
+        fetchResponse(h.fetchRequestPartitions().map((partition) => ({ partition, errorCode: 0 })))
+      )
+      try {
+        await h.group.fetch(NODE_ID)
+
+        expect(retries).toBe(3)
+        expect(h.offsetManager.lastConsumedEpoch(TOPIC, 0)).toBe(6)
+
+        await h.group.fetch(NODE_ID)
+
+        const { cursor, checksBefore } = firstFetchOfPartition0(h)
+        expect(cursor).toEqual([0, '120', 5])
+        expect(checksBefore).toContainEqual([
+          { partition: 0, currentLeaderEpoch: 5, leaderEpoch: 6 },
+        ])
+      } finally {
+        await h.teardown()
+      }
+    })
+
+    test('a seek the log sink of the switch-off warning makes finds validation already off and the refused partition already settled, and applies next round', async () => {
+      // Both partitions are refused for good.
+      const h = await createGroup({ committedEpoch: 4, validationErrorCode: 29 })
+      const atWarning = []
+      h.group.logger = createLogger({
+        level: LEVELS.WARN,
+        logCreator:
+          () =>
+          ({ log }) => {
+            if (log.message !== 'Positions cannot be validated, continuing without validation') {
+              return
+            }
+            atWarning.push({
+              disabled: h.group.positionValidator.isDisabled(),
+              validatedAgainst: h.group.positionValidator.validatedAgainst(TOPIC, 0),
+            })
+            h.group.seek({ topic: TOPIC, partition: 0, offset: '300' })
+          },
+      })
+      // A broker answers exactly the partitions the frame carried.
+      h.setResponse(() =>
+        fetchResponse(h.fetchRequestPartitions().map((partition) => ({ partition, errorCode: 0 })))
+      )
+      try {
+        await h.group.fetch(NODE_ID)
+
+        expect(atWarning).toEqual([{ disabled: true, validatedAgainst: 5 }])
+
+        await h.group.fetch(NODE_ID)
+
+        expect(h.offsetManager.nextOffset(TOPIC, 0).toString()).toEqual('300')
+        expect(h.group.positionValidator.isDisabled()).toBe(true)
+        expect(validationCount(h.requests)).toEqual(1)
+      } finally {
+        await h.teardown()
+      }
+    })
+
+    test.each(MOVES)(
+      '%s while an incremental Fetch carrying partition 0 without sending it waited in the connection queue: that frame is not written, and one frame at the same session epoch forgets partition 0 while partition 1 is fetched',
+      async (_move, move) => {
+        const h = await createGroup({ fetchSessions: true })
+        onFakeTime()
+        const blocker = withheldAnswer()
+        try {
+          // The broker's session 77 holds both partitions at offset 0 and epoch 5.
+          await openRound(h, true)
+          const connection = await h.broker.connectionPool.getConnection()
+          connection.requestQueue.maxInFlightRequests = 1
+          // An unanswered request on the same connection holds its one in-flight slot.
+          h.setValidationResponse(() => blocker.promise)
+          const blocking = h.broker.offsetForLeaderEpoch({
+            topics: [
+              {
+                topic: TOPIC,
+                partitions: [{ partition: 1, currentLeaderEpoch: 5, leaderEpoch: 4 }],
+              },
+            ],
+          })
+          await until(() => h.validationRequests().length === 1)
+          h.setResponse(fetchResponse([HEALTHY], { sessionId: SESSION_ID }))
+
+          // Both partitions are unchanged, so the queued frame would send neither of them.
+          const fetching = h.group.fetch(NODE_ID)
+          await until(() => connection.requestQueue.pending.length === 1)
+          expect(h.fetchFrames()).toHaveLength(1)
+
+          move(h)
+          const epochAfter = h.metadataCache.leaderEpoch(TOPIC, 0)
+          blocker.resolve(
+            offsetForLeaderEpochResponse([{ partition: 1, leaderEpoch: 4, endOffset: '20' }])
+          )
+          await blocking
+          const batches = await fetching
+
+          const frames = h.fetchFrames()
+          expect(frames.map(({ sessionId, sessionEpoch }) => [sessionId, sessionEpoch])).toEqual([
+            [0, 0],
+            [SESSION_ID, 1],
+          ])
+          expect(cursorsOf(frames[1])).toEqual([])
+          expect(frames[1].forgottenTopics.flatMap(({ partitions }) => partitions)).toEqual([0])
+          expect(partitionsOf(batches)).toEqual([1])
+          // The broker accepted that frame: the session holds partition 1 alone, one epoch on.
+          const session = h.group.fetchSessions.active(NODE_ID)
+          expect([session.sessionId, session.epoch]).toEqual([SESSION_ID, 2])
+          expect([...session.partitions.values()].map(({ partition }) => partition)).toEqual([1])
+
+          // The next round checks partition 0 again and sends it back into the session from its
+          // last offset; partition 1 is still carried without being sent.
+          h.setResponse(fetchResponse([{ partition: 0, errorCode: 0 }], { sessionId: SESSION_ID }))
+          await h.group.fetch(NODE_ID)
+          const next = h.fetchFrames()[2]
+          expect([next.sessionId, next.sessionEpoch]).toEqual([SESSION_ID, 2])
+          expect(cursorsOf(next)).toEqual([[0, '0', epochAfter]])
+          expect(next.forgottenTopics).toEqual([])
+        } finally {
+          jest.useRealTimers()
+          await h.teardown()
+        }
+      }
+    )
+
+    test('a frame whose admissions all still stand is checked with one comparison, and a lapse of a partition it does not carry walks it once and writes it whole', async () => {
+      // Partition 1 is led by node 1, so node 0's request carries partition 0 alone.
+      const h = await createGroup({
+        knownNodes: [NODE_ID, 1],
+        partitionLeaders: { 0: NODE_ID, 1: 1 },
+      })
+      onFakeTime()
+      try {
+        const walk = jest.spyOn(h.group, 'lapsedAdmission')
+        h.setResponse(fetchResponse([{ partition: 0, errorCode: 0, records: true }]))
+        expect(partitionsOf(await h.group.fetch(NODE_ID))).toEqual([0])
+        expect(walk).not.toHaveBeenCalled()
+
+        // Partition 1 gets an admitting entry of its own, then moves while node 0's request waits
+        // for its broker.
+        await h.group.validatePositions([{ topic: TOPIC, partitions: [1] }])
+        expect(h.group.positionValidator.entryOf(TOPIC, 1).admitted).toBe(true)
+        const lookups = h.findBrokerCalls.length
+        const release = h.holdBrokerLookup(NODE_ID)
+        h.setResponse(fetchResponse([{ partition: 0, errorCode: 0, records: true }]))
+        const fetching = h.group.fetch(NODE_ID)
+        await until(() => h.findBrokerCalls.length > lookups)
+        h.metadataCache.applyLeaderHint(TOPIC, 1, { leaderId: 1, leaderEpoch: 6 })
+        release()
+
+        expect(partitionsOf(await fetching)).toEqual([0])
+        expect(walk).toHaveBeenCalledTimes(1)
+        expect(walk.mock.results[0].value).toBeNull()
+        expect(h.fetchFrames().map(cursorsOf)).toEqual([[[0, '0', 5]], [[0, '0', 5]]])
+      } finally {
+        jest.useRealTimers()
+        await h.teardown()
+      }
+    })
+
+    test('the group subscribes once, before its first check records anything, and its stop removes the subscription', async () => {
+      const h = await createGroup()
+      onFakeTime()
+      try {
+        const listeners = h.metadataCache.partitionListeners
+        expect(listeners.size).toBe(0)
+
+        await openRound(h, false)
+        expect(listeners.size).toBe(1)
+        expect(h.group.positionValidator.entryOf(TOPIC, 0).admitted).toBe(true)
+        await h.group.fetch(NODE_ID)
+        h.group.startIdleWait()
+        await h.group.fetch(NODE_ID)
+        expect(listeners.size).toBe(1)
+
+        h.group.onStopRequested()
+        expect(listeners.size).toBe(0)
+        await h.group.validatePositions([{ topic: TOPIC, partitions: [0, 1] }])
+        expect(listeners.size).toBe(0)
+      } finally {
+        jest.useRealTimers()
+        await h.teardown()
+      }
+    })
+
+    test('a cluster that cannot report partition routing fails the round loudly instead of fetching nothing', async () => {
+      const h = await createGroup()
+      onFakeTime()
+      try {
+        h.cluster.onPartitionRouted = undefined
+
+        await expect(h.group.fetch(NODE_ID)).rejects.toThrow(TypeError)
+        expect(h.group.positionValidator.entryOf(TOPIC, 0)).toBeUndefined()
+        expect(h.fetchFrames()).toEqual([])
+      } finally {
+        jest.useRealTimers()
+        await h.teardown()
+      }
+    })
   })
 })

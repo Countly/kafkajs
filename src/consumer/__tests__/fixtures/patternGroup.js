@@ -62,6 +62,7 @@ const createPatternGroup = ({
     findGroupCoordinator: jest.fn(async () => ({ isConnected: () => true })),
     addMultipleTargetTopics: jest.fn(async () => {}),
     leaderEpoch: () => -1,
+    onPartitionRouted: () => () => {},
     defaultOffset: ({ fromBeginning }) => (fromBeginning ? '-2' : '-1'),
     fetchTopicsOffset: jest.fn(async (topics) =>
       topics.map(({ topic, partitions }) => ({

@@ -6,7 +6,15 @@ const Cluster = require('../../cluster')
 const createFetcher = require('../fetcher')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { newLogger } = require('testHelpers')
-const { createFetchGroup, fetchResponse, NODE_ID, TOPIC } = require('./fixtures/fetchHarness')
+const {
+  createFetchGroup,
+  fetchResponse,
+  trackFixtures,
+  NODE_ID,
+  TOPIC,
+} = require('./fixtures/fetchHarness')
+
+trackFixtures()
 
 /** @returns {object} an idle group with no transport or offset work */
 const idleGroup = () => {
@@ -143,7 +151,8 @@ describe('idle waiter ownership', () => {
   })
 })
 
-const fakeTimers = () => jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick'] })
+const fakeTimers = () =>
+  jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] })
 
 /** @returns {Promise<void>} lets virtual time and the continuations it releases run */
 const settle = async () => {
@@ -249,10 +258,9 @@ const trackRegistrations = (fence) => {
 
 describe('idle wait on a real fetch round', () => {
   let h
-  afterEach(async () => {
+  afterEach(() => {
     jest.clearAllTimers()
     jest.useRealTimers()
-    if (h) await h.broker.disconnect()
   })
 
   /** @returns {Promise<object>} a group whose every partition is paused, ready for idle rounds */
@@ -410,7 +418,7 @@ describe('idle wait on a real fetch round', () => {
       await finish(pending)
     })
 
-    it('re-filtering only before the build admits a partition it never prepared', async () => {
+    it('re-filtering only before the build hands it a partition no step prepared, and the validation rule keeps that partition out of the frame', async () => {
       await destination()
       const held = gate()
       const events = instrument(h, {
@@ -426,8 +434,17 @@ describe('idle wait on a real fetch round', () => {
       await drain()
       await moves[1][1](h)
       held.release()
+      await drain()
+      // The broken preparation sought and validated nothing on node 1, then built partition 0.
+      expect(events.filter(([label]) => label !== 'frame')).toEqual([
+        ['seek', [[]]],
+        ['validate', [[]]],
+        ['build', [[0]]],
+      ])
+      expect(h.group.positionValidator.validatedAgainst(TOPIC, 0)).toBeUndefined()
+      expect(events.some(([label]) => label === 'frame')).toBe(false)
+      h.group.onStopRequested()
       await finish(pending)
-      expect(() => expectPreparedBeforeSend(events)).toThrow()
     })
 
     it('a preferred replica dropped during the held await moves the partition back to its leader', async () => {
@@ -665,7 +682,6 @@ describe('idle wait on a real fetch round', () => {
         timers.mockRestore()
         h.group.onStopRequested()
         await h.broker.disconnect()
-        h = null
         expect(name).toEqual(expect.any(String))
       }
     } finally {
@@ -772,10 +788,9 @@ describe('idle wait on a real fetch round', () => {
 
 describe('bounded fetch preparation', () => {
   let h
-  afterEach(async () => {
+  afterEach(() => {
     jest.clearAllTimers()
     jest.useRealTimers()
-    if (h) await h.broker.disconnect()
   })
 
   /** Stops a runaway preparation so a regression fails an assertion instead of hanging. */
@@ -989,11 +1004,10 @@ describe('stop during an unresolved preparation', () => {
     unhandled.length = 0
     process.on('unhandledRejection', onUnhandled)
   })
-  afterEach(async () => {
+  afterEach(() => {
     process.off('unhandledRejection', onUnhandled)
     jest.clearAllTimers()
     jest.useRealTimers()
-    if (h) await h.broker.disconnect()
   })
 
   const kinds = {
@@ -1027,7 +1041,7 @@ describe('stop during an unresolved preparation', () => {
             topics: [
               {
                 topic: TOPIC,
-                partitions: [{ partition: 0, errorCode: 0, leaderEpoch: 4, endOffset: '4' }],
+                partitions: [{ partition: 0, errorCode: 0, leaderEpoch: 3, endOffset: '4' }],
               },
             ],
           },
@@ -1115,7 +1129,7 @@ describe('stop during an unresolved preparation', () => {
               topics: [
                 {
                   topic: TOPIC,
-                  partitions: [{ partition: 0, errorCode: 0, leaderEpoch: 4, endOffset: '20' }],
+                  partitions: [{ partition: 0, errorCode: 0, leaderEpoch: 3, endOffset: '20' }],
                 },
               ],
             }
@@ -1171,10 +1185,9 @@ describe('stop during an unresolved preparation', () => {
 
 describe('idle registration boundary', () => {
   let h
-  afterEach(async () => {
+  afterEach(() => {
     jest.clearAllTimers()
     jest.useRealTimers()
-    if (h) await h.broker.disconnect()
   })
 
   const pausedRound = async () => {
@@ -1394,11 +1407,6 @@ describe('run fence and preparation snapshot', () => {
 })
 
 describe('a refused guard stops the broker request before it is written', () => {
-  let h
-  afterEach(async () => {
-    if (h) await h.broker.disconnect()
-  })
-
   it.each([
     ['fetch', { topics: [{ topic: TOPIC, partitions: [{ partition: 0, fetchOffset: '0' }] }] }],
     ['listOffsets', { topics: [{ topic: TOPIC, partitions: [{ partition: 0 }] }] }],
@@ -1408,7 +1416,7 @@ describe('a refused guard stops the broker request before it is written', () => 
       { topics: [{ topic: TOPIC, partitions: [{ partition: 0, leaderEpoch: 1 }] }] },
     ],
   ])('%s', async (method, request) => {
-    h = await createFetchGroup()
+    const h = await createFetchGroup()
     const refusal = new Error('refused by the round')
     const written = h.requests().length
     await expect(h.broker[method]({ ...request, guard: () => refusal })).rejects.toBe(refusal)
@@ -1424,11 +1432,10 @@ describe('terminal run cancellation of work started by a run', () => {
     unhandled.length = 0
     process.on('unhandledRejection', onUnhandled)
   })
-  afterEach(async () => {
+  afterEach(() => {
     process.off('unhandledRejection', onUnhandled)
     jest.clearAllTimers()
     jest.useRealTimers()
-    if (h) await h.broker.disconnect()
   })
 
   /** Retires the running run and starts its replacement, as a stop and restart do. */
@@ -1439,11 +1446,19 @@ describe('terminal run cancellation of work started by a run', () => {
     return retired
   }
 
-  /** Routes `cluster.applyLeaderHint` through the production method over a held endpoint step. */
+  /**
+   * Routes `cluster.applyLeaderHint` through the production method, whose endpoint step waits for
+   * `endpoints` and then runs the production step, commit included, over a table holding node 1.
+   */
   const holdEndpoints = (endpoints) => {
     const owner = new Cluster({ logger: newLogger(), brokers: ['node0:9092'] })
     owner.metadataCache = h.metadataCache
-    jest.spyOn(owner.brokerPool, 'applyNodeEndpoints').mockImplementation(endpoints)
+    owner.brokerPool.brokers[1] = { connectionPool: { host: 'node1', port: 9092 } }
+    const apply = owner.brokerPool.applyNodeEndpoints.bind(owner.brokerPool)
+    jest.spyOn(owner.brokerPool, 'applyNodeEndpoints').mockImplementation(async (...args) => {
+      await endpoints()
+      return apply(...args)
+    })
     h.cluster.applyLeaderHint = jest.fn(owner.applyLeaderHint.bind(owner))
   }
 

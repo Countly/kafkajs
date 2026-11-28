@@ -268,9 +268,10 @@ export interface ProducerConfig extends ClientTelemetryConfig {
   maxInFlightRequests?: number | null
   /**
    * ms a partition's batch waits for records of further sends before it goes out. An integer
-   * from 0 to 2147483647; defaults to 5 (Java parity). A lone send waits up to this long; 0 sends
-   * at once - on an idempotent producer still merging the sends that queue behind a partition's
-   * batch in flight.
+   * from 0 to 2147483647; defaults to 0, which sends at once. Sends made in the same turn of the
+   * event loop still merge into one request, and an idempotent producer still merges the sends
+   * that queue behind a partition's batch in flight. Above 0, a lone send waits up to this long
+   * for more records; use it to batch more under many independent callers.
    */
   linger?: number
   /**
@@ -282,8 +283,8 @@ export interface ProducerConfig extends ClientTelemetryConfig {
    * Bound, in ms, on the waiting and the retries of one send (KIP-91); past it the send rejects
    * with `KafkaJSDeliveryTimeout`. Defaults to `retry.maxTotalTime` when that is set, else to
    * 120000 (Java parity), raised to `linger + requestTimeout` when that is larger. An explicit
-   * value is an integer of at least `linger + requestTimeout` (5 ms more than `requestTimeout` at
-   * the default `linger`) and at most 2147483647. The bound runs from the send and includes the
+   * value is an integer of at least `linger + requestTimeout` (`requestTimeout` at the default
+   * `linger`) and at most 2147483647. The bound runs from the send and includes the
    * wait for `linger` and, on an idempotent producer, for the producer id. A queued or on-wire
    * request settles at the deadline; a late answer cannot settle the send again.
    */

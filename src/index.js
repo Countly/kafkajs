@@ -582,7 +582,7 @@ module.exports = class Client {
    * `idempotent: true` or a `transactionalId` asked for it.
    * @public
    * @param {object} [options]
-   * @param {number} [options.linger=5] ms a batch waits for more records; 0 sends it at once
+   * @param {number} [options.linger=0] ms a batch waits for more records; 0 sends it at once
    * @param {number} [options.batchSize=16384] bytes of keys and values at which a batch is sent
    * @param {number} [options.deliveryTimeout] ms bounding the waiting and the retries of one send,
    *   at least `linger + requestTimeout`. A request already sent settles on its answer or on

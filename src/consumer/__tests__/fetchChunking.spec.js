@@ -2,7 +2,15 @@ const fs = require('fs')
 const path = require('path')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { mulberry32 } = require('../../../testHelpers/fuzz')
-const { TOPIC, TOPIC_ID, apiVersionsBody, createFakeBroker } = require('./fixtures/fetchHarness')
+const {
+  TOPIC,
+  TOPIC_ID,
+  apiVersionsBody,
+  createFakeBroker,
+  trackFixtures,
+} = require('./fixtures/fetchHarness')
+
+trackFixtures()
 
 const directory = path.join(__dirname, '../../protocol/requests/fetch/fixtures')
 const sessionDirectory = path.join(directory, 'java')

@@ -420,6 +420,25 @@ describe('Cluster > a coordinator answer that names a known node at a new addres
     'a suspended leader hint cannot publish its later rows after %s',
     async (boundary) => {
       const pool = cluster.brokerPool
+      cluster.metadataCache.update({
+        brokers: [],
+        topicMetadata: [
+          {
+            topicErrorCode: 0,
+            topic: 'topic',
+            partitionMetadata: [
+              {
+                partitionErrorCode: 0,
+                partitionId: 0,
+                leader: SEED.id,
+                leaderEpoch: 0,
+                replicas: [SEED.id],
+                isr: [SEED.id],
+              },
+            ],
+          },
+        ],
+      })
       const held = holdBuild(cluster, OTHER.host)
       const publishHint = jest.spyOn(cluster.metadataCache, 'applyLeaderHint')
       const hint = outcome(
@@ -534,6 +553,16 @@ describe('Cluster > a coordinator answer that names a known node at a new addres
       expect(winner.nodeId).toBe(SEED.id)
       expect(winner.connectionPool.host).toBe(destinations[newer].host)
       expect(winner === seed).toBe(newer === 'seed adoption')
+      // No claim is left pending, and every node is installed where its newest claim points.
+      for (const [nodeId, route] of pool.endpointOrder.routes) {
+        const installed = pool.brokers[nodeId]?.connectionPool
+        expect([nodeId, route.settled, installed && `${installed.host}:${installed.port}`]).toEqual(
+          [nodeId, true, route.address]
+        )
+      }
+      expect(Object.keys(pool.brokers).every((nodeId) => pool.endpointOrder.route(nodeId))).toBe(
+        true
+      )
     } finally {
       letGo(gate)
       held.release()
@@ -587,6 +616,182 @@ describe('Cluster > a coordinator answer that names a known node at a new addres
     } finally {
       letGo(gate)
     }
+  })
+
+  /**
+   * Holds the first pool build for each of `hosts` until its `release` is called; later builds and
+   * other hosts are built at once.
+   * @param {string[]} hosts
+   * @returns {{ held: { host: string, release: () => void }[], reached: (count: number) => Promise<void> }}
+   *   the held builds in call order, and a wait for the first `count` of them
+   */
+  const holdFirstBuilds = (hosts) => {
+    const builder = cluster.connectionPoolBuilder
+    const build = builder.build.bind(builder)
+    const held = []
+    const waits = []
+    jest.spyOn(builder, 'build').mockImplementation(async (destination) => {
+      const host = destination?.host
+      if (hosts.includes(host) && !held.some((gate) => gate.host === host)) {
+        const released = new Promise((release) => held.push({ host, release }))
+        for (const wait of waits) if (held.length >= wait.count) wait.resolve()
+        await released
+      }
+      return build(destination)
+    })
+    const reached = (count) =>
+      held.length >= count
+        ? Promise.resolve()
+        : new Promise((resolve) => waits.push({ count, resolve }))
+    return { held, reached }
+  }
+
+  it.each([
+    ['after the Metadata writer lost to it', 'metadata first'],
+    ['while the Metadata writer still builds', 'hint first'],
+  ])(
+    'a hint cancelled before it writes leaves the node to the Metadata response that names the same address, %s',
+    async (_, release) => {
+      const pool = cluster.brokerPool
+      const { held, reached } = holdFirstBuilds([MOVED.host, OTHER.host])
+      listed = MOVED
+      const refreshing = cluster.refreshMetadata()
+      await reached(1)
+      const generation = new Generation()
+      const hint = outcome(
+        pool.applyNodeEndpoints(
+          [
+            { nodeId: OTHER.id, host: OTHER.host, port: OTHER.port, rack: null },
+            { nodeId: COORDINATOR.id, host: MOVED.host, port: MOVED.port, rack: 'rack-1' },
+          ],
+          { fence: generation }
+        )
+      )
+      await reached(2)
+      const closed = new Error('the producer closed')
+      if (release === 'metadata first') {
+        held[0].release()
+        await refreshing
+        expect(pool.brokers[COORDINATOR.id].connectionPool.host).toBe(COORDINATOR.host)
+        generation.close(closed)
+        held[1].release()
+        expect((await hint).error).toBe(closed)
+        expect(pool.brokers[COORDINATOR.id].connectionPool.host).toBe(COORDINATOR.host)
+        await cluster.refreshMetadata()
+      } else {
+        generation.close(closed)
+        held[1].release()
+        expect((await hint).error).toBe(closed)
+        held[0].release()
+        await refreshing
+      }
+      await cluster.refreshMetadata()
+
+      const broker = await cluster.findBroker({ nodeId: COORDINATOR.id })
+      expect(broker.connectionPool.host).toBe(MOVED.host)
+      expect(pool.hasNode(OTHER.id)).toBe(false)
+      await broker.heartbeat(HEARTBEAT)
+      expect(heartbeatNodes()).toEqual([MOVED.id])
+      expect(seam.tally('FindCoordinator')).toBe(0)
+    }
+  )
+
+  it('departed node ids leave no routing state behind, and an answer held from before a departure still loses', async () => {
+    const pool = cluster.brokerPool
+    const seed = await cluster.findBroker({ nodeId: SEED.id })
+    jest
+      .spyOn(pool, 'withBroker')
+      .mockImplementationOnce((callback) => callback({ nodeId: SEED.id, broker: seed }))
+    const gate = seam.schedule.hold({ api: 'FindCoordinator' })
+    try {
+      const lookup = outcome(cluster.findGroupCoordinator({ groupId: GROUP }))
+      await gate.arrived()
+      for (let nodeId = 20; nodeId < 40; nodeId++) {
+        seam.answer('Metadata', () => ({
+          brokers: [
+            { nodeId: SEED.id, host: SEED.host, port: SEED.port, rack: 'rack-0' },
+            { nodeId, host: `rotated-${nodeId}`, port: 9092, rack: null },
+          ],
+          controllerId: SEED.id,
+          topics: [],
+        }))
+        await cluster.refreshMetadata()
+        expect(Object.keys(pool.brokers).sort()).toEqual([String(nodeId), String(SEED.id)].sort())
+        expect(pool.endpointOrder.routes.size).toBe(2)
+        expect(pool.metadataEndpointRows.size).toBe(2)
+        expect(pool.setupMetadataEndpoints.size).toBe(2)
+      }
+
+      gate.release(coordinatorAnswer(COORDINATOR))
+      const { error } = await lookup
+
+      expect(error).toMatchObject({ cause: { name: 'KafkaJSBrokerNotFound' } })
+      expect(pool.hasNode(COORDINATOR.id)).toBe(false)
+      expect(pool.endpointOrder.routes.size).toBe(2)
+      expect(pool.coordinatorNodes.size).toBe(0)
+    } finally {
+      letGo(gate)
+    }
+  })
+
+  it.each([
+    ['takes the node back to its listed address', COORDINATOR],
+    ['removes the node it no longer lists', null],
+  ])(
+    'once its lookup names another node, a route a coordinator answer moved is retired: the next Metadata response %s',
+    async (_, row) => {
+      const pool = cluster.brokerPool
+      at = MOVED
+      const moved = await cluster.findGroupCoordinator({ groupId: GROUP })
+      expect(moved.connectionPool.host).toBe(MOVED.host)
+      listed = row
+      await cluster.refreshMetadata()
+      expect(pool.brokers[COORDINATOR.id]).toBe(moved)
+      expect(moved.retired).toBe(false)
+
+      seam.answer('FindCoordinator', ({ coordinatorKeys }) => ({
+        coordinators: coordinatorKeys.map((key) => ({
+          key,
+          nodeId: SEED.id,
+          host: SEED.host,
+          port: SEED.port,
+          errorCode: 0,
+          errorMessage: null,
+        })),
+      }))
+      const seed = await cluster.findGroupCoordinator({ groupId: GROUP })
+      expect(seed.nodeId).toBe(SEED.id)
+      expect(pool.coordinatorNodes.size).toBe(0)
+      await cluster.refreshMetadata()
+
+      expect(moved.retired).toBe(true)
+      if (row) {
+        expect(pool.brokers[COORDINATOR.id].connectionPool.host).toBe(COORDINATOR.host)
+      } else {
+        expect(pool.hasNode(COORDINATOR.id)).toBe(false)
+        expect(pool.endpointOrder.route(COORDINATOR.id)).toBeUndefined()
+      }
+    }
+  )
+
+  it('an answer at the address the table holds does not stop a later Metadata response from changing the rack', async () => {
+    const current = cluster.brokerPool.brokers[COORDINATOR.id]
+    expect(current.connectionPool.rack).toBe('rack-1')
+    expect(await cluster.findGroupCoordinator({ groupId: GROUP })).toBe(current)
+    seam.answer('Metadata', () => ({
+      brokers: [
+        { nodeId: SEED.id, host: SEED.host, port: SEED.port, rack: 'rack-0' },
+        { nodeId: COORDINATOR.id, host: COORDINATOR.host, port: COORDINATOR.port, rack: 'rack-2' },
+      ],
+      controllerId: SEED.id,
+      topics: [],
+    }))
+
+    await cluster.refreshMetadata()
+    expect(cluster.brokerPool.brokers[COORDINATOR.id]).toBe(current)
+    expect(current.connectionPool.rack).toBe('rack-2')
+    await cluster.refreshMetadata()
+    expect(current.connectionPool.rack).toBe('rack-2')
   })
 })
 
