@@ -356,6 +356,8 @@ describe('discovery through a consumer group', () => {
     // A local position must not bypass the unresolved-incarnation gate.
     group.offsetManager.committedOffsets()['orders-1'][0] = '0'
     group.offsetManager.committedOffsets()['orders-1'][1] = '0'
+    // Validated first, as every fetch round does, so only the incarnation gate can leave it out.
+    await group.validatePositions([{ topic: 'orders-1', partitions: [0, 1] }])
     expect(group.buildFetchRequests([{ topic: 'orders-1', partitions: [0, 1] }])).toEqual([])
     cluster.topicId = topicId
     harness.set('orders-1', ID_B)
@@ -363,6 +365,7 @@ describe('discovery through a consumer group', () => {
     await harness.round()
     await group.offsetManager.resolveOffsets()
     expect(nextOffset(harness, 'orders-1')).toBe('0')
+    await group.validatePositions([{ topic: 'orders-1', partitions: [0, 1] }])
     expect(group.buildFetchRequests([{ topic: 'orders-1', partitions: [0, 1] }])).toHaveLength(1)
   })
 

@@ -25,7 +25,17 @@ const UNKNOWN_EPOCH = -1
  *   flight: every exit is either performed by `complete()` (validated, truncated, reset,
  *   discarded) or by the caller through `markValidated()`, `clear()` or `forgetTopic()`.
  * - **validated** — `validatedAgainst` holds the leader epoch the position was checked against.
- *   The partition is re-examined only when the cached leader epoch differs from it.
+ *   The partition is re-examined when the cached leader epoch differs from it, or once `revoke()`
+ *   dropped the entry.
+ *
+ * A validated entry is also the admission token of the data fetched under it: its `admitted` field
+ * is true from the moment it is recorded until it is replaced or dropped, which every mutation
+ * here does synchronously. The consumer group calls `revoke()` from the metadata cache's
+ * notification of every change of the partition's leader or leader epoch, so a leader that moved
+ * away and back to the same epoch ends the entry too. A holder of the entry therefore answers "may
+ * this data still be used" with one field read. `revision` advances each time an admitting entry
+ * stops admitting, so a holder of many entries that saw them all admit at one revision knows they
+ * still do while the revision is unchanged, without reading any of them.
  *
  * Every mutation is idempotent per key and last-writer-wins: fetchers run one per node and a
  * partition normally belongs to one of them per round, but that is best-effort rather than an
@@ -44,6 +54,47 @@ module.exports = class PositionValidator {
     this.entries = new Map()
     this.assignmentGeneration = 0
     this.disabled = false
+    /** @type {number} advances each time an admitting entry stops admitting */
+    this.revision = 0
+  }
+
+  /**
+   * Ends the admission of an entry that is being replaced or dropped. The revision wraps from the
+   * largest safe integer to the smallest, so it changes on every revocation: `++` alone stops
+   * advancing at 2^53.
+   * @param {{admitted: boolean}} entry
+   * @returns {void}
+   */
+  #revokeEntry(entry) {
+    if (!entry.admitted) return
+    entry.admitted = false
+    this.revision =
+      this.revision === Number.MAX_SAFE_INTEGER ? Number.MIN_SAFE_INTEGER : this.revision + 1
+  }
+
+  /**
+   * Sets the entry of `key`. The entry it replaces stops admitting at once, so whoever holds it
+   * learns that from the entry itself.
+   * @param {string} key
+   * @param {object} next
+   * @returns {void}
+   */
+  #put(key, next) {
+    const previous = this.entries.get(key)
+    if (previous !== undefined) this.#revokeEntry(previous)
+    this.entries.set(key, next)
+  }
+
+  /**
+   * Removes the entry of `key`; it stops admitting at once.
+   * @param {string} key
+   * @returns {void}
+   */
+  #drop(key) {
+    const previous = this.entries.get(key)
+    if (previous === undefined) return
+    this.#revokeEntry(previous)
+    this.entries.delete(key)
   }
 
   /**
@@ -80,12 +131,13 @@ module.exports = class PositionValidator {
     }
 
     if (this.disabled || trackedEpoch === UNKNOWN_EPOCH || currentLeaderEpoch === UNKNOWN_EPOCH) {
-      this.markValidated(topic, partition, currentLeaderEpoch)
+      this.markValidated(topic, partition, currentLeaderEpoch, generation)
       return { action: 'validated', generation }
     }
 
-    this.entries.set(key, {
+    this.#put(key, {
       validatedAgainst: undefined,
+      admitted: false,
       pending: { offset, trackedEpoch, currentLeaderEpoch },
     })
 
@@ -117,8 +169,9 @@ module.exports = class PositionValidator {
       return false
     }
 
-    this.entries.set(this.getKey(topic, partition), {
+    this.#put(this.getKey(topic, partition), {
       validatedAgainst: currentLeaderEpoch,
+      admitted: true,
       pending: null,
     })
 
@@ -204,9 +257,7 @@ module.exports = class PositionValidator {
     }
 
     const { pending } = entry
-    const positionMoved =
-      currentPosition.offset !== pending.offset ||
-      currentPosition.trackedEpoch !== pending.trackedEpoch
+    const positionMoved = !this.describes(entry, currentPosition)
 
     if (seekQueued || positionMoved) {
       entry.pending = null
@@ -224,7 +275,7 @@ module.exports = class PositionValidator {
 
     const end = Long.fromValue(endOffset)
 
-    this.markValidated(topic, partition, pending.currentLeaderEpoch)
+    this.markValidated(topic, partition, pending.currentLeaderEpoch, generation)
 
     if (end.equals(UNKNOWN_EPOCH) || Long.fromValue(leaderEpoch).equals(UNKNOWN_EPOCH)) {
       return { action: 'reset', divergingOffset: null, leaderEpoch: UNKNOWN_EPOCH }
@@ -256,8 +307,53 @@ module.exports = class PositionValidator {
   release(entries) {
     for (const { topic, partition, entry } of entries) {
       const key = this.getKey(topic, partition)
-      if (this.entries.get(key) === entry) this.entries.delete(key)
+      if (this.entries.get(key) === entry) this.#drop(key)
     }
+  }
+
+  /**
+   * Drops the state of one partition whose cached leader or leader epoch changed, or of every
+   * partition of `topic` (no `partition`), or of every partition (no `topic`), so it is validated
+   * again before it is fetched. A request in flight for it is dropped with it: its reply finds no
+   * entry of its own and applies nothing.
+   * @param {string} [topic]
+   * @param {number} [partition]
+   * @returns {void}
+   */
+  revoke(topic, partition) {
+    if (partition !== undefined) {
+      this.#drop(this.getKey(topic, partition))
+      return
+    }
+    const prefix = topic === undefined ? '' : `${topic}|`
+    for (const key of [...this.entries.keys()]) {
+      if (key.startsWith(prefix)) this.#drop(key)
+    }
+  }
+
+  /**
+   * Whether `entry`, captured when its request was made, is still the partition's entry and still
+   * awaiting that answer: not replaced, dropped, completed or discarded since. Only then may a
+   * caller that never got a usable answer move the partition on.
+   * @param {string} topic
+   * @param {number} partition
+   * @param {object} entry the entry `entryOf` returned after `request()`
+   * @returns {boolean}
+   */
+  isAwaitingWith(topic, partition, entry) {
+    return this.entries.get(this.getKey(topic, partition)) === entry && entry.pending !== null
+  }
+
+  /**
+   * Whether an awaiting entry still describes the position read now: the offset and the tracked
+   * epoch it asked about are the partition's current ones.
+   * @param {{pending: {offset: string, trackedEpoch: number}|null}} entry
+   * @param {{offset: string, trackedEpoch: number}} currentPosition read again now
+   * @returns {boolean} false as well for an entry that awaits nothing
+   */
+  describes(entry, { offset, trackedEpoch }) {
+    const { pending } = entry
+    return pending !== null && pending.offset === offset && pending.trackedEpoch === trackedEpoch
   }
 
   /**
@@ -309,7 +405,7 @@ module.exports = class PositionValidator {
    */
   forgetTopic(topic, partitions) {
     for (const partition of partitions || []) {
-      this.entries.delete(this.getKey(topic, partition))
+      this.#drop(this.getKey(topic, partition))
     }
   }
 
@@ -329,7 +425,7 @@ module.exports = class PositionValidator {
   forgetPartitions(topicPartitions) {
     for (const { topic, partitions } of topicPartitions) {
       for (const partition of partitions) {
-        this.entries.delete(this.getKey(topic, partition))
+        this.#drop(this.getKey(topic, partition))
       }
     }
   }
@@ -342,6 +438,7 @@ module.exports = class PositionValidator {
    * @returns {void}
    */
   clear() {
+    for (const entry of this.entries.values()) this.#revokeEntry(entry)
     this.entries.clear()
     this.disabled = false
     this.assignmentGeneration++

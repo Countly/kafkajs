@@ -445,3 +445,69 @@ describe('share disconnect after coordinator transport recovery', () => {
     }
   )
 })
+
+describe('share membership and a coordinator that keeps its node id at a new address', () => {
+  /** Node 0's address after it moved; the scripted cluster calls this endpoint node 2. */
+  const MOVED = { id: 2, host: 'node2', port: 9092 }
+  let h
+  let run
+
+  afterEach(async () => {
+    await h?.close()
+    h = run = undefined
+    jest.restoreAllMocks()
+  })
+
+  test('heartbeats at the new address the lookup names after NOT_COORDINATOR, with no rejoin', async () => {
+    const start = ShareRun.prototype.start
+    jest.spyOn(ShareRun.prototype, 'start').mockImplementation(function () {
+      run = this
+      return start.call(this)
+    })
+    h = shareClient({
+      nodes: 3,
+      interval: 20,
+      kafka: { brokers: ['node0:9092'] },
+      topics: { 'topic-a': { topicId: A, partitions: [{ leader: 1, epoch: 1 }] } },
+    })
+    const listed = h.cluster.answerers.get('Metadata')
+    h.cluster.answer('Metadata', (...args) => {
+      const answer = listed(...args)
+      return { ...answer, brokers: answer.brokers.filter(({ nodeId }) => nodeId !== MOVED.id) }
+    })
+    const joined = h.hold({
+      api: 'ShareGroupHeartbeat',
+      match: ({ fields }) => fields.memberEpoch === 1,
+    })
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({ eachMessage: async () => {} })
+    await joined.arrived()
+    const { memberId, token } = run.membership
+    const beatsBefore = h.frames(76).length
+
+    h.cluster.answer('FindCoordinator', ({ coordinatorKeys }) => ({
+      coordinators: coordinatorKeys.map((key) => ({
+        key,
+        nodeId: 0,
+        host: MOVED.host,
+        port: MOVED.port,
+        errorCode: 0,
+        errorMessage: null,
+      })),
+    }))
+    const reached = h.hold({ api: 'ShareGroupHeartbeat', node: MOVED.id })
+    const next = h.hold({ api: 'ShareGroupHeartbeat', node: MOVED.id })
+    joined.release({ errorCode: 16 })
+    const beat = await reached.arrived()
+    reached.release()
+    const nextBeat = await next.arrived()
+    next.release()
+
+    const after = h.frames(76).slice(beatsBefore)
+    expect(joined.call).toMatchObject({ node: 0 })
+    expect(after.map(({ fields }) => fields.memberEpoch)).not.toContain(0)
+    expect(beat.fields).toMatchObject({ memberId, memberEpoch: 1 })
+    expect(nextBeat.fields).toMatchObject({ memberId, memberEpoch: 1 })
+    expect(run.membership.token).toBe(token)
+  })
+})

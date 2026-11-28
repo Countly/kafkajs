@@ -105,6 +105,7 @@ const createGroup = async ({
     topicId: (topic) => topicIds[topic],
     leaderEpoch: (topic, partition) =>
       leaderEpochs[partition] === undefined ? -1 : leaderEpochs[partition],
+    onPartitionRouted: () => () => {},
     hasNode: () => true,
   }
 

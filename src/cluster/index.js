@@ -1,4 +1,5 @@
 const Broker = require('../broker')
+const { ON_WRITE } = require('../broker/privateOptions')
 const { checked, waitOf, shareMetadata, retrierOf, sharedSetup } = require('../admin/deadline')
 const describeThrown = require('../network/describeThrown')
 const BrokerPool = require('./brokerPool')
@@ -209,6 +210,11 @@ module.exports = class Cluster {
     this.logger = rootLogger.namespace('Cluster')
     this.retryOptions = { ...retry }
     this.retrier = (action) => retrierOf(this.retryOptions)(action)
+    /**
+     * Each FindCoordinator answer by the `BrokerPool#endpointStamp` taken as its request was sent.
+     * @type {WeakMap<object, number>}
+     */
+    this.coordinatorAnswerStamps = new WeakMap()
     this.connectionPoolBuilder = connectionPoolBuilder({
       telemetryMetrics,
       logger: rootLogger,
@@ -1568,6 +1574,19 @@ module.exports = class Cluster {
   }
 
   /**
+   * Subscribes to the routing of single partitions (`MetadataCache#onPartitionRouted`): the
+   * handler runs synchronously, after the change is visible, each time the cache accepts another
+   * leader or leader epoch for a partition, learns it, or forgets it; with no partition for a whole
+   * topic and with no arguments for everything. Internal seam for the consumer, which drops a
+   * partition's position validation there; not on the public Cluster surface.
+   * @param {(topic?: string, partition?: number) => void} handler
+   * @returns {() => void} idempotent unsubscribe
+   */
+  onPartitionRouted(handler) {
+    return this.metadataCache.onPartitionRouted(handler)
+  }
+
+  /**
    * Whether the broker table currently holds a node with this id. Used before trusting a leader
    * hint that carries no endpoint for the node it names.
    * @param {number|string} nodeId
@@ -1578,26 +1597,28 @@ module.exports = class Cluster {
   }
 
   /**
-   * Applies a leader hint a produce error carried (KIP-951): the broker that now owns the
+   * Applies a leader hint a Produce or Fetch error carried (KIP-951): the broker that now owns the
    * partition, and the endpoints of the nodes it named.
    *
-   * The epoch check runs first, so a hint that does not advance the partition's leader epoch
-   * costs nothing (unless the partition itself is unknown to the cache - see below). The endpoint
-   * work runs **before** the cache write, because the cache write is synchronous and immediately
-   * visible to routing: writing it first would publish a node id for which no broker object
-   * exists yet, and a concurrent send would take the broker-not-found path and force a metadata
-   * refresh - the exact latency this hint exists to avoid. That ordering only closes the window
-   * when the hint actually carries an endpoint for `leaderId`; a hint with no `nodeEndpoints` (the
-   * broker believes the client already knows the node) can still publish a node id the broker
-   * table has never heard of, which takes the broker-not-found path regardless of ordering here.
+   * The endpoint work runs **before** the cache write, because the cache write is synchronous and
+   * immediately visible to routing: writing it first would publish a node id for which no broker
+   * object exists yet, and a concurrent send would take the broker-not-found path and force a
+   * metadata refresh - the exact latency this hint exists to avoid.
    *
-   * The pre-check mirrors `MetadataCache#applyLeaderHint`'s own **epoch** guard exactly (an
-   * unknown cached epoch, `-1`, never rejects) so it can only short-circuit a hint the cache would
-   * reject anyway, never one it would accept; the cache stays the single authority, since it also
-   * knows about topics and partitions this pre-check cannot see. A hint for a partition the cache
-   * does not know at all is one such case the pre-check cannot short-circuit: the epoch compares
-   * as advancing (nothing cached to compare against), so the endpoint work still runs, and only
-   * `MetadataCache#applyLeaderHint`'s own `!cached` branch rejects it afterwards.
+   * The cache's own rule (`MetadataCache#admitsLeaderHint`: a named leader, a cached partition, the
+   * hint's topic incarnation, an advancing epoch) is asked before any endpoint work, so a hint it
+   * would refuse costs nothing, and again once the replacement pools are built. The hint takes one
+   * endpoint stamp before any endpoint work, ordering its rows against Metadata responses,
+   * coordinator answers and other hints for the same nodes (`EndpointOrder`). The endpoints and
+   * the route are then committed together, in one synchronous step with no await
+   * (`BrokerPool#applyNodeEndpoints`): the cache's routing listeners run once both are written,
+   * and the retirement of replaced brokers after that. A hint is applied whole or not at all: it is
+   * refused when a newer epoch or a recreation overtook it, when a disconnect or a rebootstrap
+   * came first, when a newer observation of one of its nodes intends another address, when the
+   * table no longer holds a broker or a pool one of its endpoints was staged against, or when the
+   * leader would not be in the table at an address no newer observation contradicts, as the Java
+   * client refuses a leader missing from its node map. A refused hint installs no address, retires
+   * no connection and gives up its claims, and the caller falls back to a metadata refresh.
    *
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-951%3A+Leader+discovery+optimisations+for+the+client
    * @public
@@ -1607,39 +1628,42 @@ module.exports = class Cluster {
    * @param {number} hint.leaderId
    * @param {number} hint.leaderEpoch
    * @param {{ nodeId: number, host: string, port: number, rack: string|null }[]} [hint.nodeEndpoints]
+   * @param {string} [hint.topicId] the topic id of the answer that carried the hint; the hint is
+   *   refused when the cache knows the topic under another id
    * @param {object} [options]
    * @param {import('../producer/generation')} [options.fence] captured producer lifecycle; its
    *   close prevents endpoint installation and a later cache update
    * @returns {Promise<boolean>} `false` when the hint was rejected - a non-advancing epoch, a
-   *   `leaderId` of `-1` (no hint offered), or an unknown topic/partition - `true` when it was
-   *   applied
+   *   `leaderId` of `-1` (no hint offered), an unknown topic/partition, another incarnation of the
+   *   topic, a leader the broker table would not hold, or endpoints whose staging no longer holds -
+   *   `true` when it was applied
    * @throws {Error} the lifecycle's close error
    */
   async applyLeaderHint(
-    { topic, partition, leaderId, leaderEpoch, nodeEndpoints },
+    { topic, partition, leaderId, leaderEpoch, nodeEndpoints, topicId },
     { fence } = {}
   ) {
     fence?.check()
     checked(null)
-    // Mirrors MetadataCache#applyLeaderHint's own no-hint-offered guard, so this pre-check can
-    // never itself pay for the endpoint work below on the broker's `{ -1, -1 }` default.
-    if (leaderId === -1) {
+    const hint = { leaderId, leaderEpoch, topicId }
+    const admits = () => this.metadataCache.admitsLeaderHint(topic, partition, hint)
+    if (!admits()) {
       return false
     }
 
-    const cachedLeaderEpoch = this.metadataCache.leaderEpoch(topic, partition)
-
-    if (cachedLeaderEpoch > -1 && leaderEpoch <= cachedLeaderEpoch) {
-      return false
-    }
-
-    await this.brokerPool.applyNodeEndpoints(nodeEndpoints, ...fenceArgs(fence))
+    let applied = false
+    await this.brokerPool.applyNodeEndpoints(nodeEndpoints, {
+      fence,
+      admits,
+      required: leaderId,
+      observedAt: this.brokerPool.endpointStamp(),
+      commit: () => {
+        applied = this.metadataCache.applyLeaderHint(topic, partition, hint)
+      },
+    })
     fence?.check()
     checked(null)
-    return this.metadataCache.applyLeaderHint(topic, partition, {
-      leaderId,
-      leaderEpoch,
-    })
+    return applied
   }
 
   /**
@@ -1701,10 +1725,19 @@ module.exports = class Cluster {
   }
 
   /**
-   * The broker coordinating a group or a transactional id. A coordinator the broker table does
-   * not hold yet is reached at the address FindCoordinator answered with, as the Java client
-   * reaches it, so no Metadata response is needed first. A coordinator the table holds is
-   * reached through its cached broker.
+   * The broker coordinating a group or a transactional id, reached at the address FindCoordinator
+   * answered with, as the Java client reaches it, so no Metadata response is needed first. The
+   * answer goes through `BrokerPool#applyNodeEndpoint`, stamped as its request was sent: a node the
+   * table does not hold is added, and a known node at another address is replaced (keeping its
+   * rack). A coordinator the table holds at that address is its cached broker.
+   *
+   * A later observation for the same node can supersede the answer, including a pending move or
+   * removal. Reuse requires an installed route at the intended address in the current routing
+   * generation. A stale conflict refreshes Metadata and retries with a `KafkaJSBrokerNotFound`
+   * cause. Unchanged Metadata and observations of other nodes leave the answer's order alone. A
+   * route the answer moved lasts, whatever repeated Metadata responses list, while this group or
+   * transactional id still resolves to that node; once its lookup names another node, the next
+   * Metadata response takes the node back. An answer that installs nothing gives up its claim.
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
    * @public
    * @param {object} params
@@ -1714,11 +1747,14 @@ module.exports = class Cluster {
    *   close ends the retries, and an answer that arrives after it is neither installed nor used
    * @returns {Promise<import("../../types").Broker>}
    * @throws {Error} the lifecycle's close error
+   * @throws {KafkaJSNumberOfRetriesExceeded} when a stale conflict exhausts the lookup retries
    */
   async findGroupCoordinator({ groupId, coordinatorType = COORDINATOR_TYPES.GROUP, fence }) {
     return this.retryFor(fence)(async (bail, retryCount, retryTime) => {
       try {
-        const { coordinator } = await this.findGroupCoordinatorMetadata({
+        // Stands for the request's stamp when an overridden lookup returned an answer it never saw.
+        const lookupStamp = this.brokerPool.endpointStamp()
+        const answer = await this.findGroupCoordinatorMetadata({
           groupId,
           coordinatorType,
           fence,
@@ -1726,16 +1762,25 @@ module.exports = class Cluster {
         fence?.check()
         checked(null)
 
-        if (!this.brokerPool.hasNode(coordinator.nodeId)) {
-          await this.brokerPool.applyNodeEndpoints(
-            [{ ...coordinator, rack: null }],
-            ...fenceArgs(fence)
-          )
+        const { coordinator } = answer
+        let held = this.brokerPool.applyNodeEndpoint(coordinator, {
+          fence,
+          observedAt: this.coordinatorAnswerStamps.get(answer) ?? lookupStamp,
+          owner: `${coordinatorType}:${groupId}`,
+        })
+        if (held instanceof Promise) {
+          held = await held
           fence?.check()
           checked(null)
         }
-
-        return await this.findBroker({ nodeId: coordinator.nodeId, fence })
+        const { nodeId } = coordinator
+        if (held && this.brokerPool.holdsEndpoint(nodeId, coordinator, lookupStamp)) {
+          const broker = await this.findBroker({ nodeId, fence })
+          if (this.brokerPool.holdsEndpoint(nodeId, coordinator, lookupStamp, broker)) return broker
+        }
+        throw new KafkaJSBrokerNotFound(
+          `Coordinator ${nodeId} answered at ${coordinator.host}:${coordinator.port} was superseded by a newer endpoint of that node`
+        )
       } catch (e) {
         fence?.check()
         checked(null)
@@ -1783,6 +1828,7 @@ module.exports = class Cluster {
    * @throws {Error} the lifecycle's close error
    */
   async findGroupCoordinatorMetadata({ groupId, coordinatorType, fence }) {
+    const lookupStamp = this.brokerPool.endpointStamp()
     let lastError
     let refusal
     const findCoordinator = async ({ nodeId, broker }) => {
@@ -1790,10 +1836,16 @@ module.exports = class Cluster {
         try {
           fence?.check()
           checked(null)
+          let requestStamp = lookupStamp
           const brokerMetadata = await broker.findGroupCoordinator({
             groupId,
             coordinatorType,
             ...(fence ? { guard: fence.guard } : {}),
+            [ON_WRITE]: () => {
+              if (this.brokerPool.isEndpointCurrent(lookupStamp)) {
+                requestStamp = this.brokerPool.endpointStamp()
+              }
+            },
           })
           fence?.check()
           checked(null)
@@ -1801,6 +1853,7 @@ module.exports = class Cluster {
             broker: brokerMetadata.host,
             nodeId: brokerMetadata.coordinator.nodeId,
           })
+          this.coordinatorAnswerStamps.set(brokerMetadata, requestStamp)
           return brokerMetadata
         } catch (e) {
           fence?.check()

@@ -133,6 +133,21 @@ class FetchSession {
   }
 
   /**
+   * Takes back the request `build()` prepared when its frame was never written: the session is
+   * again exactly what the broker last accepted (`previous`), at the same epoch, so the next
+   * build diffs against it. A token that is no longer the pending one changes nothing.
+   * @param {{session:FetchSession,seq:number}} token the unwritten request's identity
+   * @param {Map<string, object>} previous the partitions the session held before that build
+   * @returns {void}
+   * @throws Never.
+   */
+  withdraw(token, previous) {
+    if (!this.current(token)) return
+    this.partitions = previous
+    this.pending = null
+  }
+
+  /**
    * Fences the next request after any send exception; replica cleanup is caller-owned.
    * @param {{session:FetchSession,seq:number}} token original send identity
    * @returns {void} stale errors have no effect
