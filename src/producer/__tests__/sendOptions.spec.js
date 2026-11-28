@@ -5,7 +5,11 @@ const {
   KafkaJSInvalidConfigurationError,
   KafkaJSNonRetriableError,
   KafkaJSNotImplemented,
+  KafkaJSProducerClosedError,
 } = require('../../errors')
+const handlerContext = require('../../consumer/handlerContext')
+const OffsetOperations = require('../../consumer/offsetManager/offsetOperations')
+const TransactionOffsets = require('../state/transactionOffsets')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const Decoder = require('../../protocol/decoder')
 const gzip = require('../../protocol/message/compression/gzip')
@@ -31,6 +35,12 @@ const RETRY = { retries: 10, initialRetryTime: 10, maxRetryTime: 10, factor: 0 }
 const PATHS = [
   ['the idempotent path', {}],
   ['the plain path', { idempotent: false }],
+]
+
+/** The two sends, each with the request one record and the given `acks` make. */
+const SENDS = [
+  ['send', (acks) => ({ topic: TOPIC, messages: MESSAGES, acks })],
+  ['sendBatch', (acks) => ({ topicMessages: [{ topic: TOPIC, messages: MESSAGES }], acks })],
 ]
 
 const tick = () => new Promise((resolve) => setImmediate(resolve))
@@ -1031,10 +1041,6 @@ describe('Producer > send options', () => {
   describe('a transaction that ends while a send converts its options', () => {
     /** The Produce requests the cluster saw, whatever version the profile negotiates. */
     const produceRequests = () => rig.cluster.requests().filter(({ api }) => api === 'Produce')
-    const SENDS = [
-      ['send', (acks) => ({ topic: TOPIC, messages: MESSAGES, acks })],
-      ['sendBatch', (acks) => ({ topicMessages: [{ topic: TOPIC, messages: MESSAGES }], acks })],
-    ]
 
     test.each(SENDS)(
       '%s is refused after the conversion: nothing admitted, charged or written',
@@ -1094,6 +1100,263 @@ describe('Producer > send options', () => {
       ).resolves.toHaveLength(1)
 
       expect(refusal).not.toHaveBeenCalled()
+    })
+  })
+
+  describe.each(['tv1', 'tv2'])(
+    'a transaction that ends while an offset call reads its input (%s)',
+    (profile) => {
+      const GROUP = 'reading-group'
+      const ROWS = [{ topic: TOPIC, partitions: [{ partition: 0, offset: '5' }] }]
+      /** The batch a consumer handler is running, whose offsets tie the transaction to it. */
+      const BATCH = {
+        topic: TOPIC,
+        partition: 0,
+        assignmentEpoch: null,
+        acquireClock: 1,
+        ownershipKey: 'reading',
+        groupId: GROUP,
+        acquisition: { acquiredAt: 0, changedAt: 0, recreatedAt: 0, soughtAt: 0, retired: false },
+      }
+      /** Each place the caller's own code runs while the call reads its input. */
+      const SITES = [
+        [
+          'a getter of the offset list',
+          (read) => ({
+            consumerGroupId: GROUP,
+            get topics() {
+              read()
+              return ROWS
+            },
+          }),
+        ],
+        [
+          'a getter of the group metadata',
+          (read) => ({
+            consumerGroupMetadata: {
+              groupId: GROUP,
+              get generationId() {
+                read()
+                return 3
+              },
+              memberId: 'member',
+              groupInstanceId: null,
+            },
+            topics: ROWS,
+          }),
+        ],
+        [
+          'a getter of a topic row',
+          (read) => ({
+            consumerGroupId: GROUP,
+            topics: [
+              {
+                topic: TOPIC,
+                get partitions() {
+                  read()
+                  return ROWS[0].partitions
+                },
+              },
+            ],
+          }),
+        ],
+        [
+          'a getter of a partition row',
+          (read) => ({
+            consumerGroupId: GROUP,
+            topics: [
+              {
+                topic: TOPIC,
+                partitions: [
+                  {
+                    partition: 0,
+                    get offset() {
+                      read()
+                      return '5'
+                    },
+                  },
+                ],
+              },
+            ],
+          }),
+        ],
+      ]
+      let begin, hold, enlist
+
+      /** The offset requests the cluster saw. */
+      const offsetRequests = () =>
+        rig.cluster
+          .requests()
+          .filter(({ api }) => api === 'AddOffsetsToTxn' || api === 'TxnOffsetCommit')
+          .map(({ api }) => api)
+
+      beforeEach(() => {
+        begin = jest.spyOn(OffsetOperations.prototype, 'begin')
+        hold = jest.spyOn(TransactionOffsets.prototype, 'hold')
+        enlist = jest.spyOn(TransactionOffsets.prototype, 'enlist')
+      })
+
+      test.each(SITES)(
+        '%s that aborts is refused after it was read: no fence, no input tie, no offset request',
+        async (_, make) => {
+          rig = await Rig.start({ transactionalId: 'reading' }, { profile })
+          const transaction = await rig.producer.transaction()
+          let aborted = null
+          const read = () => {
+            aborted ??= transaction.abort()
+          }
+
+          const error = await handlerContext
+            .run(BATCH, () => transaction.sendOffsets(make(read)))
+            .then(
+              () => null,
+              (failure) => failure
+            )
+
+          expect(aborted).not.toBeNull()
+          expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+          expect(error.message).toBe('Cannot continue to use transaction once ended')
+          await expect(aborted).resolves.toBeUndefined()
+          expect(begin).not.toHaveBeenCalled()
+          expect(hold).not.toHaveBeenCalled()
+          expect(enlist).not.toHaveBeenCalled()
+          expect(offsetRequests()).toEqual([])
+          expect(transaction.isActive()).toBe(false)
+        }
+      )
+
+      test('a getter that closes the producer is refused with the close error: no fence, no offset request', async () => {
+        rig = await Rig.start({ transactionalId: 'reading' }, { profile })
+        const transaction = await rig.producer.transaction()
+        let closed = null
+
+        const error = await handlerContext
+          .run(BATCH, () =>
+            transaction.sendOffsets({
+              consumerGroupId: GROUP,
+              get topics() {
+                closed ??= rig.producer.disconnect({ timeout: 0 })
+                return ROWS
+              },
+            })
+          )
+          .then(
+            () => null,
+            (failure) => failure
+          )
+        await closed
+
+        expect(error).toBeInstanceOf(KafkaJSProducerClosedError)
+        expect(begin).not.toHaveBeenCalled()
+        expect(hold).not.toHaveBeenCalled()
+        expect(enlist).not.toHaveBeenCalled()
+        expect(offsetRequests()).toEqual([])
+      })
+
+      test('a call whose reads leave the transaction open takes its fence, ties the batch and sends its offsets', async () => {
+        rig = await Rig.start({ transactionalId: 'reading' }, { profile })
+        const transaction = await rig.producer.transaction()
+        let reads = 0
+
+        await handlerContext.run(BATCH, () =>
+          transaction.sendOffsets({
+            consumerGroupId: GROUP,
+            get topics() {
+              reads += 1
+              return ROWS
+            },
+          })
+        )
+        await transaction.commit()
+
+        expect(reads).toBe(1)
+        expect(begin).toHaveBeenCalled()
+        expect(hold).toHaveBeenCalledTimes(1)
+        expect(enlist).toHaveBeenCalledTimes(1)
+        expect(offsetRequests()).toEqual(
+          profile === 'tv1' ? ['AddOffsetsToTxn', 'TxnOffsetCommit'] : ['TxnOffsetCommit']
+        )
+      })
+    }
+  )
+
+  describe('a producer that a send closes while it converts its options', () => {
+    test.each(SENDS)(
+      '%s is refused after the conversion: nothing admitted or written, idempotence kept across a reconnect',
+      async (method, request) => {
+        rig = await Rig.start()
+        let closed = null
+        const acks = {
+          valueOf: () => {
+            closed ??= rig.producer.disconnect({ timeout: 0 })
+            return 1
+          },
+        }
+
+        const error = await rig.producer[method](request(acks)).then(
+          () => null,
+          (failure) => failure
+        )
+        await closed
+
+        expect(closed).not.toBeNull()
+        expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+        expect(error.message).toBe(
+          "The producer is disconnecting; therefore, it can't safely accept messages anymore"
+        )
+        expect(acquire).not.toHaveBeenCalled()
+        expect(debit).not.toHaveBeenCalled()
+        expect(rig.produced()).toEqual([])
+        expect(rig.producer.isIdempotent()).toBe(true)
+
+        await rig.producer.connect()
+        await expect(rig.producer[method](request(-1))).resolves.toHaveLength(1)
+        expect(rig.producer.isIdempotent()).toBe(true)
+        const produced = rig.produced()
+        expect(produced).toHaveLength(1)
+        expect(produced[0].acks).toBe(-1)
+      }
+    )
+  })
+
+  describe('a send that is refused turns idempotence off for nobody', () => {
+    test.each([
+      [
+        'a record without a value',
+        { topic: TOPIC, messages: [{ key: 'k' }] },
+        `Invalid message without value for topic "${TOPIC}" at index 0`,
+      ],
+      [
+        'a record list that is not an array',
+        { topic: TOPIC, messages: null },
+        `Invalid messages array [null] for topic "${TOPIC}"`,
+      ],
+    ])('%s with acks 1 is refused and the producer stays idempotent', async (_, send, message) => {
+      rig = await Rig.start()
+
+      await expect(rig.producer.send({ ...send, acks: 1 })).rejects.toThrow(message)
+
+      expect(rig.producer.isIdempotent()).toBe(true)
+      expect(rig.produced()).toEqual([])
+    })
+
+    test('a send with acks 1 on a disconnected producer is refused and the producer stays idempotent', async () => {
+      rig = await Rig.start()
+      await rig.producer.disconnect()
+
+      await expect(
+        rig.producer.send({ topic: TOPIC, messages: MESSAGES, acks: 1 })
+      ).rejects.toThrow('The producer is disconnected')
+
+      expect(rig.producer.isIdempotent()).toBe(true)
+    })
+
+    test('a send with acks 1 that is accepted still turns idempotence off', async () => {
+      rig = await Rig.start()
+
+      await rig.producer.send({ topic: TOPIC, messages: MESSAGES, acks: 1 })
+
+      expect(rig.producer.isIdempotent()).toBe(false)
     })
   })
 })

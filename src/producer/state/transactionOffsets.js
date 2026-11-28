@@ -59,17 +59,15 @@ class TransactionOffsets {
   }
 
   /**
-   * Copies every wire field and takes the mutation fence synchronously, before any await.
-   * Empty input owns no fence. Neither wire retries nor staging reads the caller's arrays.
+   * Copies every wire field of the offsets: the one read of the caller's arrays, rows and getters,
+   * and it changes no state. Neither wire retries nor staging reads the caller's arrays again.
    * A topic or partition given more than once is copied once, in first-seen order, with the
    * partition's last entry, as the broker would store it and as the Java client's map sends it.
-   * @param {import('../../consumer/offsetManager/offsetOperations')} ledger
-   * @param {string} groupId
    * @param {object[]} topics
-   * @returns {object} the call and its lifetime permit
+   * @returns {ReadonlyArray<{ topic: string, partitions: ReadonlyArray<object> }>} the frozen copy
    * @throws {TypeError} for malformed offset arrays, before transmission
    */
-  snapshot(ledger, groupId, topics) {
+  static copy(topics) {
     const byTopic = new Map()
     topics.forEach(({ topic, partitions }) => {
       const byPartition = byTopic.get(topic) ?? new Map()
@@ -81,11 +79,35 @@ class TransactionOffsets {
         )
       })
     })
-    const copied = Object.freeze(
+    return Object.freeze(
       Array.from(byTopic, ([topic, byPartition]) =>
         Object.freeze({ topic, partitions: Object.freeze([...byPartition.values()]) })
       )
     )
+  }
+
+  /**
+   * `copy` and `hold` in one step, for a caller with nothing to check between them.
+   * @param {import('../../consumer/offsetManager/offsetOperations')} ledger
+   * @param {string} groupId
+   * @param {object[]} topics
+   * @returns {object} the call and its lifetime permit
+   * @throws {TypeError} for malformed offset arrays, before transmission
+   */
+  snapshot(ledger, groupId, topics) {
+    return this.hold(ledger, groupId, TransactionOffsets.copy(topics))
+  }
+
+  /**
+   * Takes the mutation fence of copied offsets synchronously, before any await. Empty input owns
+   * no fence. It is the first state change of an offset call: the caller copies the offsets, checks
+   * that the call may still go on, and only then holds them.
+   * @param {import('../../consumer/offsetManager/offsetOperations')} ledger
+   * @param {string} groupId
+   * @param {ReturnType<typeof TransactionOffsets.copy>} copied
+   * @returns {object} the call and its lifetime permit
+   */
+  hold(ledger, groupId, copied) {
     const cells = copied.flatMap(({ topic, partitions }) =>
       partitions.map(({ partition }) => ({ topic, partition }))
     )

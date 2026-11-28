@@ -17,6 +17,7 @@ const {
 const COORDINATOR_TYPES = require('../../protocol/coordinatorTypes')
 const { isUsableTopicId, usableTopicIds } = require('../../protocol/requests/topicIds')
 const ProducerStateManager = require('../state')
+const TransactionOffsets = require('../state/transactionOffsets')
 const { transactionStateFor } = require('../state/errorClassifier')
 const assert = require('assert')
 
@@ -168,6 +169,9 @@ const hasPartitions = (topics) => topics.some(({ partitions }) => partitions.len
 
 /** The captured ids of a call that names no topic; never written to. */
 const NO_TOPIC_IDS = new Map()
+
+/** The refusal of a `sendOffsets` caller with no eligibility of its own to ask again. */
+const NOT_REFUSED = () => null
 
 /**
  * The error a commit whose `EndTxn` outcome is unknown rejects with: the last retriable error of a
@@ -1216,14 +1220,19 @@ const createEosManager = ({
      *
      * The offsets are copied, and their ledger fence taken, when the method is called, before any
      * await; the calls of one transaction then run one at a time in call order, each with its
-     * retries. Accepted offsets are staged, the last call winning for a partition, and reach the
-     * shared committed-offset cache only when `commit()` is confirmed; a failed call releases its
-     * own fence.
+     * retries. Between the two, once everything the caller gave has been read, the call is checked
+     * once: refused, with no state changed, when the lifecycle it captured has closed or `refusalOf`
+     * names an error, which a getter of the caller's own can cause. Accepted offsets are staged,
+     * the last call winning for a partition, and reach the shared committed-offset cache only when
+     * `commit()` is confirmed; a failed call releases its own fence.
      * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics
      * @param {object} options
      * @param {import('../../../types').ConsumerGroupMetadata} [options.consumerGroupMetadata]
      * @param {string} [options.consumerGroupId]
      * @param {OffsetCommitTopic[]} options.topics
+     * @param {() => ?Error} [refusalOf] the transaction's own eligibility, asked once after the
+     *   reads: the error the call is refused with now, or null; a call with none is never refused
+     *   by it
      * @returns {Promise<void>}
      * @throws {KafkaJSNonRetriableError} when both `consumerGroupMetadata` and `consumerGroupId`
      *   are given, or neither; nothing is armed then
@@ -1249,7 +1258,10 @@ const createEosManager = ({
      * @property {number} [leaderEpoch] the committed leader epoch; -1 when absent
      * @property {string|null} [metadata]
      */
-    async sendOffsets({ consumerGroupId, consumerGroupMetadata, topics } = {}) {
+    async sendOffsets(
+      { consumerGroupId, consumerGroupMetadata, topics } = {},
+      refusalOf = NOT_REFUSED
+    ) {
       const generation = getGeneration()
       stateManager.transaction.guard('sendOffsets')
       const { groupId, generationId, memberId, groupInstanceId } = consumerGroupOf({
@@ -1257,10 +1269,17 @@ const createEosManager = ({
         consumerGroupMetadata,
       })
       assert(topics, 'Missing offset topics')
-      const snapshot = stateManager.offsets.snapshot(
+      const copied = TransactionOffsets.copy(topics)
+      // The caller's values are all read: what they did to the producer or the transaction while
+      // being read is checked once, before the call changes any state.
+      const refused = generation?.guard() ?? refusalOf()
+      if (refused) {
+        throw refused
+      }
+      const snapshot = stateManager.offsets.hold(
         cluster.offsetOperations({ groupId }),
         groupId,
-        topics
+        copied
       )
       const captured = captureTopicIds(snapshot.topics, (name) => cluster.topicId(name))
       const topicIds = usableTopicIds(

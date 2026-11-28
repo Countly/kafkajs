@@ -259,7 +259,10 @@ module.exports = ({
   }
 
   /**
-   * Converts a send's options, validates it and appends it to the accumulator.
+   * Converts a send's options, validates it and appends it to the accumulator. Everything the
+   * caller's code can touch is read first; then every refusal is decided (`refusal`, the topic,
+   * the config rule for `acks`, the records, the connection status); only then does the send change
+   * anything: turn idempotence off for acks other than -1, hand the accumulated batches on, append.
    * @param {number} startedAt when the public call began, in epoch ms
    * @param {*} acksOption
    * @param {*} timeoutOption
@@ -269,7 +272,8 @@ module.exports = ({
    *   conversions, the records' getters) and before anything changes: the error the send is
    *   refused with, or null
    * @returns {Promise<object[]>}
-   * @throws {Error} what `refusal` returned
+   * @throws {Error} what `refusal` returned, or the refusal of the topic, the records, the `acks`
+   *   rule or the connection status, which includes a producer a conversion has closed
    */
   const produce = (startedAt, acksOption, timeoutOption, compressionOption, given, refusal) => {
     const acks = classifyAcks(acksOption)
@@ -287,20 +291,10 @@ module.exports = ({
       throw new KafkaJSNonRetriableError(`Invalid topic`)
     }
 
-    if (idempotence.isEnabled() && acks !== -1) {
-      if (idempotence.isExplicit()) {
-        throw new KafkaJSInvalidConfigurationError(
-          `Not requiring ack for all messages invalidates the idempotent producer's EoS guarantees`
-        )
-      }
-
-      // Accumulated batches still carry the producer id: they go out idempotently first.
-      flush()
-      idempotence.disable(
-        'acks',
-        `Idempotence disabled: a send asked for acks ${acks}, and an idempotent producer needs ` +
-          'acks -1 (all). Send with acks -1 to keep idempotence, or create the producer with ' +
-          'idempotent: false to silence this warning.'
+    const disablesIdempotence = idempotence.isEnabled() && acks !== -1
+    if (disablesIdempotence && idempotence.isExplicit()) {
+      throw new KafkaJSInvalidConfigurationError(
+        `Not requiring ack for all messages invalidates the idempotent producer's EoS guarantees`
       )
     }
 
@@ -320,6 +314,18 @@ module.exports = ({
     }
 
     validateConnectionStatus()
+
+    // Every refusal is behind us: a refused send turns nothing off and hands nothing on.
+    if (disablesIdempotence) {
+      // Accumulated batches still carry the producer id: they go out idempotently first.
+      flush()
+      idempotence.disable(
+        'acks',
+        `Idempotence disabled: a send asked for acks ${acks}, and an idempotent producer needs ` +
+          'acks -1 (all). Send with acks -1 to keep idempotence, or create the producer with ' +
+          'idempotent: false to silence this warning.'
+      )
+    }
 
     const mergedTopicMessages = topicMessages.reduce((merged, { topic, messages }) => {
       const index = merged.findIndex(({ topic: mergedTopic }) => topic === mergedTopic)

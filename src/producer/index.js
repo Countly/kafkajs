@@ -577,8 +577,10 @@ const createProducer = ({
     /**
      * The one eligibility rule of the transaction's operations: refused once the transaction has
      * ended, with the armed error while it can only be aborted or the producer is unusable, while
-     * its commit is pending, and once it is ending. Asked when an operation is called and, for a
-     * send, again once the caller's own conversions have run, which can end the transaction.
+     * its commit is pending, and once it is ending. Asked when an operation is called and again,
+     * for a send and for `sendOffsets`, once everything the caller gave has been read: a getter or
+     * conversion of the caller's can end the transaction, and no state may change for a call that
+     * is then refused.
      * @param {string} method the name the pending-commit error gives the call
      * @returns {?Error} why the operation is refused now; null when it may go on
      */
@@ -597,7 +599,8 @@ const createProducer = ({
     }
 
     /**
-     * Wraps `send`, `sendBatch` or `sendOffsets` with `refusalOf`.
+     * Wraps `sendOffsets` with `refusalOf` at the call, and tracks it; `send` and `sendBatch` use
+     * it the same way, and the operation asks `refusalOf` again after reading its input.
      * @param {string} method the name the pending-commit error gives the call
      * @param {Function} fn
      * @returns {Function}
@@ -715,11 +718,10 @@ const createProducer = ({
       sendOffsets: transactionGuard(
         'sendOffsets',
         async ({ consumerGroupMetadata, consumerGroupId, topics }) => {
-          await transactionalEosManager.sendOffsets({
-            consumerGroupMetadata,
-            consumerGroupId,
-            topics,
-          })
+          await transactionalEosManager.sendOffsets(
+            { consumerGroupMetadata, consumerGroupId, topics },
+            () => refusalOf('sendOffsets')
+          )
         }
       ),
       isActive,
