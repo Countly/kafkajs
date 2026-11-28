@@ -7,7 +7,7 @@ const {
   KafkaJSRecordTooLargeError,
   KafkaJSProducerClosedError,
 } = require('../../errors')
-const { Deadline, ExpiryTimer } = require('../deadline')
+const { Deadline, ExpiryTimer, MAX_DELAY } = require('../deadline')
 const { Admission } = require('./admission')
 const JoinOrder = require('./joinOrder')
 const {
@@ -433,8 +433,14 @@ class JoinStep {
   full = false
   /** whether publication makes its batch, which stays pending, due at once */
   hurry = false
-  /** ms of the timer its batch gets after publication: its linger or its deadline; -1 for none */
-  delay = -1
+  /** whether its batch gets a new timer after publication (`cap`, `expiresAt`) */
+  armed = false
+  /** at most how many ms that timer waits from when it is set: the linger of a new batch */
+  cap = Infinity
+  /** the epoch ms that timer fires by at the latest: its delivery deadline or original linger */
+  expiresAt = Infinity
+  /** @type {?PendingBatch} the pending batch placement read for it, which must still be pending */
+  found = null
   /** its batch's bytes once the run joins it */
   filled = 0
   /** its batch's wire bytes once the run joins it */
@@ -494,6 +500,21 @@ class JoinStep {
     this.messages = carried
     this.bytes = bytes
     this.shares = shares
+  }
+
+  /**
+   * Forgets its placement, so the join can place it again against the current pending batches:
+   * the batch, shell and settler it chose are dropped unpublished.
+   * @returns {void}
+   */
+  unplace() {
+    this.fresh = false
+    this.displaced = null
+    this.found = null
+    this.hurry = false
+    this.armed = false
+    this.cap = Infinity
+    this.expiresAt = Infinity
   }
 }
 
@@ -566,6 +587,20 @@ const halvesOf = (settler) => {
 }
 
 /**
+ * A failure's `outcome`, read once: a send path may fail with any value, and one whose `outcome`
+ * cannot be read has none, so reading it never interrupts a settlement.
+ * @param {*} error
+ * @returns {*}
+ */
+const outcomeOf = (error) => {
+  try {
+    return error?.outcome
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * One `append()`: settles once every share of its records - one per batch carrying some of them -
  * has settled, resolving with one `RecordMetadata` per partition, by topic, then partition, or
  * rejecting with the first error any share failed with, whatever value that is (`null` and
@@ -585,6 +620,8 @@ class AppendedSend {
   /** whether a share failed: `#error` holds the first failure, whatever its value */
   #failed = false
   #error
+  /** whether the first failure said `outcome: 'unsent'` */
+  #unsent = false
   /** whether a share was delivered or failed with an outcome other than `'unsent'` */
   #written = false
   #resolve
@@ -634,11 +671,13 @@ class AppendedSend {
    * @returns {void}
    */
   failed(error) {
+    const unsent = outcomeOf(error) === 'unsent'
     if (!this.#failed) {
       this.#failed = true
       this.#error = error
+      this.#unsent = unsent
     }
-    if (error?.outcome !== 'unsent') this.#written = true
+    if (!unsent) this.#written = true
     this.#settleOne()
   }
 
@@ -649,17 +688,28 @@ class AppendedSend {
       return
     }
 
-    const error = this.#error
-    if (!this.#failed) {
-      this.#resolve((this.#metadata ?? []).sort(byTopicThenPartition))
-    } else if (error?.outcome === 'unsent' && this.#written) {
-      const message = `Some records of this send may have been written: ${error.message}`
-      this.#reject(new error.constructor(message, { cause: error, outcome: 'unknown' }))
+    if (this.#failed) {
+      this.#reject(this.#unsent && this.#written ? this.#widened() : this.#error)
     } else {
-      this.#reject(error)
+      this.#resolve((this.#metadata ?? []).sort(byTopicThenPartition))
     }
     this.#holder.untrack()
     this.#holder = null
+  }
+
+  /**
+   * The first failure, said `'unsent'`, as `outcome: 'unknown'` for a send some of whose records
+   * may have been written; the failure itself when it cannot be read or rebuilt.
+   * @returns {*}
+   */
+  #widened() {
+    const error = this.#error
+    try {
+      const message = `Some records of this send may have been written: ${error.message}`
+      return new error.constructor(message, { cause: error, outcome: 'unknown' })
+    } catch {
+      return error
+    }
   }
 }
 
@@ -1043,6 +1093,13 @@ class PendingSend {
  */
 
 /**
+ * @typedef {object} Outgoing one request's batches, out of `#pending` and waiting in `#outbox`
+ * @property {PendingBatch[]} batches the batches, which share their options, in hand-off order
+ * @property {?Promise<void>} sent its request's outcome once it began, which never rejects; null
+ *   until then, and for good when a forced close refused the batches instead
+ */
+
+/**
  * The accumulator every send goes through (`linger`, `batchSize`): coalesces the records of
  * several sends into one batch per topic-partition, in the order they reach it, and hands each
  * batch to the send path as it flushes. A batch is due `linger` ms after its first records
@@ -1097,13 +1154,15 @@ class Accumulator {
   /** @type {Map<string, PendingBatch>} */
   #pending = new Map()
   /**
-   * @type {(PendingBatch|PendingBatch[])[]} the batches published joins took out of `#pending`
-   *   and have not handed on yet, in hand-off order: a displaced batch, which goes alone, or the
-   *   batches a join filled, which go with the due ones. Every hand-off, flush and forced close
-   *   takes them from here, so no batch is out of both this and `#pending` before the send path
-   *   owns it
+   * @type {Fifo<Outgoing>} the batches taken out of `#pending` and not handed to the send path
+   *   yet, one entry per request, in hand-off order. Every batch leaving `#pending` enters it in
+   *   the same step, before anything a caller supplied can run, and leaves it only when its own
+   *   request begins (`#dispatch`) or a forced close takes it: so a batch is always in `#pending`,
+   *   here, or owned by the send path, and every hand-off, flush and forced close reads both
    */
-  #leaving = []
+  #outbox = new Fifo()
+  /** how many `flush()` calls began: a join prepared across one hands its batches on at once */
+  #flushes = 0
   /** the joins under way refuse with its `error` once a transaction's abort sweep sets it */
   #sweep = { error: null }
   /** @type {Map<string, number>} by key, the batches handed on and not settled yet */
@@ -1131,10 +1190,11 @@ class Accumulator {
    *   that a flush is complete when `flush()` returns. Once it returns it owns them and retires
    *   each; when it throws instead it took none, and the accumulator retires them
    * @param {() => boolean} [options.lingers] whether a batch that forms now may wait for `linger`;
-   *   asked while a join is prepared, before any of it is published, so a close it causes refuses
-   *   that send. It must not hand batches on
+   *   asked while a join is prepared, before any of it is published: a close it causes refuses
+   *   that send, and a flush it causes makes the join place its records again and hand them on
    * @param {() => boolean} [options.holds] whether a due batch waits for its partition's batch in
-   *   flight to settle
+   *   flight to settle; asked once per hand-off of the due batches, before any is taken, and once
+   *   per placement of a join that fills a batch
    * @param {(topic: string, partition: number) => number|null|undefined} [options.leaderOf]
    *   the node that leads a partition, read from what the client already knows and never fetched;
    *   asked once for each batch that waits for its `linger`, while the join that makes it is
@@ -1142,7 +1202,9 @@ class Accumulator {
    *   not known, and a batch whose leader is not known is never merged
    * @param {number} [options.deadline] ms from a send's public call to its delivery deadline, the
    *   send path's own: a send still waiting for its partitions settles with `KafkaJSDeliveryTimeout`
-   *   when it is reached, and a held batch goes out then
+   *   when it is reached, and a held batch goes out then. `linger`, `batchSize` and `deadline` are
+   *   each read once, here, as numbers (null or undefined `deadline`: none), so no later timer or
+   *   size decision converts them again
    * @param {(error: Error) => Error} [options.expired] called with the error of a send that
    *   expired before it joined a batch, or that the buffer refused, to arm a transaction; returns
    *   the error to reject with. Not called for a send whose deadline passed while it waited to
@@ -1171,14 +1233,14 @@ class Accumulator {
     pinner = NO_PINNER,
     getGeneration = () => undefined,
   }) {
-    this.#linger = linger
-    this.#batchSize = batchSize
+    this.#linger = Number(linger)
+    this.#batchSize = Number(batchSize)
     this.#partition = partition
     this.#sendPartitioned = sendPartitioned
     this.#lingers = lingers
     this.#holds = holds
     this.#leaderOf = leaderOf
-    this.#deadline = deadline
+    this.#deadline = deadline == null ? undefined : Number(deadline)
     this.#expired = expired
     this.#admission = admission
     this.#pinner = pinner
@@ -1397,10 +1459,21 @@ class Accumulator {
    * Rejects every send still waiting for its partitions and every batch that has not left this
    * accumulator, with `outcome: 'unsent'`, and clears their timers. Admission waiters are
    * cancelled by their `Admission`; a held assignment keeps its send's shell until it returns.
+   * Every batch is taken out of `#outbox` and `#pending` before the first rejection, so a flush or
+   * close that a rejection reaches finds none of them.
    * @param {Error} [surfaced] what the sends reject with instead of that error
    * @returns {void}
    */
   forceClose(surfaced) {
+    /** @type {PendingBatch[]} the batches waiting for their request, in hand-off order, then pending */
+    const refused = []
+    for (let entry = this.#outbox.shift(); entry !== undefined; entry = this.#outbox.shift()) {
+      refused.push(...entry.batches)
+    }
+    for (const batch of this.#pending.values()) {
+      refused.push(batch)
+    }
+    this.#pending.clear()
     this.#order.clear()
     for (let send = this.#holders.peek(); send !== undefined; send = this.#holders.peek()) {
       this.#settleHolder(
@@ -1414,15 +1487,9 @@ class Accumulator {
           )
       )
     }
-    for (const unit of this.#leaving.splice(0)) {
-      for (const batch of Array.isArray(unit) ? unit : [unit]) {
-        this.#refuse(batch, surfaced)
-      }
-    }
-    for (const batch of this.#pending.values()) {
+    for (const batch of refused) {
       this.#refuse(batch, surfaced)
     }
-    this.#pending.clear()
     this.#checkIdle()
   }
 
@@ -1670,14 +1737,20 @@ class Accumulator {
    *
    * A join publishes all of the send or nothing. It is prepared first, changing no batch: the
    * records are read (`#measure`, the only place they are), each run's batch is chosen, new
-   * batches are made as shells with their settlers, `lingers` and `leaderOf` are asked (`#place`,
-   * `#plan`) and each timer's delay is computed. A failure there leaves no batch, share, debit or
-   * timer behind. Then the fence: a send whose producer closed, or whose transaction began its
-   * abort sweep, while it was prepared is refused. Publication (`#publish`) only links and counts,
-   * and calls nothing. Until the send path owns a batch it stays in `#pending` or in `#leaving`,
-   * which every hand-off, flush and forced close reads, and a timer is set only after publication
-   * and only on a batch still pending: so whatever a timer's creation or a hand-off calls finds
-   * the join wholly published, and nothing it closes or flushes is handed on or timed afterwards.
+   * batches are made as shells with their settlers, `lingers`, `holds` and `leaderOf` are asked
+   * (`#place`, `#plan`) and each timer's intent is decided. A failure there leaves no batch, share,
+   * debit or timer behind. Those callbacks may flush or close: a pending batch the placement chose
+   * that is no longer pending afterwards, or any flush begun since the join did, makes it place
+   * the send again against the pending batches as they are now - after a flush, with every batch
+   * handed on at once, as the flush asked, and with no callback asked. Each placement ends at the
+   * fence: a send whose producer closed, or whose transaction began its abort sweep, is refused.
+   * Publication (`#publish`) only links and counts, and calls nothing.
+   *
+   * Invariant: from publication until the send path owns it, each batch is in `#pending` or in
+   * `#outbox`, both of which every hand-off, flush and forced close reads; a timer is set only
+   * after publication and only on a batch still pending. So whatever a timer's creation or a
+   * hand-off calls finds the join wholly published, and nothing it closes or flushes is handed on
+   * or timed afterwards.
    * @param {{ topic: string, partition: number, messages: object[] }[]} entries
    * @param {{ acks: number, timeout?: number, compression?: number, createdAt: number }} options
    * @param {PendingSend} holder the send whose records these are
@@ -1685,12 +1758,12 @@ class Accumulator {
    * @throws {KafkaJSProducerClosedError} `outcome: 'unsent'`, when the lifecycle closed while the
    *   join was prepared; the lifecycle's own error when initial fencing closed it
    * @throws {*} the error `abortJoins` was given, when it was called while the join was prepared;
-   *   whatever reading a record, `chunkCapacity` or `lingers` throws
+   *   whatever reading a record, `chunkCapacity`, `lingers` or `holds` throws
    */
   #join(entries, { acks, timeout, compression, createdAt }, holder) {
     const lifecycle = this.#getGeneration()
     const sweep = this.#sweep
-    const now = Date.now()
+    const flushes = this.#flushes
     // One due time for every batch this append creates, so they fall due together.
     const shape = {
       options: `${acks}/${timeout}/${compression}`,
@@ -1698,37 +1771,68 @@ class Accumulator {
       timeout,
       compression,
       createdAt,
-      dueAt: now + this.#linger,
+      dueAt: Date.now() + this.#linger,
     }
     const steps = this.#measure(entries, compression)
     let send
     const appended = new Promise((resolve, reject) => {
       send = new AppendedSend(holder, resolve, reject)
     })
-    /** @type {PendingBatch[]} the batches this append fills, handed on after publication */
+    /** @type {PendingBatch[]} the batches this append fills, then the due ones going with them */
     const full = []
     /** @type {JoinStep[]} each partition's last run whose batch stays pending after the join */
     const joined = []
-    this.#place(steps, shape, send, full, joined)
-    const due = full.length > 0 || this.#linger === 0
-    this.#plan(joined, due, createdAt, now)
-    if (lifecycle?.closed) {
-      throw this.#closedError(lifecycle, 'The producer was closed before the send joined a batch')
-    }
-    if (sweep.error !== null) {
-      throw sweep.error
+    let hurried = false
+    let holding
+    for (;;) {
+      this.#place(steps, shape, send, full, joined, hurried)
+      holding = full.length > 0 && this.#holds()
+      this.#plan(joined, full.length > 0 || this.#linger === 0, createdAt)
+      if (lifecycle?.closed) {
+        throw this.#closedError(lifecycle, 'The producer was closed before the send joined a batch')
+      }
+      if (sweep.error !== null) {
+        throw sweep.error
+      }
+      const flushed = !hurried && this.#flushes !== flushes
+      if (!flushed && !this.#moved(steps)) {
+        break
+      }
+      hurried ||= flushed
+      full.length = 0
+      joined.length = 0
+      for (const step of steps) {
+        step.unplace()
+      }
     }
 
-    this.#publish(steps, full, holder, createdAt)
-    this.#arm(steps, joined)
-    if (this.#leaving.length > 0) {
-      this.#drain()
-    }
-    if (full.length === 0 && this.#linger === 0) {
+    const filled = full.length > 0
+    const held = this.#publish(steps, full, holder, createdAt, holding)
+    this.#arm(steps, joined, full)
+    this.#dispatch()
+    this.#timeHeld(held)
+    if (!filled && this.#linger === 0) {
       this.#queueHandOff()
     }
     send.joined()
     return appended
+  }
+
+  /**
+   * Whether a callback asked while the join was placed took a pending batch it chose: placement
+   * then starts again. A batch never returns to `#pending` once it leaves and no join is published
+   * while another is prepared, so each new placement relies on fewer pending batches, and the
+   * placements end.
+   * @param {JoinStep[]} steps
+   * @returns {boolean}
+   */
+  #moved(steps) {
+    for (const { found } of steps) {
+      if (found !== null && this.#pending.get(found.key) !== found) {
+        return true
+      }
+    }
+    return false
   }
 
   /**
@@ -1765,18 +1869,20 @@ class Accumulator {
    * batch, or a new shell when there is none or when the pending one has other options or would
    * pass `batchSize` or the run's capacity (that one is displaced). Makes the shells and settlers,
    * and decides which batches are full: every run's but the last of its partition, one at
-   * `batchSize`, and any while `lingers()` is false, which is asked for each last run whose batch
-   * is not full.
+   * `batchSize`, every one when `hurried`, and any while `lingers()` is false, which is asked for
+   * each last run whose batch is not full otherwise. Each pending batch it reads is kept as the
+   * run's `found`, for `#moved`.
    * @param {JoinStep[]} steps
    * @param {{ options: string, acks: number, timeout?: number, compression?: number,
    *   createdAt: number, dueAt: number }} shape
    * @param {AppendedSend} send
    * @param {PendingBatch[]} full takes the batches that leave in the join's hand-off
    * @param {JoinStep[]} joined takes, per partition, the last run whose batch stays pending
+   * @param {boolean} hurried a flush began while the join was prepared: every batch is full
    * @returns {void}
    * @throws {*} whatever `lingers` throws
    */
-  #place(steps, shape, send, full, joined) {
+  #place(steps, shape, send, full, joined, hurried) {
     /** @type {?Map<string, ?JoinStep>} per partition, its last run on a batch left open, or null */
     const open = steps.length > 1 ? new Map() : null
     for (const step of steps) {
@@ -1788,6 +1894,7 @@ class Accumulator {
       if (previous === undefined) {
         batch = this.#pending.get(step.key)
         if (batch !== undefined) {
+          step.found = batch
           filled = batch.bytes
           wired = batch.wire
           length = batch.messages.length
@@ -1819,7 +1926,7 @@ class Accumulator {
       step.filled = filled + step.bytes
       step.wired = wired + step.wire
       step.length = length + step.messages.length
-      step.full = !step.last || step.filled >= this.#batchSize || !this.#lingers()
+      step.full = !step.last || step.filled >= this.#batchSize || hurried || !this.#lingers()
       if (step.full) {
         full.push(batch)
       }
@@ -1835,17 +1942,18 @@ class Accumulator {
   /**
    * Decides, before anything of the join is published, what happens to the timer of each batch
    * left pending: in a join that is due, a batch not yet due becomes due and loses its timer;
-   * a new shell gets its merge key (`leaderOf` is asked here) and a timer for its `linger`, or for
-   * less when its delivery deadline comes first; a pending batch an older send joins has its timer
-   * moved to the earlier deadline - a lingering one still waits no longer than its original
-   * `linger`, which is not restarted, and a held one goes out at the deadline.
+   * a new shell gets its merge key (`leaderOf` is asked here) and a timer for its `linger`, fired
+   * no later than its delivery deadline; a pending batch an older send joins has its timer moved
+   * to the earlier deadline - a lingering one still fires no later than its original `linger`,
+   * which is not restarted, and a held one goes out at the deadline. Each timer is planned as a
+   * `cap` and an absolute `expiresAt`, and its delay is taken from the clock when it is set
+   * (`#setTimer`), so time a callback takes here never pushes it past either.
    * @param {JoinStep[]} joined each partition's last run whose batch stays pending
    * @param {boolean} due whether the join hands its batches on now
    * @param {number} createdAt when the send's public call began
-   * @param {number} now when the join began
    * @returns {void}
    */
-  #plan(joined, due, createdAt, now) {
+  #plan(joined, due, createdAt) {
     for (const step of joined) {
       const { batch } = step
       if (!batch.due && due) {
@@ -1853,14 +1961,19 @@ class Accumulator {
       } else if (!batch.due && batch.timer === null) {
         // Only a new shell is pending, not due and without a timer.
         batch.mergeKey = this.#mergeKeyOf(batch)
-        step.delay = this.#lingerOf(batch.createdAt, now)
+        step.armed = true
+        step.cap = this.#linger
+        if (this.#deadline !== undefined) {
+          step.expiresAt = batch.createdAt + this.#deadline
+        }
       } else if (
         createdAt < batch.createdAt &&
         batch.timer !== null &&
         this.#deadline !== undefined
       ) {
         const deadlineAt = createdAt + this.#deadline
-        step.delay = Math.max(0, (batch.due ? deadlineAt : Math.min(batch.dueAt, deadlineAt)) - now)
+        step.armed = true
+        step.expiresAt = batch.due ? deadlineAt : Math.min(batch.dueAt, deadlineAt)
       }
     }
   }
@@ -1904,24 +2017,27 @@ class Accumulator {
 
   /**
    * Publishes a prepared join in one step that only links and counts: per run it moves the batch
-   * the run displaced from `#pending` to `#leaving`, links a new shell and debits its charge,
-   * registers the run's settler with its send, adds the run's records, bytes and shares to its
-   * batch and its earlier start when it brings one, and moves a full batch out of `#pending` or
-   * makes a batch due as `#plan` decided; the full batches then join `#leaving` together. It reads
-   * no record, sets or clears no timer and calls nothing a caller or the producer supplied; the
-   * arrays and maps it grows are the only things it can allocate.
+   * the run displaced from `#pending` to `#outbox`, alone, links a new shell and debits its
+   * charge, registers the run's settler with its send, adds the run's records, bytes and shares to
+   * its batch and its earlier start when it brings one, and takes a full batch out of `#pending`
+   * or makes a batch due as `#plan` decided. When the join fills a batch, the due batches not held
+   * then leave `#pending` too (`#sweepDue`), and they and the full ones enter `#outbox` together.
+   * It reads no record, sets or clears no timer and calls nothing a caller or the producer
+   * supplied; the outbox entries, trackers and the arrays and maps it grows are all it allocates.
    * @param {JoinStep[]} steps
-   * @param {PendingBatch[]} full the batches the join fills
+   * @param {PendingBatch[]} full the batches the join fills; takes the due batches going with them
    * @param {PendingSend} holder
    * @param {number} createdAt when the send's public call began
-   * @returns {void}
+   * @param {boolean} holding what `holds()` answered while the join was prepared
+   * @returns {?PendingBatch[]} the due batches held behind their partition's batch in flight, which
+   *   have a delivery deadline and no timer yet
    */
-  #publish(steps, full, holder, createdAt) {
+  #publish(steps, full, holder, createdAt, holding) {
     for (const step of steps) {
       const { batch, displaced } = step
       if (displaced !== null) {
         this.#pending.delete(displaced.key)
-        this.#leaving.push(displaced)
+        this.#handOn([displaced])
       }
       if (step.fresh) {
         this.#admission.debit(BATCH_DEBIT)
@@ -1946,54 +2062,63 @@ class Accumulator {
         batch.due = true
       }
     }
-    if (full.length > 0) {
-      this.#leaving.push(full)
+    if (full.length === 0) {
+      return null
     }
+    const held = this.#sweepDue(holding, full)
+    this.#handOn(full)
+    return held
   }
 
   /**
    * The timer work of a published join, after publication: clears the timers of the batches it
-   * moved to `#leaving` and of those it made due or whose timer it moves, then sets the timers
+   * moved to `#outbox` and of those it made due or whose timer it moves, then sets the timers
    * `#plan` decided (`#setTimer`).
    * @param {JoinStep[]} steps
    * @param {JoinStep[]} joined each partition's last run whose batch stays pending
+   * @param {PendingBatch[]} full the batches the join's hand-off carries
    * @returns {void}
    */
-  #arm(steps, joined) {
-    for (const { displaced, full, batch } of steps) {
+  #arm(steps, joined, full) {
+    for (const { displaced } of steps) {
       if (displaced !== null) {
         clearTimeout(displaced.timer)
       }
-      if (full) {
-        clearTimeout(batch.timer)
-      }
     }
-    for (const { hurry, delay, batch } of joined) {
-      if (hurry || delay >= 0) {
+    for (const batch of full) {
+      clearTimeout(batch.timer)
+    }
+    for (const { hurry, armed, batch } of joined) {
+      if (hurry || armed) {
         clearTimeout(batch.timer)
         batch.timer = null
       }
     }
-    for (const { delay, batch } of joined) {
-      if (delay >= 0) {
-        this.#setTimer(batch, delay)
+    for (const { armed, batch, cap, expiresAt } of joined) {
+      if (armed) {
+        this.#setTimer(batch, cap, expiresAt)
       }
     }
   }
 
   /**
    * Sets a pending batch's one timer: a due batch goes out when it fires (`#flushBatch`), any
-   * other batch's `linger` runs out (`#expire`). Creating a timer can call an application's hook,
-   * which may close or flush the producer: nothing is set for a batch that is no longer pending
-   * or already has a timer, and a timer whose creation let that happen is cleared at once.
+   * other batch's `linger` runs out (`#expire`). It fires after `cap` ms and no later than
+   * `expiresAt`, read against the clock now, when it is set; at most 2147483647 ms on.
+   * Creating a timer can call an application's hook, which may close or flush the producer:
+   * nothing is set for a batch that is no longer pending or already has a timer, and a timer whose
+   * creation let that happen is cleared at once.
    * @param {PendingBatch} batch
-   * @param {number} delay ms
+   * @param {number} cap ms
+   * @param {number} expiresAt epoch ms, or Infinity
    * @returns {void}
    */
-  #setTimer(batch, delay) {
+  #setTimer(batch, cap, expiresAt) {
     if (this.#pending.get(batch.key) !== batch || batch.timer !== null) {
       return
     }
+    const bound = expiresAt === Infinity ? cap : Math.min(cap, expiresAt - Date.now())
+    const delay = Math.min(MAX_DELAY, Math.max(0, bound))
     const timer = batch.due
       ? setTimeout(() => this.#flushBatch(batch), delay)
       : setTimeout(() => this.#expire(batch), delay)
@@ -2005,36 +2130,8 @@ class Accumulator {
   }
 
   /**
-   * How long a batch waits for more records: its `linger`, or less when its delivery deadline
-   * comes first, so the send path sees it by then.
-   * @param {number} createdAt when the batch's earliest send began
-   * @param {number} now
-   * @returns {number} ms
-   */
-  #lingerOf(createdAt, now) {
-    return this.#deadline === undefined
-      ? this.#linger
-      : Math.max(0, Math.min(this.#linger, createdAt + this.#deadline - now))
-  }
-
-  /**
-   * Hands on what published joins left in `#leaving`, oldest first: a displaced batch alone, the
-   * batches a join filled with the due ones (`#handOnDue`). A hand-off that flushes or closes the
-   * producer meanwhile takes the rest from `#leaving` itself, in the same order.
-   * @returns {Promise<unknown>[]} one per hand-off; none rejects
-   */
-  #drain() {
-    const sent = []
-    while (this.#leaving.length > 0) {
-      const unit = this.#leaving.shift()
-      sent.push(Array.isArray(unit) ? this.#handOnDue(unit) : this.#send([unit]))
-    }
-    return sent
-  }
-
-  /**
    * How many batches wait for a partition: its pending batch and the batches handed on and not
-   * settled yet - the queue an adaptive partitioner weighs. Reads two maps by one `topic/partition`
+   * settled yet, those in `#outbox` included - the queue an adaptive partitioner weighs. Reads two maps by one `topic/partition`
    * key, only when an adaptive partitioner picks.
    * @param {string} topic
    * @param {number} partition
@@ -2047,17 +2144,23 @@ class Accumulator {
 
   /**
    * Hands every pending batch to the send path now - in one call per `acks`, `timeout` and
-   * `compression` - and clears their timers; first, in order, the batches published joins have
-   * not handed on yet (`#drain`), which are older than the pending ones of their partitions.
-   * @returns {Promise<void>} settles once every batch it handed on has settled; never rejects
+   * `compression` - and clears their timers; first, in order, the batches already waiting in
+   * `#outbox`, which are older than the pending ones of their partitions. Every one of them is in
+   * `#outbox` before the first request begins, so a request that closes or flushes the producer
+   * meanwhile finds the rest there. A join being prepared meanwhile hands its batches on at once.
+   * @returns {Promise<void>} settles once every batch it handed on or found waiting has settled,
+   *   whichever call began its request; a batch a forced close refused counts as settled. Never
+   *   rejects
    */
   async flush() {
-    const drained = this.#leaving.length > 0 ? this.#drain() : null
+    this.#flushes += 1
     const batches = [...this.#pending.values()]
     batches.forEach((batch) => clearTimeout(batch.timer))
     this.#pending.clear()
-    const sent = this.#sendGrouped(batches)
-    await (drained === null ? sent : Promise.all([...drained, sent]))
+    this.#handOn(batches)
+    const outgoing = [...this.#outbox]
+    this.#dispatch()
+    await Promise.all(outgoing.map(({ sent }) => sent))
   }
 
   /**
@@ -2084,7 +2187,7 @@ class Accumulator {
       this.#closers.length > 0 &&
       this.#appending === 0 &&
       this.#pending.size === 0 &&
-      this.#leaving.length === 0 &&
+      this.#outbox.size === 0 &&
       this.#unsettled.size === 0
     ) {
       for (const resolve of this.#closers.splice(0)) {
@@ -2163,38 +2266,60 @@ class Accumulator {
 
   /**
    * Hands on every due batch that is not held for its partition's batch in flight, in one call
-   * with `full` per options; then a held one with a delivery deadline is timed to go out at it
-   * (`#setTimer`), so no timer is created while a batch taken out of the pending ones is not yet
-   * handed on.
-   * @param {PendingBatch[]} [full] batches already taken out of the pending ones, never held
-   * @returns {Promise<unknown>} settles once the batches it handed on have; never rejects
+   * per options; then a held one with a delivery deadline is timed to go out at it
+   * (`#timeHeld`). `holds()` is asked once, before any batch is taken, so nothing runs between
+   * taking a batch out of `#pending` and putting it in `#outbox`.
+   * @returns {void}
    */
-  #handOnDue(full = []) {
+  #handOnDue() {
     const ready = []
+    const held = this.#sweepDue(this.#holds(), ready)
+    for (const batch of ready) {
+      clearTimeout(batch.timer)
+    }
+    this.#handOn(ready)
+    this.#dispatch()
+    this.#timeHeld(held)
+  }
+
+  /**
+   * Takes every due batch that is not held out of `#pending`, onto `taken`, and calls nothing:
+   * held means that `holding` is true and its partition has a batch handed on and not settled,
+   * one waiting in `#outbox` included.
+   * @param {boolean} holding what `holds()` answered
+   * @param {PendingBatch[]} taken
+   * @returns {?PendingBatch[]} the held due batches that have a delivery deadline and no timer
+   */
+  #sweepDue(holding, taken) {
     /** @type {?PendingBatch[]} */
     let held = null
     for (const batch of this.#pending.values()) {
       if (!batch.due) {
         continue
       }
-      if (!this.#isHeld(batch)) {
-        ready.push(batch)
+      if (!holding || !this.#unsettled.has(batch.key)) {
+        this.#pending.delete(batch.key)
+        taken.push(batch)
       } else if (this.#deadline !== undefined && batch.timer === null) {
         held ??= []
         held.push(batch)
       }
     }
-    for (const batch of ready) {
-      clearTimeout(batch.timer)
-      this.#pending.delete(batch.key)
+    return held
+  }
+
+  /**
+   * Times each held due batch to go out at its delivery deadline (`#setTimer`).
+   * @param {?PendingBatch[]} held
+   * @returns {void}
+   */
+  #timeHeld(held) {
+    if (held === null) {
+      return
     }
-    const sent = this.#sendGrouped(full.length === 0 ? ready : [...full, ...ready])
-    if (held !== null) {
-      for (const batch of held) {
-        this.#setTimer(batch, Math.max(0, batch.createdAt + this.#deadline - Date.now()))
-      }
+    for (const batch of held) {
+      this.#setTimer(batch, Infinity, batch.createdAt + this.#deadline)
     }
-    return sent
   }
 
   /**
@@ -2233,22 +2358,50 @@ class Accumulator {
   }
 
   /**
-   * Sends batches in one call per `acks`, `timeout` and `compression`. Batches that share their
-   * options - every hand-off of a send that asked for one set of them - go to the send path as
-   * they are, with no grouping.
-   * @param {PendingBatch[]} batches
-   * @returns {Promise<unknown>} settles once they all have; never rejects
+   * A due batch's timer fired: it goes out alone, if it is still pending.
+   * @param {PendingBatch} batch
+   * @returns {void}
    */
-  #sendGrouped(batches) {
+  #flushBatch(batch) {
+    if (this.#pending.get(batch.key) !== batch) {
+      return
+    }
+    this.#pending.delete(batch.key)
+    batch.timer = null
+    this.#handOn([batch])
+    this.#dispatch()
+  }
+
+  /**
+   * Puts batches just taken out of `#pending` in `#outbox`, one entry per `acks`, `timeout` and
+   * `compression`, in the order of their first batch, and counts each as handed on and unsettled
+   * from now, with one more settler that ends that count when it settles. Batches that share
+   * their options - every hand-off of a send that asked for one set of them - make one entry as
+   * they are, with no grouping. Calls nothing.
+   * @param {PendingBatch[]} batches nothing else changes the array afterwards
+   * @returns {void}
+   */
+  #handOn(batches) {
     if (batches.length === 0) {
-      return Promise.resolve()
+      return
+    }
+    for (const batch of batches) {
+      const { key } = batch
+      this.#unsettled.set(key, (this.#unsettled.get(key) ?? 0) + 1)
+      batch.settlers.push(
+        new BatchTracker(
+          () => this.#unsettled.set(key, (this.#unsettled.get(key) ?? 0) + 1),
+          () => this.#settled(key)
+        )
+      )
     }
     let shared = true
     for (let i = 1; i < batches.length && shared; i++) {
       shared = batches[i].options === batches[0].options
     }
     if (shared) {
-      return this.#send(batches)
+      this.#outbox.push({ batches, sent: null })
+      return
     }
     /** @type {Map<string, PendingBatch[]>} */
     const groups = new Map()
@@ -2260,39 +2413,32 @@ class Accumulator {
         group.push(batch)
       }
     }
-    return Promise.all(Array.from(groups.values(), (group) => this.#send(group)))
+    for (const group of groups.values()) {
+      this.#outbox.push({ batches: group, sent: null })
+    }
   }
 
   /**
-   * @param {PendingBatch} batch
-   * @returns {Promise<void>}
+   * Sends what waits in `#outbox`, oldest entry first, taking each entry out only as its request
+   * begins. A request that flushes or closes the producer meanwhile hands on or refuses the rest
+   * itself, in the same order, and this loop then finds nothing left.
+   * @returns {void}
    */
-  #flushBatch(batch) {
-    clearTimeout(batch.timer)
-    this.#pending.delete(batch.key)
-    return this.#send([batch])
+  #dispatch() {
+    for (let entry = this.#outbox.shift(); entry !== undefined; entry = this.#outbox.shift()) {
+      entry.sent = this.#send(entry.batches)
+    }
   }
 
   /**
-   * Sends batches that share their options, each with one more settler that counts it as unsettled
-   * until it settles. A failure of the call itself - one that settled no batch, whether the send
-   * path threw or rejected - rejects every settler that is still waiting, so a hand-off never
-   * throws into the join or timer that made it. A send path that throws took none of the batches,
-   * so they retire here; one that rejects took them and retires them itself.
+   * Sends batches that share their options. A failure of the call itself - one that settled no
+   * batch, whether the send path threw or rejected - rejects every settler that is still waiting,
+   * so a hand-off never throws into the join or timer that made it. A send path that throws took
+   * none of the batches, so they retire here; one that rejects took them and retires them itself.
    * @param {PendingBatch[]} batches
    * @returns {Promise<void>} never rejects
    */
   #send(batches) {
-    for (const batch of batches) {
-      const { key } = batch
-      this.#unsettled.set(key, (this.#unsettled.get(key) ?? 0) + 1)
-      batch.settlers.push(
-        new BatchTracker(
-          () => this.#unsettled.set(key, (this.#unsettled.get(key) ?? 0) + 1),
-          () => this.#settled(key)
-        )
-      )
-    }
     const [{ acks, timeout, compression }] = batches
     let sent
     try {
