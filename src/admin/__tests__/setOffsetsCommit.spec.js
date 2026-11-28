@@ -740,6 +740,7 @@ describe('Admin > setOffsets > commits the offsets itself, over a stub coordinat
       findGroupCoordinator: findGroupCoordinator
         ? jest.fn(() => findGroupCoordinator(coordinator))
         : async () => coordinator,
+      withCoordinatorBroker: (_nodeId, work) => work(coordinator),
     }
     return { admin: createAdmin({ cluster, logger, retry: RETRY }), coordinator }
   }

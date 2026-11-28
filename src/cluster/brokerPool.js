@@ -1708,6 +1708,35 @@ module.exports = class BrokerPool {
   }
 
   /**
+   * Starts work on the current incarnation of a coordinator node. A metadata refresh can replace
+   * its broker during connection setup, so check the table again before using the result.
+   * @template T
+   * @param {number} nodeId coordinator node id
+   * @param {(broker: Broker) => Promise<T>} work request to start while the broker is current
+   * @param {object} [options]
+   * @param {import('../producer/generation')} [options.fence] original consumer operation
+   * @returns {Promise<T>} the request's result
+   */
+  async withCoordinatorBroker(nodeId, work, { fence } = {}) {
+    for (;;) {
+      const current = this.brokers[nodeId]
+      const pool = current?.connectionPool
+      let broker
+      try {
+        broker = await this.findBroker({ nodeId, fence })
+      } catch (error) {
+        fence?.check()
+        checked(null)
+        if (this.brokers[nodeId] === current && current?.connectionPool === pool) throw error
+        continue
+      }
+      fence?.check()
+      checked(null)
+      if (this.brokers[nodeId] === broker && broker.connectionPool === pool) return work(broker)
+    }
+  }
+
+  /**
    * Tries brokers in shuffled order, skipping connection failures as well as callback failures.
    * Other lookup failures propagate immediately. If no callback succeeds, the last connection
    * failure is thrown if any broker failed to connect; otherwise returns null.

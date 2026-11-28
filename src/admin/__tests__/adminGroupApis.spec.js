@@ -41,6 +41,7 @@ const clusterOver = (broker) => ({
   brokerPool: { brokers: { 0: broker } },
   findBroker: async () => broker,
   findGroupCoordinator: async () => broker,
+  withCoordinatorBroker: (_nodeId, work) => work(broker),
 })
 
 describe('Admin > group APIs > bytes on the wire', () => {

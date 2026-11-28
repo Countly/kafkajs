@@ -88,6 +88,7 @@ const stubCluster = ({
 
   return {
     refreshMetadata: async () => {},
+    withCoordinatorBroker: (nodeId, work) => work(coordinators.get(nodeId)),
     findGroupCoordinator: async ({ groupId }) => {
       onFindCoordinator(groupId)
       const nodeId = nodeIdFor(groupId)
@@ -1191,15 +1192,24 @@ describe('Admin > describeGroups > routing', () => {
             return { ...row, members: [{ ...row.members[0], memberId }] }
           }
           const consumerGroupDescribe = async ({ groupIds }) => ({
-            groups: [withMember(groupIds[0], 'first'), withMember(groupIds[0], 'second')],
+            groups: [
+              withMember('foreign', 'foreign'),
+              withMember(groupIds[0], 'first'),
+              withMember(groupIds[0], 'second'),
+            ],
           })
+          const encode = jest.spyOn(MemberAssignment, 'encode')
+          try {
+            const groups = await run({ consumerGroupDescribe }, [SURROGATE, LITERAL])
 
-          const groups = await run({ consumerGroupDescribe }, [SURROGATE, LITERAL])
-
-          expect(groups.map(({ groupId, members }) => [groupId, members[0].memberId])).toEqual([
-            [SURROGATE, 'first'],
-            [LITERAL, 'first'],
-          ])
+            expect(encode).toHaveBeenCalledTimes(1)
+            expect(groups.map(({ groupId, members }) => [groupId, members[0].memberId])).toEqual([
+              [SURROGATE, 'first'],
+              [LITERAL, 'first'],
+            ])
+          } finally {
+            encode.mockRestore()
+          }
         })
 
         it.each([
@@ -1634,7 +1644,7 @@ describe('Admin > describeGroups > routing', () => {
 
 const logger = { namespace: () => logger, debug() {} }
 test('does not duplicate an in-flight successful split classic batch', async () => {
-  jest.useFakeTimers()
+  jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
   const a = {
     nodeId: 1,
     describeGroups: jest
@@ -1660,6 +1670,7 @@ test('does not duplicate an in-flight successful split classic batch', async () 
   }
   const cluster = {
     refreshMetadata: jest.fn(async () => {}),
+    withCoordinatorBroker: (nodeId, work) => work([original, a, b][nodeId]),
     findGroupCoordinator: jest
       .fn()
       .mockResolvedValueOnce(original)
@@ -1667,18 +1678,14 @@ test('does not duplicate an in-flight successful split classic batch', async () 
       .mockImplementation(async ({ groupId }) => (groupId === 'a' ? a : b)),
   }
   try {
-    const result = createGroupDescriptions({
-      cluster,
-      logger,
-      retry: { retries: 3, initialRetryTime: 1, factor: 0, multiplier: 1 },
-    })
-      .describe(['a', 'b'])
-      .then(
-        (value) => ({ value }),
-        (error) => ({ error })
-      )
-    await jest.advanceTimersByTimeAsync(100)
-    const outcome = await result
+    const outcome = observe(
+      createGroupDescriptions({
+        cluster,
+        logger,
+        retry: { retries: 3, initialRetryTime: 1, factor: 0, multiplier: 1 },
+      }).describe(['a', 'b'])
+    )
+    await driveUntilSettled(outcome)
     expect(outcome.error).toBeUndefined()
     expect(outcome.value.groups.map((row) => row.groupId).sort()).toEqual(['a', 'b'])
     expect(b.describeGroups).toHaveBeenCalledTimes(1)
@@ -1731,9 +1738,13 @@ describe('Admin > describeGroups > a DescribeGroups answer read row by row', () 
     }
   })
 
-  /** The ids a DescribeGroups v6 request body asks for. */
-  const askedIn = (body) =>
-    new Decoder(body).readUVarIntArray((decoder) => decoder.readUVarIntString())
+  /** Reads the ids carried by the requested DescribeGroups version. */
+  const askedIn = (body, version) => {
+    const decoder = new Decoder(body)
+    return version === 6
+      ? decoder.readUVarIntArray((entry) => entry.readUVarIntString())
+      : decoder.readArray((entry) => entry.readString())
+  }
 
   /**
    * A DescribeGroups v6 response body: a described group with one member named `memberId`, or a
@@ -1774,21 +1785,41 @@ describe('Admin > describeGroups > a DescribeGroups answer read row by row', () 
       .writeTaggedFields().buffer
 
   /**
-   * An admin over one real broker on a fake socket that offers DescribeGroups up to v6 and no
+   * A v2 description with a stable group or a group-level error and no members.
+   * @param {object[]} rows group ids and optional broker error codes
+   * @returns {Buffer} DescribeGroups v2 response body
+   */
+  const answerV2Of = (rows) => {
+    const groups = rows.map(({ groupId, errorCode = 0 }) =>
+      new Encoder()
+        .writeInt16(errorCode)
+        .writeString(groupId)
+        .writeString(errorCode === 0 ? 'Stable' : '')
+        .writeString(errorCode === 0 ? 'consumer' : '')
+        .writeString(errorCode === 0 ? 'range' : '')
+        .writeArray([])
+    )
+    return new Encoder().writeInt32(0).writeArray(groups, 'object').buffer
+  }
+
+  /**
+   * An admin over one real broker on a fake socket that offers the selected DescribeGroups and no
    * ConsumerGroupDescribe, so every id is described through DescribeGroups. `answer(asked, index)`
    * gives the rows of the `index`-th request for the ids it asked.
    */
-  const adminOver = (answer) => {
+  const adminOver = (answer, version = 6) => {
     const found = []
     harness = createGroupApiBroker({
-      versions: { [apiKeys.DescribeGroups]: { minVersion: 0, maxVersion: 6 } },
+      versions: { [apiKeys.DescribeGroups]: { minVersion: 0, maxVersion: version } },
       respond: () => {
         const index = harness.requests.length - 1
-        return answerOf(answer(askedIn(harness.requests[index].body), index))
+        const rows = answer(askedIn(harness.requests[index].body, version), index)
+        return version === 6 ? answerOf(rows) : answerV2Of(rows)
       },
     })
     const cluster = {
       refreshMetadata: jest.fn(async () => {}),
+      withCoordinatorBroker: (_nodeId, work) => work(harness.broker),
       findGroupCoordinator: jest.fn(async ({ groupId }) => {
         found.push(groupId)
         return harness.broker
@@ -1801,7 +1832,8 @@ describe('Admin > describeGroups > a DescribeGroups answer read row by row', () 
     }
   }
 
-  const sent = () => harness.requests.map(({ apiKey, body }) => [apiKey, askedIn(body)])
+  const sent = (version = 6) =>
+    harness.requests.map(({ apiKey, body }) => [apiKey, askedIn(body, version)])
 
   test.each([
     ['COORDINATOR_LOAD_IN_PROGRESS', COORDINATOR_LOAD_IN_PROGRESS, ['a', 'b'], 0],
@@ -1842,6 +1874,30 @@ describe('Admin > describeGroups > a DescribeGroups answer read row by row', () 
       ])
     }
   )
+
+  test('keeps the settled v2 description while retrying only its loading sibling', async () => {
+    const { admin } = adminOver(
+      (asked, index) =>
+        asked.map((groupId) => ({
+          groupId,
+          errorCode: index === 0 && groupId === 'b' ? COORDINATOR_LOAD_IN_PROGRESS : 0,
+        })),
+      2
+    )
+
+    const outcome = observe(admin.describeGroups(['a', 'b']))
+    await driveUntilSettled(outcome)
+
+    expect(outcome.error).toBeUndefined()
+    expect(outcome.value.groups.map(({ groupId, state }) => [groupId, state])).toEqual([
+      ['a', 'Stable'],
+      ['b', 'Stable'],
+    ])
+    expect(sent(2)).toEqual([
+      [apiKeys.DescribeGroups, ['a', 'b']],
+      [apiKeys.DescribeGroups, ['b']],
+    ])
+  })
 
   test('fails the call on a GROUP_AUTHORIZATION_FAILED row next to a described one, sending nothing again', async () => {
     const { admin } = adminOver((asked) =>
@@ -1885,7 +1941,7 @@ describe('Admin > describeGroups > a DescribeGroups answer read row by row', () 
   })
 })
 
-describe('Admin > describeGroups > two coordinators in one attempt', () => {
+describe('Admin > describeGroups > two coordinators', () => {
   beforeEach(() => {
     jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
   })
@@ -1902,6 +1958,7 @@ describe('Admin > describeGroups > two coordinators in one attempt', () => {
     ]
     const cluster = {
       refreshMetadata: jest.fn(async () => {}),
+      withCoordinatorBroker: (nodeId, work) => work(nodes[nodeId]),
       findGroupCoordinator: jest.fn(async ({ groupId }) => {
         found.push(groupId)
         return nodes[groupId === 'a' ? 0 : 1]
@@ -1927,7 +1984,7 @@ describe('Admin > describeGroups > two coordinators in one attempt', () => {
   // The refusal comes from DescribeGroups' own rule as a request without the row-by-row option
   // gives it; the row form is driven through a real broker above.
   test.each([
-    ['the refusal arriving last', 10, 20],
+    ['the refusal arriving last', 5, 10],
     ['the refusal arriving first', 20, 10],
   ])(
     'ends the call with the GROUP_AUTHORIZATION_FAILED one coordinator answers while another loses its connection, with %s',
@@ -1996,7 +2053,7 @@ describe('Admin > describeGroups > two coordinators in one attempt', () => {
 
       expect(outcome.error).toBeUndefined()
       expect(
-        outcome.value.groups.map(({ groupId, members }) => [groupId, members[0].memberId])
+        outcome.value.groups.map(({ groupId, members }) => [groupId, members[0].memberId]).sort()
       ).toEqual([
         ['a', 'from-a'],
         ['b', 'from-b'],
@@ -2038,7 +2095,7 @@ describe('Admin > describeGroups > two coordinators in one attempt', () => {
       expect(found).toEqual(['a', 'b'])
       expect(cluster.refreshMetadata).not.toHaveBeenCalled()
       expect(
-        outcome.value.groups.map(({ groupId, members }) => [groupId, members[0].memberId])
+        outcome.value.groups.map(({ groupId, members }) => [groupId, members[0].memberId]).sort()
       ).toEqual([
         ['a', 'from-a'],
         ['b', 'from-b'],
@@ -2079,102 +2136,202 @@ describe('Admin > describeGroups > two coordinators in one attempt', () => {
     expect(found).toEqual(['a'])
   })
 
-  test('waits for every coordinator lookup of an attempt, so the next attempt does not look a sibling up again', async () => {
+  test('retries a lookup and describes its group while another lookup is pending', async () => {
     const found = []
-    let failed = false
     const node = {
       nodeId: 0,
       consumerGroupDescribe: jest.fn(async ({ groupIds }) => ({
-        groups: groupIds.map((groupId) => consumerGroupRow(groupId)),
+        groups: groupIds.map(consumerGroupRow),
       })),
-      describeGroups: jest.fn(),
     }
     const cluster = {
-      refreshMetadata: jest.fn(async () => {}),
+      withCoordinatorBroker: (_nodeId, work) => work(node),
       findGroupCoordinator: jest.fn(async ({ groupId }) => {
         found.push(groupId)
-        if (groupId === 'a' && !failed) {
-          failed = true
-          throw new KafkaJSError('The coordinator is not available yet')
-        }
-        if (groupId === 'b') await after(30)
+        if (found.length === 1) throw new KafkaJSError('The coordinator is not available yet')
+        if (groupId === 'b') await after(40)
         return node
       }),
     }
     const admin = createAdmin({ logger: newLogger(), retry: tenMsRetry, cluster })
 
     const outcome = observe(admin.describeGroups(['a', 'b']))
+    for (let step = 0; step < 3; step++) {
+      await new Promise(setImmediate)
+      await jest.advanceTimersByTimeAsync(10)
+    }
+    const early = node.consumerGroupDescribe.mock.calls.map(([request]) => request.groupIds)
     await driveUntilSettled(outcome)
 
+    expect(early).toEqual([['a']])
     expect(outcome.error).toBeUndefined()
     expect(found).toEqual(['a', 'b', 'a'])
     expect(node.consumerGroupDescribe.mock.calls.map(([request]) => request.groupIds)).toEqual([
-      ['b'],
       ['a'],
-    ])
-    expect(outcome.value.groups.map(({ groupId, errorCode }) => [groupId, errorCode])).toEqual([
-      ['b', 0],
-      ['a', 0],
+      ['b'],
     ])
   })
 
-  test('asks a loading id again only after the slower request of another coordinator in the same attempt has settled', async () => {
-    const started = performance.now()
-    const askedAt = []
-    const { admin, nodes } = twoCoordinators(
-      {
-        consumerGroupDescribe: jest.fn(async ({ groupIds }) => {
-          await after(50)
-          return { groups: groupIds.map((groupId) => consumerGroupRow(groupId)) }
-        }),
-      },
-      {
-        consumerGroupDescribe: jest.fn(async ({ groupIds }) => {
-          askedAt.push(performance.now() - started)
+  /**
+   * A coordinator that describes through the chosen API. Classic rows carry the same versioned
+   * error the internal result reader returns in the wire tests.
+   */
+  const describeVia = (api, answer) =>
+    api === 'consumer'
+      ? { consumerGroupDescribe: jest.fn(answer) }
+      : { consumerGroupDescribe: notConsumerGroups, describeGroups: jest.fn(answer) }
+
+  test.each(['consumer', 'classic'])(
+    'keeps the %s retry budget across coordinator moves',
+    async (api) => {
+      const lookedUp = []
+      const sentTo = []
+      const row = api === 'consumer' ? consumerGroupRow : classicGroupRow
+      const cluster = stubCluster({
+        ...describeVia(api, async function ({ groupIds }) {
+          sentTo.push(this.nodeId)
           return {
-            groups: groupIds.map((groupId) =>
-              askedAt.length === 1
-                ? { ...consumerGroupRow(groupId), errorCode: COORDINATOR_LOAD_IN_PROGRESS }
-                : consumerGroupRow(groupId)
-            ),
+            groups: groupIds.map((id) => ({
+              ...row(id),
+              errorCode: NOT_COORDINATOR,
+              members: [],
+              ...(api === 'classic' && { error: createErrorFromCode(NOT_COORDINATOR) }),
+            })),
           }
         }),
-      }
-    )
+        onFindCoordinator: (id) => lookedUp.push(id),
+        nodeIdFor: () => lookedUp.length,
+      })
+      const admin = createAdmin({ logger: newLogger(), retry: tenMsRetry, cluster })
+      const outcome = observe(admin.describeGroups(['a']))
+      await driveUntilSettled(outcome)
 
+      expect(lookedUp).toEqual(['a', 'a', 'a'])
+      expect(sentTo).toEqual([1, 2, 3])
+      expect(outcome.error).toMatchObject({
+        name: 'KafkaJSNumberOfRetriesExceeded',
+        retryCount: 2,
+        code: NOT_COORDINATOR,
+      })
+    }
+  )
+
+  test.each(['consumer', 'classic'])(
+    'retries a loading %s group before a held sibling answers near the deadline',
+    async (api) => {
+      let releaseSibling
+      const held = new Promise((resolve) => {
+        releaseSibling = resolve
+      })
+      const row = api === 'consumer' ? consumerGroupRow : classicGroupRow
+      const method = api === 'consumer' ? 'consumerGroupDescribe' : 'describeGroups'
+      let first = true
+      const retriesWhileHeld = []
+      let siblingInFlight = false
+      let released = false
+      const { admin, nodes } = twoCoordinators(
+        describeVia(api, async ({ groupIds }) => {
+          const [groupId] = groupIds
+          if (!first) {
+            retriesWhileHeld.push(siblingInFlight && !released)
+            return { groups: [row(groupId)] }
+          }
+          first = false
+          const errorCode = COORDINATOR_LOAD_IN_PROGRESS
+          return {
+            groups: [
+              {
+                ...row(groupId),
+                errorCode,
+                members: [],
+                ...(api === 'classic' && { error: createErrorFromCode(errorCode) }),
+              },
+            ],
+          }
+        }),
+        describeVia(api, () => {
+          siblingInFlight = true
+          return held
+        }),
+        { apiTimeout: 60 }
+      )
+
+      const outcome = observe(admin.describeGroups(['a', 'b']))
+      for (let step = 0; step < 5; step++) {
+        await new Promise(setImmediate)
+        await jest.advanceTimersByTimeAsync(10)
+      }
+      await jest.advanceTimersByTimeAsync(5)
+      const siblingWasAsked = nodes[1][method].mock.calls.length === 1
+      released = true
+      releaseSibling({ groups: [row('b')] })
+      await driveUntilSettled(outcome)
+
+      expect(siblingWasAsked).toBe(true)
+      expect(retriesWhileHeld).toEqual([true])
+      expect(outcome.error).toBeUndefined()
+      expect(outcome.value.groups.map(({ groupId }) => groupId)).toEqual(['a', 'b'])
+      expect(nodes[0][method]).toHaveBeenCalledTimes(2)
+      expect(nodes[1][method]).toHaveBeenCalledTimes(1)
+    }
+  )
+
+  test('starts a ready classic fallback while another consumer description is in flight', async () => {
+    let releaseSibling
+    const held = new Promise((resolve) => {
+      releaseSibling = resolve
+    })
+    const { admin, nodes } = twoCoordinators(
+      describeVia('classic', async ({ groupIds }) => ({ groups: groupIds.map(classicGroupRow) })),
+      describeVia('consumer', () => held)
+    )
     const outcome = observe(admin.describeGroups(['a', 'b']))
+    for (let step = 0; step < 3; step++) {
+      await new Promise(setImmediate)
+      await jest.advanceTimersByTimeAsync(10)
+    }
+    const fallbackStarted = nodes[0].describeGroups.mock.calls.length === 1
+    releaseSibling({ groups: [consumerGroupRow('b')] })
     await driveUntilSettled(outcome)
 
+    expect(fallbackStarted).toBe(true)
     expect(outcome.error).toBeUndefined()
-    expect(nodes[0].consumerGroupDescribe).toHaveBeenCalledTimes(1)
-    expect(nodes[1].consumerGroupDescribe).toHaveBeenCalledTimes(2)
-    // The retry waits for the 50 ms request of the other coordinator, then the 10 ms backoff.
-    expect(askedAt[1]).toBeGreaterThanOrEqual(60)
+    expect(outcome.value.groups.map(({ groupId, groupType }) => [groupId, groupType])).toEqual([
+      ['b', 'consumer'],
+      ['a', 'classic'],
+    ])
   })
 
-  test('asks every unresolved id again after the request of one coordinator times out', async () => {
-    const started = performance.now()
-    const askedAt = []
+  test('backs off on a request timeout without delaying another coordinator retry', async () => {
+    const events = []
+    let failed = false
+    let loading = true
     const { admin, nodes } = twoCoordinators(
       {
         consumerGroupDescribe: jest.fn(async ({ groupIds }) => {
-          if (nodes[0].consumerGroupDescribe.mock.calls.length === 1) {
+          if (!failed) {
+            failed = true
             await after(50)
+            events.push('a timed out')
             throw new KafkaJSRequestTimeoutError('Request ConsumerGroupDescribe timed out')
           }
-          return { groups: groupIds.map((groupId) => consumerGroupRow(groupId)) }
+          events.push('a retried')
+          return { groups: groupIds.map(consumerGroupRow) }
         }),
       },
       {
         consumerGroupDescribe: jest.fn(async ({ groupIds }) => {
-          askedAt.push(performance.now() - started)
-          return {
-            groups: groupIds.map((groupId) =>
-              askedAt.length === 1
-                ? { ...consumerGroupRow(groupId), errorCode: COORDINATOR_LOAD_IN_PROGRESS }
-                : consumerGroupRow(groupId)
-            ),
+          if (loading) {
+            loading = false
+            return {
+              groups: groupIds.map((id) => ({
+                ...consumerGroupRow(id),
+                errorCode: COORDINATOR_LOAD_IN_PROGRESS,
+              })),
+            }
           }
+          events.push('b retried')
+          return { groups: groupIds.map(consumerGroupRow) }
         }),
       }
     )
@@ -2185,10 +2342,10 @@ describe('Admin > describeGroups > two coordinators in one attempt', () => {
     expect(outcome.error).toBeUndefined()
     expect(nodes[0].consumerGroupDescribe).toHaveBeenCalledTimes(2)
     expect(nodes[1].consumerGroupDescribe).toHaveBeenCalledTimes(2)
-    expect(askedAt[1]).toBeGreaterThanOrEqual(60)
+    expect(events).toEqual(['b retried', 'a timed out', 'a retried'])
     expect(outcome.value.groups.map(({ groupId, errorCode }) => [groupId, errorCode])).toEqual([
-      ['a', 0],
       ['b', 0],
+      ['a', 0],
     ])
   })
 
@@ -2271,6 +2428,7 @@ describe('Admin > describeGroups > two coordinators in one attempt', () => {
 describe('Admin > describeGroups > a coordinator node that moved to another address', () => {
   const { Kafka } = require('../../..')
   const Broker = require('../../broker')
+  const Cluster = require('../../cluster')
   const { createScriptedCluster } = require('../../../testHelpers/scriptedCluster')
 
   // The scripted sockets deliver data and closes through queueMicrotask, which must stay real.
@@ -2289,11 +2447,11 @@ describe('Admin > describeGroups > a coordinator node that moved to another addr
   /**
    * A real Kafka admin over a cluster whose node 1 is the coordinator of every group, at `OLD`
    * until `state.moved`, then at `NEW`; both addresses stay up and answer as node 1. Metadata and
-   * FindCoordinator name node 1 at its current address. ConsumerGroupDescribe is answered by
+   * FindCoordinator name node 1 at its current address. The description is answered by
    * `answer(host, groupId, call, state)` on the real broker the client picked, by that broker's
    * address; `metadataSeen` holds how many Metadata requests had been written at each such call.
    */
-  const movingCluster = (answer) => {
+  const movingCluster = (answer, { api = 'consumer', mixed = false, failRefresh = false } = {}) => {
     const state = { moved: false }
     const at = () => (state.moved ? NEW : OLD)
     const scripted = createScriptedCluster({ nodes: [A, OLD, NEW] })
@@ -2315,21 +2473,61 @@ describe('Admin > describeGroups > a coordinator node that moved to another addr
     const asked = []
     const metadataSeen = []
     const metadataRequests = () => scripted.requests().filter(({ api }) => api === 'Metadata')
-    jest.spyOn(Broker.prototype, 'consumerGroupDescribe').mockImplementation(async function ({
-      groupIds,
-    }) {
-      asked.push([this.connectionPool.host, ...groupIds])
+    const find = Cluster.prototype.findGroupCoordinator
+    const initial = []
+    let initialReady
+    const lookups = jest
+      .spyOn(Cluster.prototype, 'findGroupCoordinator')
+      .mockImplementation(function (request) {
+        const found = find.call(this, request)
+        if (!mixed || state.moved) return found
+        // Release both initial, real discoveries in request order to exercise one mixed batch.
+        const index = initial.push(found) - 1
+        initialReady ??= Promise.resolve().then(() => Promise.all(initial))
+        return initialReady.then((brokers) => brokers[index])
+      })
+    const refresh = Cluster.prototype.refreshMetadata
+    const refreshes = []
+    jest.spyOn(Cluster.prototype, 'refreshMetadata').mockImplementation(async function (...args) {
+      if (!state.moved) return refresh.apply(this, args)
+      if (failRefresh && refreshes.length === 0) {
+        refreshes.push('failed')
+        throw new KafkaJSConnectionError('Metadata transport failed')
+      }
+      await refresh.apply(this, args)
+      refreshes.push('completed')
+    })
+    if (api === 'classic') {
+      jest
+        .spyOn(Broker.prototype, 'consumerGroupDescribe')
+        .mockImplementation(async ({ groupIds }) => ({
+          groups: groupIds.map((groupId) => ({ groupId, errorCode: GROUP_ID_NOT_FOUND })),
+        }))
+    }
+    const method = api === 'classic' ? 'describeGroups' : 'consumerGroupDescribe'
+    jest.spyOn(Broker.prototype, method).mockImplementation(async function ({ groupIds }) {
+      const { host } = this.connectionPool
+      if (host === OLD.host) state.oldBroker ??= this
+      if (host === NEW.host) state.oldRetired = state.oldBroker.retired
+      asked.push([host, ...groupIds])
       metadataSeen.push(metadataRequests().length)
       return {
-        groups: groupIds.flatMap((groupId) =>
-          answer(this.connectionPool.host, groupId, asked.length, state)
-        ),
+        groups: groupIds
+          .flatMap((groupId) => answer(host, groupId, asked.length, state, groupIds))
+          .map((row) =>
+            api === 'classic' && row.errorCode !== 0
+              ? { ...row, error: createErrorFromCode(row.errorCode) }
+              : row
+          ),
       }
     })
     const admin = new Kafka(
-      scripted.kafkaOptions({ brokers: [`${A.host}:${A.port}`], retry: tenMsRetry })
+      scripted.kafkaOptions({
+        brokers: [`${A.host}:${A.port}`],
+        retry: mixed ? { ...tenMsRetry, retries: 5 } : tenMsRetry,
+      })
     ).admin()
-    return { scripted, admin, state, asked, metadataSeen, metadataRequests }
+    return { scripted, admin, state, asked, metadataSeen, metadataRequests, refreshes, lookups }
   }
 
   const run = async ({ scripted, admin }, work) => {
@@ -2369,6 +2567,57 @@ describe('Admin > describeGroups > a coordinator node that moved to another addr
       ['g', 0],
     ])
   })
+
+  test.each([
+    ['consumer', 'loading first', ['load', 'move'], false],
+    ['consumer', 'moved first', ['move', 'load'], false],
+    ['classic', 'loading first', ['load', 'move'], false],
+    ['classic', 'moved first', ['move', 'load'], false],
+    ['consumer', 'a failed refresh', ['load', 'move'], true],
+    ['classic', 'a failed refresh', ['load', 'move'], true],
+  ])(
+    'uses the current broker for a pending %s sibling after %s',
+    async (api, _order, ids, failRefresh) => {
+      const row = api === 'consumer' ? consumerGroupRow : classicGroupRow
+      let movedDescribed = false
+      const fixture = movingCluster(
+        (host, groupId, _call, state, groupIds) => {
+          if (host === OLD.host && groupId === 'move') {
+            state.moved = true
+            return [{ ...row(groupId), errorCode: NOT_COORDINATOR, members: [] }]
+          }
+          if (groupId === 'load') {
+            state.loadAtNew = (state.loadAtNew || 0) + Number(host === NEW.host)
+            if (
+              host === OLD.host ||
+              !movedDescribed ||
+              state.loadAtNew === 1 ||
+              groupIds.includes('move')
+            ) {
+              return [{ ...row(groupId), errorCode: COORDINATOR_LOAD_IN_PROGRESS, members: [] }]
+            }
+          }
+          if (groupId === 'move') movedDescribed = true
+          return [row(groupId)]
+        },
+        { api, mixed: true, failRefresh }
+      )
+      const outcome = await run(fixture, () => fixture.admin.describeGroups(ids))
+
+      expect(outcome.error).toBeUndefined()
+      expect(fixture.asked[0]).toEqual([OLD.host, ...ids])
+      expect(fixture.asked.filter(([, ...groupIds]) => groupIds.includes('move'))).toEqual([
+        [OLD.host, ...ids],
+        expect.arrayContaining([NEW.host, 'move']),
+      ])
+      const last = fixture.asked[fixture.asked.length - 1]
+      expect(last).toEqual([NEW.host, 'load'])
+      expect(fixture.state.oldRetired).toBe(true)
+      expect(fixture.refreshes).toEqual(failRefresh ? ['failed', 'completed'] : ['completed'])
+      expect(fixture.lookups.mock.calls.map(([{ groupId }]) => groupId)).toEqual([...ids, 'move'])
+      expect(outcome.value.groups.map(({ groupId }) => groupId).sort()).toEqual(['load', 'move'])
+    }
+  )
 
   test.each([
     [

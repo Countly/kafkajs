@@ -26,6 +26,9 @@ const {
 } = require('../errors')
 const { attachFailureSource } = require('./failureSource')
 const { ADMIN_MUTATION, ON_WRITE, ON_DECODED, UNCHECKED_ROWS } = require('./privateOptions')
+const {
+  readResults: readGroupDescriptionResults,
+} = require('../protocol/requests/describeGroups/responseRows')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { GROUP_STATES, GROUP_TYPES, toDisplayName } = require('../protocol/groupTypes')
 const shuffle = require('../utils/shuffle')
@@ -2055,22 +2058,9 @@ module.exports = class Broker {
     const describeGroups = this.lookupRequest(apiKeys.DescribeGroups, requests.DescribeGroups)
     const protocolRequest = describeGroups({ groupIds, includeAuthorizedOperations })
     if (options?.[UNCHECKED_ROWS]) {
-      const { parse } = protocolRequest.response
       protocolRequest.response = {
         ...protocolRequest.response,
-        parse: async (data) => ({
-          ...data,
-          groups: await Promise.all(
-            data.groups.map(async (group) => {
-              try {
-                await parse({ ...data, groups: [group] })
-                return group
-              } catch (error) {
-                return { ...group, error }
-              }
-            })
-          ),
-        }),
+        parse: readGroupDescriptionResults(protocolRequest.request.apiVersion, groupIds),
       }
     }
     return await this[PRIVATE.SEND_REQUEST](protocolRequest, guard)

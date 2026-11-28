@@ -1,8 +1,5 @@
 const { buildDecode } = require('../v3/response')
-const { failure, createErrorFromCode } = require('../../../error')
-
-/** GROUP_ID_NOT_FOUND: at v6 this is an answer about one group, not a failed request. */
-const GROUP_ID_NOT_FOUND = 69
+const { parseRows } = require('../responseRows')
 
 /**
  * Throws for every group-level error code except `GROUP_ID_NOT_FOUND`.
@@ -20,17 +17,7 @@ const GROUP_ID_NOT_FOUND = 69
  * @throws {KafkaJSProtocolError} on any other group-level code, first one wins
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-1043%3A+Administration+of+groups
  */
-const parse = async (data) => {
-  const errored = data.groups.find(
-    (group) => failure(group.errorCode) && group.errorCode !== GROUP_ID_NOT_FOUND
-  )
-
-  if (errored) {
-    throw createErrorFromCode(errored.errorCode)
-  }
-
-  return data
-}
+const parse = parseRows(6)
 
 /**
  * DescribeGroupsResponse (Version: 6) — flexible (KIP-482), response header v1

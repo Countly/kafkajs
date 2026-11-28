@@ -27,6 +27,7 @@ describe('authorized operations', () => {
       const cluster = {
         refreshMetadata: jest.fn(async () => {}),
         findGroupCoordinator: jest.fn(async ({ groupId }) => targets[Number(groupId.slice(1)) % 2]),
+        withCoordinatorBroker: (nodeId, work) => work(targets[nodeId]),
       }
       const ids = ['g0', 'g1', 'g2', 'g3', 'g4']
       const { groups } = await createGroupDescriptions({
@@ -77,6 +78,7 @@ describe('authorized operations', () => {
       const cluster = {
         refreshMetadata: jest.fn(async () => {}),
         findGroupCoordinator: jest.fn(async () => coordinator),
+        withCoordinatorBroker: (_nodeId, work) => work(coordinator),
       }
       const descriptions = createGroupDescriptions({ cluster, logger })
       const ids = masks.map((_, index) => `g${index}`)
@@ -126,6 +128,7 @@ describe('authorized operations', () => {
     }
     const cluster = {
       refreshMetadata: jest.fn(async () => {}),
+      withCoordinatorBroker: (nodeId, work) => work(nodeId === 0 ? original : replacement),
       findGroupCoordinator: jest
         .fn()
         .mockResolvedValueOnce(original)

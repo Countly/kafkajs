@@ -1765,6 +1765,19 @@ module.exports = class Cluster {
   }
 
   /**
+   * Dispatches group-description work by node id through the pool that owns broker incarnations.
+   * @template T
+   * @param {number} nodeId previously discovered coordinator node
+   * @param {(broker: import('../broker')) => Promise<T>} work request to start on its current broker
+   * @param {object} [options]
+   * @param {import('../producer/generation')} [options.fence] original consumer operation
+   * @returns {Promise<T>} the request's result
+   */
+  withCoordinatorBroker(nodeId, work, options) {
+    return this.brokerPool.withCoordinatorBroker(nodeId, work, options)
+  }
+
+  /**
    * One FindCoordinator answer, from the first cached broker that gives one. Before the first
    * Metadata response the broker table is empty, and the seed broker is asked instead; a
    * connection failure or a timeout there is retriable, as the next cached broker would be.

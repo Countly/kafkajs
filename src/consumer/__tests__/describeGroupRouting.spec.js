@@ -53,6 +53,7 @@ const build = (
   const cluster = {
     refreshMetadata: async () => {},
     findGroupCoordinator: async () => harness.broker,
+    withCoordinatorBroker: (_nodeId, work) => work(harness.broker),
     onTopicRecreated: () => () => {},
   }
 
@@ -200,6 +201,7 @@ describe('Consumer > describeGroup > routing', () => {
         cluster: {
           refreshMetadata: async () => {},
           findGroupCoordinator: async () => coordinator,
+          withCoordinatorBroker: (_nodeId, work) => work(coordinator),
           onTopicRecreated: () => () => {},
         },
         groupId,

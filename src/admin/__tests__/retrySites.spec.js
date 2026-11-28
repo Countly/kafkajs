@@ -43,25 +43,17 @@ describe('admin retry ownership', () => {
     for (const method of sites) expect(index).toMatch(new RegExp(`const ${method} = async`))
   })
 
-  it('runs both group describe APIs through the one counted retry loop of the group resolver', () => {
+  it('runs both group describe APIs through the same per-id retry path', () => {
     const groups = fs.readFileSync(path.join(__dirname, '..', 'groupDescriptions.js'), 'utf8')
-    const start = groups.indexOf('  async #resolve(')
-    const end = groups.indexOf('\n  async #', start + 1)
-    expect([start > 0, end > start]).toEqual([true, true])
-    const resolver = groups.slice(start, end)
-
-    // The resolver holds the only counted retry of the file...
-    expect(groups.match(/this\.#retrier\(context\)\(/g)).toHaveLength(1)
-    expect(resolver.match(/this\.#retrier\(context\)\(/g)).toHaveLength(1)
-    // ...and each API reaches it from exactly one call site, the consumer API first.
-    const calls = [...groups.matchAll(/this\.#resolve\((\w+(?:\.\w+)?), context, this\.#(\w+)\(/g)]
-    expect(calls.map(([, ids, api]) => [ids, api])).toEqual([
-      ['names.ids', 'consumerApi'],
-      ['fallbackIds', 'classicApi'],
-    ])
-    expect(groups.match(/this\.#resolve\(/g)).toHaveLength(2)
-    expect(groups.match(/this\.#askConsumer\(/g)).toHaveLength(1)
-    expect(groups.match(/this\.#askClassic\(/g)).toHaveLength(1)
+    const resolver = fs.readFileSync(
+      path.join(__dirname, '..', 'groupDescriptionResolver.js'),
+      'utf8'
+    )
+    expect(groups.match(/new GroupDescriptionResolver\(/g)).toHaveLength(1)
+    expect(groups).toContain('await resolver.resolve(names.ids)')
+    expect(resolver.match(/this\.retrier\(/g)).toHaveLength(1)
+    const calls = [...resolver.matchAll(/this\.#resolveApi\(entry, this\.(\w+)\)/g)]
+    expect(calls.map(([, api]) => api)).toEqual(['consumer', 'classic'])
   })
 
   it('builds generic retries only at the deadline boundary', () => {

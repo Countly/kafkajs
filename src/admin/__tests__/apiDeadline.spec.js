@@ -436,6 +436,7 @@ describe('admin invocation deadlines', () => {
         findConnectedBroker: async () => broker,
         findBroker: async () => broker,
         findGroupCoordinator: async () => broker,
+        withCoordinatorBroker: (_nodeId, work) => work(broker),
         getNodeIds: () => ['0'],
         findTopicPartitionMetadata: () => [{ partitionId: 0, leader: 0 }],
         findLeaderForPartitions: () => ({ 0: [0] }),
