@@ -357,7 +357,6 @@ const createProducer = ({
 
   let transactionalEosManager
   let transactionalMessageProducer
-  let abortingDelivery = null
   /**
    * @type {{ abort: () => Promise<void>, ending: () => (Promise<void>|null), ended: () => boolean }|null}
    *   the abort of the last transaction object, with its end under way and whether it has ended:
@@ -550,7 +549,6 @@ const createProducer = ({
         INITIALIZED,
         getGeneration,
         callbacks,
-        abortRefusal: () => abortingDelivery,
       })
     const { stateManager } = transactionalEosManager
 
@@ -678,8 +676,10 @@ const createProducer = ({
     }
 
     /**
-     * Abort the ongoing transaction: rejects the batches still queued - accumulated ones
-     * included - waits for the rest of the transaction's operations, then aborts it. It ends the
+     * Abort the ongoing transaction: revokes the requests not yet written (a custom codec still
+     * compressing one is no longer waited for) and rejects the batches still queued - accumulated
+     * ones included - then waits for the rest of the transaction's operations, so a send not yet
+     * queued is delivered as before, then aborts it. It ends the
      * transaction even when the abort fails, unless the producer is unusable. A rejected batch
      * that was already sent once leaves its sequence spent, so the abort then moves the producer
      * to a new epoch (see `abort()` on the eosManager). Called while a `commit()` of the
@@ -698,7 +698,6 @@ const createProducer = ({
         'The transaction was aborted while this batch was waiting to be sent'
       )
       if (ending === null && stateManager.state() === IN_TRANSACTION) {
-        abortingDelivery = droppedError
         transactionalMessageProducer.abortUnwritten(droppedError)
       }
       // The accumulated batches join the queue, so the abort rejects them with the rest.
@@ -709,12 +708,6 @@ const createProducer = ({
           : []
       const droppedSequences = dropped.some(({ firstSequence }) => firstSequence !== null)
       const ended = endWith(() => transactionalEosManager.abort({ droppedSequences }))
-      if (abortingDelivery === droppedError) {
-        const release = () => {
-          if (abortingDelivery === droppedError) abortingDelivery = null
-        }
-        ended.then(release, release)
-      }
       transactionalMessageProducer.flush(ended)
       return ended
     }

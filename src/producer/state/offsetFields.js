@@ -1,11 +1,20 @@
-const Long = require('../../utils/long')
+/**
+ * Whether reading a value can run the caller's code (a getter, `valueOf`, `toString`, a Proxy).
+ * @param {*} value
+ * @returns {boolean}
+ */
+const isObject = (value) =>
+  value !== null && (typeof value === 'object' || typeof value === 'function')
 
 /**
- * Captures the number the int32 encoder writes, including its range and coercion rules.
+ * Captures an int32 field. A primitive is kept as given, for the encoder to check as it always
+ * has; an object is converted once here, with the encoder's range and coercion rules.
  * @param {*} value
- * @returns {number}
+ * @returns {*} the primitive as given, or the converted number
+ * @throws {RangeError} for an object whose number is outside the int32 range
  */
 const int32 = (value) => {
+  if (!isObject(value)) return value
   const number = +value
   if (number < -2147483648 || number > 2147483647) {
     throw new RangeError('Offset request field is outside the int32 range')
@@ -14,30 +23,27 @@ const int32 = (value) => {
 }
 
 /**
- * Captures a nullable Kafka string. The string encoder accepts strings without coercion.
+ * Captures a nullable Kafka string field. A primitive is kept as given; an object is refused,
+ * since the string encoder writes no object.
  * @param {*} value
- * @returns {string|null|undefined}
+ * @returns {*} the primitive as given
+ * @throws {TypeError} for an object
  */
 const text = (value) => {
-  if (value != null && typeof value !== 'string') {
-    throw new TypeError('Offset request field must be a string')
-  }
+  if (isObject(value)) throw new TypeError('Offset request field must be a string')
   return value
 }
 
 /**
- * Captures an int64 as its signed wire value in decimal, reading the payload of a Long once.
+ * Captures an int64 field. A primitive is kept as given; an object (a `Long` or a value with a
+ * conversion of its own) is read once and kept as its signed wire value in decimal.
  * @param {*} value
- * @returns {string}
+ * @returns {*} the primitive as given, or the decimal string
  */
 const int64 = (value) => {
-  let number
-  if (value != null && (typeof value === 'object' || typeof value === 'function')) {
-    const payload = value.value
-    number = typeof payload === 'bigint' ? payload : BigInt(value)
-  } else {
-    number = Long.fromValue(value).value
-  }
+  if (!isObject(value)) return value
+  const payload = value.value
+  const number = typeof payload === 'bigint' ? payload : BigInt(value)
   return String(BigInt.asIntN(64, number))
 }
 

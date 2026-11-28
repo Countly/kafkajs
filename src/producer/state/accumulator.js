@@ -1272,13 +1272,6 @@ class Accumulator {
       throw this.#expired(this.#timedOut(send))
     }
 
-    let charge
-    try {
-      this.#assertFits(topicMessages, compression, codec)
-      charge = chargeOf(topicMessages, this.#admission.capacity)
-    } catch (error) {
-      throw this.#expired(error)
-    }
     this.#appending += 1
     send.holdTopics()
     send.lanes = send.topics
@@ -1286,6 +1279,8 @@ class Accumulator {
     this.track(send)
     let reservation
     try {
+      this.#assertFits(topicMessages, compression, codec)
+      const charge = chargeOf(topicMessages, this.#admission.capacity)
       const granted = this.#admission.acquire(charge.total, send.deadline)
       reservation = granted instanceof Promise ? this.#granted(await granted, generation) : granted
       send.admit(reservation, charge)

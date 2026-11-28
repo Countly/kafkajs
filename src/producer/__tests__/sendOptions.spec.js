@@ -1627,8 +1627,17 @@ describe('Producer > send options', () => {
       return rig.producer.disconnect(action === 'force-close' ? { timeout: 0 } : undefined)
     }
 
-    /** @returns {boolean} whether the end drops an unwritten send */
+    /** @returns {boolean} whether the end drops a send queued or on a request not yet written */
     const dropsUnwritten = (action) => action === 'abort' || action === 'force-close'
+
+    /**
+     * @returns {boolean} whether the end also drops a send still being admitted or routed: an
+     *   abort delivers it, as it always has, before it ends the transaction
+     */
+    const dropsUnqueued = (action) => action === 'force-close'
+
+    /** @returns {boolean} whether the end closes the producer and its connections with it */
+    const closes = (action) => action.endsWith('close')
 
     test.each([
       ['explicit plain', { idempotent: false }, -1, false],
@@ -1801,14 +1810,16 @@ describe('Producer > send options', () => {
       async (_, options) => {
         jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
         const held = holdCodec()
-        rig = await Rig.start({ ...options, deliveryTimeout: 1000, linger: 0 })
+        // The least deliveryTimeout accepted: linger 0 plus the 5000 ms requestTimeout.
+        rig = await Rig.start({ ...options, deliveryTimeout: 5000, linger: 0 })
+        const connected = jest.getTimerCount()
         const send = (extra) =>
           rig.producer.send({ topic: TOPIC, messages: [{ value: VALUE, partition: 0 }], ...extra })
         const expired = send(compressed).catch((error) => error)
         try {
           await waitFor(() => held.compress.mock.calls.length === 1)
           expect(acquire.mock.contexts[0].debts).toBeGreaterThan(0)
-          await jest.advanceTimersByTimeAsync(1000)
+          await jest.advanceTimersByTimeAsync(5000)
           expect(await expired).toMatchObject({ name: 'KafkaJSDeliveryTimeout', outcome: 'unsent' })
           expect(rig.produced()).toEqual([])
           await expectReleased()
@@ -1818,7 +1829,7 @@ describe('Producer > send options', () => {
           await held.finished
           await tick()
           expect(rig.produced()).toHaveLength(1)
-          expect(jest.getTimerCount()).toBe(0)
+          expect(jest.getTimerCount()).toBe(connected)
         } finally {
           held.release()
         }
@@ -1960,6 +1971,7 @@ describe('Producer > send options', () => {
         rig = await Rig.start({ transactionalId: 'external-end', linger: 0 }, { profile: 'tv2' })
         const { producer } = rig
         const transaction = await producer.transaction()
+        const connected = jest.getTimerCount()
         const sent = transaction.send({ topic: TOPIC, messages: MESSAGES, ...compressed })
         const delivery = sent.catch((error) => error)
         try {
@@ -1984,7 +1996,7 @@ describe('Producer > send options', () => {
             expect(produceRequests()).toHaveLength(1)
             await expectReleased()
           }
-          expect(jest.getTimerCount()).toBe(0)
+          expect(jest.getTimerCount()).toBe(closes(action) ? 0 : connected)
         } finally {
           held.release()
         }
@@ -2000,6 +2012,7 @@ describe('Producer > send options', () => {
           { profile: 'tv2' }
         )
         const transaction = await rig.producer.transaction()
+        const connected = jest.getTimerCount()
         const send = (marker) =>
           transaction
             .send({ topic: TOPIC, messages: [{ value: marker.repeat(1500), partition: 0 }] })
@@ -2012,20 +2025,20 @@ describe('Producer > send options', () => {
         expect(produceRequests()).toEqual([])
 
         await endFromOutside(transaction, action)
-        if (dropsUnwritten(action)) {
-          expect(await first).toBeInstanceOf(Error)
-          expect(await second).toBeInstanceOf(Error)
-          expect(produceRequests()).toEqual([])
-        } else {
-          expect(await first).toHaveLength(1)
-          expect(await second).toHaveLength(1)
-          const records = rig.produced().flatMap(({ partitions }) => partitions)
-          expect(records.map(({ count }) => count)).toEqual([1, 1])
-          expect(records[0].body.includes(Buffer.from('x'.repeat(1500)))).toBe(true)
-          expect(records[1].body.includes(Buffer.from('y'.repeat(1500)))).toBe(true)
-        }
+        // The first send lingers in the accumulator; the second is still waiting for admission.
+        const delivered = []
+        if (dropsUnwritten(action)) expect(await first).toBeInstanceOf(Error)
+        else delivered.push(['x', await first])
+        if (dropsUnqueued(action)) expect(await second).toBeInstanceOf(Error)
+        else delivered.push(['y', await second])
+        const records = rig.produced().flatMap(({ partitions }) => partitions)
+        expect(records.map(({ count }) => count)).toEqual(delivered.map(() => 1))
+        delivered.forEach(([marker, metadata], index) => {
+          expect(metadata).toHaveLength(1)
+          expect(records[index].body.includes(Buffer.from(marker.repeat(1500)))).toBe(true)
+        })
         await expectReleased()
-        expect(jest.getTimerCount()).toBe(0)
+        expect(jest.getTimerCount()).toBe(closes(action) ? 0 : connected)
       }
     )
 
@@ -2035,6 +2048,7 @@ describe('Producer > send options', () => {
         jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
         rig = await Rig.start({ transactionalId: 'routing-end', linger: 0 }, { profile: 'tv2' })
         const transaction = await rig.producer.transaction()
+        const connected = jest.getTimerCount()
         let release
         let entered = false
         const route = new Promise((resolve) => {
@@ -2058,7 +2072,7 @@ describe('Producer > send options', () => {
           const ending = endFromOutside(transaction, action)
           release()
           await ending
-          if (dropsUnwritten(action)) {
+          if (dropsUnqueued(action)) {
             expect(await delivery).toBeInstanceOf(Error)
             expect(produceRequests()).toEqual([])
           } else {
@@ -2066,7 +2080,7 @@ describe('Producer > send options', () => {
             expect(produceRequests()).toHaveLength(1)
           }
           await expectReleased()
-          expect(jest.getTimerCount()).toBe(0)
+          expect(jest.getTimerCount()).toBe(closes(action) ? 0 : connected)
         } finally {
           release()
         }

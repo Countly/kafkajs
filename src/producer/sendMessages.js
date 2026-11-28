@@ -314,22 +314,13 @@ class ProduceAttempt {
    *   loop's also settles every other due delivery
    * @param {number} [maxRequestSize=Infinity] cap checked at transmission
    * @param {import('./generation')} [generation] captured lifecycle; never recaptured
-   * @param {() => ?Error} [abortRefusal] the owning transaction's abort, if any
    */
-  constructor(
-    deliveries,
-    getConnectionStatus,
-    expire,
-    maxRequestSize = Infinity,
-    generation,
-    abortRefusal
-  ) {
+  constructor(deliveries, getConnectionStatus, expire, maxRequestSize = Infinity, generation) {
     this.deliveries = deliveries.slice()
     this.getConnectionStatus = getConnectionStatus
     this.expire = expire
     this.maxRequestSize = maxRequestSize
     this.generation = generation
-    this.abortRefusal = abortRefusal
     this.written = false
     this.revoked = null
     for (const delivery of this.deliveries) delivery.currentAttempt = this
@@ -371,7 +362,7 @@ class ProduceAttempt {
    * @returns {Error|null} refusal before any write, or null
    */
   guard = (frameLength) => {
-    const closed = this.revoked ?? this.generation?.guard() ?? this.abortRefusal?.()
+    const closed = this.revoked ?? this.generation?.guard()
     if (closed) return closed
     const statusError = connectionStatusError(this.getConnectionStatus())
     if (statusError) return statusError
@@ -633,7 +624,6 @@ class DrainLoop {
   #budget
   #generation
   #callbacks
-  #abortRefusal
   /** @type {Set<Send>} */
   #sends = new Set()
   /** @type {Map<string, Map<number, Fifo<Delivery>>>} every partition's live batches, by enqueue order */
@@ -682,7 +672,6 @@ class DrainLoop {
     budget = new RequestBudget(),
     generation,
     callbacks,
-    abortRefusal,
   }) {
     this.#logger = logger
     this.#cluster = cluster
@@ -695,7 +684,6 @@ class DrainLoop {
     this.#budget = budget
     this.#generation = generation
     this.#callbacks = callbacks
-    this.#abortRefusal = abortRefusal
     this.#expiry = new ExpiryTimer(this.#expireDue)
   }
 
@@ -1237,8 +1225,7 @@ class DrainLoop {
       this.#getConnectionStatus,
       () => this.#expireDue(Date.now()),
       this.#budget.maxRequestSize,
-      this.#generation,
-      this.#abortRefusal
+      this.#generation
     )
     for (const batch of batches) {
       deliveryOf(batch).dispatched = true
@@ -1771,7 +1758,6 @@ const createSendMessages = ({
   budget = new RequestBudget(),
   getGeneration = () => undefined,
   callbacks,
-  abortRefusal,
 }) => {
   const isIdempotent = () => idempotence !== undefined && idempotence.isEnabled()
   let loop = null
@@ -2014,11 +2000,6 @@ const createSendMessages = ({
         recordsOf(send)
         await cluster.refreshMetadataIfNecessary({ fence, background: true })
         fence?.check()
-        const closed = abortRefusal?.()
-        if (closed) {
-          send.refused = true
-          throw closed
-        }
 
         const entries = []
         for (const { topic, messages } of recordsOf(send)) {
@@ -2134,7 +2115,6 @@ const createSendMessages = ({
         budget,
         generation,
         callbacks,
-        abortRefusal,
       })
     }
     return loop.send({ acks, timeout, compression, codec, batches })

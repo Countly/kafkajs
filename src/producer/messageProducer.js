@@ -35,7 +35,6 @@ const { classifyAcks, classifyTimeout, classifyCompression } = require('./sendOp
  * @param {() => import('./generation')|undefined} [options.getGeneration] current producer lifecycle
  * @param {() => ?Error} [options.fatalRefusal] the producer-wide armed fatal error
  * @param {import('./deliveryCallbacks')} [options.callbacks] the producer's callback context
- * @param {() => ?Error} [options.abortRefusal] refusal of unwritten work in an aborting transaction
  * @returns {{ send: Function, sendBatch: Function, sendersWith: Function,
  *   ensureInitialized: Function, flush: Function, close: Function, unsettled: () => Promise<void>[], forceClose: (surfaced?: Error) => void,
  *   depthOf: (topic: string, partition: number) => number }} `depthOf` counts the batches
@@ -62,7 +61,6 @@ module.exports = ({
   getGeneration = () => undefined,
   fatalRefusal,
   callbacks,
-  abortRefusal,
 }) => {
   const idempotentSend = createSendMessages({
     logger,
@@ -78,7 +76,6 @@ module.exports = ({
     budget,
     getGeneration,
     callbacks,
-    abortRefusal,
   })
   let plainSend = null
   /** How many `flush(until)` calls are waiting for their `until`: batches linger only at 0. */

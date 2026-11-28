@@ -12,8 +12,9 @@
  * Usage: node scripts/benchmarks/recordBatchDecode.js [--iterations 20000] [--arm <name>] [--work-multiplier <k>]
  * Prints one JSON line: { available, iterations, nsPerOp, roundNsPerOp, opsPerSecond, records,
  * decompressCalls }.
- * `decompressCalls` is how many times the codec's `decompress` ran in 10 untimed decodes, counted by
- * wrapping it: 10 for a compressed arm, 0 for the uncompressed one.
+ * `decompressCalls` is how many times the codec's `decompress` ran in 10 untimed decodes, counted
+ * through a wrapping codec registered for its type: 10 for a compressed arm, 0 for the uncompressed
+ * one.
  *
  * `--checksum [--arms uncompressed,gzip,snappy]` is not a measurement: it decodes each arm's
  * response once, untimed, and prints `{ checksums: { <arm>: { available, records, sha256 } } }`,
@@ -71,8 +72,8 @@ const responseOf = (batch) =>
 
 /**
  * @param {string} arm
- * @returns {Promise<?{ fixture: Buffer, codec: ?object }>} the response to decode and the codec it
- *   uses; `null` when this tree has no such codec
+ * @returns {Promise<?{ fixture: Buffer, codec: ?object, type?: number }>} the response to decode,
+ *   the codec it uses and that codec's type; `null` when this tree has no such codec
  */
 const prepare = async (arm) => {
   if (arm === 'uncompressed') {
@@ -97,7 +98,7 @@ const prepare = async (arm) => {
       RecordEncoder({ offsetDelta: n, key: Buffer.from(`key-${n}`), value: Buffer.alloc(100, n) })
     )
     const batch = Buffer.from((await RecordBatch({ compression: type, records })).buffer)
-    return { fixture: responseOf(batch), codec }
+    return { fixture: responseOf(batch), codec, type }
   } catch (error) {
     return null
   }
@@ -180,30 +181,37 @@ const run = async (fixture, options, iterations, workMultiplier = 1) => {
 }
 
 /**
- * Decodes the fixture a few times with the codec's `decompress` wrapped, then puts it back.
+ * Decodes the fixture a few times with a counting codec registered for `type`, then puts the
+ * registered factory back. The codec object itself is not changed: built-in codecs are frozen.
  * @param {Buffer} fixture
  * @param {object} options
  * @param {?object} codec
+ * @param {number} [type] the codec's type in the registry
  * @returns {Promise<number>} how many times `decompress` ran
  */
-const countDecompressCalls = async (fixture, options, codec) => {
+const countDecompressCalls = async (fixture, options, codec, type) => {
   if (codec === null) {
     return 0
   }
 
-  const original = codec.decompress
+  const { Codecs } = require('../../src/protocol/message/compression')
+  const factory = Codecs[type]
   let calls = 0
-  codec.decompress = (...args) => {
-    calls += 1
-    return original.apply(codec, args)
+  const counting = {
+    ...codec,
+    decompress: (...args) => {
+      calls += 1
+      return codec.decompress(...args)
+    },
   }
+  Codecs[type] = () => counting
 
   try {
     for (let i = 0; i < COUNTED; i++) {
       await decode(fixture, options)
     }
   } finally {
-    codec.decompress = original
+    Codecs[type] = factory
   }
 
   return calls
@@ -243,10 +251,10 @@ if (require.main === module) {
       return
     }
 
-    const { fixture, codec } = prepared
+    const { fixture, codec, type } = prepared
     const options = { checkCrcs: false, maxDecompressedBatchBytes: BOUND }
     const records = countRecords(await decode(fixture, options))
-    const decompressCalls = await countDecompressCalls(fixture, options, codec)
+    const decompressCalls = await countDecompressCalls(fixture, options, codec, type)
     const { nsPerOp, roundNsPerOp, opsPerSecond } = await run(
       fixture,
       options,

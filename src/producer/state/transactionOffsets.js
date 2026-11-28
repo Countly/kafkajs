@@ -62,6 +62,8 @@ class TransactionOffsets {
   /**
    * Copies every wire field of the offsets: the one read of the caller's arrays, rows and getters,
    * and it changes no state. Neither wire retries nor staging reads the caller's arrays again.
+   * A primitive field is copied as given, so the request and the committed-offset cache see the
+   * caller's values as before; an object field is converted once here (`offsetFields`).
    * A topic or partition given more than once is copied once, in first-seen order, with the
    * partition's last entry, as the broker would store it and as the Java client's map sends it.
    * @param {object[]} topics
@@ -79,11 +81,11 @@ class TransactionOffsets {
       Array.prototype.forEach.call(partitions, ({ partition, offset, leaderEpoch, metadata }) => {
         const id = int32(partition)
         byPartition.set(
-          id,
+          Number(id),
           Object.freeze({
             partition: id,
             offset: int64(offset),
-            leaderEpoch: leaderEpoch == null ? leaderEpoch : int32(leaderEpoch),
+            leaderEpoch: int32(leaderEpoch),
             metadata: text(metadata),
           })
         )
@@ -156,7 +158,7 @@ class TransactionOffsets {
     if (snapshot.ended) return
     for (const { topic, partitions } of snapshot.topics) {
       for (const fields of partitions) {
-        const key = JSON.stringify([snapshot.groupId, topic, fields.partition])
+        const key = JSON.stringify([snapshot.groupId, topic, Number(fields.partition)])
         const previous = this.entries.get(key)
         snapshot.remaining += 1
         this.entries.set(key, { snapshot, topic, fields })
