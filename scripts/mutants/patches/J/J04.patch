@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -4081,7 +4081,7 @@
+    */
+   async refreshLeaderlessMetadata(run) {
+     if (run.fence.closed) return
+-    let attempt = this.leaderlessRefresh
++    let attempt = null
+     if (!attempt) {
+       const now = performance.now()
+       if (now - this.leaderlessRefreshAt < this.leaderlessRefreshInterval) return

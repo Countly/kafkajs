@@ -1,0 +1,11 @@
+--- a/src/protocol/recordBatch/v0/decoder.js
++++ b/src/protocol/recordBatch/v0/decoder.js
+@@ -349,7 +349,7 @@
+     return []
+   }
+ 
+-  const recordLimit = Math.max(1, Math.floor(limit / RECORD_CEILING_BYTES))
++  const recordLimit = 1
+ 
+   if (count > recordLimit) {
+     throw corrupt(

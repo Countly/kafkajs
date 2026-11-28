@@ -85,6 +85,8 @@ describe('Admin > removeMembersFromConsumerGroup', () => {
       expect(cluster.findGroupCoordinator).toHaveBeenCalledWith({ groupId: GROUP })
       expect(coordinator.leaveGroup).toHaveBeenCalledTimes(1)
       expect(coordinator.leaveGroup.mock.calls[0][0]).toEqual({
+        [require('../../broker/privateOptions').ADMIN_MUTATION]:
+          require('../../broker/privateOptions').ADMIN_MUTATION,
         groupId: GROUP,
         members: [
           { memberId: '', groupInstanceId: 'a', reason: DEFAULT_REASON },
@@ -192,6 +194,16 @@ describe('Admin > removeMembersFromConsumerGroup', () => {
       expect(coordinator.leaveGroup).not.toHaveBeenCalled()
     })
 
+    test('resolves [] without a request for a missing group on a cluster without the consumer protocol (ConsumerGroupDescribe answers 35)', async () => {
+      const { admin, coordinator } = build({
+        group: { groupId: GROUP, errorCode: 35, members: [] },
+      })
+
+      await expect(admin.removeMembersFromConsumerGroup({ groupId: GROUP })).resolves.toEqual([])
+      expect(coordinator.describeGroups).toHaveBeenCalledTimes(1)
+      expect(coordinator.leaveGroup).not.toHaveBeenCalled()
+    })
+
     test("rejects a group of another protocol type, as Java's describeConsumerGroups does", async () => {
       const connect = {
         groupId: GROUP,
@@ -268,31 +280,56 @@ describe('Admin > removeMembersFromConsumerGroup', () => {
     const request = { groupId: GROUP, members: [{ groupInstanceId: 'a' }] }
 
     test.each([[14], [15], [16]])(
-      '%i, a coordinator that cannot serve yet, is asked again',
+      '%i, a coordinator lookup failure is retried before sending',
       async (code) => {
-        const leaveGroup = jest
-          .fn()
-          .mockRejectedValueOnce(createErrorFromCode(code))
-          .mockResolvedValue({ members: [left('', 'a')] })
+        const leaveGroup = jest.fn(async () => ({ members: [left('', 'a')] }))
         const { admin, cluster } = build({ leaveGroup })
+        cluster.findGroupCoordinator.mockRejectedValueOnce(createErrorFromCode(code))
 
         await expect(admin.removeMembersFromConsumerGroup(request)).resolves.toEqual([
           { memberId: '', groupInstanceId: 'a', errorCode: 0, error: null },
         ])
-        expect(leaveGroup).toHaveBeenCalledTimes(2)
+        expect(leaveGroup).toHaveBeenCalledTimes(1)
         expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
       }
     )
 
-    test('that never settles rejects with the retry budget, naming the cause', async () => {
-      const leaveGroup = jest.fn().mockRejectedValue(createErrorFromCode(16))
+    test('14, a coordinator still loading the group, is asked again', async () => {
+      const leaveGroup = jest
+        .fn()
+        .mockRejectedValueOnce(createErrorFromCode(14))
+        .mockResolvedValue({ members: [left('', 'a')] })
+      const { admin, cluster } = build({ leaveGroup })
+
+      await expect(admin.removeMembersFromConsumerGroup(request)).resolves.toEqual([
+        { memberId: '', groupInstanceId: 'a', errorCode: 0, error: null },
+      ])
+      expect(leaveGroup).toHaveBeenCalledTimes(2)
+      expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
+    })
+
+    test('a coordinator that stays loading rejects with the retry budget, naming the cause', async () => {
+      const leaveGroup = jest.fn().mockRejectedValue(createErrorFromCode(14))
       const { admin } = build({ leaveGroup })
+
+      await expect(admin.removeMembersFromConsumerGroup(request)).rejects.toMatchObject({
+        name: 'KafkaJSNumberOfRetriesExceeded',
+        cause: expect.objectContaining({ code: 14 }),
+      })
+      expect(leaveGroup).toHaveBeenCalledTimes(RETRY.retries + 1)
+    })
+
+    test('an exhausted coordinator lookup preserves the cause', async () => {
+      const leaveGroup = jest.fn()
+      const { admin, cluster } = build({ leaveGroup })
+      cluster.findGroupCoordinator.mockRejectedValue(createErrorFromCode(16))
 
       await expect(admin.removeMembersFromConsumerGroup(request)).rejects.toMatchObject({
         name: 'KafkaJSNumberOfRetriesExceeded',
         cause: expect.objectContaining({ code: 16 }),
       })
-      expect(leaveGroup).toHaveBeenCalledTimes(RETRY.retries + 1)
+      expect(leaveGroup).not.toHaveBeenCalled()
+      expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(RETRY.retries + 1)
     })
 
     test.each([[30], [41]])(

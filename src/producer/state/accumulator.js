@@ -9,10 +9,12 @@ const {
 } = require('../../errors')
 const { Deadline, ExpiryTimer } = require('../deadline')
 const { Admission } = require('./admission')
+const JoinOrder = require('./joinOrder')
+const { projectionsOf, deliverRecords } = require('./recordErrors')
 const {
   chargeOf,
   share,
-  ownedBuffer,
+  SendCopy,
   wire,
   recordsBytes,
   RequestBudget,
@@ -313,16 +315,49 @@ const ownedTimestamp = (timestamp) => {
 }
 
 /**
- * A copy of a record's headers, each own key read once: an array value is copied too, and every
- * Buffer is kept as `ownedBuffer` keeps it.
+ * A copy of a record's headers, each own key read once: an array value is copied too, element by
+ * element up to its length read once, with its holes, without calling its methods. Each Buffer is
+ * put in the copy as it is and noted in `copies`.
  * @param {*} headers
+ * @param {SendCopy} copies
  * @returns {object}
  */
-const ownedHeaders = (headers) => {
+const ownedHeaders = (headers, copies) => {
   const copy = { ...headers }
   for (const name of Object.keys(copy)) {
     const header = copy[name]
-    copy[name] = Array.isArray(header) ? header.map(ownedBuffer) : ownedBuffer(header)
+    if (!Array.isArray(header)) {
+      copies.note(copy, name)
+      continue
+    }
+    const { length } = header
+    const list = new Array(length)
+    for (let i = 0; i < length; i++) {
+      if (i in header) {
+        list[i] = header[i]
+        copies.note(list, i)
+      }
+    }
+    copy[name] = list
+  }
+  return copy
+}
+
+/**
+ * A plain array of `own(element)` for each element of `list`, holes kept. Built by index, so the
+ * result is the producer's own array whatever class, iterator or `map` the caller's list has.
+ * @template T, U
+ * @param {T[]} list
+ * @param {(element: T) => U} own
+ * @returns {U[]}
+ */
+const ownedList = (list, own) => {
+  const { length } = list
+  const copy = new Array(length)
+  for (let i = 0; i < length; i++) {
+    if (i in list) {
+      copy[i] = own(list[i])
+    }
   }
   return copy
 }
@@ -331,13 +366,14 @@ const ownedHeaders = (headers) => {
  * The producer's own copy of a record, each field read once: its own enumerable fields, so a
  * custom partitioner still sees them, and the fields the producer reads, also when they come from
  * a prototype. A header container, a header-value array, a `Date` and a `Long` are copied, so
- * changing them after the call changes nothing; the bytes of a Buffer are shared, unless it is a
- * small view of a large backing store (`ownedBuffer`). Anything that is not an object is kept, so
- * validation fails it as before.
+ * changing them after the call changes nothing; each Buffer is put in the copy as it is and noted
+ * in `copies`, which copies those that pin a large store. Anything that is not an object is kept,
+ * so validation fails it as before.
  * @param {*} message
+ * @param {SendCopy} copies
  * @returns {*}
  */
-const ownedRecord = (message) => {
+const ownedRecord = (message, copies) => {
   if (message === null || typeof message !== 'object') {
     return message
   }
@@ -351,14 +387,10 @@ const ownedRecord = (message) => {
       }
     }
   }
-  if (Buffer.isBuffer(record.key)) {
-    record.key = ownedBuffer(record.key)
-  }
-  if (Buffer.isBuffer(record.value)) {
-    record.value = ownedBuffer(record.value)
-  }
+  copies.note(record, 'key')
+  copies.note(record, 'value')
   if (record.headers != null) {
-    record.headers = ownedHeaders(record.headers)
+    record.headers = ownedHeaders(record.headers, copies)
   }
   if (record.timestamp != null) {
     record.timestamp = ownedTimestamp(record.timestamp)
@@ -464,19 +496,26 @@ const halvesOf = (settler) => {
  * share holding its first record, whatever order the answers came in. The send counts as one
  * more share until `joined()`, so no share can settle it while its records are still joining.
  * Settling it ends its holder's place in the flush inventory (`PendingSend#untrack`).
+ * It rejects with `outcome: 'unsent'` only when every share failed unsent. When its first error says
+ * `'unsent'` but another share was delivered or failed otherwise, it rejects with a new error of the
+ * same class, `outcome: 'unknown'`, the first error as `cause`; that error is never changed, as
+ * other sends may share it.
  */
 class AppendedSend {
   #pending = 1
   /** @type {?object[]} created by the first metadata, so a held send keeps no array */
   #metadata = null
   #error = null
+  #projected = false
+  /** whether a share was delivered or failed with an outcome other than `'unsent'` */
+  #written = false
   #resolve
   #reject
   #holder
 
   /**
    * @param {PendingSend} holder the send whose flush tracking ends when this settles
-   * @param {(metadata: object[]) => void} resolve settles the append's promise
+   * @param {(result: object[]|object) => void} resolve settles the append's promise
    * @param {(error: Error) => void} reject
    */
   constructor(holder, resolve, reject) {
@@ -507,16 +546,22 @@ class AppendedSend {
       this.#metadata ??= []
       this.#metadata.push(metadata)
     }
+    this.#written = true
     this.#settleOne()
   }
 
   /**
    * One share failed.
-   * @param {Error} error
+   * @param {Error} error the batch's error
+   * @param {object} [projected] this send's detached record failure
    * @returns {void}
    */
-  failed(error) {
-    this.#error = this.#error || error
+  failed(error, projected) {
+    if (!this.#error) {
+      this.#error = projected ?? error
+      this.#projected = projected !== undefined
+    }
+    if (error?.outcome !== 'unsent') this.#written = true
     this.#settleOne()
   }
 
@@ -527,8 +572,15 @@ class AppendedSend {
       return
     }
 
-    if (this.#error !== null) {
-      this.#reject(this.#error)
+    const error = this.#error
+    if (this.#projected) {
+      error.mixedOutcome = error.outcome === 'unsent' && this.#written
+      this.#resolve(error)
+    } else if (error?.outcome === 'unsent' && this.#written) {
+      const message = `Some records of this send may have been written: ${error.message}`
+      this.#reject(new error.constructor(message, { cause: error, outcome: 'unknown' }))
+    } else if (error !== null) {
+      this.#reject(error)
     } else {
       this.#resolve((this.#metadata ?? []).sort(byTopicThenPartition))
     }
@@ -628,14 +680,15 @@ class Settler {
 
   /**
    * @param {Error} error
+   * @param {object} [projected] detached failure data for this send
    * @returns {void}
    */
-  reject(error) {
+  reject(error, projected) {
     if (this.#settled) {
       return
     }
     this.#settled = true
-    this.#send.failed(error)
+    this.#send.failed(error, projected)
   }
 }
 
@@ -725,7 +778,7 @@ class PendingSend {
     this.deadline = deadline
     this.settled = false
     this.pins = 0
-    /** @type {?(error: Error) => void} rejects the send; set while it is held */
+    /** @type {?((error: Error) => void)} rejects the send; set while held */
     this.reject = null
     /** @type {?import('./admission').Reservation} the send's bytes in the buffer, once admitted */
     this.reservation = null
@@ -738,6 +791,19 @@ class PendingSend {
     this.topics = null
     /** @type {?FlushEpoch} the flush epoch it counts in until it settles */
     this.epoch = null
+    /** @type {?(string|string[])} the topics whose call order it keeps (see `JoinOrder`) */
+    this.lanes = null
+    /** @type {?object[]} its records assigned to partitions, while it waits to join */
+    this.entries = null
+    /** @type {?((outcome: object[]|object) => void)} resolves the send; set while held */
+    this.resolve = null
+    /** @type {?{ acks: number, timeout?: number, compression?: number }} its request options */
+    this.options = null
+    /**
+     * whether the partitioner call of its current partitioning attempt failed, which queued
+     * nothing; set at that call, cleared when an attempt starts
+     */
+    this.refused = false
   }
 
   /**
@@ -885,6 +951,8 @@ class PendingSend {
  * @property {(PendingSend|number)[]|null} owners each send whose records it carries, followed by
  *   the bytes of their shares still charged; null once it has retired
  * @property {BatchOwnership} ownership transfers the payload and debit when a guard subdivides it
+ * @property {object|null} [token] set by the first answer that reports an error for it; a cut
+ *   clears it, so an answer to the uncut batch names no record of a half
  * @property {() => void} retire releases its shares and repays its debt, once; the send path calls
  *   it when nothing holds the batch any more
  * @property {() => void} detach drops its records and gives back the bytes of their shares, once;
@@ -955,6 +1023,8 @@ class Accumulator {
   #appending = 0
   /** @type {(() => void)[]} the `close()` calls waiting for nothing to be left to deliver */
   #closers = []
+  /** the call order sends join their batches in, per topic */
+  #order = new JoinOrder((send) => this.#joinHeld(send))
 
   /**
    * @param {object} options
@@ -981,7 +1051,8 @@ class Accumulator {
    *   when it is reached, and a held batch goes out then
    * @param {(error: Error) => Error} [options.expired] called with the error of a send that
    *   expired before it joined a batch, or that the buffer refused, to arm a transaction; returns
-   *   the error to reject with
+   *   the error to reject with. Not called for a send whose deadline passed while it waited to
+   *   retry a failed partitioner call (`PendingSend#refused`): it rejects with the timeout as it is
    * @param {{ holdTopic(topic: string): void, releaseTopic(topic: string): void }} [options.pinner]
    *   the producer cluster's topic pins: each send pins its topics until its shell is released
    * @param {() => (import('../generation')|undefined)} [options.getGeneration] the producer's
@@ -1027,19 +1098,28 @@ class Accumulator {
    * a record, its headers, a header-value array or a `Date` or `Long` timestamp after the call
    * changes nothing. A record's own enumerable fields are kept beside the fields the producer
    * reads; the bytes of its Buffers are shared, as in 2.2.4, except a small view of a large backing
-   * store, which is copied. Entries and records that are not objects are kept as they are, and so
-   * is a `messages` that is not an array, so validation refuses them as before.
+   * store: all of those in the send are copied into one store of their own (`SendCopy`). Entries
+   * and records that are not objects are kept as they are, and so is a `messages` that is not an
+   * array, so validation refuses them as before.
    * @param {{ topic: string, messages: object[] }[]} topicMessages
    * @returns {{ topic: string, messages: object[] }[]}
    */
   static snapshot(topicMessages) {
-    return topicMessages.map((entry) => {
+    const copies = new SendCopy()
+    const snapshot = ownedList(topicMessages, (entry) => {
       if (entry === null || typeof entry !== 'object') {
         return entry
       }
       const { topic, messages } = entry
-      return { topic, messages: Array.isArray(messages) ? messages.map(ownedRecord) : messages }
+      return {
+        topic,
+        messages: Array.isArray(messages)
+          ? ownedList(messages, (message) => ownedRecord(message, copies))
+          : messages,
+      }
     })
+    copies.copy()
+    return snapshot
   }
 
   /**
@@ -1067,6 +1147,7 @@ class Accumulator {
         recordCount: child.messages.length,
         wire: recordsBytes(child.messages),
         settlers: index === 0 ? first : second,
+        token: null,
       }))
     }
     const retires = bothOf(retire)
@@ -1078,6 +1159,7 @@ class Accumulator {
       recordCount: payload.length,
       wire: recordsBytes(payload),
       settlers: index === 0 ? first : second,
+      token: null,
       retire: () => {
         payload.length = 0
         retires[index]?.()
@@ -1087,6 +1169,22 @@ class Accumulator {
         detaches[index]?.()
       },
     }))
+  }
+
+  /**
+   * Each accumulator send's own error for a batch that fails with `delivered`, from the answer
+   * occurrence its settlement received (see `recordErrors.projectionsOf`). A send's records are
+   * the range from its settler's index to the next settler's; a send that owns none of the
+   * reported indices still gets its own result, with the shared raw entries. Called before the
+   * batch detaches. Other settlers are not in the map and get `delivered` itself.
+   * @param {{ settlers: object[], messages: object[], token?: object|null }} batch
+   * @param {Error} delivered
+   * @param {{ error: Error, token: object }} occurrence
+   * @returns {Map<Settler, object>|null} null when every settler gets `delivered`
+   */
+  static projectionsFor(batch, delivered, occurrence) {
+    const owners = batch.settlers.filter((settler) => settler instanceof Settler)
+    return projectionsOf(batch, delivered, occurrence, owners)
   }
 
   /**
@@ -1104,7 +1202,10 @@ class Accumulator {
    * admitted: at once when it fits and no send waits, else after the sends ahead of it, within
    * `maxBlockMs` and its deadline. Its records are the caller's owned copy (`Accumulator.snapshot`),
    * held by the send while it waits; a refusal drops them. A refusal goes through `expired`, so it
-   * arms a transaction and the send rejects with the refusal itself.
+   * arms a transaction and the send rejects with the refusal itself. It takes its place in its
+   * topics' call order there too (see `JoinOrder`), so a send admitted after a wait still joins
+   * before every later send of its topics; a refusal gives the place up. Admission is FIFO, so no
+   * later send holds buffer room while it waits for this one to be admitted.
    * @param {object} request
    * @param {number} request.acks
    * @param {number} [request.timeout]
@@ -1141,6 +1242,8 @@ class Accumulator {
 
     this.#appending += 1
     send.holdTopics()
+    send.lanes = send.topics
+    this.#order.enter(send)
     this.track(send)
     try {
       this.#assertFits(topicMessages, compression)
@@ -1149,9 +1252,11 @@ class Accumulator {
       send.admit(granted instanceof Promise ? this.#granted(await granted) : granted, charge)
     } catch (error) {
       send.records = null
+      send.settled = true
       send.releaseTopics()
       send.untrack()
       this.#end()
+      this.#order.passed(send)
       throw this.#expired(error)
     }
     return this.#hold(send, { acks, timeout, compression })
@@ -1211,6 +1316,7 @@ class Accumulator {
    * @returns {void}
    */
   forceClose(surfaced) {
+    this.#order.clear()
     for (let send = this.#holders.peek(); send !== undefined; send = this.#holders.peek()) {
       this.#settleHolder(
         send,
@@ -1268,16 +1374,21 @@ class Accumulator {
   }
 
   /**
-   * Holds a send while its records are assigned their partitions, then joins them to batches. The
-   * send settles at its deadline even while the assignment never returns: its records are dropped,
-   * and what the assignment does afterwards is ignored.
+   * Holds a send while its records are assigned their partitions, then joins them to batches in
+   * call order: after every earlier send that shares a topic with it has joined or ended (see
+   * `JoinOrder`), so partitioning that finishes out of order (a failed metadata refresh retried
+   * on each send's own backoff) cannot reorder records within a partition. The send settles at its
+   * deadline even while the assignment never returns or it waits for an earlier send: its records
+   * are dropped, and what the assignment does afterwards is ignored.
    * @param {PendingSend} send
    * @param {{ acks: number, timeout?: number, compression?: number }} options
    * @returns {Promise<object[]>} the send's outcome, as `append()` describes it
    */
   #hold(send, options) {
-    return new Promise((resolve, reject) => {
+    const pending = new Promise((resolve, reject) => {
       send.reject = reject
+      send.resolve = resolve
+      send.options = options
       this.#register(send)
 
       send.pin()
@@ -1290,16 +1401,9 @@ class Accumulator {
       assigned.then(
         (entries) => {
           send.unpin()
-          if (this.#leave(send)) {
-            try {
-              resolve(this.#join(entries, { ...options, createdAt: send.deadline.startedAt }, send))
-            } catch (error) {
-              reject(error)
-              send.untrack()
-            } finally {
-              send.release()
-              this.#end()
-            }
+          if (!send.settled) {
+            send.entries = entries
+            this.#order.ready(send)
           }
         },
         (error) => {
@@ -1309,10 +1413,32 @@ class Accumulator {
             reject(error)
             send.untrack()
             this.#end()
+            this.#order.passed(send)
           }
         }
       )
     })
+    // Delivery takes the hop previously used to adopt the separate batch promise.
+    return pending.then(deliverRecords)
+  }
+
+  /**
+   * Joins a held send's assigned records to their batches, once `JoinOrder` lets it.
+   * @param {PendingSend} send not settled, with its `entries`
+   * @returns {void}
+   */
+  #joinHeld(send) {
+    const { entries, resolve, reject, options } = send
+    this.#leave(send)
+    try {
+      this.#join(entries, { ...options, createdAt: send.deadline.startedAt }, send, resolve, reject)
+    } catch (error) {
+      reject(error)
+      send.untrack()
+    } finally {
+      send.release()
+      this.#end()
+    }
   }
 
   /**
@@ -1345,7 +1471,10 @@ class Accumulator {
 
     send.settled = true
     send.records = null
+    send.entries = null
     send.reject = null
+    send.resolve = null
+    send.options = null
     if (this.#holders.peek() === send) {
       this.#holders.shift()
     } else {
@@ -1378,7 +1507,7 @@ class Accumulator {
       send !== undefined && send.deadline.dueAt <= now;
       send = this.#holders.peek()
     ) {
-      this.#settleHolder(send, this.#timedOut(send))
+      this.#settleHolder(send, this.#timedOut(send), send.refused)
     }
 
     const next = this.#holders.peek()
@@ -1386,19 +1515,22 @@ class Accumulator {
   }
 
   /**
-   * Ends a registered send's wait with `error`, through `expired`; its shell stays charged until
-   * its pins end.
+   * Ends a registered send's wait with `error`, through `expired` unless `refused`. Its shell stays
+   * charged until its pins end.
    * @param {PendingSend} send
    * @param {Error} error
+   * @param {boolean} [refused=false] the deadline passed while the send waited to retry a failed
+   *   partitioner call: the timeout stands as it is and arms nothing. A forced close never passes it
    * @returns {void}
    */
-  #settleHolder(send, error) {
+  #settleHolder(send, error, refused = false) {
     const { reject } = send
     this.#leave(send)
     send.release()
-    reject(this.#expired(error))
+    reject(refused ? error : this.#expired(error))
     send.untrack()
     this.#end()
+    this.#order.passed(send)
   }
 
   /**
@@ -1427,13 +1559,12 @@ class Accumulator {
    * @param {{ topic: string, partition: number, messages: object[] }[]} entries
    * @param {{ acks: number, timeout?: number, compression?: number, createdAt: number }} options
    * @param {PendingSend} holder the send whose records these are
-   * @returns {Promise<object[]>} the append's outcome, as `append()` describes it
+   * @param {Function} resolve settles the held send with metadata or detached failure data
+   * @param {Function} reject settles the held send with an ordinary failure
+   * @returns {void}
    */
-  #join(entries, { acks, timeout, compression, createdAt }, holder) {
-    let send
-    const appended = new Promise((resolve, reject) => {
-      send = new AppendedSend(holder, resolve, reject)
-    })
+  #join(entries, { acks, timeout, compression, createdAt }, holder, resolve, reject) {
+    const send = new AppendedSend(holder, resolve, reject)
     const options = `${acks}/${timeout}/${compression}`
     // One due time for every batch this append creates, so they fall due together.
     const dueAt = Date.now() + this.#linger
@@ -1485,7 +1616,6 @@ class Accumulator {
       this.#queueHandOff()
     }
     send.joined()
-    return appended
   }
 
   /**

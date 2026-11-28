@@ -138,7 +138,7 @@ Note that the broker may be configured to reject your authentication attempt if 
 | option                    | description                                                                                                                                                                             | default |
 | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
 | authenticationTimeout | Whole SASL exchange cap in ms, including a token callback or signer; integer 1..2147483647, legacy numeric string accepted. During setup the remaining readiness budget also applies. | `10000` |
-| reauthenticationThreshold | When periodic reauthentication (`connections.max.reauth.ms`) is configured on the broker side, reauthenticate when `reauthenticationThreshold` milliseconds remain of session lifetime. | `10000` |
+| reauthenticationThreshold | When periodic reauthentication (`connections.max.reauth.ms`) is configured on the broker side, reauthenticate when `reauthenticationThreshold` milliseconds remain of the session lifetime, counted from when the final SASL request was written to the socket. A negative value counts as `0`: the session is renewed once it has ended. | `10000` |
 
 ### PLAIN/SCRAM Example
 
@@ -190,6 +190,9 @@ async function that is used to return the OAuth bearer token.
 The OAuth bearer token must be an object with properties value and
 (optionally) extensions, that will be sent during the SASL/OAUTHBEARER
 request.
+
+`authorizationIdentity` (optional) is sent as the SASL authorization identity.
+Apache Kafka accepts it only when it equals the token's principal name.
 
 The implementation of the oauthBearerProvider must take care that tokens are
 reused and refreshed when appropriate. An example implementation using
@@ -410,7 +413,7 @@ new Kafka({
 })
 ```
 
-A producer's explicit `deliveryTimeout` must be at least its `linger` (5 ms unless the producer sets another, see the [accumulator](Producing.md#accumulator)) plus this value - 30005 ms with both defaults - see [Delivery timeout](Producing.md#delivery-timeout).
+A producer's explicit `deliveryTimeout` must be at least its `linger` (0 ms unless the producer sets another, see the [accumulator](Producing.md#accumulator)) plus this value - 30000 ms with both defaults - see [Delivery timeout](Producing.md#delivery-timeout).
 
 The request timeout can be disabled by setting `enforceRequestTimeout` to `false`.
 
@@ -421,6 +424,8 @@ new Kafka({
   enforceRequestTimeout: false
 })
 ```
+
+Without the timeout, a broker that stops answering while its connection stays open holds a Metadata request forever. A consumer whose metadata is older than `metadataMaxAge` then pauses its fetches, and a producer starts no further background metadata refresh, so it notices new partitions only when a send error forces a refresh. See [Consuming](Consuming.md#options) and [Producing](Producing.md#options).
 
 ## Max In Flight Requests
 
@@ -436,6 +441,50 @@ kafka.producer({
 ```
 
 An idempotent producer - the default - allows at most 5. A producer that did not ask for idempotence and passes more, or `null`, runs without it and logs one warning; with `idempotent: true` or a `transactionalId` the combination throws `KafkaJSInvalidConfigurationError`. See [Idempotence](Producing.md#idempotence).
+
+## Queued requests and memory
+
+Each broker connection keeps a queue of requests that wait to be written. The queue has no size limit. A request waits there while the connection has `maxInFlightRequests` requests in flight, and while a broker throttle asks the client to hold back. A waiting request keeps its encoded frame and its promise in memory until it is written, answered or removed.
+
+| Setting | What it bounds | What it does not bound |
+|---|---|---|
+| `requestTimeout` | How long a request that was written waits for its answer. Fetch, JoinGroup and SyncGroup use a longer timeout derived from their wait or rebalance time. | How long a request waits in the queue. The timer starts when the request is written, so a queued request is never timed out for waiting. |
+| `maxInFlightRequests` | How many written requests wait for an answer on one connection. | How many requests wait to be written, or how many bytes they hold. |
+
+With `enforceRequestTimeout: false`, a written request is not timed out either.
+
+A finite budget ends the call that holds it: an admin call's `apiTimeout`, or the `retry.maxTotalTime` of the consumer calls that honour it (see [Default Retry](#default-retry)). A request made under such a budget is not written once the budget has passed. An admin call also removes its own unsent requests from the queue at that moment. A budget limits how long one call can wait. It does not limit how many calls you start, so it is not a memory limit.
+
+### Bounding calls in your application
+
+If your code can start many calls at once, for example one admin call for each incoming request, bound them yourself. The client does not.
+
+1. Count the calls you started and have not seen settle. At your limit, stop creating calls: reject them, drop them, or hold them in a queue of your own with a fixed size.
+2. Free a slot when the Kafka call itself settles. Never free it when your own timer fires.
+3. Give every call a finite budget so that it does settle: `apiTimeout` on admin calls, `retry.maxTotalTime` for the consumer calls that honour it, and `disconnect({ timeout })` to close.
+
+```javascript
+const MAX_CALLS = 20
+let active = 0
+
+const admit = async (call) => {
+  if (active >= MAX_CALLS) throw new Error('Too many Kafka calls in progress')
+  active += 1
+  try {
+    return await call()
+  } finally {
+    active -= 1
+  }
+}
+
+const topics = await admit(() => admin.listTopics({ apiTimeout: 10000 }))
+```
+
+`Promise.race([call, timer])` does not cancel a call. It only stops your code from waiting for it. The call keeps running. Its request stays queued until it is written, or until an admin call's budget removes it. A written request stays in flight until it is answered or `requestTimeout` ends it. If you free your slot when the race timer fires, the calls still running can exceed your limit. No call takes an `AbortSignal`.
+
+`producer.send()` is bounded separately: the records of a send are charged against `bufferMemory`, and a send that does not fit waits at most `maxBlockMs` before it rejects (see [Memory](Producing.md#memory)). That bound counts the records of sends. It does not limit other requests on the same connections.
+
+The `REQUEST_QUEUE_SIZE` instrumentation event reports how many requests wait on a connection (see [Instrumentation events](InstrumentationEvents.md)). It shows the queue. It does not limit it.
 
 ## Max Response Size
 
@@ -532,16 +581,65 @@ until it is stale) and then hits one transient failure, such as a rolling restar
 election, does **not** rebootstrap; it only rebootstraps once the failures are back-to-back for
 the whole window.
 
-A rebootstrap waits for each connection's in-flight requests to drain, then closes every
-connection the client holds. A request already in flight when it starts normally completes on the
-old socket rather than being rejected; the connections themselves are gone by the time
-`rebootstrap()` returns, so the *next* request the caller makes goes through the caller's normal
-retry path (the producer's or consumer's own `retry` configuration) against the rebuilt cluster —
-it is not itself a source of message loss, but a producer created with `idempotent: false` can
-duplicate records the broker had already appended when a produce is retried. SASL authentication state
-(the blackout applied after a rejected credential) is preserved across a rebootstrap, and a SASL
-authentication failure is never a rebootstrap trigger — a rejected credential means the broker is
-reachable and fine, only this client's credentials are bad, which no rebootstrap can fix.
+A rebootstrap replaces the seed broker, then in one step forgets the cached metadata and the broker
+table, starts closing every old connection in the background without waiting for it, and resets
+the recovery clock. The replaced connections take no new request and drain in the background: a
+request already written to an old connection can still complete, and can still succeed, when the
+broker answers within `requestTimeout`, and is rejected with `KafkaJSConnectionClosedError` when the
+connection closes first. The *next* request the caller makes goes through the caller's normal retry
+path (the producer's or consumer's own `retry` configuration) against the rebuilt cluster — it is
+not itself a source of message loss, but a producer created with `idempotent: false` can duplicate
+records the broker had already appended when a produce is retried.
+
+A metadata answer or failure that arrives after the rebootstrap, for a refresh sent
+before it, changes no cached metadata, no broker table and no recovery clock, starts no further
+rebootstrap, and the refresh rejects with a retriable `KafkaJSConnectionError` ("Metadata refresh
+was overtaken by a rebootstrap"). Two exceptions keep their own error: a caller that refused first
+(a lifecycle close or a deadline), and a `REBOOTSTRAP_REQUIRED` answer to the refresh's own
+requests that started the rebootstrap. A refresh whose answer was accepted just before the rebootstrap
+stops installing at the rebootstrap and rejects the same way, but what it already did before (for
+example a `TOPIC_RECREATED` event or a dropped producer topic) stays done. A refresh started after a
+rebootstrap never shares a request with one started before it. The client does not resend the
+overtaken request itself. A consumer whose startup is overtaken crashes with this retriable error
+and restarts by its restart policy. Many admin calls and `consumer.subscribe()` reject with it at
+once, so call them again (a `subscribe()` with a pattern keeps its previous subscription). Producer
+sends retry it within their retry settings, so with `retry: { retries: 0 }` the send fails and must
+be made again. A producer created with `idempotent: false` can still duplicate records when a send
+that was already appended is retried.
+
+Not covered in 3.0.0: coordinator lookups, lookups by topic id, `assign()`, offset lookups and the
+leader hints carried in Produce and Fetch answers can still act on an answer from before a
+rebootstrap until the next metadata refresh replaces it. If the old cluster is still reachable,
+such an answer can send a later request there, and a write or offset commit that succeeds there
+stays. A broker chosen just before a rebootstrap can be handed to a caller; its request may fail
+with a retriable connection error or may still succeed on the old cluster.
+
+Each replaced connection drains on its own for at most `requestTimeout`, counted from when it was
+replaced. The same holds for the connections a metadata refresh replaces: a broker whose address
+moved, one the answer no longer lists, and a replaced connection pool. A client `disconnect()`
+started meanwhile closes these connections too. Without a close timeout it waits, alongside its
+current connections, for what is left of that bound on the slowest of them, so at most
+`requestTimeout`; a shorter close timeout closes them sooner, and a timeout of 0 at once. This is
+only the transport part of a close; stopping, leaving the group and the final telemetry push come on
+top. Closing one of these connections can fail, for example when a custom socket's `destroy()`
+throws. A failure of the background drain is logged. A failure of the close the `disconnect()`
+itself starts on them is reported once every drain it waits for has settled, as a failure on a
+current connection is: a consumer's `disconnect()` rejects with it unless its timeout forced the
+close, an admin client's `disconnect()` without a timeout and the share consumer's `disconnect()`
+reject with it, and a producer's `disconnect()` or an admin `disconnect({ timeout })` logs it and
+resolves.
+
+SASL authentication state (the blackout applied after a rejected credential) is preserved across a
+rebootstrap, and a SASL authentication failure is never a rebootstrap trigger — a rejected
+credential means the broker is reachable and fine, only this client's credentials are bad, which no
+rebootstrap can fix.
+
+A rebootstrap trusts the configured broker list. If that list now leads to a different Kafka
+cluster, the client installs the new cluster's metadata without noticing the change, and a consumer
+keeps the positions it held on the old cluster: it may fetch from the new cluster at those offsets
+before it rejoins its group or is reassigned there, and a consumer that uses `assign()` may keep
+doing so for as long as it keeps those positions. Point the broker list of a running client only at
+brokers of the same cluster.
 
 ## Default Retry
 
@@ -590,7 +688,7 @@ An async function that will be invoked after the consumer exhausts all retries, 
 
 A fenced static instance and a fatal membership error under the consumer protocol never restart, even if `restartOnFailure` returns `true`. A duplicate `groupInstanceId` must be removed, or the rejected membership configuration, authorization or broker capability must be corrected first. Other terminal errors retain the callback policy.
 
-For a classic consumer, a lost broker connection or a moved group coordinator on its own requests is not a terminal death while it lasts less than `sessionTimeout`: the consumer retries it without crashing and without calling this function (see [Membership errors during rebalance](Consuming.md#membership-errors)). An error from your handler, and a consumer with `groupProtocol: 'consumer'`, still count against `retry.retries`.
+For a classic consumer, a lost broker connection or a moved group coordinator on its own requests is not a terminal death while it lasts less than `sessionTimeout`: the consumer retries it without crashing and without calling this function (see [Membership errors during rebalance](Consuming.md#membership-errors)). An error from your handler still counts against `retry.retries`. So does a failure during the join of a consumer with `groupProtocol: 'consumer'`. The requests of that consumer's running fetch loop are different: it retries a lost connection, a request timeout or a moved, unavailable or loading coordinator on them without spending `retry.retries` and without a time limit. That ends when the requests succeed again, the coordinator reports the membership lost, a handler overruns `maxPollInterval` or you stop the consumer. See [Choosing a server-side assignor](Consuming.md#choosing-a-server-side-assignor).
 
 The function has the following signature: `(error: Error) => Promise<boolean>`
 

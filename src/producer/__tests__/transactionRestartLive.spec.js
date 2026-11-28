@@ -29,6 +29,7 @@ const {
 const { sleep, waitForCondition } = require('../../consumer/__tests__/fixtures/liveScenario')
 const {
   crashAfterProduce,
+  droppedFrom,
   outcomeOf,
   settledTransactionVersion,
 } = require('./fixtures/liveTransactions')
@@ -104,6 +105,9 @@ const PRODUCER_FENCED = 90
 // The broker the abortable-send scenario stops, and its node id; kafka1 stays up as the bootstrap.
 const STOPPED_SERVICE = 'kafka3'
 const STOPPED_NODE = 3
+const STOPPED_PORT = 9098
+const GROUP_COORDINATOR_NOT_AVAILABLE = 15
+const COMMIT = 1 // the control record type of a commit marker
 
 /**
  * Live proof of transaction recovery: a producer killed between a resolved Produce and its EndTxn
@@ -111,9 +115,10 @@ const STOPPED_NODE = 3
  * visible; a send that fails for good inside a transaction makes it abort-only and the same
  * producer carries on after `abort()`; a commit whose EndTxn answers were lost is pending, refuses
  * `abort()`, and completes when it is sent again, and one that never reached the coordinator before
- * it aborted the transaction on its timeout is refused when it is sent again; and a takeover of an
- * abandoned transaction under the production retry defaults, against both a short and the default
- * transaction timeout. The coordinator writes its own state with the transaction's timeout as the
+ * it aborted the transaction on its timeout is refused when it is sent again; a commit whose
+ * transaction coordinator could not be found while its broker was down stays pending and completes
+ * once the broker is back; and a takeover of an abandoned transaction under the production retry
+ * defaults, against both a short and the default transaction timeout. The coordinator writes its own state with the transaction's timeout as the
  * write timeout, so a very short one can leave an abort pending.
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging
  * @see https://github.com/apache/kafka/blob/4.3.1/core/src/main/scala/kafka/coordinator/transaction/TransactionStateManager.scala
@@ -133,6 +138,8 @@ describeRestart('Producer > transaction recovery (live)', () => {
   let loseCommitAnswers = false
   /** When set, an EndTxn commit is reported as timed out without reaching the coordinator. */
   let dropCommits = false
+  /** When set, every FindCoordinator for this key is answered GROUP_COORDINATOR_NOT_AVAILABLE. */
+  let refusedLookups = null
   /** The cluster's finalized transaction version, recorded with the evidence. */
   let cluster
   let kafka
@@ -145,7 +152,15 @@ describeRestart('Producer > transaction recovery (live)', () => {
       FEATURE_HOOK_BUDGET_MS - CASE_JOIN_MS,
       async () => {
         cluster = await settledTransactionVersion()
-        const { initProducerId, endTxn } = Broker.prototype
+        const { initProducerId, endTxn, findGroupCoordinator } = Broker.prototype
+        jest
+          .spyOn(Broker.prototype, 'findGroupCoordinator')
+          .mockImplementation(async function (request) {
+            if (refusedLookups !== null && request.groupId === refusedLookups) {
+              throw new KafkaJSProtocolError(createErrorFromCode(GROUP_COORDINATOR_NOT_AVAILABLE))
+            }
+            return findGroupCoordinator.call(this, request)
+          })
         jest.spyOn(Broker.prototype, 'initProducerId').mockImplementation(async function (request) {
           const record = { transactionalId: request.transactionalId, error: null }
           initializations.push(record)
@@ -184,6 +199,7 @@ describeRestart('Producer > transaction recovery (live)', () => {
     ends.length = 0
     loseCommitAnswers = false
     dropCommits = false
+    refusedLookups = null
     child = null
     kafka = new Kafka({
       clientId: `e2e-p7-transaction-restart-${secureRandom()}`,
@@ -293,6 +309,21 @@ describeRestart('Producer > transaction recovery (live)', () => {
     records(prefix, count)
       .map(({ value }) => value)
       .sort()
+
+  /**
+   * A fresh transactional id whose transaction coordinator listens on `port`.
+   * @param {number} port
+   * @returns {Promise<string>}
+   * @throws {Error} when none was found in 60 tries; each id has about a one in three chance
+   */
+  const transactionalIdOn = async (port) => {
+    for (let attempt = 0; attempt < 60; attempt++) {
+      const transactionalId = `e2e-transaction-restart-coordinator-${secureRandom()}`
+      const coordinator = await coordinatorOf(transactionalId, COORDINATOR_TYPES.TRANSACTION)
+      if (coordinator.port === port) return transactionalId
+    }
+    throw new Error(`No transactional id found whose coordinator listens on ${port}`)
+  }
 
   test(
     'a producer killed between Produce and EndTxn leaves records no read_committed reader sees, and the next owner of its transactional id commits',
@@ -410,6 +441,117 @@ describeRestart('Producer > transaction recovery (live)', () => {
       expect(leaderBack).toBe(true)
       expect(abort.error).toBeNull()
       expect(values).toEqual(valuesOf('next'))
+    }),
+    caseTimeout(SCENARIO_BUDGET_MS)
+  )
+
+  // The transaction state topic has two replicas here, so a stopped coordinator's partition fails
+  // over well inside one commit's lookup budget. While the broker is down, every FindCoordinator
+  // for the transactional id is answered GROUP_COORDINATOR_NOT_AVAILABLE, as during an election, so
+  // the commit's discovery runs out for certain. That refusal starts only once the producer's own
+  // cluster has dropped the stopped broker, so no connection failure to it stands in for the
+  // discovery error. The refusal is injected: this proves the client's recovery and the durability
+  // after the restart, not that a real broker answers so throughout an outage.
+  test(
+    'commit recovers after the transaction coordinator broker is stopped and restarted',
+    liveCase(SCENARIO_BUDGET_MS, async () => {
+      const topic = `e2e-transaction-restart-coordinator-${secureRandom()}`
+      const groupId = `e2e-transaction-restart-coordinator-group-${secureRandom()}`
+      const admin = await connected(kafka.admin())
+      await admin.createTopics({
+        waitForLeaders: true,
+        topics: [{ topic, replicaAssignment: [{ partition: 0, replicas: [1, 2] }] }],
+      })
+      const transactionalId = await transactionalIdOn(STOPPED_PORT)
+      const producer = await connected(
+        kafka.producer({ transactionalId, retry: RETRY, metadataMaxAge: 0 })
+      )
+      const endsOf = () => ends.filter((end) => end.transactionalId === transactionalId)
+      const { findGroupCoordinator } = Cluster.prototype
+      let producerCluster = null
+      const capture = jest
+        .spyOn(Cluster.prototype, 'findGroupCoordinator')
+        .mockImplementation(function (request) {
+          if (request.groupId === transactionalId) producerCluster = this
+          return findGroupCoordinator.call(this, request)
+        })
+      let transaction
+      try {
+        transaction = await producer.transaction()
+      } finally {
+        capture.mockRestore()
+      }
+      await transaction.send({ topic, messages: records('committed') })
+      await transaction.sendOffsets({
+        consumerGroupId: groupId,
+        topics: [{ topic, partitions: [{ partition: 0, offset: String(RECORDS + 1) }] }],
+      })
+      stopBroker(STOPPED_SERVICE)
+      const brokerGone = await waitForCondition(
+        async () => (await brokersUp(admin)) === 2,
+        BROKER_BUDGET
+      )
+      await transaction.send({ topic, messages: records('after-stop', 1) })
+      const producerDropped = await waitForCondition(
+        () => droppedFrom(producerCluster, { nodeId: STOPPED_NODE, live: [1, 2], topics: [topic] }),
+        BROKER_BUDGET
+      )
+      refusedLookups = transactionalId
+      const commit = await outcomeOf(transaction.commit())
+      const endsWhileDown = endsOf().length
+      startBroker(STOPPED_SERVICE)
+      const brokerBack = await waitForCondition(
+        async () => (await brokersUp(admin)) === 3,
+        BROKER_BUDGET
+      )
+      refusedLookups = null
+      const retried = await outcomeOf(transaction.commit())
+      const next = await outcomeOf(producer.transaction())
+      if (next.value) await next.value.abort()
+      const values = await readCommitted(topic, RECORDS + 1)
+      const [partition] = (await readLog({ brokers: plainTextBrokers(), topic })).values()
+      const markers = partition.records
+        .filter(({ batchContext }) => batchContext.isControlBatch)
+        .map(({ key }) => key.readInt16BE(2))
+      const [{ partitions }] = await admin.fetchOffsets({ groupId, topics: [topic] })
+
+      writeEvidence(EVIDENCE, {
+        scenario: 'coordinator-restart',
+        cluster,
+        brokerGone,
+        producerDropped,
+        brokerBack,
+        commit: commit.error && {
+          name: commit.error.name,
+          retriable: commit.error.retriable,
+          message: commit.error.message,
+          cause: commit.error.cause?.name,
+        },
+        endsWhileDown,
+        retried: retried.error && retried.error.name,
+        next: next.error && next.error.name,
+        ends: endsOf(),
+        markers,
+        offset: String(partitions[0].offset),
+        values,
+      })
+      expect(brokerGone).toBe(true)
+      expect(producerDropped).toBe(true)
+      expect(commit.error).not.toBeNull()
+      expect(commit.error.retriable).toBe(true)
+      expect(commit.error.message).toBe(
+        'The transaction coordinator could not be found; the commit is pending, call commit() again'
+      )
+      expect(commit.error.cause?.name).toBe('KafkaJSGroupCoordinatorNotFound')
+      expect(endsWhileDown).toBe(0)
+      expect(brokerBack).toBe(true)
+      expect(retried.error).toBeNull()
+      expect(endsOf()).toHaveLength(1)
+      expect(endsOf()[0].transactionResult).toBe(true)
+      expect(next.error).toBeNull()
+      expect(markers).toEqual([COMMIT])
+      expect(String(partitions[0].offset)).toBe(String(RECORDS + 1))
+      expect(values).toEqual([...valuesOf('committed'), ...valuesOf('after-stop', 1)].sort())
     }),
     caseTimeout(SCENARIO_BUDGET_MS)
   )

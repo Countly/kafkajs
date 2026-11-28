@@ -3605,6 +3605,8 @@ const JOBS = {
 }
 const CHILD_SECONDS = 610
 const RESERVE_SECONDS = 300
+/** Bound of one reporter reset before a delivery observation; declared apart from the session budget. */
+const PREPARE_SECONDS = 300
 
 /** @param {string} jobName declared job @returns {number} children the fixed schedule executes: m*(n+1) */
 const childCount = (jobName) => {
@@ -3719,7 +3721,8 @@ const verifyProvenance = (manifest) => {
 /** Rejects any manifest that is not exactly a declared, balanced, complete session.
  * @param {object} manifest immutable session declaration @param {Function} [parse] argv parser (tests only)
  * @returns {void} @throws {AssertionError|UsageError} for a changed arm, label, reference, run count, control,
- * configuration hash, relative path or a budget below `children*610+300` seconds
+ * configuration hash, relative path, a budget below `children*610+300` seconds, or a delivery session without
+ * its brokers, absolute reporter sink and telemetry cluster
  */
 const validateManifest = (manifest, parse = parseWorkerArgs) => {
   assert.equal(manifest.schemaVersion, 1)
@@ -3752,6 +3755,24 @@ const validateManifest = (manifest, parse = parseWorkerArgs) => {
     configs.push(common)
   }
   for (const config of configs.slice(1)) assert.deepEqual(config, configs[0])
+  if (job.mode === 'delivery') {
+    const { fixture } = manifest
+    assert(
+      Array.isArray(fixture?.brokers) && fixture.brokers.length > 0,
+      'a delivery session declares its brokers'
+    )
+    assert(
+      typeof fixture.sink === 'string' && path.isAbsolute(fixture.sink),
+      'a delivery session declares its absolute reporter sink'
+    )
+    assert(
+      typeof fixture.compose?.file === 'string' &&
+        path.isAbsolute(fixture.compose.file) &&
+        typeof fixture.compose.project === 'string' &&
+        fixture.compose.project.length > 0,
+      'a delivery session declares its telemetry cluster: an absolute Compose file and a project'
+    )
+  }
   assert.equal(manifest.codecs?.none, true)
   assert.equal(manifest.codecs?.gzip, true)
   assert.equal(typeof manifest.codecs?.zstd, 'boolean')
@@ -3886,6 +3907,128 @@ const appendDurable = (file, line) => {
   }
 }
 
+/** Internal listener of each telemetry broker, which its own readiness probe connects to. */
+const BROKER_SERVICES = { kafka1: 'kafka1:29092', kafka2: 'kafka2:29095', kafka3: 'kafka3:29098' }
+
+/** @param {number} ms milliseconds @returns {void} blocks the synchronous controller between readiness probes */
+const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+
+/**
+ * Restarts the telemetry cluster with an empty reporter sink before a delivery observation, outside its measured
+ * window. A reporter keeps its sequence, queue, overflow state and written-byte count for its JVM's lifetime and
+ * resumes from the size of the export file it finds, so a fresh observation needs a stopped reporter, an empty sink
+ * and a new JVM: stop the cluster (each reporter drains and exits), retain the sink under the session, clear it,
+ * start the cluster and wait until every broker answers and every reporter has written its new load proof.
+ * One reset is bounded by `PREPARE_SECONDS`.
+ */
+class ReporterReset {
+  #fixture
+  #retained
+  #run
+  #sleep
+  #now
+
+  /**
+   * @param {{fixture:{sink:string,compose:{file:string,project:string}},retained:string,run?:Function,
+   *   sleep?:Function,now?:Function}} options the manifest fixture, the session directory that keeps each
+   *   cleared sink, and test hooks for the `docker` spawn, the readiness sleep and the clock
+   */
+  constructor({ fixture, retained, run = spawnSync, sleep = sleepSync, now = Date.now }) {
+    this.#fixture = fixture
+    this.#retained = retained
+    this.#run = run
+    this.#sleep = sleep
+    this.#now = now
+  }
+
+  /**
+   * Resets the cluster before observation `ordinal`.
+   * @param {number} ordinal the observation about to start
+   * @returns {{retained:string[],elapsedMs:number}} the files kept from the cleared sink and the reset's duration
+   * @throws {Error} when a Compose step fails, the sink cannot be kept and cleared, or the cluster is not ready
+   *   within `PREPARE_SECONDS`; the observation must then not start
+   */
+  prepare(ordinal) {
+    const started = this.#now()
+    const deadline = started + PREPARE_SECONDS * 1000
+    try {
+      this.#compose(['stop', '--timeout', '30'], deadline)
+      const retained = this.#retain(ordinal)
+      this.#compose(['start'], deadline)
+      this.#awaitReady(deadline)
+      return { retained, elapsedMs: this.#now() - started }
+    } catch (error) {
+      throw new Error(`reporter reset before observation ${ordinal}: ${error.message}`, {
+        cause: error,
+      })
+    }
+  }
+
+  /** @param {string[]} args Compose arguments @param {number} deadline epoch ms
+   * @param {boolean} [required] whether a failure throws @returns {boolean} the command succeeded
+   * @throws {Error} for a required command that failed or ran out of time
+   */
+  #compose(args, deadline, required = true) {
+    const { file, project } = this.#fixture.compose
+    const left = deadline - this.#now()
+    if (left <= 0) throw new Error(`the cluster was not ready within ${PREPARE_SECONDS} s`)
+    const result = this.#run('docker', ['compose', '-p', project, '-f', file, ...args], {
+      encoding: 'utf8',
+      timeout: left,
+    })
+    if (!result.error && result.status === 0) return true
+    if (!required) return false
+    const outcome = result.error ? result.error.message : `exited ${result.status ?? result.signal}`
+    throw new Error(`docker compose ${args[0]} ${outcome}: ${String(result.stderr ?? '').trim()}`)
+  }
+
+  /** Moves every sink file into `<retained>/<ordinal>`; copies first, so nothing is lost on failure.
+   * @param {number} ordinal next observation @returns {string[]} the kept file names
+   */
+  #retain(ordinal) {
+    const { sink } = this.#fixture
+    const names = fs.readdirSync(sink).sort()
+    const kept = path.join(this.#retained, String(ordinal).padStart(4, '0'))
+    makeExclusiveDirectory(kept)
+    for (const name of names)
+      fs.copyFileSync(path.join(sink, name), path.join(kept, name), fs.constants.COPYFILE_EXCL)
+    for (const name of names) fs.rmSync(path.join(sink, name))
+    assert.equal(fs.readdirSync(sink).length, 0, 'the reporter sink is not empty after the reset')
+    return names
+  }
+
+  /** @param {number} deadline epoch ms @returns {void} once every broker answers and every reporter loaded
+   * @throws {Error} when the deadline passes first
+   */
+  #awaitReady(deadline) {
+    const proofs = Object.keys(BROKER_SERVICES).map(
+      (service) => `reporter-${service.slice(-1)}.json`
+    )
+    for (;;) {
+      const answering = Object.entries(BROKER_SERVICES).every(([service, address]) =>
+        this.#compose(
+          [
+            'exec',
+            '-T',
+            service,
+            '/opt/kafka/bin/kafka-topics.sh',
+            '--bootstrap-server',
+            address,
+            '--list',
+          ],
+          deadline,
+          false
+        )
+      )
+      const loaded = proofs.every((name) => fs.existsSync(path.join(this.#fixture.sink, name)))
+      if (answering && loaded) return
+      if (this.#now() + 2000 >= deadline)
+        throw new Error(`the cluster was not ready within ${PREPARE_SECONDS} s`)
+      this.#sleep(2000)
+    }
+  }
+}
+
 /** Runs and re-verifies one balanced session of child workers under the inherited scheduler. */
 class TelemetrySession {
   #manifest
@@ -3895,9 +4038,11 @@ class TelemetrySession {
   #declared
   #meta = null
   #completed = 0
+  #reset
 
   /** @param {{manifest:object,directory:string,io?:object}} options immutable manifest, a not yet existing
-   * absolute evidence directory and private test hooks (`spawnSync`, `verifyWorker`, `parse`, `now`)
+   * absolute evidence directory and private test hooks (`spawnSync`, `verifyWorker`, `parse`, `now`, and
+   * `reset`, the reporter reset of a delivery session)
    * @throws {AssertionError|UsageError} for an invalid manifest or an unavailable required capability
    */
   constructor({ manifest, directory, io = {} }) {
@@ -3913,6 +4058,15 @@ class TelemetrySession {
     this.#directory = directory
     this.#job = JOBS[manifest.job]
     this.#declared = schedule(this.#job.roles, this.#job.reference, this.#job.runs)
+    this.#reset =
+      this.#job.mode !== 'delivery'
+        ? null
+        : (io.reset ??
+          new ReporterReset({
+            fixture: manifest.fixture,
+            retained: this.#file('sinks'),
+            now: this.#io.now,
+          }))
   }
 
   /** @param {string} name file under the evidence directory @returns {string} absolute path */
@@ -4006,7 +4160,9 @@ class TelemetrySession {
     return numericProjection(envelope)
   }
 
-  /** Executes exactly m*(n+1) children through the unchanged scheduler and seals the receipt.
+  /** Executes exactly m*(n+1) children through the unchanged scheduler and seals the receipt. A delivery session
+   * resets the reporter before every child, after the previous child's evidence is sealed and before the new
+   * child's deadline is stamped; each reset is journalled (`prepared`) with its kept sink files and duration.
    * @returns {{exit:number,disposition:string,failures:object[],receipt:object}} verdict; 0 pass, 1 gate or
    * control failure, 3 void
    * @throws {Error|AggregateError} child, verification or write failure; cleanup errors are kept beside it
@@ -4014,7 +4170,8 @@ class TelemetrySession {
   run() {
     verifyProvenance(this.#manifest)
     makeExclusiveDirectory(this.#directory)
-    for (const name of ['workers', 'envelopes', 'stderr']) makeExclusiveDirectory(this.#file(name))
+    for (const name of ['workers', 'envelopes', 'stderr', ...(this.#reset ? ['sinks'] : [])])
+      makeExclusiveDirectory(this.#file(name))
     const manifestBytes = Buffer.from(JSON.stringify(this.#manifest))
     fs.writeFileSync(this.#file('manifest.json'), manifestBytes, { flag: 'wx', mode: 0o600 })
     const manifestSha256 = sha256(manifestBytes)
@@ -4023,6 +4180,20 @@ class TelemetrySession {
       label: arm.label,
       run: (reportAs = arm.label) => {
         const ordinal = this.#completed
+        if (this.#reset) {
+          const { retained, elapsedMs } = this.#reset.prepare(ordinal)
+          appendDurable(
+            this.#file('journal.jsonl'),
+            JSON.stringify({
+              job: this.#manifest.job,
+              ordinal,
+              label: reportAs,
+              disposition: 'prepared',
+              retained,
+              elapsedMs,
+            })
+          )
+        }
         appendDurable(
           this.#file('journal.jsonl'),
           JSON.stringify({
@@ -4436,6 +4607,8 @@ module.exports = {
   PayloadWorkload,
   DeliveryWorkload,
   TelemetrySession,
+  ReporterReset,
+  PREPARE_SECONDS,
   main,
 }
 

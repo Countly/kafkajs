@@ -368,7 +368,10 @@ new KafkaJSError('Invalid partition metadata', { retriable: true })
 new KafkaJSError('The group is rebalancing')
 new KafkaJSError(new Error('💣'), { retriable: true })
 
-new KafkaJSOffsetOutOfRange(new Error(), { topic: topic, partition: 0 })
+new KafkaJSOffsetOutOfRange(Object.assign(new Error(), { type: 'OFFSET_OUT_OF_RANGE', code: 1 }), {
+  topic: topic,
+  partition: 0,
+})
 
 new KafkaJSNumberOfRetriesExceeded(new Error(), { retryCount: 0, retryTime: 0 })
 
@@ -389,16 +392,9 @@ new KafkaJSRequestTimeoutError('Request requestInfo timed out', {
 
 new KafkaJSTopicMetadataNotLoaded('Topic metadata not loaded', { topic: topic })
 
-const partitionMetadata: PartitionMetadata = {
-  partitionErrorCode: 0,
-  partitionId: 0,
-  leader: 2,
-  replicas: [2],
-  isr: [2],
-}
 new KafkaJSStaleTopicMetadataAssignment('Topic has been updated', {
   topic: topic,
-  unknownPartitions: [partitionMetadata],
+  unknownPartitions: [2],
 })
 
 new KafkaJSServerDoesNotSupportApiKey(
@@ -489,6 +485,23 @@ consumer.on(consumer.events.POLL_INTERVAL_EXCEEDED, e => {
   void elapsed
   void isStatic
   void generationId
+})
+consumer.on(consumer.events.TOPIC_METADATA_STATUS, e => {
+  const topic: string = e.payload.topic
+  const groupId: string | null = e.payload.groupId
+  if (e.payload.status === 'unavailable') {
+    const code: 3 = e.payload.code
+    const type: 'UNKNOWN_TOPIC_OR_PARTITION' = e.payload.type
+    void code
+    void type
+  } else {
+    const code: 0 = e.payload.code
+    const type: null = e.payload.type
+    void code
+    void type
+  }
+  void topic
+  void groupId
 })
 // The option and the deprecated alias both compile.
 kafka.consumer({ groupId: 'g', maxPollInterval: 300000 })
@@ -753,16 +766,16 @@ const commitError = new KafkaJSCommitFailedError('x', { reason: 'membership-lost
 const commitIsNonRetriable: KafkaJSNonRetriableError = commitError
 const commitReason: 'membership-lost' | 'poll-interval-exceeded' | 'stale-assignment' =
   commitError.reason
-const commitCause: Error = commitError.cause
+const commitCause: Error | undefined = commitError.cause
 const commitType: string | undefined = commitError.type
-const commitCode: number | undefined = commitError.code
-// @ts-expect-error `cause` is required: a refused commit always names the loss
-new KafkaJSCommitFailedError('x', { reason: 'membership-lost' })
+const commitCode: number | string | undefined = commitError.code
+const staleCommit = new KafkaJSCommitFailedError('x', { reason: 'stale-assignment' })
+const staleCause: Error | undefined = staleCommit.cause
 // @ts-expect-error not a reason
 new KafkaJSInvalidFrameError('x', { reason: 'too-big' })
 void [frameIsConnectionError, frameReason, frameSize, corruptIsNonRetriable, corruptReason]
 void [boundNext, boundCodec, boundLimit]
-void [commitIsNonRetriable, commitReason, commitCause, commitType, commitCode]
+void [commitIsNonRetriable, commitReason, commitCause, commitType, commitCode, staleCause]
 
 // The error classes of a closed connection, a join that needs its member id, a broken invariant,
 // an undecodable number, a refused topic creation and a consumer with no broker to fetch from.
@@ -808,7 +821,7 @@ new Kafka({ brokers: ['localhost:9092'], metadataClusterCheck: false })
 new Kafka({ brokers: ['localhost:9092'], metadataClusterCheck: 'false' })
 
 // KafkaJSLockTimeout stays exported.
-new KafkaJSLockTimeout()
+new KafkaJSLockTimeout('lock')
 
 // The broker surface transactions use.
 const useBroker = async (broker: Broker) => {
@@ -1614,6 +1627,7 @@ const legacyCallback: kafkajs.SASLOptions = {
   oauthBearerProvider: async () => ({ value: 'token', extensions: { trace: 'one' } }),
 }
 const helperCallback: kafkajs.SASLOptions = { mechanism: 'oauthbearer', oauthBearerProvider: helperProvider }
+const authzCallback: kafkajs.SASLOptions = { mechanism: 'oauthbearer', oauthBearerProvider: helperProvider, authorizationIdentity: 'principal' }
 // @ts-expect-error secret and assertion are exclusive
 oauthBearer.clientCredentials({ tokenEndpointUrl: 'https://issuer.example/token', clientId: 'id', clientSecret: 'secret', clientAssertion: signedAssertion })
 // @ts-expect-error one credential form is required
@@ -1685,11 +1699,11 @@ deadlineAdmin.fetchTopicMetadata({ includeTopicAuthorizedOperations: 'true' })
 void adminDeadlineConfig
 
 const inheritedNonRetriableErrors: KafkaJSNonRetriableError[] = [
-  new KafkaJSPartialMessageError(), new KafkaJSSASLAuthenticationError(),
-  new KafkaJSGroupCoordinatorNotFound(), new KafkaJSNotImplemented(),
-  new KafkaJSTimeout(), new KafkaJSUnsupportedMagicByteInMessageSet(),
+  new KafkaJSPartialMessageError('partial'), new KafkaJSSASLAuthenticationError('sasl'),
+  new KafkaJSGroupCoordinatorNotFound('coordinator'), new KafkaJSNotImplemented('todo'),
+  new KafkaJSTimeout('timeout'), new KafkaJSUnsupportedMagicByteInMessageSet('magic'),
 ]
-const inheritedLockTimeout: KafkaJSTimeout = new KafkaJSLockTimeout()
+const inheritedLockTimeout: KafkaJSTimeout = new KafkaJSLockTimeout('lock')
 const createTopicDetail: string | null = new KafkaJSCreateTopicError(new Error('stable'), 't', 'detail').errorMessage
 async function offsetIsolationOptions(admin: Admin) {
   await admin.fetchTopicOffsets('t', {isolationLevel: 'read_uncommitted', apiTimeout: 10})
@@ -2011,3 +2025,357 @@ telemetryShare.registerMetricForSubscription({ name: 'com.example.share', type: 
 // @ts-expect-error the ID getter does not accept signal strings
 telemetryShare.clientInstanceId('SIGTERM')
 void [telemetryShareSurface, telemetryShareId, telemetryShareDisconnect]
+
+import { KafkaJSRebalanceNotConvergedError as NotConverged } from './index'
+{
+  const notConverged = new NotConverged('cooperative rebalance did not converge in 20 rounds')
+  const asBase: KafkaJSError = notConverged
+  const retriable: boolean = notConverged.retriable
+  void asBase
+  void retriable
+  new NotConverged('x', { cause: new Error('y') })
+}
+
+import { KafkaJSTopicRecreatedError as TopicRecreated } from './index'
+{
+  const recreated = new TopicRecreated('topic orders was recreated', {
+    topic: 'orders',
+    previousTopicId: 'old-id',
+    topicId: 'new-id',
+    groupId: 'billing',
+    cause: new Error('y'),
+  })
+  const asBase: KafkaJSNonRetriableError = recreated
+  const topic: string = recreated.topic
+  const previousTopicId: string = recreated.previousTopicId
+  const topicId: string = recreated.topicId
+  const groupId: string | null = recreated.groupId
+  void [asBase, topic, previousTopicId, topicId, groupId]
+  new TopicRecreated('x', { topic: 'orders', previousTopicId: 'old-id', topicId: 'new-id' })
+  // @ts-expect-error the topic and both ids are required
+  new TopicRecreated('x', { topic: 'orders' })
+  // @ts-expect-error the fields are read-only
+  recreated.topicId = 'other'
+}
+
+import {
+  KafkaJSUnknownOutcomeError as UnknownOutcome,
+  UnknownOutcomeRequest,
+  KafkaJSNonRetriableError as NonRetriableBase,
+} from './index'
+{
+  const lost = new UnknownOutcome('lost', {
+    requests: [{ api: 'DeleteRecords', apiVersion: 2, nodeId: 1, items: [{ topic: 't' }] }],
+    cause: new Error('closed'),
+  })
+  const asBase: NonRetriableBase = lost
+  const outcome: 'unknown' = lost.outcome
+  const request: UnknownOutcomeRequest = lost.requests[0]
+  const items: unknown[] | null = request.items
+  void asBase
+  void outcome
+  void items
+  new UnknownOutcome('lost')
+  // @ts-expect-error outcome is always 'unknown'
+  const other: 'applied' = lost.outcome
+  void other
+}
+
+// Error declarations match what the constructors read and what the fields hold.
+{
+  const protocolError = Object.assign(new Error('x'), { type: 'OFFSET_OUT_OF_RANGE', code: 1 })
+  new KafkaJSTimeout('timed out', { cause: new Error('socket') })
+  // @ts-expect-error the constructor reads the message
+  new KafkaJSTimeout()
+  new KafkaJSNonRetriableError('x', { cause: new Error('y') })
+  new KafkaJSError('x', { cause: new Error('y') })
+  new kafkajs.KafkaJSMetadataNotLoaded('x', { retriable: false, cause: new Error('y') })
+  // @ts-expect-error the constructor reads the message
+  new kafkajs.KafkaJSBrokerNotFound()
+  new KafkaJSProtocolError(protocolError, { retriable: false })
+  // @ts-expect-error a protocol error is built from a protocol error
+  new KafkaJSProtocolError('x')
+  // @ts-expect-error the topic and partition are required
+  new KafkaJSOffsetOutOfRange(protocolError)
+  // @ts-expect-error the retry counts are required
+  new KafkaJSNumberOfRetriesExceeded(new Error('x'))
+  const ids: number[] | undefined = ({} as KafkaJSStaleTopicMetadataAssignment).unknownPartitions
+  // @ts-expect-error the partitions are absent when no metadata was passed
+  const definiteIds: number[] = ({} as KafkaJSStaleTopicMetadataAssignment).unknownPartitions
+  // @ts-expect-error the topic is absent when no metadata was passed
+  const definiteTopic: string = ({} as KafkaJSStaleTopicMetadataAssignment).topic
+  new KafkaJSStaleTopicMetadataAssignment('x')
+  new KafkaJSStaleTopicMetadataAssignment('x', { topic: 't', unknownPartitions: [1] })
+  // @ts-expect-error a wrapped Node.js error has a string code
+  const numericCode: number | undefined = ({} as KafkaJSError).code
+  const refused: boolean = ({} as KafkaJSConnectionError).code === 'ECONNREFUSED'
+  // @ts-expect-error the broker can be unknown
+  const known: string = ({} as KafkaJSConnectionError).broker
+  const closed: string = ({} as KafkaJSConnectionClosedError).broker
+  const first: number | undefined = ({} as kafkajs.KafkaJSDeleteTopicRecordsError).partitions[0]?.partition
+  new kafkajs.KafkaJSDeleteTopicRecordsError({ partitions: [] })
+  const row = ({} as kafkajs.KafkaJSDeleteTopicRecordsError).partitions[0]
+  const rowOffset: string | undefined = row.offset
+  // @ts-expect-error the offset is undefined when the response row matched no request
+  const definiteOffset: string = row.offset
+  const rowError: KafkaJSError | null | undefined = row.error
+  // @ts-expect-error a row can carry no error
+  const definiteError: KafkaJSError = row.error
+  new kafkajs.KafkaJSDeleteTopicRecordsError({
+    topic: 't',
+    partitions: [{ partition: 0, offset: undefined, error: null }],
+  })
+  new kafkajs.KafkaJSDeleteTopicRecordsError({ partitions: [{ partition: 0, offset: '1' }] })
+  const groupMessage: string | null | undefined = ({} as kafkajs.KafkaJSDeleteGroupsErrorGroups).errorMessage
+  new KafkaJSProtocolError({
+    type: 'OFFSET_OUT_OF_RANGE',
+    code: 1,
+    message: 'out of range',
+    retriable: false,
+    helpUrl: 'https://kafka.apache.org/',
+    category: 'invalidConfiguration',
+  })
+  new KafkaJSOffsetOutOfRange(
+    { type: 'OFFSET_OUT_OF_RANGE', code: 1, message: 'out of range', helpUrl: 'https://kafka.apache.org/' },
+    { topic: 't', partition: 0 }
+  )
+  void [
+    ids,
+    definiteIds,
+    definiteTopic,
+    numericCode,
+    refused,
+    known,
+    closed,
+    first,
+    rowOffset,
+    definiteOffset,
+    rowError,
+    definiteError,
+    groupMessage,
+  ]
+}
+
+// Admin results are declared with the fields the calls return.
+declare const resultShapeBroker: kafkajs.Broker
+const useAdminResultShapes = async () => {
+  const row = (await admin.listPartitionReassignments({})).topics[0]
+  const rowName: string = row.name
+  const rowPartition: number = row.partitions[0].partition
+  const rowAdding: number[] = row.partitions[0].addingReplicas
+  const rowRemoving: number[] = row.partitions[0].removingReplicas
+  const rowReplicas: number[] = row.partitions[0].replicas
+  const ongoing: kafkajs.OngoingPartitionReassignment = { partition: 0, replicas: [1], addingReplicas: [], removingReplicas: [] }
+  // The objects carry both identity keys, so only the missing array decides each assignment.
+  const addingOmitted = { partition: 0, partitionIndex: 0, replicas: [1], removingReplicas: [] }
+  const removingOmitted = { partition: 0, partitionIndex: 0, replicas: [1], addingReplicas: [] }
+  // @ts-expect-error a row always carries addingReplicas
+  const noAdding: kafkajs.OngoingPartitionReassignment = addingOmitted
+  // @ts-expect-error a row always carries removingReplicas
+  const noRemoving: kafkajs.OngoingPartitionReassignment = removingOmitted
+  const brokerReply = await resultShapeBroker.listPartitionReassignments({})
+  const brokerCode: number = brokerReply.errorCode
+  const brokerThrottle: number = brokerReply.throttleTime
+  const brokerClientThrottle: number = brokerReply.clientSideThrottleTime
+  const brokerTopics: kafkajs.OngoingTopicReassignment[] = brokerReply.topics
+  await resultShapeBroker.listPartitionReassignments({ topics: null })
+  await admin.listPartitionReassignments({ topics: null })
+  await admin.listPartitionReassignments({ topics: [{ topic, partitions: [0] }] })
+
+  const described = await admin.describeConfigs({
+    includeSynonyms: true,
+    resources: [{ type: ConfigResourceTypes.TOPIC, name: topic }],
+  })
+  const entry = described.resources[0].configEntries[0]
+  // @ts-expect-error a sensitive or unset config has no value
+  const entryText: string = entry.configValue
+  const entryValue: string | null = entry.configValue
+  // @ts-expect-error a synonym of an unset config has no value
+  const synonymText: string = entry.configSynonyms[0].configValue
+  const synonymValue: string | null = entry.configSynonyms[0].configValue
+  // @ts-expect-error a resource without an error has no message
+  const resourceText: string = described.resources[0].errorMessage
+  const resourceMessage: string | null = described.resources[0].errorMessage
+  // @ts-expect-error describeConfigs never sets the throttle time
+  const describedThrottle: number = described.throttleTime
+  const describedThrottleUnset: undefined = described.throttleTime
+
+  const acls = await admin.describeAcls({
+    resourceType: AclResourceTypes.TOPIC,
+    resourcePatternType: ResourcePatternTypes.LITERAL,
+    operation: AclOperationTypes.ANY,
+    permissionType: AclPermissionTypes.ALLOW,
+  })
+  // @ts-expect-error describeAcls never sets the throttle time
+  const aclsThrottle: number = acls.throttleTime
+  // @ts-expect-error describeAcls never sets an error code
+  const aclsCode: number = acls.errorCode
+  const aclsMessage: undefined = acls.errorMessage
+  const aclsResources: kafkajs.DescribeAclResource[] = acls.resources
+
+  const deleted = await admin.deleteAcls({
+    filters: [
+      {
+        resourceType: AclResourceTypes.TOPIC,
+        resourcePatternType: ResourcePatternTypes.LITERAL,
+        operation: AclOperationTypes.ANY,
+        permissionType: AclPermissionTypes.ALLOW,
+      },
+    ],
+  })
+  // @ts-expect-error deleteAcls never sets the throttle time
+  const deletedThrottle: number = deleted.throttleTime
+  // @ts-expect-error a filter without an error has no message
+  const filterText: string | undefined = deleted.filterResponses[0].errorMessage
+  const filterMessage: string | null | undefined = deleted.filterResponses[0].errorMessage
+  // @ts-expect-error a matching ACL without an error has no message
+  const matchingText: string | undefined = deleted.filterResponses[0].matchingAcls[0].errorMessage
+  const matchingMessage: string | null | undefined = deleted.filterResponses[0].matchingAcls[0].errorMessage
+
+  // @ts-expect-error createPartitions resolves nothing
+  const created: boolean = await admin.createPartitions({ topicPartitions: [] })
+  const createdNothing: void = await admin.createPartitions({ topicPartitions: [] })
+
+  await admin.electLeaders()
+  await admin.electLeaders({ electionType: 'unclean' })
+  await admin.fetchTopicOffsetsByTimestamp(topic, '1700000000000')
+  await admin.fetchTopicOffsetsByTimestamp(topic, '-1', { isolationLevel: 'read_committed' })
+  await admin.fetchTopicOffsetsByTimestamp(topic, 'maxTimestamp')
+
+  // @ts-expect-error an 'any' match takes no name
+  await admin.describeClientQuotas({ components: [{ entityType: 'user', matchType: 'any', match: 'x' }] })
+  // @ts-expect-error a 'default' match takes no name
+  await admin.describeClientQuotas({ components: [{ entityType: 'user', matchType: 'default', match: 'x' }] })
+  // @ts-expect-error an exact match needs a name
+  await admin.describeClientQuotas({ components: [{ entityType: 'user', matchType: 'exact' }] })
+  await admin.describeClientQuotas({
+    components: [
+      { entityType: 'user', matchType: 'exact', match: 'u' },
+      { entityType: 'client-id', matchType: 'default' },
+      { entityType: 'ip', matchType: 'any' },
+    ],
+  })
+
+  const errored: GroupDescription['groupType'] = ''
+  void [
+    rowName,
+    rowPartition,
+    rowAdding,
+    rowRemoving,
+    rowReplicas,
+    ongoing,
+    noAdding,
+    noRemoving,
+    brokerCode,
+    brokerThrottle,
+    brokerClientThrottle,
+    brokerTopics,
+    entryText,
+    entryValue,
+    synonymText,
+    synonymValue,
+    resourceText,
+    resourceMessage,
+    describedThrottle,
+    describedThrottleUnset,
+    aclsThrottle,
+    aclsCode,
+    aclsMessage,
+    aclsResources,
+    deletedThrottle,
+    filterText,
+    filterMessage,
+    matchingText,
+    matchingMessage,
+    created,
+    createdNothing,
+    errored,
+  ]
+}
+void useAdminResultShapes
+
+import * as net from 'net'
+import * as tls from 'tls'
+
+// Declarations of the consumer, producer, assigner and event surface match what the runtime does.
+namespace ConsumerProducerEventDeclarations {
+  const kafka = new kafkajs.Kafka({ brokers: [] })
+  const producer = kafka.producer()
+  const share = kafka.shareConsumer({ groupId: 'g' })
+  declare const bigTimestamp: bigint
+
+  // A rebalance reason can be one the client names, or the text given to `enforceRebalance`.
+  type Reason = kafkajs.ConsumerRebalancingEvent['payload']['reason']
+  const named: Reason = 'rebalance-in-progress'
+  const subscriptionChanged: Reason = 'subscription-changed'
+  const enforced: Reason = 'enforced-rebalance'
+  const custom: Reason = 'custom'
+  const absent: Reason = undefined
+  // @ts-expect-error a reason is text
+  const numeric: Reason = 5
+  void [named, subscriptionChanged, enforced, custom, absent, numeric]
+
+  // A decoded assigner buffer can carry no user data: Java members send none.
+  const metadata = AssignerProtocol.MemberMetadata.decode(Buffer.alloc(0))
+  // @ts-expect-error decoded userData can be null
+  void (metadata && metadata.userData.length)
+  void (metadata && metadata.userData && metadata.userData.length)
+  const assignment = AssignerProtocol.MemberAssignment.decode(Buffer.alloc(0))
+  // @ts-expect-error decoded userData can be null
+  void assignment?.userData.length
+  void assignment?.userData?.length
+  const nullableUserData: Buffer | null | undefined = assignment?.userData
+  void nullableUserData
+
+  // `MemberAssignment.encode` defaults the user data, and accepts the null the wire carries.
+  const encodedWithout: Buffer = AssignerProtocol.MemberAssignment.encode({ version: 1, assignment: {} })
+  const encodedNull: Buffer = AssignerProtocol.MemberAssignment.encode({ version: 1, assignment: { t: [0] }, userData: null })
+  const encodedBytes: Buffer = AssignerProtocol.MemberAssignment.encode({ version: 1, assignment: { t: [0] }, userData: Buffer.alloc(0) })
+  void [encodedWithout, encodedNull, encodedBytes]
+
+  // A record timestamp is a string, a number, a `Date` or a `bigint`, as `send` has always taken.
+  const sendTimestamps = async () => {
+    await producer.send({ topic: 't', messages: [{ value: 'a', timestamp: '1' }] })
+    await producer.send({ topic: 't', messages: [{ value: 'a', timestamp: Date.now() }] })
+    await producer.send({ topic: 't', messages: [{ value: 'a', timestamp: new Date() }] })
+    await producer.send({ topic: 't', messages: [{ value: 'a', timestamp: bigTimestamp }] })
+    // @ts-expect-error a timestamp is not a boolean
+    await producer.send({ topic: 't', messages: [{ value: 'a', timestamp: true }] })
+  }
+  void sendTimestamps
+
+  // A share consumer runs exactly one handler.
+  const runShare = async () => {
+    await share.run({ eachMessage: async () => {} })
+    await share.run({ eachBatch: async () => {} })
+    // @ts-expect-error exactly one handler
+    await share.run({})
+    // @ts-expect-error exactly one handler
+    await share.run({ eachMessage: async () => {}, eachBatch: async () => {} })
+  }
+  void runShare
+
+  // A socket factory gets `ssl` as configured: `true`, an options object, `false` or `null`.
+  const factory: kafkajs.ISocketFactory = (args) => {
+    const enabled: boolean = args.ssl === true
+    const disabled: boolean = args.ssl === false || args.ssl === null
+    const options: tls.ConnectionOptions | undefined = typeof args.ssl === 'object' && args.ssl ? args.ssl : undefined
+    void [enabled, disabled, options]
+    return new net.Socket()
+  }
+  void factory
+
+  // A halted partition can have no member id yet.
+  const halted = {} as kafkajs.ConsumerPartitionHaltedEventPayload
+  const haltedMember: string | null = halted.memberId
+  // @ts-expect-error a halted partition can have no member
+  const haltedId: string = halted.memberId
+  void [haltedMember, haltedId]
+
+  // The root logger has no namespace.
+  const entry = {} as kafkajs.LogEntry
+  const entryNamespace: string | undefined = entry.namespace
+  // @ts-expect-error the root logger has no namespace
+  const ns: string = entry.namespace
+  void [entryNamespace, ns]
+}

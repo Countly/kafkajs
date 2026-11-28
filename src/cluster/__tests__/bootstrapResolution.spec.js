@@ -375,6 +375,296 @@ describe('Bootstrap DNS resolution', () => {
     await expect(hangingList.gate.wait()).rejects.toBe(listWait.error)
   })
 
+  describe('when the clock passes the deadline before the deadline timer fires', () => {
+    /** Moves the clock past a round started now without running any timer. */
+    const passDeadline = () => jest.setSystemTime(Date.now() + TIMEOUT + 1)
+
+    test('a success delivered after the deadline rejects with the cached error', async () => {
+      const { gate, dns } = createGate({ hosts: ['a.test'] })
+      const waiting = watch(gate.wait())
+      await flush()
+      expect(dns.calls).toHaveLength(1)
+
+      passDeadline()
+      dns.calls[0].callback(null, ADDRESSES)
+      await flush()
+
+      expect(gate.state).toBe('failed')
+      expect(waiting.error).toBeInstanceOf(KafkaJSBootstrapResolutionError)
+      expect(waiting.error.message).toContain('a.test')
+      expect(jest.getTimerCount()).toBe(0)
+    })
+
+    test('no lookup starts after the deadline', async () => {
+      const { gate, dns } = createGate({ hosts: ['a.test'], plan: () => 'fail' })
+      const waiting = watch(gate.wait())
+      await flush()
+      expect(dns.calls).toHaveLength(1)
+
+      passDeadline()
+      await jest.advanceTimersByTimeAsync(RETRY.initialRetryTime)
+
+      expect(dns.calls).toHaveLength(1)
+      expect(gate.state).toBe('failed')
+      expect(waiting.error).toBeInstanceOf(KafkaJSBootstrapResolutionError)
+      expect(waiting.error.cause.code).toBe('ENOTFOUND')
+      expect(jest.getTimerCount()).toBe(0)
+    })
+
+    test('a late dynamic host list does not start DNS', async () => {
+      let supply
+      const { gate, dns } = createGate({
+        resolveHosts: () => new Promise((resolve) => (supply = resolve)),
+      })
+      const waiting = watch(gate.wait())
+      await flush()
+
+      passDeadline()
+      supply(['a.test'])
+      await flush()
+
+      expect(dns.calls).toHaveLength(0)
+      expect(gate.state).toBe('failed')
+      expect(waiting.error).toBeInstanceOf(KafkaJSBootstrapResolutionError)
+      expect(jest.getTimerCount()).toBe(0)
+    })
+
+    test('a repeated wait returns the same error after expiry', async () => {
+      const { gate, dns, resolveHosts } = createGate({ hosts: ['a.test'] })
+      const waiting = watch(gate.wait())
+      await flush()
+
+      passDeadline()
+      dns.calls[0].callback(null, ADDRESSES)
+      await flush()
+      expect(waiting.error).toBeInstanceOf(KafkaJSBootstrapResolutionError)
+
+      await expect(gate.wait()).rejects.toBe(waiting.error)
+      await expect(gate.wait()).rejects.toBe(waiting.error)
+      await jest.advanceTimersByTimeAsync(5 * TIMEOUT)
+      expect(dns.calls).toHaveLength(1)
+      expect(resolveHosts).toHaveBeenCalledTimes(1)
+    })
+
+    test('a late callback of a cancelled round is ignored', async () => {
+      const { gate, dns } = createGate({ hosts: ['a.test'] })
+      watch(gate.wait())
+      await flush()
+      const [old] = dns.calls
+      gate.cancel(new Error('client disconnected'))
+      const fresh = watch(gate.wait())
+      await flush()
+      expect(dns.calls).toHaveLength(2)
+
+      passDeadline()
+      old.callback(null, ADDRESSES)
+      old.callback(notFound('a.test'))
+      await flush()
+      expect(gate.state).toBe('pending')
+      expect(fresh.done).toBe(false)
+
+      dns.calls[1].callback(null, ADDRESSES)
+      await flush()
+      expect(gate.state).toBe('failed')
+      expect(fresh.error).toBeInstanceOf(KafkaJSBootstrapResolutionError)
+      expect(dns.calls).toHaveLength(2)
+      expect(jest.getTimerCount()).toBe(0)
+    })
+
+    test('a success 1 ms before the deadline opens the gate', async () => {
+      const startedAt = Date.now()
+      const { gate, dns } = createGate({ hosts: ['a.test'] })
+      const waiting = watch(gate.wait())
+      await flush()
+
+      jest.setSystemTime(startedAt + TIMEOUT - 1)
+      dns.calls[0].callback(null, ADDRESSES)
+      await flush()
+
+      expect(gate.state).toBe('open')
+      expect(waiting).toEqual({ done: true, error: null })
+      expect(jest.getTimerCount()).toBe(0)
+    })
+
+    test('a success exactly at the deadline rejects with the cached error', async () => {
+      const startedAt = Date.now()
+      const { gate, dns } = createGate({ hosts: ['a.test'] })
+      const waiting = watch(gate.wait())
+      await flush()
+
+      jest.setSystemTime(startedAt + TIMEOUT)
+      dns.calls[0].callback(null, ADDRESSES)
+      await flush()
+
+      expect(gate.state).toBe('failed')
+      expect(waiting.error).toBeInstanceOf(KafkaJSBootstrapResolutionError)
+      await expect(gate.wait()).rejects.toBe(waiting.error)
+      await expect(gate.wait()).rejects.toBe(waiting.error)
+      expect(dns.calls).toHaveLength(1)
+      expect(jest.getTimerCount()).toBe(0)
+    })
+
+    test('a dynamic list failure before the deadline returns its error and leaves the gate idle', async () => {
+      const startedAt = Date.now()
+      const failure = new Error('provider failed')
+      let fail
+      const { gate, dns, resolveHosts } = createGate({
+        resolveHosts: () => new Promise((resolve, reject) => (fail = reject)),
+      })
+      const waiting = watch(gate.wait())
+      await flush()
+
+      jest.setSystemTime(startedAt + TIMEOUT - 1)
+      fail(failure)
+      await flush()
+
+      expect(waiting.error).toBe(failure)
+      expect(gate.state).toBe('idle')
+      expect(dns.calls).toHaveLength(0)
+      expect(resolveHosts).toHaveBeenCalledTimes(1)
+      expect(jest.getTimerCount()).toBe(0)
+    })
+
+    test.each([
+      ['exactly at', 0],
+      ['after', 1],
+    ])(
+      'a dynamic list failure %s the deadline caches the error and starts no new round',
+      async (_, late) => {
+        const startedAt = Date.now()
+        const failure = new Error('provider failed')
+        let fail
+        const { gate, dns, resolveHosts } = createGate({
+          resolveHosts: () => new Promise((resolve, reject) => (fail = reject)),
+        })
+        const waiting = watch(gate.wait())
+        await flush()
+
+        jest.setSystemTime(startedAt + TIMEOUT + late)
+        fail(failure)
+        await flush()
+
+        expect(gate.state).toBe('failed')
+        expect(waiting.error).toBeInstanceOf(KafkaJSBootstrapResolutionError)
+        expect(waiting.error.cause).toBe(failure)
+        await expect(gate.wait()).rejects.toBe(waiting.error)
+        await expect(gate.wait()).rejects.toBe(waiting.error)
+        await jest.advanceTimersByTimeAsync(5 * TIMEOUT)
+        expect(resolveHosts).toHaveBeenCalledTimes(1)
+        expect(dns.calls).toHaveLength(0)
+        expect(jest.getTimerCount()).toBe(0)
+      }
+    )
+  })
+
+  /**
+   * @param {Function} lookup the `dns.lookup` stand-in
+   * @param {string[]} [hosts] the bootstrap list
+   * @returns {BootstrapResolution} a gate over `lookup`
+   */
+  const gateOver = (lookup, hosts = ['a.test']) =>
+    new BootstrapResolution({
+      timeout: TIMEOUT,
+      resolveHosts: async () => hosts,
+      lookup,
+      retry: RETRY,
+      now: () => Date.now(),
+    })
+
+  test('a lookup that throws synchronously is retried like a failed lookup', async () => {
+    const thrown = new Error('invalid lookup arguments')
+    const recovering = jest.fn((host, options, callback) => {
+      if (recovering.mock.calls.length === 1) throw thrown
+      Promise.resolve().then(() => callback(null, ADDRESSES))
+    })
+    const recoveringGate = gateOver(recovering)
+    const opening = watch(recoveringGate.wait())
+    try {
+      await flush()
+      expect(recovering).toHaveBeenCalledTimes(1)
+      expect(opening.done).toBe(false)
+      await jest.advanceTimersByTimeAsync(RETRY.initialRetryTime)
+      expect(recovering).toHaveBeenCalledTimes(2)
+      expect(opening).toEqual({ done: true, error: null })
+    } finally {
+      recoveringGate.cancel(new Error('test cleanup'))
+    }
+
+    const failing = watch(
+      gateOver(() => {
+        throw thrown
+      }).wait()
+    )
+    await jest.advanceTimersByTimeAsync(TIMEOUT)
+    expect(failing.error).toBeInstanceOf(KafkaJSBootstrapResolutionError)
+    expect(failing.error.message).toBe(
+      `Bootstrap DNS resolution failed: none of a.test resolved within ${TIMEOUT} ms (last error: invalid lookup arguments)`
+    )
+    expect(failing.error.cause).toBe(thrown)
+  })
+
+  test('an empty address list is not a resolution', async () => {
+    const empty = jest.fn((host, options, callback) => {
+      const answer = empty.mock.calls.length === 1 ? [] : ADDRESSES
+      Promise.resolve().then(() => callback(null, answer))
+    })
+    const opening = watch(gateOver(empty).wait())
+    await flush()
+    expect(empty).toHaveBeenCalledTimes(1)
+    expect(opening.done).toBe(false)
+    await jest.advanceTimersByTimeAsync(RETRY.initialRetryTime)
+    expect(empty).toHaveBeenCalledTimes(2)
+    expect(opening).toEqual({ done: true, error: null })
+
+    const failing = watch(
+      gateOver((host, options, callback) => Promise.resolve().then(() => callback(null, []))).wait()
+    )
+    await jest.advanceTimersByTimeAsync(TIMEOUT)
+    expect(failing.error).toBeInstanceOf(KafkaJSBootstrapResolutionError)
+    expect(failing.error.message).toBe(
+      `Bootstrap DNS resolution failed: none of a.test resolved within ${TIMEOUT} ms (last error: a.test resolved to no address)`
+    )
+  })
+
+  test('the failure for an empty bootstrap list names the bootstrap list', async () => {
+    const lookup = jest.fn()
+    const failing = watch(gateOver(lookup, []).wait())
+    await jest.advanceTimersByTimeAsync(TIMEOUT)
+    expect(failing.error).toBeInstanceOf(KafkaJSBootstrapResolutionError)
+    expect(failing.error.message).toBe(
+      `Bootstrap DNS resolution failed: none of the bootstrap list resolved within ${TIMEOUT} ms`
+    )
+    expect(failing.error.cause).toBeUndefined()
+    expect(lookup).not.toHaveBeenCalled()
+  })
+
+  test('a failed round whose wait promise was dropped is not an unhandled rejection', () => {
+    const { execFileSync } = require('node:child_process')
+    const script = `
+      const BootstrapResolution = require('./src/cluster/bootstrapResolution')
+      const unhandled = []
+      process.on('unhandledRejection', (error) => unhandled.push(error.message))
+      let now = 0
+      const gate = new BootstrapResolution({
+        timeout: 1000,
+        resolveHosts: async () => ['a.test'],
+        lookup: (host, options, callback) => {
+          now = 1000
+          callback(new Error('getaddrinfo ENOTFOUND a.test'))
+        },
+        now: () => now,
+      })
+      gate.wait()
+      setImmediate(() => process.stdout.write(JSON.stringify({ state: gate.state, unhandled })))
+    `
+    const report = execFileSync(process.execPath, ['-e', script], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+    expect(JSON.parse(report)).toEqual({ state: 'failed', unhandled: [] })
+  })
+
   test('rejects invalid timeout configuration before network work', async () => {
     const resolveHosts = jest.fn()
     const lookup = jest.fn()

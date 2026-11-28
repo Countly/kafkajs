@@ -750,22 +750,27 @@ describe('share administration', () => {
       }
     )
 
-    test.each(OFFSET_CALLS)('%s relocates once to the new coordinator', async (method, options) => {
-      const first = coordinator(0)
-      const second = coordinator(1)
-      const wire = brokerMethodOf(method)
-      first[wire].mockResolvedValueOnce(
-        method === 'listShareGroupOffsets'
-          ? { groups: [{ groupId: 'share-group', errorCode: 16, topics: [] }] }
-          : { errorCode: 16, responses: [] }
-      )
-      f = fixture([first, second])
-      f.cluster.findGroupCoordinator.mockResolvedValueOnce(first).mockResolvedValueOnce(second)
-      await f.admin[method](options)
-      expect(first[wire]).toHaveBeenCalledTimes(1)
-      expect(second[wire]).toHaveBeenCalledTimes(1)
-      expect(f.cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
-    })
+    test.each(OFFSET_CALLS)(
+      '%s keeps a coordinator error for mutations and relocates for reads',
+      async (method, options) => {
+        const first = coordinator(0)
+        const second = coordinator(1)
+        const wire = brokerMethodOf(method)
+        first[wire].mockResolvedValueOnce(
+          method === 'listShareGroupOffsets'
+            ? { groups: [{ groupId: 'share-group', errorCode: 16, topics: [] }] }
+            : { errorCode: 16, responses: [] }
+        )
+        f = fixture([first, second])
+        f.cluster.findGroupCoordinator.mockResolvedValueOnce(first).mockResolvedValueOnce(second)
+        const reading = method === 'listShareGroupOffsets'
+        if (reading) await f.admin[method](options)
+        else await expect(f.admin[method](options)).rejects.toMatchObject({ code: 16 })
+        expect(first[wire]).toHaveBeenCalledTimes(1)
+        expect(second[wire]).toHaveBeenCalledTimes(reading ? 1 : 0)
+        expect(f.cluster.findGroupCoordinator).toHaveBeenCalledTimes(reading ? 2 : 1)
+      }
+    )
 
     test.each([14, 16])(
       'offset group error %s remains a protocol error after bounded retry',
@@ -820,6 +825,8 @@ describe('share administration', () => {
         apiKey,
         apiName,
       })
+      expect(error.cause).toBeInstanceOf(KafkaJSProtocolError)
+      expect(error.cause).toMatchObject({ type: 'UNSUPPORTED_VERSION', code: 35 })
       expect(broker[wire]).toHaveBeenCalledTimes(1)
     })
 
@@ -877,6 +884,8 @@ describe('share administration', () => {
           apiKey,
           apiName,
         })
+        expect(error.cause).toBeInstanceOf(KafkaJSProtocolError)
+        expect(error.cause).toMatchObject({ type: 'UNSUPPORTED_VERSION', code: 35 })
         expect(broker[wire]).toHaveBeenCalledTimes(1)
         expect(f.cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
       }

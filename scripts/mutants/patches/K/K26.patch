@@ -1,0 +1,11 @@
+--- a/scripts/benchmarks/fetchSessions.js
++++ b/scripts/benchmarks/fetchSessions.js
+@@ -279,7 +279,7 @@
+     const elapsedMs = this.ended - this.started
+     if (elapsedMs <= 0) throw new Error('Empty measurement interval')
+     const counts = this.accounting.result()
+-    const cpuMicros = end.user - this.cpuStart.user + end.system - this.cpuStart.system
++    const cpuMicros = end.user - this.cpuStart.user
+     const messages = counts.deliveredMessages
+     return {
+       ...counts,

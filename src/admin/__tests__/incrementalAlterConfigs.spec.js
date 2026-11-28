@@ -324,7 +324,7 @@ describe('Admin > incrementalAlterConfigs > failures', () => {
     expect(controller.incrementalAlterConfigs).toHaveBeenCalledTimes(1)
   })
 
-  test('sends the whole call again when a resource answers NOT_CONTROLLER, as Java does', async () => {
+  test('reports a mutation resource that answers NOT_CONTROLLER without resending', async () => {
     let attempt = 0
     const answer = async ({ resources }) => {
       attempt += 1
@@ -338,12 +338,12 @@ describe('Admin > incrementalAlterConfigs > failures', () => {
 
     const response = await admin.incrementalAlterConfigs({ resources: [topicResource()] })
 
-    expect(response.resources[0].errorCode).toBe(0)
-    expect(controller.incrementalAlterConfigs).toHaveBeenCalledTimes(2)
-    expect(cluster.refreshMetadata).toHaveBeenCalledTimes(2)
+    expect(response.resources[0].errorCode).toBe(NOT_CONTROLLER)
+    expect(controller.incrementalAlterConfigs).toHaveBeenCalledTimes(1)
+    expect(cluster.refreshMetadata).toHaveBeenCalledTimes(1)
   })
 
-  test('gives up with KafkaJSNumberOfRetriesExceeded when NOT_CONTROLLER persists', async () => {
+  test('retries validation and gives up when NOT_CONTROLLER persists', async () => {
     const answer = async ({ resources }) => ({
       resources: resources.map((resource) => resultFor(resource, { errorCode: NOT_CONTROLLER })),
     })
@@ -354,7 +354,7 @@ describe('Admin > incrementalAlterConfigs > failures', () => {
     })
 
     await expect(
-      admin.incrementalAlterConfigs({ resources: [topicResource()] })
+      admin.incrementalAlterConfigs({ resources: [topicResource()], validateOnly: true })
     ).rejects.toMatchObject({ name: 'KafkaJSNumberOfRetriesExceeded', retriable: false })
     expect(controller.incrementalAlterConfigs).toHaveBeenCalledTimes(2)
   })
@@ -427,6 +427,21 @@ describe('Admin > incrementalAlterConfigs > on the wire', () => {
     expect(harness.requests[0].body.toString('hex')).toEqual(
       vector('Request', 'set').hex.replace('063630303030', '01')
     )
+  })
+
+  test('refuses an answer whose Responses list is null', async () => {
+    // ThrottleTimeMs 0, Responses 00 (the compact null), body tags 00
+    const admin = adminOverBroker('000000000000')
+
+    await expect(
+      admin.incrementalAlterConfigs({ resources: [topicResource()] })
+    ).rejects.toMatchObject({
+      name: 'KafkaJSUnknownOutcomeError',
+      cause: expect.objectContaining({
+        name: 'KafkaJSPartialMessageError',
+        message: expect.stringContaining('IncrementalAlterConfigsResponse.Responses'),
+      }),
+    })
   })
 
   test('resolves the per-resource results the broker answered', async () => {

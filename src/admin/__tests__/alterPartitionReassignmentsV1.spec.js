@@ -40,21 +40,18 @@ describe('reassignment replication policy', () => {
       })
     }
   )
-  it('retains terminal children, retries only retryable children, and never resends success', async () => {
+  it('reports terminal and retriable partition errors of one answer without resending', async () => {
     const { admin, broker } = fixture()
     const terminal = new KafkaJSAlterPartitionReassignmentsError(createErrorFromCode(39), 't', 0)
     const temporary = new KafkaJSAlterPartitionReassignmentsError(createErrorFromCode(7), 't', 1)
-    broker.alterPartitionReassignments.mockRejectedValueOnce(
-      new KafkaJSAggregateError('mixed', [terminal, temporary])
-    )
+    const answer = new KafkaJSAggregateError('mixed', [terminal, temporary])
+    broker.alterPartitionReassignments.mockRejectedValueOnce(answer)
     await expect(
       admin.alterPartitionReassignments({ topics, allowReplicationFactorChange: false })
-    ).rejects.toMatchObject({ errors: [expect.objectContaining({ topic: 't', partition: 0 })] })
-    expect(broker.alterPartitionReassignments.mock.calls[1][0]).toEqual({
-      topics: [{ topic: 't', partitionAssignment: [{ partition: 1, replicas: [1, 2] }] }],
-      timeout: undefined,
-      allowReplicationFactorChange: false,
-    })
+    ).rejects.toBe(answer)
+    expect(broker.alterPartitionReassignments.mock.calls).toEqual([
+      [{ topics, timeout: undefined, allowReplicationFactorChange: false }],
+    ])
     expect(topics[0].partitionAssignment).toHaveLength(3)
   })
   it.each([null, 0, 'false'])(

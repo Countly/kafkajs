@@ -886,8 +886,7 @@ describe('bounded capture of the round', () => {
   )
 
   test('restores shared clocks when overlapping rounds finish out of order', async () => {
-    const imported = require('node:perf_hooks').performance
-    const originals = [Date.now, process.hrtime.bigint, imported.now, global.performance.now]
+    const originals = [Date.now, process.hrtime.bigint, performance.now]
     const first = new PublicTelemetryRound({ kind: 'producer' })
     const second = new PublicTelemetryRound({ kind: 'producer' })
     try {
@@ -898,27 +897,24 @@ describe('bounded capture of the round', () => {
       await first.dispose()
       expect(Date.now()).toBe(1020)
       expect(process.hrtime.bigint()).toBe(20000000n)
-      expect(imported.now()).toBe(20)
+      expect(performance.now()).toBe(20)
     } finally {
       await first.dispose()
       await second.dispose()
     }
-    expect([Date.now, process.hrtime.bigint, imported.now, global.performance.now]).toEqual(
-      originals
-    )
+    expect([Date.now, process.hrtime.bigint, performance.now]).toEqual(originals)
   })
 
   test('preserves a performance spy owned by the enclosing fake-clock fixture', async () => {
-    const imported = require('node:perf_hooks').performance
-    const enclosing = jest.spyOn(imported, 'now').mockReturnValue(37)
+    const enclosing = jest.spyOn(performance, 'now').mockReturnValue(37)
     const round = new PublicTelemetryRound({ kind: 'producer' })
     try {
       round.installClocks()
       round.clock.jump(20)
-      expect(imported.now()).toBe(20)
+      expect(performance.now()).toBe(20)
       await round.dispose()
-      expect(imported.now).toBe(enclosing)
-      expect(imported.now()).toBe(37)
+      expect(performance.now).toBe(enclosing)
+      expect(performance.now()).toBe(37)
     } finally {
       await round.dispose()
       enclosing.mockRestore()
@@ -926,8 +922,7 @@ describe('bounded capture of the round', () => {
   })
 
   test('restores its clocks even when a collaborator restoration throws', async () => {
-    const imported = require('node:perf_hooks').performance
-    const originals = [Date.now, process.hrtime.bigint, imported.now]
+    const originals = [Date.now, process.hrtime.bigint, performance.now]
     const round = new PublicTelemetryRound({ kind: 'producer' })
     const reason = new Error('restore failed')
     round.installClocks()
@@ -935,7 +930,7 @@ describe('bounded capture of the round', () => {
       throw reason
     })
     await expect(round.dispose()).rejects.toBe(reason)
-    expect([Date.now, process.hrtime.bigint, imported.now]).toEqual(originals)
+    expect([Date.now, process.hrtime.bigint, performance.now]).toEqual(originals)
   })
 
   test.each([false, true])(

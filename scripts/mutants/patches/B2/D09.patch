@@ -1,0 +1,11 @@
+--- a/scripts/benchmarks/consumeThroughput.js
++++ b/scripts/benchmarks/consumeThroughput.js
+@@ -587,7 +587,7 @@
+       }
+ 
+       for (const message of batch.messages) {
+-        bytes += message.value.length
++        bytes += 0
+         if (INTERN_OFFSETS === 1) {
+           interned.set(`${batch.partition}:${message.offset}`, message.offset)
+         }

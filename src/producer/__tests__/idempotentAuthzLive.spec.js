@@ -11,6 +11,7 @@ const {
 const { KafkaJSInvalidConfigurationError } = require('../../errors')
 const { errorCodeOf } = require('../../../scripts/e2e/idempotentAuthzProbe')
 const { plainTextBrokers, saslBrokers, secureRandom, writeEvidence } = require('testHelpers')
+const { clusterAclPort, waitForAclBindings } = require('../../../testHelpers/aclPropagation')
 const { sleep, withTimeout } = require('../../consumer/__tests__/fixtures/liveScenario')
 
 // Gated: it needs the ACL cluster arm. Run alone: `npm run test:e2e:idempotent-authz`.
@@ -53,18 +54,21 @@ describeAuthz('Producer > the idempotent default on a cluster that enforces ACLs
     }).admin()
     await admin.connect()
     // A run that stopped before its afterAll can leave a grant behind, and WRITE on any topic is
-    // enough for InitProducerId: start from a principal that holds nothing.
-    await admin.deleteAcls({
-      filters: [
-        {
-          resourceType: AclResourceTypes.ANY,
-          resourcePatternType: ResourcePatternTypes.ANY,
-          principal: RESTRICTED_PRINCIPAL,
-          operation: AclOperationTypes.ANY,
-          permissionType: AclPermissionTypes.ANY,
-        },
-      ],
-    })
+    // enough for InitProducerId: start from a principal that holds nothing, on every broker.
+    const restrictedAcls = {
+      resourceType: AclResourceTypes.ANY,
+      resourcePatternType: ResourcePatternTypes.ANY,
+      principal: RESTRICTED_PRINCIPAL,
+      operation: AclOperationTypes.ANY,
+      permissionType: AclPermissionTypes.ANY,
+    }
+    await admin.deleteAcls({ filters: [restrictedAcls] })
+    const aclPort = await clusterAclPort({ brokers: plainTextBrokers() })
+    try {
+      await waitForAclBindings({ port: aclPort, filter: restrictedAcls, expected: [] })
+    } finally {
+      await aclPort.close()
+    }
     topic = `e2e-p7-idempotent-authz-${secureRandom()}`
     await admin.createTopics({
       topics: [{ topic, numPartitions: 1, replicationFactor: 1 }],

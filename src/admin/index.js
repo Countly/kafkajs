@@ -1,3 +1,4 @@
+const describeThrown = require('../network/describeThrown')
 const createDelegationTokens = require('./delegationTokens')
 const createClientQuotas = require('./clientQuotas')
 const createScramCredentials = require('./scramCredentials')
@@ -9,7 +10,9 @@ const { inspect } = require('util')
 const AdminLifecycle = require('./lifecycle')
 const {
   retrierOf,
-  currentDeadline,
+  endsCall,
+  isAnsweredError,
+  settleMutations,
   wrapAdmin,
   validateApiTimeout,
   checked,
@@ -17,14 +20,14 @@ const {
   sharedSetup,
   waitForOf: waitFor,
 } = require('./deadline')
-const { createOffsets } = require('./offsets')
+const { createOffsets, OffsetAdmin } = require('./offsets')
 const createLogDirs = require('./logDirs')
+const { ADMIN_MUTATION } = require('../broker/privateOptions')
 const groupBy = require('../utils/groupBy')
-const createConsumer = require('../consumer')
-const { disposeConsumer } = require('../consumer/disposal')
+const Long = require('../utils/long')
+const { assertPartitionId, isPartitionId, printable } = require('../utils/partitionId')
 const InstrumentationEventEmitter = require('../instrumentation/emitter')
 const { events, wrap: wrapEvent, unwrap: unwrapEvent } = require('./instrumentationEvents')
-const { LEVELS } = require('../loggers')
 const {
   KafkaJSNonRetriableError,
   KafkaJSInvalidConfigurationError,
@@ -75,9 +78,17 @@ const { CONNECT, DISCONNECT } = events
 
 const NOT_CONTROLLER_CODE = 41
 const GROUP_ID_NOT_FOUND_CODE = 69
+const UNKNOWN_TOPIC_OR_PARTITION_CODE = 3
+/** The largest offset a commit can carry: OffsetCommit offsets are signed int64. */
+const MAX_OFFSET = 2n ** 63n - 1n
 const CONSUMER_PROTOCOL_TYPE = 'consumer'
 const UNANSWERED_MEMBER_CODE = -1
 const THROTTLING_QUOTA_EXCEEDED_CODE = 89
+/**
+ * Failures a deleteTopics attempt tries again when it wrote nothing: the controller moved, or a
+ * target topic is missing from metadata for now. Both the by-name and the by-id attempt use it.
+ */
+const DELETE_TOPICS_RETRIED = new Set(['NOT_CONTROLLER', 'UNKNOWN_TOPIC_OR_PARTITION'])
 
 /** What the coordinator logs as the reason a member was removed, when the caller gives none. */
 const DEFAULT_REMOVE_REASON = 'member was removed by an admin'
@@ -129,6 +140,221 @@ const retryOnLeaderNotAvailable = (fn, opts = {}) => {
 }
 
 const isConsumerGroupRunning = (description) => ['Empty', 'Dead'].includes(description.state)
+
+/**
+ * An offset as a commit carries it. Only a decimal integer string (an optional sign and digits), a
+ * safe integer number, a bigint or a `Long` is read; anything else, `'NaN'`, a blank or prefixed
+ * string, a boolean or an array say, is refused rather than read as 0 the way `Long.fromValue` would.
+ * @param {string|number|bigint|Long} offset a long of at least 0, or `-1` (latest) or `-2` (earliest)
+ * @returns {string} the offset in decimal
+ * @throws {KafkaJSNonRetriableError} for anything else, a value above the signed int64 range
+ *   included
+ */
+const commitOffsetOf = (offset) => {
+  const text = typeof offset === 'bigint' || offset instanceof Long ? offset.toString() : offset
+  const value =
+    (typeof text === 'string' && /^[+-]?\d+$/.test(text)) || Number.isSafeInteger(text)
+      ? BigInt(text)
+      : null
+  if (value === null || value > MAX_OFFSET) {
+    throw new KafkaJSNonRetriableError(
+      `Invalid offset, expected a long received ${printable(offset)}`
+    )
+  }
+  if (value < 0n && value !== BigInt(EARLIEST_OFFSET) && value !== BigInt(LATEST_OFFSET)) {
+    throw new KafkaJSNonRetriableError('Offset must not be a negative number')
+  }
+  return value.toString()
+}
+
+/**
+ * The items of an array, its length and each index read once. The array's own iterator is not
+ * used, and an index the array does not own (a hole, even one its prototype fills) is refused.
+ * @param {unknown[]} list
+ * @param {(index: number) => string} holeMessage
+ * @returns {unknown[]}
+ * @throws {KafkaJSNonRetriableError} with `holeMessage` of the first index the array does not own,
+ *   or for a length that is not an array length (which only a proxy can report)
+ */
+const itemsOf = (list, holeMessage) => {
+  const length = list.length
+  if (!Number.isInteger(length) || length < 0 || length > 2 ** 32 - 1) {
+    throw new KafkaJSNonRetriableError(`Invalid array length ${printable(length)}`)
+  }
+  const items = []
+  for (let i = 0; i < length; i++) {
+    if (!Object.hasOwn(list, i)) throw new KafkaJSNonRetriableError(holeMessage(i))
+    items.push(list[i])
+  }
+  return items
+}
+
+/**
+ * A copy of the partitions `deleteTopicRecords` was asked to delete from, each entry read once, so
+ * later changes by the caller cannot reach the request.
+ * @param {unknown} partitions
+ * @returns {{ partition: number, offset: string }[]} each offset in decimal
+ * @throws {KafkaJSNonRetriableError} for anything but a non-empty array of entries with a partition
+ *   id listed once and an offset from 0 to 2^63 - 1, or `-1` (the high watermark)
+ */
+const deletionsOf = (partitions) => {
+  if (!Array.isArray(partitions)) throw new KafkaJSNonRetriableError('Invalid partitions')
+
+  const expected = (i) => `Invalid partitions, expected { partition, offset } at index ${i}`
+  const items = itemsOf(partitions, expected)
+  if (items.length === 0) throw new KafkaJSNonRetriableError('Invalid partitions')
+  const copy = []
+  const seen = new Set()
+  for (let i = 0; i < items.length; i++) {
+    const entry = items[i]
+    if (entry === null || typeof entry !== 'object') {
+      throw new KafkaJSNonRetriableError(expected(i))
+    }
+    const { partition, offset } = entry
+    assertPartitionId(partition)
+    if (seen.has(partition)) {
+      throw new KafkaJSNonRetriableError(
+        `Invalid partitions, partition ${partition} is listed more than once`
+      )
+    }
+    const value = commitOffsetOf(offset)
+    if (value === String(EARLIEST_OFFSET)) {
+      throw new KafkaJSNonRetriableError('Offset must not be a negative number')
+    }
+    seen.add(partition)
+    copy.push({ partition, offset: value })
+  }
+  return copy
+}
+
+/**
+ * A copy of the reassignments `alterPartitionReassignments` was asked for, each entry read once,
+ * so later changes by the caller cannot reach the request. Holes and `null` entries are refused,
+ * not skipped.
+ * @param {unknown[]} topics
+ * @returns {{ topic: string, partitionAssignment: { partition: number, replicas: number[] }[] }[]}
+ * @throws {KafkaJSNonRetriableError} for an entry that is not an object, a topic name that is not
+ *   a string or is listed twice, a partition or replica id that is not an integer from 0 to
+ *   2^31 - 1, a partition listed twice for a topic, replicas that are not an array, or a replica
+ *   listed twice for a partition
+ */
+const reassignmentsOf = (topics) => {
+  const expected = (i) =>
+    `Invalid topics array, expected { topic, partitionAssignment } at index ${i}`
+  const items = itemsOf(topics, expected)
+  const copy = []
+  for (let i = 0; i < items.length; i++) {
+    const entry = items[i]
+    if (entry === null || typeof entry !== 'object') {
+      throw new KafkaJSNonRetriableError(expected(i))
+    }
+    const { topic, partitionAssignment } = entry
+    if (typeof topic !== 'string') {
+      throw new KafkaJSNonRetriableError(
+        'Invalid topics array, the topic names have to be a valid string'
+      )
+    }
+    copy.push({ topic, partitionAssignment })
+  }
+
+  if (new Set(copy.map(({ topic }) => topic)).size < copy.length) {
+    throw new KafkaJSNonRetriableError(
+      'Invalid topics array, it cannot have multiple entries for the same topic'
+    )
+  }
+
+  for (const entry of copy) {
+    const { topic, partitionAssignment } = entry
+    if (!Array.isArray(partitionAssignment)) {
+      throw new KafkaJSNonRetriableError(
+        `Invalid partitions array: ${printable(partitionAssignment)} for topic: ${topic}`
+      )
+    }
+
+    const expected = (i) =>
+      `Invalid partitions array, expected { partition, replicas } at index ${i} for topic: ${topic}`
+    const assignments = itemsOf(partitionAssignment, expected)
+    const partitions = new Set()
+    entry.partitionAssignment = []
+    for (let i = 0; i < assignments.length; i++) {
+      const assignment = assignments[i]
+      if (assignment === null || typeof assignment !== 'object') {
+        throw new KafkaJSNonRetriableError(expected(i))
+      }
+      const { partition, replicas } = assignment
+      if (!isPartitionId(partition)) {
+        throw new KafkaJSNonRetriableError(
+          `Invalid partitions index: ${printable(partition)} for topic: ${topic}`
+        )
+      }
+      if (partitions.has(partition)) {
+        throw new KafkaJSNonRetriableError(
+          `Invalid partitions array, partition ${partition} is listed more than once for topic: ${topic}`
+        )
+      }
+      partitions.add(partition)
+
+      if (!Array.isArray(replicas)) {
+        throw new KafkaJSNonRetriableError(
+          `Invalid replica assignment: ${printable(replicas)} for topic: ${topic} on partition: ${partition}`
+        )
+      }
+      const where = `for topic: ${topic} on partition: ${partition}`
+      const replicaIds = itemsOf(
+        replicas,
+        (i) => `Invalid replica assignment: hole at index ${i} ${where}`
+      )
+      if (!replicaIds.every(isPartitionId)) {
+        throw new KafkaJSNonRetriableError(
+          `Invalid replica assignment: ${replicaIds.map(printable).join(',')} ${where}. Replicas must be a non negative number`
+        )
+      }
+      const unique = new Set()
+      for (const id of replicaIds) {
+        if (unique.has(id)) {
+          throw new KafkaJSNonRetriableError(
+            `Invalid replica assignment: replica ${id} is listed more than once ${where}`
+          )
+        }
+        unique.add(id)
+      }
+      entry.partitionAssignment.push({ partition, replicas: replicaIds })
+    }
+  }
+  return copy
+}
+
+/**
+ * Reads and checks the `deleteTopicRecords` options when the call is admitted, before any await.
+ * @param {{ topic: string, partitions: unknown }} options
+ * @returns {[{ topic: string, partitions: { partition: number, offset: string }[] }]} the
+ *   arguments the method runs with
+ * @throws {KafkaJSNonRetriableError} for an invalid topic, or partitions `deletionsOf` refuses
+ */
+const deletionInput = ({ topic, partitions }) => {
+  if (!topic || typeof topic !== 'string') {
+    throw new KafkaJSNonRetriableError(`Invalid topic "${topic}"`)
+  }
+  return [{ topic, partitions: deletionsOf(partitions) }]
+}
+
+/**
+ * Reads and checks the `alterPartitionReassignments` options when the call is admitted, before any
+ * await.
+ * @param {{ topics: unknown, timeout?: number, allowReplicationFactorChange?: boolean }} options
+ * @returns {[{ topics: object[], timeout?: number, allowReplicationFactorChange: boolean }]} the
+ *   arguments the method runs with
+ * @throws {KafkaJSInvalidConfigurationError} when `allowReplicationFactorChange` is not a boolean
+ * @throws {KafkaJSNonRetriableError} for topics that are not an array or `reassignmentsOf` refuses
+ */
+const reassignmentInput = ({ topics, timeout, allowReplicationFactorChange = true }) => {
+  if (typeof allowReplicationFactorChange !== 'boolean')
+    throw new KafkaJSInvalidConfigurationError('Invalid allowReplicationFactorChange')
+  if (!topics || !Array.isArray(topics)) {
+    throw new KafkaJSNonRetriableError(`Invalid topics array ${printable(topics)}`)
+  }
+  return [{ topics: reassignmentsOf(topics), timeout, allowReplicationFactorChange }]
+}
 
 /**
  * The static members `removeMembersFromConsumerGroup` was asked to remove, once each, as LeaveGroup
@@ -192,7 +418,7 @@ const findTopicPartitions = async (cluster, topic) => {
   return cluster
     .findTopicPartitionMetadata(topic)
     .map(({ partitionId }) => partitionId)
-    .sort()
+    .sort((a, b) => a - b)
 }
 const indexByPartition = (array) =>
   array.reduce(
@@ -222,12 +448,24 @@ const throttledTopics = ({ topicErrors }) =>
     : null
 
 /**
- * The key of one partition of one topic, for the calls that answer per partition.
- * @param {string} topic
- * @param {number} partition
- * @returns {string}
+ * Binds a by-name DeleteTopics quota refusal to the topic ids the answer gave, so a later attempt
+ * reaches only the topics the controller refused, never a topic recreated under the same name.
+ * @param {Error} error what `Broker#deleteTopics` rejected with, carrying the failed `topicErrors`
+ * @param {string[]} names the names the request carried
+ * @returns {Map<string, string>|null} refused id to name, or null unless every failed row was
+ *   refused by the quota and names one requested topic and its id, each once
  */
-const partitionKey = (topic, partition) => `${topic}|${partition}`
+const quotaRefusedIds = ({ topicErrors }, names) => {
+  const refused = throttledTopics({ topicErrors })
+  if (!refused || refused.size !== topicErrors.length) return null
+  const requested = new Set(names)
+  const ids = new Map()
+  for (const { topic, topicId } of topicErrors) {
+    if (!requested.has(topic) || typeof topicId !== 'string' || ids.has(topicId)) return null
+    ids.set(topicId, topic)
+  }
+  return ids
+}
 
 /**
  * Whether a config resource names something: a non-empty string, except for BROKER, whose empty
@@ -440,6 +678,7 @@ module.exports = ({
   const logger = rootLogger.namespace('Admin')
   const instrumentationEmitter = rootInstrumentationEmitter || new InstrumentationEventEmitter()
   const shareGroups = createShareGroups({ cluster, retry })
+  const offsetAdmin = new OffsetAdmin({ cluster, retry })
 
   const lifecycle = new AdminLifecycle({
     cluster,
@@ -683,9 +922,75 @@ module.exports = ({
     })
   }
 
+  /**
+   * One DeleteTopics attempt by id, inside a `deleteTopics` retrier. A confirmed id leaves the
+   * pending set and, while metadata still maps its name to it, the admin's target topics. When
+   * every topic the controller answered with an error was refused by its mutation quota, the
+   * pending set narrows to those ids and the retrier sends them again; any other answered error
+   * ends the call.
+   * @param {{pending: string[], knownNames: Map<string, string>, names: Map<string, string>}} state
+   *   ids still to delete, their names as last known, and the caller's name for each id of a
+   *   by-name call (its errors name topics as the caller did)
+   * @param {number} [timeout] broker timeout
+   * @param {Function} bail ends the retries with its error
+   * @returns {Promise<void>}
+   * @throws {Error} a failure the retrier may try again
+   */
+  const deleteTopicIdsOnce = async (state, timeout, bail) => {
+    const forget = (confirmed) => {
+      for (const id of confirmed) {
+        const name = state.knownNames.get(id)
+        if (name !== undefined && cluster.metadataCache?.topicId(name) === id)
+          cluster.targetTopics.delete(name)
+      }
+    }
+    try {
+      checked(await waitOf(() => cluster.refreshMetadata()))
+      for (const id of state.pending) {
+        const name = cluster.metadataCache?.topicName(id)
+        if (name !== undefined && !state.knownNames.has(id)) state.knownNames.set(id, name)
+      }
+      const broker = checked(await waitOf(() => cluster.findControllerBroker()))
+      checked(await waitOf(() => broker.deleteTopics({ topicIds: state.pending, timeout })))
+      const confirmed = state.pending
+      state.pending = []
+      forget(confirmed)
+    } catch (error) {
+      const failures = error.topicErrors?.map((row) => ({
+        ...row,
+        topic: state.names.get(row.topicId) ?? row.topic ?? row.topicId,
+      }))
+      if (failures) error.topicErrors = failures
+      if (failures) {
+        const failed = new Set(failures.map((row) => row.topicId))
+        forget(state.pending.filter((id) => !failed.has(id)))
+      }
+      if (endsCall(error) || isAnsweredError(error)) return bail(error)
+      if (
+        failures?.length > 0 &&
+        failures.every((row) => row.errorCode === THROTTLING_QUOTA_EXCEEDED_CODE)
+      ) {
+        const refused = new Set(failures.map((row) => row.topicId))
+        state.pending = state.pending.filter((id) => refused.has(id))
+        if (state.pending.length === 0) return bail(error)
+        throw error
+      }
+      if (failures || !DELETE_TOPICS_RETRIED.has(error.type)) return bail(error)
+      if (error.type === 'NOT_CONTROLLER') checked(await waitOf(() => cluster.refreshMetadata()))
+      throw error
+    }
+  }
+
   /** Deletes names or canonical IDs with the existing void/throw contract.
    * ID responses must cover the attempted set before cleanup. Confirmed IDs leave the mutation
    * set before follow-up metadata refresh; metadata retries share the invocation deadline.
+   * When every topic the controller answered with an error was refused by its mutation quota
+   * (`THROTTLING_QUOTA_EXCEEDED`), only those topics are sent again within the `retry` budget, by
+   * topic id: a by-name call sends a refused topic again by the id the answer gave for it, so a
+   * topic recreated under that name meanwhile is not deleted, and a refusal that gives no usable id
+   * (DeleteTopics v5 and older, or a null id) is final. Errors still name the topics the caller
+   * passed. Any other answered error is final and a written request with no answer rejects with
+   * `KafkaJSUnknownOutcomeError`.
    * @param {object} options exclusive topics or topicIds, with optional broker timeout
    * @returns {Promise<void>} deletion and follow-up metadata refresh completed
    * @throws {Error} validation, protocol, discovery or invocation failure
@@ -708,53 +1013,8 @@ module.exports = ({
       const ids = topicIds.map((id) => id.toLowerCase())
       if (new Set(ids).size !== ids.length)
         throw new KafkaJSInvalidConfigurationError('Duplicate topicIds')
-      let pending = ids
-      const knownNames = new Map()
-      const forget = (confirmed) => {
-        for (const id of confirmed) {
-          const name = knownNames.get(id)
-          if (name !== undefined && cluster.metadataCache?.topicId(name) === id)
-            cluster.targetTopics.delete(name)
-        }
-      }
-      await retrierOf(retry)(async (bail) => {
-        try {
-          checked(await waitOf(() => cluster.refreshMetadata()))
-          for (const id of pending) {
-            const name = cluster.metadataCache?.topicName(id)
-            if (name !== undefined && !knownNames.has(id)) knownNames.set(id, name)
-          }
-          const broker = checked(await waitOf(() => cluster.findControllerBroker()))
-          checked(await waitOf(() => broker.deleteTopics({ topicIds: pending, timeout })))
-          const confirmed = pending
-          pending = []
-          forget(confirmed)
-        } catch (error) {
-          const failures = error.topicErrors?.map((row) => ({
-            ...row,
-            topic: row.topic ?? row.topicId,
-          }))
-          if (failures) error.topicErrors = failures
-          if (failures) {
-            const failed = new Set(failures.map((row) => row.topicId))
-            forget(pending.filter((id) => !failed.has(id)))
-          }
-          if (
-            failures?.length > 0 &&
-            failures.every((row) => row.errorCode === THROTTLING_QUOTA_EXCEEDED_CODE)
-          ) {
-            const refused = new Set(failures.map((row) => row.topicId))
-            pending = pending.filter((id) => refused.has(id))
-            if (pending.length === 0) bail(error)
-            throw error
-          }
-          if (error.type === 'NOT_CONTROLLER') {
-            checked(await waitOf(() => cluster.refreshMetadata()))
-            throw error
-          }
-          bail(error)
-        }
-      })
+      const byId = { pending: ids, knownNames: new Map(), names: new Map() }
+      await retrierOf(retry)((bail) => deleteTopicIdsOnce(byId, timeout, bail))
       return retrierOf(retry)(async (bail) => {
         try {
           checked(await waitOf(() => cluster.refreshMetadata()))
@@ -772,63 +1032,52 @@ module.exports = ({
       throw new KafkaJSNonRetriableError('Invalid topics array, the names must be a valid string')
     }
 
-    const retrier = retrierOf(retry)
-    let pending = topics
-
-    return retrier(async (bail, retryCount, retryTime) => {
+    const names = topics.slice()
+    let byId = null
+    await retrierOf(retry)(async (bail, retryCount, retryTime) => {
+      if (byId) return deleteTopicIdsOnce(byId, timeout, bail)
       try {
-        checked(await waitOf(async () => cluster.refreshMetadata()))
-        const broker = checked(await waitOf(async () => cluster.findControllerBroker()))
-        checked(await waitOf(async () => broker.deleteTopics({ topics: pending, timeout })))
-
-        // Remove deleted topics
-
-        // Remove deleted topics
-        for (const topic of topics) {
-          cluster.targetTopics.delete(topic)
-        }
-
-        checked(await waitOf(async () => cluster.refreshMetadata()))
-      } catch (e) {
-        if (e.topicErrors) {
-          // a name the broker did not list as failed was deleted: the next refresh must not ask for it
-          const failed = new Set(e.topicErrors.map(({ topic }) => topic))
-          for (const topic of pending) {
-            if (!failed.has(topic)) {
-              cluster.targetTopics.delete(topic)
-            }
+        checked(await waitOf(() => cluster.refreshMetadata()))
+        const broker = checked(await waitOf(() => cluster.findControllerBroker()))
+        checked(await waitOf(() => broker.deleteTopics({ topics: names, timeout })))
+      } catch (error) {
+        if (error.topicErrors) {
+          const failed = new Set(error.topicErrors.map(({ topic }) => topic))
+          for (const topic of names) {
+            if (!failed.has(topic)) cluster.targetTopics.delete(topic)
           }
         }
-
-        const refused = throttledTopics(e)
-
+        const refused = !endsCall(error) && !isAnsweredError(error) && quotaRefusedIds(error, names)
         if (refused) {
-          pending = pending.filter((topic) => refused.has(topic))
+          byId = { pending: [...refused.keys()], knownNames: new Map(refused), names: refused }
           logger.warn('A quota refused topic deletions', {
-            topics: [...refused],
+            topics: [...refused.values()],
             retryCount,
             retryTime,
           })
-          throw e
+          throw error
         }
-
-        if (['NOT_CONTROLLER', 'UNKNOWN_TOPIC_OR_PARTITION'].includes(e.type)) {
-          logger.warn('Could not delete topics', { error: e.message, retryCount, retryTime })
-          throw e
-        }
-
-        if (e.type === 'REQUEST_TIMED_OUT') {
+        if (error.type === 'REQUEST_TIMED_OUT') {
           logger.error(
             'Could not delete topics, check if "delete.topic.enable" is set to "true" (the default value is "false") or increase the timeout',
-            {
-              error: e.message,
-              retryCount,
-              retryTime,
-            }
+            { error: error.message, retryCount, retryTime }
           )
         }
-
-        bail(e)
+        if (endsCall(error) || isAnsweredError(error) || error.topicErrors) return bail(error)
+        if (DELETE_TOPICS_RETRIED.has(error.type)) {
+          logger.warn('Could not delete topics', { error: error.message, retryCount, retryTime })
+          throw error
+        }
+        return bail(error)
+      }
+      for (const topic of names) cluster.targetTopics.delete(topic)
+    })
+    return retrierOf(retry)(async (bail) => {
+      try {
+        checked(await waitOf(() => cluster.refreshMetadata()))
+      } catch (error) {
+        if (error.type === 'NOT_CONTROLLER') throw error
+        bail(error)
       }
     })
   }
@@ -1153,69 +1402,48 @@ module.exports = ({
   }
 
   /**
-   * Commits the `-1` (latest) and `-2` (earliest) entries of a `setOffsets` call as the group's
-   * offsets, as the admin's joined member. A consumer seek to a sentinel only moves that consumer's
-   * position and commits nothing, so `setOffsets` commits the sentinels itself; the seeks commit the
-   * concrete offsets. The last entry for a partition wins, as it does for the seeks, and an entry
-   * for a partition the topic does not have is dropped, as a seek to one is.
-   * @param {import('../../types').Consumer} consumer the admin's member of the group, joined
-   * @param {{ groupId: string, topic: string, partitions: Array<SeekEntry> }} request
-   * @returns {Promise<void>}
-   * @throws {KafkaJSProtocolError} the coordinator's answer when it rejects the commit
-   */
-  const commitSentinels = async (consumer, { groupId, topic, partitions }) => {
-    const last = new Map(partitions.map(({ partition, offset }) => [partition, Number(offset)]))
-    const existing = new Set(
-      cluster.findTopicPartitionMetadata(topic).map(({ partitionId }) => partitionId)
-    )
-    const sentinels = [...last]
-      .filter(
-        ([partition, offset]) =>
-          existing.has(partition) && (offset === EARLIEST_OFFSET || offset === LATEST_OFFSET)
-      )
-      .map(([partition, offset]) => ({ partition, offset: String(offset) }))
-    if (sentinels.length === 0) return
-
-    const { generationId, memberId, groupInstanceId } = consumer.groupMetadata()
-    const coordinator = checked(await waitOf(async () => cluster.findGroupCoordinator({ groupId })))
-    checked(
-      await waitOf(async () =>
-        coordinator.offsetCommit({
-          groupId,
-          groupGenerationId: generationId,
-          memberId,
-          groupInstanceId,
-          topics: [{ topic, partitions: sentinels }],
-        })
-      )
-    )
-  }
-
-  /**
    * @typedef {Object} SeekEntry
    * @property {number} partition
    * @property {string} offset
    */
 
   /**
-   * Sets the committed offsets of a consumer group that has no running members, through a
-   * temporary member of the group. The last entry for a partition wins, and an entry for a
-   * partition the topic does not have is ignored. An offset of `-1` (latest) or `-2` (earliest) is
-   * committed as given and stays that marker until it is resolved (`fetchOffsets` with
-   * `resolveOffsets` does so); any other offset is committed by a seek of the member. On every
-   * exit the call awaits disposal of the member, which releases its cluster subscriptions even if
-   * stopping fails. A disposal failure does not replace the call's outcome. Disposal itself does
-   * not disconnect the admin's shared cluster.
+   * Sets the committed offsets of a consumer group that has no running members. The admin writes
+   * them itself, with one OffsetCommit to the group's coordinator that carries no member id and
+   * generation -1, as the Java admin's `alterConsumerGroupOffsets` does; it never joins the group.
+   * The last entry for a partition wins, and every named partition is sent, in partition order: the
+   * coordinator refuses one the topic does not have with `UNKNOWN_TOPIC_OR_PARTITION`. Each commit
+   * carries only the partition and offset, so stored metadata becomes empty and the leader epoch
+   * unknown. An offset of `-1` (latest) or `-2` (earliest) is committed as
+   * given and stays that marker until it is resolved (`fetchOffsets` with `resolveOffsets` does so,
+   * and a consumer without a seek applies its reset policy to it). A group that does not exist is
+   * created by the coordinator. A member that starts during the call makes the coordinator refuse
+   * the commit with `UNKNOWN_MEMBER_ID`. Partitions answered with a retriable coordinator code are
+   * sent again within the retry budget; a confirmed partition is never sent again by this call.
+   * A `KafkaJSAggregateError` names every partition not confirmed, and the partitions it does not
+   * name were committed; any other rejection means no partition was confirmed. A commit that timed
+   * out may still have been applied. On a classic group that is already empty the commit does not
+   * restart the group's empty-since time, so these offsets can expire `offsets.retention.minutes`
+   * after the group became empty rather than after this call. Sending the call again writes the offsets again,
+   * over anything committed in between.
    * @param {object} request
    * @param {string} request.groupId
    * @param {string} request.topic
    * @param {Array<SeekEntry>} request.partitions at least one entry
-   * @returns {Promise<void>}
-   * @throws {KafkaJSNonRetriableError} for a missing `groupId` or `topic`, no `partitions`, an
-   *   entry with an invalid partition or offset, or a group whose state is not `Empty` or `Dead`
-   * @throws {Error} what subscribing, describing the group, starting the member, committing a
-   *   sentinel offset or stopping the member raised; a stop failure can replace a sentinel-commit
-   *   failure
+   * @returns {Promise<void>} once the coordinator accepted every offset
+   * @throws {KafkaJSNonRetriableError} before any request, for a missing `groupId` or `topic`, no
+   *   `partitions`, an entry whose partition is not a partition id, or an offset that is not a
+   *   decimal integer string or safe integer number of at least 0 (and at most the int64 maximum)
+   *   or exactly `-1`/`-2`; and, before any commit, for a group whose state is
+   *   not `Empty` or `Dead`
+   * @throws {KafkaJSProtocolError} `UNKNOWN_TOPIC_OR_PARTITION` for a topic the cluster does not
+   *   have, or the code a group description was refused with
+   * @throws {KafkaJSAggregateError} one child per partition not committed (see
+   *   `OffsetAdmin#commitOffsets`)
+   * @throws {Error} the commit request's own failure, a timeout say, when no partition was confirmed
+   *   or answered with a code
+   * @throws {KafkaJSInvariantViolation} for a malformed commit reply
+   * @throws {KafkaJSTimeout} once the API deadline passed
    */
   const setOffsets = async ({ groupId, topic, partitions }) => {
     if (!groupId) {
@@ -1229,76 +1457,31 @@ module.exports = ({
     if (!partitions || partitions.length === 0) {
       throw new KafkaJSNonRetriableError(`Invalid partitions`)
     }
+    for (const { partition } of partitions) assertPartitionId(partition)
+    const offsets = new Map(
+      partitions.map(({ partition, offset }) => [partition, commitOffsetOf(offset)])
+    )
 
-    return cluster.withGroup(groupId, async () => {
-      const round = currentDeadline()
-      const consumer = createConsumer({
-        logger: rootLogger.namespace('Admin', LEVELS.NOTHING),
-        cluster,
-        groupId,
-        ownsCluster: false,
-      })
-      /** Releases only the borrowed consumer under its original invocation's wire fence.
-       * @returns {Promise<void>} disposal failure cannot replace the call's own outcome
-       */
-      const dispose = () => round.run(() => disposeConsumer(consumer).catch(() => {}))
-      const unown = round.own(() => {
-        dispose().catch(() => {})
-      })
+    const existing = checked(await waitOf(async () => findTopicPartitions(cluster, topic)))
+    if (existing.length === 0) throw createErrorFromCode(UNKNOWN_TOPIC_OR_PARTITION_CODE)
 
-      try {
-        checked(await waitOf(async () => consumer.subscribe({ topic, fromBeginning: true })))
-        const description = checked(await waitOf(async () => consumer.describeGroup()))
+    const { groups } = checked(await waitOf(async () => describeGroups([groupId])))
+    const group = groups.find((row) => row.groupId === groupId)
+    if (group === undefined) {
+      throw new KafkaJSNonRetriableError(`The coordinator described no group for ${groupId}`)
+    }
+    const missing = group.state === 'Dead' && group.errorCode === GROUP_ID_NOT_FOUND_CODE
+    if (group.errorCode !== 0 && !missing) throw createErrorFromCode(group.errorCode)
+    if (!isConsumerGroupRunning(group)) {
+      throw new KafkaJSNonRetriableError(
+        `The consumer group must have no running instances, current state: ${group.state}`
+      )
+    }
 
-        if (!isConsumerGroupRunning(description)) {
-          throw new KafkaJSNonRetriableError(
-            `The consumer group must have no running instances, current state: ${description.state}`
-          )
-        }
-
-        checked(
-          await waitOf(
-            async () =>
-              new Promise((resolve, reject) => {
-                consumer.on(consumer.events.CRASH, ({ payload }) => reject(payload.error))
-                let committed = null
-                consumer.on(consumer.events.GROUP_JOIN, () => {
-                  committed ??= round.wait(() =>
-                    commitSentinels(consumer, { groupId, topic, partitions })
-                  )
-                  committed.catch(() => {})
-                })
-                consumer.on(consumer.events.FETCH, () => {
-                  if (round.expired) return
-                  committed
-                    .finally(() => disposeConsumer(consumer))
-                    .then(resolve)
-                    .catch(reject)
-                })
-
-                consumer
-                  .run({
-                    eachBatchAutoResolve: false,
-                    eachBatch: async () => true,
-                  })
-                  .catch(reject)
-
-                // This consumer doesn't need to consume any data
-                consumer.pause([{ topic }])
-
-                for (const seekData of partitions) {
-                  consumer.seek({ topic, ...seekData })
-                }
-              })
-          )
-        )
-      } finally {
-        // The consumer shares this admin's cluster, so it is disposed, not disconnected. A failed
-        // stop is already logged by the consumer and must not replace the call's own outcome.
-        unown()
-        await dispose()
-      }
-    })
+    const cells = [...offsets]
+      .sort(([a], [b]) => a - b)
+      .map(([partition, offset]) => ({ partition, offset }))
+    await offsetAdmin.commitOffsets({ groupId, topic, cells })
   }
 
   /**
@@ -1471,7 +1654,10 @@ module.exports = ({
 
         const brokers = Array.from(resourcerByBroker.keys())
         const responses = checked(
-          await waitOf(async () => Promise.all(brokers.map(alterConfigsAction)))
+          await waitOf(() => {
+            const sends = brokers.map(alterConfigsAction)
+            return validateOnly ? Promise.all(sends) : settleMutations(sends)
+          })
         )
         const responseResources = responses.reduce(
           (result, { resources }) => [...result, ...resources],
@@ -1480,6 +1666,7 @@ module.exports = ({
 
         return { resources: responseResources }
       } catch (e) {
+        if (endsCall(e) || isAnsweredError(e)) return bail(e)
         if (e.type === 'NOT_CONTROLLER') {
           logger.warn('Could not alter configs', { error: e.message, retryCount, retryTime })
           throw e
@@ -1556,22 +1743,22 @@ module.exports = ({
           )
         )
         const responses = checked(
-          await waitOf(async () =>
-            Promise.all(
-              Array.from(resourcesByBroker, ([broker, group]) =>
-                broker.incrementalAlterConfigs({ resources: group, validateOnly: !!validateOnly })
-              )
+          await waitOf(() => {
+            const sends = Array.from(resourcesByBroker, async ([broker, group]) =>
+              broker.incrementalAlterConfigs({ resources: group, validateOnly: !!validateOnly })
             )
-          )
+            return validateOnly ? Promise.all(sends) : settleMutations(sends)
+          })
         )
         const results = responses.flatMap((response) => response.resources)
 
-        if (results.some(({ errorCode }) => errorCode === NOT_CONTROLLER_CODE)) {
+        if (validateOnly && results.some(({ errorCode }) => errorCode === NOT_CONTROLLER_CODE)) {
           throw createErrorFromCode(NOT_CONTROLLER_CODE)
         }
 
         return { resources: inRequestOrder(resources, results) }
       } catch (e) {
+        if (endsCall(e) || isAnsweredError(e)) return bail(e)
         if (e.type === 'NOT_CONTROLLER') {
           logger.warn('Could not alter configs', { error: e.message, retryCount, retryTime })
           throw e
@@ -1592,8 +1779,8 @@ module.exports = ({
    * is never retried: it rejects once every page is in. A topic recreated between pages is read
    * again from the start the same way.
    *
-   * The whole read, the metadata refresh and every attempt included, has one deadline of 60 s
-   * inherited from the public call. At its actual monotonic deadline it rejects with
+   * The whole read, including metadata refresh, every page and every attempt, inherits the
+   * public call's `apiTimeout` (60000 ms by default). At its actual monotonic deadline it rejects with
    * `KafkaJSTimeout`, also with request timeout enforcement disabled. Expiry detaches local
    * waits, pages, retry timers and unsent requests. Shared discovery stops only when no live
    * caller remains; physical setup keeps its own budget. Already-written mutations may apply.
@@ -1666,15 +1853,18 @@ module.exports = ({
    * leader is returned with `leader: -1` instead of being waited for (Kafka 4.1.2 and 4.3 brokers
    * leave its `partitionErrorCode` at 0; a non-zero code is passed through), and a topic that does
    * not exist fails the call rather than being created. A failed request is retried on the `retry`
-   * budget, as the other admin calls are, and the whole read has one deadline of 60 s, after which
-   * it rejects with `KafkaJSTimeout`. A broker that does not offer the API is asked through
-   * Metadata after all. The option applies only to topics named explicitly: empty or omitted `topics` go through Metadata.
+   * budget, as the other admin calls are. Metadata discovery, every page and retry, and an
+   * unsupported-API Metadata fallback share the public call's `apiTimeout` (60000 ms by default).
+   * At that deadline the call rejects with `KafkaJSTimeout`; the fallback's shorter Metadata
+   * polling cap is nested inside it, never added. The option applies only to topics named
+   * explicitly: empty or omitted `topics` go through Metadata.
    *
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-966%3A+Eligible+Leader+Replicas
    *
    * @param {Object} [options]
    * @param {string[]} [options.topics]
    * @param {boolean} [options.useDescribeTopicPartitions=false]
+   * @param {number} [options.apiTimeout] per-call budget in ms; defaults to the admin's configured budget
    * @return {Promise<TopicsMetadata>}
    * @throws {KafkaJSNonRetriableError} if a topic name is not a valid string
    *
@@ -1889,27 +2079,20 @@ module.exports = ({
           }
 
           const nodeIds = Object.keys(brokersPerNode)
-          const outcomes = checked(
-            await Promise.allSettled(
-              nodeIds.map(async (nodeId) =>
-                checked(
-                  await waitOf(async () =>
-                    brokersPerNode[nodeId].deleteGroups(brokersPerGroups[nodeId])
-                  )
-                )
+          checked(
+            await waitOf(() =>
+              settleMutations(
+                nodeIds.map(async (nodeId) =>
+                  brokersPerNode[nodeId].deleteGroups(brokersPerGroups[nodeId])
+                ),
+                (value, index) => {
+                  const nodeId = nodeIds[index]
+                  rowsByNode[nodeId] = [...(rowsByNode[nodeId] || []), ...value.results]
+                  for (const groupId of brokersPerGroups[nodeId]) answered.add(groupId)
+                }
               )
             )
           )
-
-          outcomes.forEach((outcome, index) => {
-            if (outcome.status !== 'fulfilled') return
-            const nodeId = nodeIds[index]
-            rowsByNode[nodeId] = [...(rowsByNode[nodeId] || []), ...outcome.value.results]
-            for (const groupId of brokersPerGroups[nodeId]) answered.add(groupId)
-          })
-
-          const rejected = outcomes.find(({ status }) => status === 'rejected')
-          if (rejected) throw rejected.reason
         }
 
         // Rows keep coordinator order, as a single attempt returns them, whichever attempt answered.
@@ -1977,9 +2160,10 @@ module.exports = ({
    * instance id and dynamic ones by member id, and a group with no member resolves `[]` without a
    * request; a group of another protocol type (a Connect group, say) is refused, as Java does.
    * With `members` given, each `{ groupInstanceId }` names a static member; a repeated
-   * instance id is sent once. The request goes to the group coordinator, and a coordinator that is
-   * not the right one, not available or still loading the group is asked again on the `retry`
-   * budget; any other top-level error rejects. A member that could not be removed is a result, not
+   * instance id is sent once. The request goes to the group coordinator. A coordinator lookup that
+   * fails, and a coordinator that answers it is still loading the group, are tried again on the
+   * `retry` budget; any other top-level answer rejects, and a written request with no answer
+   * rejects with `KafkaJSUnknownOutcomeError`. A member that could not be removed is a result, not
    * an error: a group that does not exist answers every member `UNKNOWN_MEMBER_ID`.
    *
    * @param {Object} options
@@ -2027,6 +2211,7 @@ module.exports = ({
     const request = {
       groupId,
       members: leaving.map((member) => ({ ...member, reason: sentReason })),
+      [ADMIN_MUTATION]: ADMIN_MUTATION,
     }
 
     return retrierOf(retry)(async (bail, retryCount, retryTime) => {
@@ -2038,6 +2223,7 @@ module.exports = ({
 
         return leaving.map((member, index) => toRemoveMemberResult(member, response.members[index]))
       } catch (e) {
+        if (endsCall(e) || isAnsweredError(e)) return bail(e)
         if (isStaleCoordinator(e) || e.code === COORDINATOR_LOAD_IN_PROGRESS_CODE) {
           logger.warn('Could not remove members from the group', {
             error: e.message,
@@ -2059,39 +2245,43 @@ module.exports = ({
    * partition without a leader within the `retry` budget and then fails. The partitions' leaders
    * are looked up next, inside the retrier: a cached leader of -1 refreshes the metadata and goes
    * round again, as the Java `Admin#deleteRecords` retries its leader lookup, and so does any
-   * retriable failure. The request to each leader is built on the first attempt that finds them all
-   * and kept: a broker that already answered is not asked again, and a retry goes to the node it
-   * was built for, after a stale-metadata answer too.
+   * retriable failure before a request is written. The request to each leader is built on the
+   * first attempt that finds them all and kept: a leader that answered, with or without partition
+   * errors, is not asked again, and a retry goes only to the leaders whose request was not sent,
+   * at the node it was built for. A written request that got no answer rejects the call with
+   * `KafkaJSUnknownOutcomeError`, which wins over partition errors from other leaders.
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/admin/internals/PartitionLeaderStrategy.java
+   *
+   * The public call checks and copies its input (`deletionInput`) synchronously, when it is made,
+   * so a change the caller makes to the input afterwards reaches no request.
    *
    * @param {string} topic
    * @param {Array<SeekEntry>} partitions
    * @return {Promise}
+   * @throws {KafkaJSNonRetriableError} before any request, when the partitions are not a
+   *   non-empty array of entries with a partition id listed once and an offset from 0 to 2^63 - 1
+   *   or `-1`
    * @throws {KafkaJSDeleteTopicRecordsError} at once, not retried, when a requested partition is
    *   not in the topic's metadata, once the offsets read has succeeded: a topic that stays
    *   leaderless fails that read first, with the `KafkaJSNonRetriableError` below
-   * @throws {KafkaJSNumberOfRetriesExceeded} when a retriable failure outlives the `retry` budget;
-   *   its `cause` is the last failure
-   * @throws {KafkaJSNonRetriableError} when a broker refuses a partition for good (its `cause` is
-   *   the `KafkaJSDeleteTopicRecordsError` naming the partitions), or when the offsets read fails,
-   *   as for a partition that stays without a leader (`type` `LEADER_NOT_AVAILABLE`)
+   * @throws {KafkaJSNumberOfRetriesExceeded} when a failure before a request is written outlives
+   *   the `retry` budget; its `cause` is the last failure
+   * @throws {KafkaJSNonRetriableError} once every leader answered, when any answered with
+   *   partition errors (its `cause` is one `KafkaJSDeleteTopicRecordsError` naming the refused
+   *   partitions of all leaders), or when the offsets read fails, as for a partition that stays
+   *   without a leader (`type` `LEADER_NOT_AVAILABLE`)
+   * @throws {KafkaJSUnknownOutcomeError} when a written request got no answer
    *
    * @typedef {Object} SeekEntry
    * @property {number} partition
    * @property {string} offset
    */
   const deleteTopicRecords = async ({ topic, partitions }) => {
-    if (!topic || typeof topic !== 'string') {
-      throw new KafkaJSNonRetriableError(`Invalid topic "${topic}"`)
-    }
-
-    if (!partitions || partitions.length === 0) {
-      throw new KafkaJSNonRetriableError(`Invalid partitions`)
-    }
-
     const topicOffsets = checked(await waitOf(async () => fetchTopicOffsets(topic)))
     /** @type {Object<string, { topic: string, partitions: SeekEntry[] }>|null} */
     let seekEntriesByBroker = null
+    /** @type {{ partition: number, offset: string, error: Error }[]} answered partition errors */
+    const refused = []
 
     const retrier = retrierOf(retry)
     return retrier(async (bail) => {
@@ -2120,7 +2310,7 @@ module.exports = ({
               low: undefined,
             }
             // warn in case of offset below low watermark
-            if (parseInt(offset) < parseInt(low) && parseInt(offset) !== -1) {
+            if (offset !== '-1' && low !== undefined && BigInt(offset) < BigInt(low)) {
               logger.warn(
                 'The requested offset is before the earliest offset maintained on the partition - no records will be deleted from this partition',
                 {
@@ -2150,60 +2340,34 @@ module.exports = ({
           )
         }
 
-        const partitionErrors = []
-
         const brokerRequests = entries(seekEntriesByBroker).map(
           ([nodeId, { topic, partitions }]) =>
             async () => {
               const broker = checked(await waitOf(async () => cluster.findBroker({ nodeId })))
-              checked(
-                await waitOf(async () => broker.deleteRecords({ topics: [{ topic, partitions }] }))
-              )
-              // remove successful entry so it's ignored on retry
+              try {
+                checked(
+                  await waitOf(async () =>
+                    broker.deleteRecords({ topics: [{ topic, partitions }] })
+                  )
+                )
+              } catch (e) {
+                if (!(e instanceof KafkaJSDeleteTopicRecordsError)) throw e
+                refused.push(...e.partitions)
+              }
+              // an answered leader is not asked again
               delete seekEntriesByBroker[nodeId]
             }
         )
 
-        checked(
-          await waitOf(async () =>
-            Promise.all(
-              brokerRequests.map((request) =>
-                request().catch((e) => {
-                  if (e.name === 'KafkaJSDeleteTopicRecordsError') {
-                    e.partitions.forEach(({ partition, offset, error }) => {
-                      partitionErrors.push({
-                        partition,
-                        offset,
-                        error,
-                      })
-                    })
-                  } else {
-                    // then it's an unknown error, not from the broker response
-                    throw e
-                  }
-                })
-              )
-            )
-          )
-        )
-
-        if (partitionErrors.length > 0) {
-          throw new KafkaJSDeleteTopicRecordsError({
-            topic,
-            partitions: partitionErrors,
-          })
-        }
+        checked(await waitOf(() => settleMutations(brokerRequests.map((request) => request()))))
       } catch (e) {
-        if (
-          e.retriable &&
-          (staleMetadata(e) ||
-            e.partitions?.some(
-              ({ error }) => staleMetadata(error) || error.name === 'KafkaJSMetadataNotLoaded'
-            ))
-        ) {
-          checked(await waitOf(async () => cluster.refreshMetadata()))
-        }
+        if (endsCall(e) || isAnsweredError(e)) return bail(e)
+        if (e.retriable && staleMetadata(e)) checked(await waitOf(() => cluster.refreshMetadata()))
         throw e
+      }
+      if (refused.length > 0) {
+        const error = new KafkaJSDeleteTopicRecordsError({ topic, partitions: refused })
+        return bail(new KafkaJSNonRetriableError(error, { cause: error }))
       }
     })
   }
@@ -2544,147 +2708,54 @@ module.exports = ({
   }
 
   /**
-   * Alter the replicas partitions are assigned to for a topic. A failure that names only some
-   * partitions does not repeat the others: each retry sends just the partitions the broker said
-   * could still go through (`retriable`), with their original replicas, and a partition it refused
-   * for good is remembered across the retries.
+   * Alter the replicas partitions are assigned to for a topic. The request is written at most
+   * once: a controller lookup that fails before it (`NOT_CONTROLLER`) is retried, and a broker
+   * answer, including per-partition errors, ends the call.
    * @param {Object} request
    * @param {import("../../types").IPartitionReassignment[]} request.topics topics and the paritions to be reassigned
    * @param {number} [request.timeout]
    * @returns {Promise<void>}
-   * @throws {KafkaJSAggregateError} when a partition was refused for good: one error per such
-   *   partition, not retriable, followed by the failures of an attempt that ran out of retries
-   * @throws {KafkaJSNumberOfRetriesExceeded|Error} what ended the retries, unchanged, when no
-   *   partition was refused for good
+   * @throws {KafkaJSNonRetriableError} before any request, for topics that `reassignmentInput`
+   *   refuses; the public call copies the topics when it is made, so a later change by the caller
+   *   reaches no request
+   * @throws {KafkaJSAggregateError} the broker's per-partition errors, one child per partition
+   * @throws {KafkaJSUnknownOutcomeError} when the written request got no answer
+   * @throws {KafkaJSNumberOfRetriesExceeded|Error} what ended the retries before the request was
+   *   written, unchanged
    */
-  const alterPartitionReassignments = async ({
-    topics,
-    timeout,
-    allowReplicationFactorChange = true,
-  }) => {
-    if (typeof allowReplicationFactorChange !== 'boolean')
-      throw new KafkaJSInvalidConfigurationError('Invalid allowReplicationFactorChange')
-    if (!topics || !Array.isArray(topics)) {
-      throw new KafkaJSNonRetriableError(`Invalid topics array ${topics}`)
-    }
-
-    if (topics.filter(({ topic }) => typeof topic !== 'string').length > 0) {
-      throw new KafkaJSNonRetriableError(
-        'Invalid topics array, the topic names have to be a valid string'
-      )
-    }
-
-    const topicNames = new Set(topics.map(({ topic }) => topic))
-    if (topicNames.size < topics.length) {
-      throw new KafkaJSNonRetriableError(
-        'Invalid topics array, it cannot have multiple entries for the same topic'
-      )
-    }
-
-    for (const { topic, partitionAssignment } of topics) {
-      if (!partitionAssignment || !Array.isArray(partitionAssignment)) {
-        throw new KafkaJSNonRetriableError(
-          `Invalid partitions array: ${partitionAssignment} for topic: ${topic}`
-        )
-      }
-
-      for (const { partition, replicas } of partitionAssignment) {
-        if (
-          partition === null ||
-          partition === undefined ||
-          typeof partition !== 'number' ||
-          partition < 0
-        ) {
-          throw new KafkaJSNonRetriableError(
-            `Invalid partitions index: ${partition} for topic: ${topic}`
-          )
-        }
-
-        if (!replicas || !Array.isArray(replicas)) {
-          throw new KafkaJSNonRetriableError(
-            `Invalid replica assignment: ${replicas} for topic: ${topic} on partition: ${partition}`
-          )
-        }
-
-        if (replicas.filter((replica) => typeof replica !== 'number' || replica < 0).length >= 1) {
-          throw new KafkaJSNonRetriableError(
-            `Invalid replica assignment: ${replicas} for topic: ${topic} on partition: ${partition}. Replicas must be a non negative number`
-          )
-        }
-      }
-    }
-
-    const outcome = new AggregateOutcome({
-      keys: topics.flatMap(({ topic, partitionAssignment }) =>
-        partitionAssignment.map(({ partition }) => partitionKey(topic, partition))
-      ),
-      keyOf: ({ topic, partition }) => partitionKey(topic, partition),
-      select: (keys) =>
-        topics
-          .map((entry) => ({
-            ...entry,
-            partitionAssignment: entry.partitionAssignment.filter(({ partition }) =>
-              keys.has(partitionKey(entry.topic, partition))
-            ),
-          }))
-          .filter(({ partitionAssignment }) => partitionAssignment.length > 0),
-      message: 'Errors altering partition reassignments',
-    })
-    const retrier = retrierOf(retry)
-    let outstanding
-
-    try {
-      checked(
-        await waitOf(async () =>
-          retrier(async (bail, retryCount, retryTime) => {
-            try {
-              checked(await waitOf(async () => cluster.refreshMetadata()))
-              const broker = checked(await waitOf(async () => cluster.findControllerBroker()))
-              checked(
-                await waitOf(async () =>
-                  broker.alterPartitionReassignments({
-                    topics: outcome.pending,
-                    timeout,
-                    allowReplicationFactorChange,
-                  })
-                )
-              )
-              outcome.succeeded()
-            } catch (e) {
-              if (e.type === 'NOT_CONTROLLER') {
-                logger.warn('Could not reassign partitions', {
-                  error: e.message,
-                  retryCount,
-                  retryTime,
+  const alterPartitionReassignments = async ({ topics, timeout, allowReplicationFactorChange }) => {
+    const sent = topics.filter(({ partitionAssignment }) => partitionAssignment.length > 0)
+    checked(
+      await waitOf(async () =>
+        retrierOf(retry)(async (bail, retryCount, retryTime) => {
+          try {
+            checked(await waitOf(async () => cluster.refreshMetadata()))
+            const broker = checked(await waitOf(async () => cluster.findControllerBroker()))
+            checked(
+              await waitOf(async () =>
+                broker.alterPartitionReassignments({
+                  topics: sent,
+                  timeout,
+                  allowReplicationFactorChange,
                 })
-                throw e
-              }
-
-              if (isPerItemFailure(e)) {
-                const retryable = outcome.settle(e)
-                if (retryable) {
-                  logger.warn('Could not reassign some partitions yet', {
-                    partitions: retryable.errors.map(({ topic, partition }) =>
-                      partitionKey(topic, partition)
-                    ),
-                    retryCount,
-                    retryTime,
-                  })
-                  throw retryable
-                }
-                return
-              }
-
-              bail(e)
+              )
+            )
+          } catch (e) {
+            if (endsCall(e) || isAnsweredError(e) || isPerItemFailure(e)) return bail(e)
+            if (e.type === 'NOT_CONTROLLER') {
+              logger.warn('Could not reassign partitions', {
+                error: e.message,
+                retryCount,
+                retryTime,
+              })
+              throw e
             }
-          })
-        )
-      )
-    } catch (e) {
-      outstanding = e
-    }
 
-    outcome.finish(outstanding)
+            bail(e)
+          }
+        })
+      )
+    )
   }
 
   /**
@@ -2764,9 +2835,9 @@ module.exports = ({
     return instrumentationEmitter.addListener(unwrapEvent(eventName), (event) => {
       event.type = wrapEvent(event.type)
       Promise.resolve(listener(event)).catch((e) => {
-        logger.error(`Failed to execute listener: ${e.message}`, {
+        logger.error(`Failed to execute listener: ${describeThrown(e)}`, {
           eventName,
-          stack: e.stack,
+          stack: describeThrown(e, 'stack'),
         })
       })
     })
@@ -2876,6 +2947,7 @@ module.exports = ({
       deleteGroups: 1,
     },
     apiTimeout,
-    lifecycle
+    lifecycle,
+    { deleteTopicRecords: deletionInput, alterPartitionReassignments: reassignmentInput }
   )
 }

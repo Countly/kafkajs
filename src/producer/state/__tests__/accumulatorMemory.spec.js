@@ -10,6 +10,7 @@ const {
   succeeded,
   flushAll,
   quiescent,
+  takeSent,
   transactionalProducer,
   watch,
 } = require('../../__tests__/fixtures/bufferHarness')
@@ -29,14 +30,16 @@ const MEASUREMENT_TIMEOUT_MS = 45000
 
 /**
  * Measures a scenario's retained storage in a plain Node process, because Jest's own heap carries
- * the coverage counters and the async-hook bookkeeping of `--detectOpenHandles`.
+ * the coverage counters and the async-hook bookkeeping of `--detectOpenHandles`. The process runs
+ * `--jitless`: optimized code is compiled on background threads, so how much of it a reading holds
+ * depends on thread timing rather than on the records.
  * @param {'held'|'pinned'|'tracked'} scenario
- * @returns {{ shape: string, capacity: number, measured: number, counted: number }[]} one sample
- *   per population, in bytes
+ * @returns {{ shape: string, capacity: number, measured: number, counted: number, residual: number }[]}
+ *   one sample per population, in bytes
  * @throws {Error} naming the cause when the process fails, times out or prints anything but JSON
  */
 const measuredInChild = (scenario) => {
-  const run = spawnSync(process.execPath, [RETAINED_STORAGE, scenario], {
+  const run = spawnSync(process.execPath, ['--jitless', RETAINED_STORAGE, scenario], {
     encoding: 'utf8',
     timeout: MEASUREMENT_TIMEOUT_MS,
     killSignal: 'SIGKILL',
@@ -77,6 +80,7 @@ describe('Producer > the buffer > the bound on held records', () => {
       const population = await fill(capacity, records)
       const { admission, batches, wave } = population
       let outcomes
+      let held = null
       try {
         // the same turn admitted its sends before any of their batches existed
         expect(wave).not.toBeNull()
@@ -85,11 +89,15 @@ describe('Producer > the buffer > the bound on held records', () => {
         expect(admission.waitingBytes).toBeLessThanOrEqual(capacity)
         expect(admission.waitingBytes).toBeGreaterThan(0)
         expect(admission.debts).toBeLessThanOrEqual(1024 * batches.length)
-        const heldRecords = batches.reduce((sum, batch) => sum + batch.messages.length, 0)
+        held = takeSent({ batches })
+        const heldRecords = held.batches.reduce((sum, { count }) => sum + count, 0)
         expect(heldRecords).toBeLessThanOrEqual(Math.floor((2 * capacity) / 88))
       } finally {
         outcomes = await drain(population)
       }
+      expect((await held.read()).map(({ records }) => records.length)).toEqual(
+        held.batches.map(({ count }) => count)
+      )
       expect(outcomes.at(-1)).toMatchObject({ reason: 'queue-full' })
       expect(countersOf(admission)).toEqual(quiescent(admission))
     })
@@ -126,7 +134,8 @@ describe('Producer > the buffer > the bound on held records', () => {
     })
     await flushAll()
 
-    expect(batches.map(({ messages }) => messages.length)).toEqual([3, 3, 3, 1])
+    const chunks = takeSent({ batches })
+    expect(chunks.batches.map(({ count }) => count)).toEqual([3, 3, 3, 1])
     const last = batches.pop()
     await drain({ batches, sends: [] })
     expect(admission.reserved).toBe(1536 + 525 + 64)
@@ -144,6 +153,7 @@ describe('Producer > the buffer > the bound on held records', () => {
     await drain({ batches, sends: [sent, waiting] })
     expect(await sent).toEqual([{ topicName: TOPIC, partition: 0, baseOffset: '0' }])
     expect(countersOf(admission)).toEqual(quiescent(admission))
+    expect((await chunks.read()).map(({ records }) => records.length)).toEqual([3, 3, 3, 1])
   })
 
   test('the storage the held records retain is within what they are charged, over 0.9', () => {

@@ -525,7 +525,11 @@ class ShareFetchLoop {
         exchange.refused = refused
         return refused
       }
-      if (frameLength !== undefined) exchange.sentAt = this.now()
+      if (frameLength !== undefined) {
+        exchange.sentAt = this.now()
+        if (exchange.kind === 'fetch' && exchange.descriptor.epoch === 0)
+          this.session.trackOpen(exchange.binding)
+      }
       return null
     }
     return exchange
@@ -1322,12 +1326,15 @@ class ShareFetchLoop {
    * closing sends only its preserved terminal subset under its own predicate. Repeated calls share
    * the first.
    * @param {object} [options] Closing context.
-   * @param {{guard: (frameLength?: number) => Error|null, captured: object, operation: import('../groupProtocol/interface').ConsumerOperation}} [options.closing]
+   * @param {{guard: (frameLength?: number) => Error|null, captured: object, operation: import('../groupProtocol/interface').ConsumerOperation, close?: (connection: object) => void}} [options.closing]
    *   A captured close: `captured` comes from {@link ShareFetchLoop#captureFinal}, `guard` is the
    *   immutable closing predicate of the closing episode and `operation` is the episode's own
    *   operation, which is required: the final's wait and its queue registration belong to it, so
    *   its expiry settles an unanswered final, and a predicate alone cannot wake a waiting request.
-   *   A close without an operation settles its captured tickets not sent and rejects.
+   *   `close`, when given, closes the socket of an unanswered final in place of this loop, so the
+   *   episode closes each connection once. A close without an operation settles its captured
+   *   tickets not sent and rejects. A final the broker answered without a top-level error sets
+   *   `captured.confirmed`.
    * @returns {Promise<void>} Resolves when the node is disposed.
    * @throws {KafkaJSInvariantViolation} When a captured close has no operation.
    * @throws {Error} The final's failure; the node is disposed regardless.
@@ -1401,19 +1408,19 @@ class ShareFetchLoop {
    * transport whether or not the node was disposed first. The predicate is checked again after the
    * answer, and an answer that arrives after it refused is not published as acceptance.
    * @private
-   * @param {{guard: (frameLength?: number) => Error|null, captured: object, operation?: import('../groupProtocol/interface').ConsumerOperation}} closing
+   * @param {{guard: (frameLength?: number) => Error|null, captured: object, operation?: import('../groupProtocol/interface').ConsumerOperation, close?: (connection: object) => void}} closing
    *   The closing context; its operation is required.
    * @returns {Promise<void>}
    * @throws {KafkaJSInvariantViolation} When there is no operation; the captured tickets are first
    *   settled not sent.
    */
-  async sendFinal({ guard, captured, operation }) {
+  async sendFinal({ guard, captured, operation, close }) {
     if (!operation) {
       const error = new KafkaJSInvariantViolation('A captured close requires its closing operation')
       this.settleAll(captured.prepared, 'not-sent', error)
       throw error
     }
-    await this.writeFinal(operation, guard, captured)
+    await this.writeFinal(operation, guard, captured, close)
   }
 
   /**
@@ -1426,10 +1433,18 @@ class ShareFetchLoop {
    *   wait and its queue registration.
    * @param {(frameLength?: number) => Error|null} guard The closing predicate.
    * @param {{binding: object, prepared: object[], fields: object, descriptor: object}} captured
-   *   What {@link ShareFetchLoop#captureFinal} froze.
+   *   What {@link ShareFetchLoop#captureFinal} froze; gets `confirmed` when the broker answered
+   *   the final without a top-level error.
+   * @param {(connection: object) => void} [close] Closes the socket of an unanswered final; this
+   *   loop's own close when omitted.
    * @returns {Promise<void>}
    */
-  async writeFinal(operation, guard, captured) {
+  async writeFinal(
+    operation,
+    guard,
+    captured,
+    close = (connection) => this.closeSocket(connection)
+  ) {
     const { binding, prepared, fields, descriptor } = captured
     const exchange = {
       apiKey: 79,
@@ -1472,7 +1487,7 @@ class ShareFetchLoop {
       const written = exchange.sentAt !== undefined
       this.exchanges.delete(exchange)
       if (written && !exchange.settled && !ShareSession.bindingLost(binding))
-        this.closeSocket(binding.connection)
+        close(binding.connection)
       this.settleAll(prepared, written ? 'session-lost' : 'not-sent', error)
       return
     }
@@ -1483,6 +1498,7 @@ class ShareFetchLoop {
       return
     }
     const policy = this.session.applyFinal(descriptor, response)
+    captured.confirmed = policy.error === null
     this.completeFinal(exchange, response, policy, this.resultOf(exchange, this.now()))
   }
 
@@ -1500,11 +1516,7 @@ class ShareFetchLoop {
       return
     }
     if (!row.pendingHandlers || row.dispatched) return
-    const { records } = row.walk.deliver
-    row.ledger.complete(
-      records.map((record) => record.offset),
-      'release'
-    )
+    row.ledger.complete(row.ledger.offsets, 'release')
     row.pendingHandlers = false
   }
 
@@ -1521,19 +1533,36 @@ class ShareFetchLoop {
    *   outcome of acquisitions that are not settled.
    * @param {{prepared: object[]}} [options.preserve] A captured final whose exact tickets survive.
    * @param {number} [options.drainTimeout=0] Milliseconds the data socket may drain before it closes.
+   * @param {boolean} [options.closeSockets=true] Whether disposal closes those sockets itself; a
+   *   close episode passes false and decides every connection once from the run's open bindings.
    * @returns {void} Idempotent and synchronous; a socket close is observed in the background.
    */
-  dispose(cause, { reason = 'session-lost', preserve = null, drainTimeout = 0 } = {}) {
+  dispose(
+    cause,
+    { reason = 'session-lost', preserve = null, drainTimeout = 0, closeSockets = true } = {}
+  ) {
     if (this.disposed) return
     this.disposed = true
     this.finishing = true
     const unanswered = new Set()
-    for (const { sentAt, binding, settled } of this.exchanges)
-      if (sentAt !== undefined && !settled && binding && !ShareSession.bindingLost(binding))
-        unanswered.add(binding.connection)
+    if (closeSockets)
+      for (const binding of this.writtenBindings()) unanswered.add(binding.connection)
     this.invalidateAll(reason, preserve, cause)
     this.session.retire(cause || new KafkaJSNonRetriableError('Share node was disposed'))
     for (const connection of unanswered) this.closeSocket(connection, drainTimeout)
+  }
+
+  /**
+   * @returns {object[]} The bindings of every request this node tracks as written and unanswered
+   *   whose socket is still the one it was written on, including an opening request the broker
+   *   may already have applied.
+   */
+  writtenBindings() {
+    const bindings = []
+    for (const { sentAt, binding, settled } of this.exchanges)
+      if (sentAt !== undefined && !settled && binding && !ShareSession.bindingLost(binding))
+        bindings.push(binding)
+    return bindings
   }
 
   /**

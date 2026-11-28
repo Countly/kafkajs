@@ -1,0 +1,23 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -1436,7 +1436,8 @@
+     const waiters = new Set()
+     const fence = new Generation()
+     // Pinned before the round's first await and kept through its retries and its apply.
+-    const pin = this.subscription?.pin() ?? null
++    const owner = this
++    let pin = null
+     let retired = null
+     let issued = false
+     let currentAttempt = leaderAttempt
+@@ -1447,7 +1448,9 @@
+       /** Closed with the round, so work started for it stops dialling and retrying. */
+       fence,
+       /** The desired subscription this round joins and applies; null without a client pattern. */
+-      pin,
++      get pin() {
++        return (pin ??= owner.subscription?.pin() ?? null)
++      },
+       allowAutoTopicCreation:
+         this.regexSubscription != null || this.subscribedTopicRegex != null || this.subscription
+           ? false

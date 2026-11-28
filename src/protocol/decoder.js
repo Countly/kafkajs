@@ -1,4 +1,5 @@
 const {
+  KafkaJSCorruptRecordError,
   KafkaJSPartialMessageError,
   KafkaJSInvalidVarIntError,
   KafkaJSInvalidLongError,
@@ -16,8 +17,14 @@ const OTHER_BITS = 0x7f // 127
 
 const UUID_SIZE = 16
 
-/** Largest decoded protocol array count; record headers are bounded by bytes instead. */
+/** Largest decoded protocol array count; record headers are bounded by their batch budget instead. */
 const MAX_ARRAY_COUNT = 1000000
+
+/**
+ * @param {*} value
+ * @returns {boolean} whether `value` is a number of at least 0 (`Infinity` included, NaN not)
+ */
+const isBudgetValue = (value) => typeof value === 'number' && value >= 0
 
 /** Largest tagged-field count accepted in one tag section. */
 const MAX_TAGGED_FIELDS = 10000
@@ -83,6 +90,27 @@ module.exports = class Decoder {
     }
 
     return array
+  }
+
+  /**
+   * Refuses a null string or bytes value that the message definition does not allow to be null at
+   * the version being read. The string and bytes readers return null for the null length, and a
+   * required field read as null would reach the caller as the text `null` or a crash.
+   * @template T
+   * @param {T|null} value what a string or bytes reader returned
+   * @param {string} field the response field, as `<Message>.<Path>` in the Apache message
+   *   definition, for the error
+   * @returns {T} `value`
+   * @throws {KafkaJSPartialMessageError} when `value` is null
+   */
+  static requireValue(value, field) {
+    if (value === null) {
+      throw new KafkaJSPartialMessageError(
+        `${field} is null, but the message definition does not allow null there`
+      )
+    }
+
+    return value
   }
 
   constructor(buffer) {
@@ -346,15 +374,25 @@ module.exports = class Decoder {
   }
 
   /**
-   * Signed-varint-counted record headers, bounded only by the bytes left in this decoder.
-   * A count of -1 reads as an empty array. Unlike protocol arrays, headers have no count cap;
-   * the result grows as entries decode, without preallocating from the untrusted count.
+   * Signed-varint-counted record headers, bounded by the bytes left in this decoder and by the
+   * headers left in the batch's budget, which every record of the batch draws on. A count of -1
+   * reads as an empty array. The result grows as entries decode, without preallocating from the
+   * untrusted count; the count is debited from the budget once all of them have decoded.
    * @param {(decoder: Decoder) => *} reader reads one header
+   * @param {{ remaining: number, limit: number }} budget the headers the batch may still decode,
+   *   and the batch's header ceiling
    * @returns {Array} headers in wire order
+   * @throws {TypeError} when `remaining` or `limit` is not a number of at least 0, before any read
    * @throws {KafkaJSPartialMessageError} when the count is negative other than -1, exceeds the
    *   remaining bytes, or a header is truncated
+   * @throws {KafkaJSCorruptRecordError} with reason `count` and the ceiling as `limit` when the
+   *   count is above `remaining`, before any header is read
    */
-  readVarIntArrayBytesBounded(reader) {
+  readVarIntArrayBytesBounded(reader, budget) {
+    if (!isBudgetValue(budget?.remaining) || !isBudgetValue(budget.limit)) {
+      throw new TypeError('The header budget needs a remaining and a limit of at least 0')
+    }
+
     const length = this.readVarInt()
 
     if (length === -1) {
@@ -362,11 +400,20 @@ module.exports = class Decoder {
     }
 
     this.ensureReadable(length, 'readVarIntArrayBytesBounded')
+
+    if (length > budget.remaining) {
+      throw new KafkaJSCorruptRecordError(
+        `Record header count ${length} is above the ${budget.remaining} headers left of the batch header ceiling ${budget.limit}`,
+        { reason: 'count', limit: budget.limit }
+      )
+    }
+
     const array = []
     for (let i = 0; i < length; i++) {
       array.push(reader(this))
     }
 
+    budget.remaining -= length
     return array
   }
 
@@ -452,23 +499,45 @@ module.exports = class Decoder {
     return array
   }
 
+  /**
+   * Reads a signed INT32 varint (ZigZag), as a record writes its lengths and deltas.
+   * @returns {number}
+   * @throws {KafkaJSInvalidVarIntError} when the fifth byte still has its continuation bit: an INT32
+   *         takes at most 5 bytes, and a longer one would wrap the shift into a wrong value; or when
+   *         a fifth and last byte is above 0x0f, so it carries bits beyond 32
+   * @throws {KafkaJSPartialMessageError} when the buffer ends inside the varint
+   */
   readVarInt() {
     let currentByte
     let result = 0
     let i = 0
 
     do {
+      if (i > 28) {
+        throw new KafkaJSInvalidVarIntError('Invalid VarInt, must contain 5 bytes or less')
+      }
       this.ensureReadable(1, 'readVarInt')
       currentByte = this.buffer[this.offset++]
       result += (currentByte & OTHER_BITS) << i
       i += 7
     } while (currentByte >= MOST_SIGNIFICANT_BIT)
 
+    // i is 35 when the fifth byte ended the varint
+    if (i === 35 && currentByte > 0x0f) {
+      throw new KafkaJSInvalidVarIntError('Invalid VarInt, the fifth byte carries bits beyond 32')
+    }
+
     return Decoder.decodeZigZag(result)
   }
 
-  // By default JavaScript's numbers are of type float64, performing bitwise operations converts the numbers to a signed 32-bit integer
-  // Unsigned Right Shift Operator >>> ensures the returned value is an unsigned 32-bit integer
+  /**
+   * Reads an unsigned INT32 varint, as flexible versions write compact lengths and tags. Bitwise
+   * operators work on signed 32-bit integers, so `>>> 0` returns the result unsigned.
+   * @returns {number}
+   * @throws {KafkaJSInvalidVarIntError} when the fifth byte still has its continuation bit, or is
+   *         above 0x0f and so carries bits beyond 32
+   * @throws {KafkaJSPartialMessageError} when the buffer ends inside the varint
+   */
   readUVarInt() {
     let currentByte
     let result = 0
@@ -481,6 +550,9 @@ module.exports = class Decoder {
         throw new KafkaJSInvalidVarIntError('Invalid VarInt, must contain 5 bytes or less')
       }
       this.ensureReadable(1, 'readUVarInt')
+    }
+    if (i === 28 && currentByte > 0x0f) {
+      throw new KafkaJSInvalidVarIntError('Invalid VarInt, the fifth byte carries bits beyond 32')
     }
     result |= currentByte << i
     return result >>> 0
@@ -532,6 +604,14 @@ module.exports = class Decoder {
     return taggedFields
   }
 
+  /**
+   * Reads a signed INT64 varint (ZigZag), as a record writes its timestamp delta.
+   * @returns {Long}
+   * @throws {KafkaJSInvalidLongError} when the tenth byte still has its continuation bit, or is
+   *         above 0x01 and so carries bits beyond 64: `Long` is not wrapped to 64 bits, so the value
+   *         would leave the INT64 range
+   * @throws {KafkaJSPartialMessageError} when the buffer ends inside the varint
+   */
   readVarLong() {
     let currentByte
     let result = Long.fromInt(0)
@@ -546,6 +626,11 @@ module.exports = class Decoder {
       result = result.add(Long.fromInt(currentByte & OTHER_BITS).shiftLeft(i))
       i += 7
     } while (currentByte >= MOST_SIGNIFICANT_BIT)
+
+    // i is 70 when the tenth byte ended the varint
+    if (i === 70 && currentByte > 0x01) {
+      throw new KafkaJSInvalidLongError('Invalid Long, the tenth byte carries bits beyond 64')
+    }
 
     return Decoder.decodeZigZag64(result)
   }

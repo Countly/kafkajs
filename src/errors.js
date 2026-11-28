@@ -193,10 +193,12 @@ class KafkaJSNumberOfRetriesExceeded extends KafkaJSNonRetriableError {
     this.retryTime = retryTime
 
     // The wrapped error may itself be a wrapper (KafkaJSError around a protocol error), so
-    // walk the chain for the first typed link.
+    // walk the chain for the first typed link. A chain may loop: a link seen before ends it.
     let source = e
+    const seen = new Set()
     try {
-      while (source && source.type === undefined && source.cause) {
+      while (source && source.type === undefined && !seen.has(source)) {
+        seen.add(source)
         source = source.cause
       }
       if (source && source.type !== undefined) {
@@ -274,9 +276,21 @@ class KafkaJSDeleteGroupsError extends KafkaJSError {
   }
 }
 
+/**
+ * The broker cannot serve a request at any version this client implements, or refused it as
+ * unsupported.
+ * @extends KafkaJSNonRetriableError
+ */
 class KafkaJSServerDoesNotSupportApiKey extends KafkaJSNonRetriableError {
-  constructor(e, { apiKey, apiName } = {}) {
-    super(e)
+  /**
+   * @param {Error|string} e Original error or message.
+   * @param {object} [metadata]
+   * @param {number} [metadata.apiKey] Refused API key.
+   * @param {string} [metadata.apiName] Protocol name of that API.
+   * @param {Error} [metadata.cause] The broker's error, when the broker refused the request.
+   */
+  constructor(e, { apiKey, apiName, cause } = {}) {
+    super(e, { cause })
     this.apiKey = apiKey
     this.apiName = apiName
     this.name = 'KafkaJSServerDoesNotSupportApiKey'
@@ -324,9 +338,10 @@ class KafkaJSShareGroupsNotSupportedError extends KafkaJSServerDoesNotSupportApi
    * @param {string} metadata.apiName Protocol name of that API.
    * @param {'api-not-advertised'|'api-version-range'|'feature-disabled'|'refused-by-broker'} metadata.reason Stage that refused.
    * @param {number|null} [metadata.shareVersion=null] Finalized `share.version` level, or null when the broker reported no feature epoch.
+   * @param {Error} [metadata.cause] The broker's error, when the broker refused the request.
    */
-  constructor(e, { apiKey, apiName, reason, shareVersion = null }) {
-    super(e, { apiKey, apiName })
+  constructor(e, { apiKey, apiName, reason, shareVersion = null, cause }) {
+    super(e, { apiKey, apiName, cause })
     this.name = 'KafkaJSShareGroupsNotSupportedError'
     this.reason = reason
     this.shareVersion = shareVersion
@@ -375,6 +390,29 @@ class KafkaJSTimeout extends KafkaJSNonRetriableError {
   }
 }
 
+/**
+ * A request that changes broker state was written and no usable answer arrived, so it may have
+ * been applied. The client does not send it again: the call rejects with this error instead.
+ * Not retriable: check the state of the items in `requests` before repeating the call.
+ * @class
+ */
+class KafkaJSUnknownOutcomeError extends KafkaJSNonRetriableError {
+  /**
+   * @param {Error|string} e diagnostic message
+   * @param {object} [options]
+   * @param {{ api: string, apiVersion: number, nodeId: number|null, items: any[]|null }[]} [options.requests]
+   *   each written request without an answer and the items it carried (`null` when they could
+   *   not be named)
+   * @param {Error} [options.cause] the error that ended the first of those requests
+   */
+  constructor(e, { requests = [], cause } = {}) {
+    super(e, { cause })
+    this.name = 'KafkaJSUnknownOutcomeError'
+    this.outcome = 'unknown'
+    this.requests = requests
+  }
+}
+
 class KafkaJSLockTimeout extends KafkaJSTimeout {
   constructor() {
     super(...arguments)
@@ -413,7 +451,8 @@ class KafkaJSInvariantViolation extends KafkaJSNonRetriableError {
     this.name = 'KafkaJSInvariantViolation'
 
     if (issueUrl !== null) {
-      const issueTitle = encodeURIComponent(`Invariant violation: ${message}`)
+      // encodeURIComponent throws on a lone surrogate, which a message can carry from a caller's name
+      const issueTitle = encodeURIComponent(`Invariant violation: ${message}`.toWellFormed())
       this.helpUrl = `${issueUrl}/new?assignees=&labels=bug&template=bug_report.md&title=${issueTitle}`
     }
   }
@@ -511,9 +550,8 @@ class KafkaJSAggregateError extends Error {
 }
 
 /**
- * Raised inside the fetch loop to make a fetcher stop and start again when the group rebalances.
- * Flow control rather than a failure; it extends `Error` directly and keeps the `name` `'Error'`
- * it has always had, so it only gains the `category` every error carries.
+ * Kept for compatibility; no longer thrown. It extends `Error` directly and keeps the `name`
+ * `'Error'` it has always had, so it only gains the `category` every error carries.
  */
 class KafkaJSFetcherRebalanceError extends Error {
   constructor() {
@@ -526,6 +564,26 @@ class KafkaJSNoBrokerAvailableError extends KafkaJSError {
   constructor() {
     super('No broker available')
     this.name = 'KafkaJSNoBrokerAvailableError'
+  }
+}
+
+/**
+ * A classic-protocol rebalance chain with a cooperative assignor completed its 20-round limit and
+ * another round was still required. Retriable, so the default `restartOnFailure` policy restarts
+ * the consumer, which rejoins and resumes from the committed offsets (the offset reset policy
+ * applies where none is committed); records processed since the last commit can be delivered
+ * again. A custom `restartOnFailure` receives this error itself and restarts only when it returns
+ * true. Classic eager chains and consumer-protocol (KIP-848) groups have no round limit and never
+ * raise it.
+ */
+class KafkaJSRebalanceNotConvergedError extends KafkaJSError {
+  /**
+   * @param {Error|string} e
+   * @param {{ cause?: Error }} [options]
+   */
+  constructor(e, { cause } = {}) {
+    super(e, { retriable: true, cause })
+    this.name = 'KafkaJSRebalanceNotConvergedError'
   }
 }
 
@@ -651,13 +709,14 @@ class KafkaJSInvalidFrameError extends KafkaJSConnectionError {
 /**
  * A Fetch record batch is corrupt or breaks a decoding bound: its length, magic byte, record count
  * or control record is impossible, its checksum does not match, its compressed body is malformed,
- * or it decompresses past `maxDecompressedBatchBytes`. Non-retriable; repeating the fetch returns
+ * it decompresses past `maxDecompressedBatchBytes`, or its records carry more headers than the
+ * header ceiling that option sets. Non-retriable; repeating the fetch returns
  * the same bytes. `offset` is the first offset of the batch as a decimal string, when it could be
  * read. `nextOffset`, present only when the batch boundary was validated (a readable, non-negative
  * `lastOffsetDelta` and, with `checkCrcs`, a matching checksum), is where `consumer.seek` goes to
  * skip the batch. `codec` names the compression codec of a compressed batch, and `limit` the bound
- * in force: bytes for `decompressed-size` and `decompression`, records for a `count` over the
- * derived record ceiling.
+ * in force: bytes for `decompressed-size` and `decompression`; for a `count`, records over the
+ * record ceiling or headers over the header ceiling.
  */
 class KafkaJSCorruptRecordError extends KafkaJSNonRetriableError {
   /**
@@ -683,20 +742,52 @@ class KafkaJSCorruptRecordError extends KafkaJSNonRetriableError {
 }
 
 /**
+ * A topic this consumer holds positions of came back under a new topic id: it was deleted and
+ * recreated. The new topic has its own offsets, so the consumer's run stops with this error and is
+ * never restarted automatically, whatever `restartOnFailure` decides. Non-retriable.
+ */
+class KafkaJSTopicRecreatedError extends KafkaJSNonRetriableError {
+  /**
+   * @param {Error|string} e
+   * @param {object} options
+   * @param {string} options.topic the topic name
+   * @param {string} options.previousTopicId the id the consumer's positions belong to
+   * @param {string} options.topicId the id the topic has now
+   * @param {string|null} [options.groupId=null] the consumer group, null without one
+   * @param {Error} [options.cause]
+   */
+  constructor(e, { topic, previousTopicId, topicId, groupId = null, cause } = {}) {
+    super(e, { cause })
+    this.name = 'KafkaJSTopicRecreatedError'
+    this.topic = topic
+    this.previousTopicId = previousTopicId
+    this.topicId = topicId
+    this.groupId = groupId
+  }
+}
+
+/**
  * An offset commit was refused because the consumer lost its group membership, or because a
- * handler or a retry outlived a rejoin. `cause` is the loss. For a loss the broker reported,
+ * handler or a retry outlived a rejoin. Reason `stale-assignment` also covers a handler commit of
+ * offsets for a batch fetched before a `consumer.seek()` of its partition, with no rejoin, so it
+ * does not by itself mean the group rebalanced, and, under `groupProtocol: 'consumer'`, a commit
+ * built under a member epoch of 0 or below (a member joining, or one that left the group, such as
+ * a commit still retrying when the consumer stops). It is also the `cause` of the
+ * `KafkaJSTransactionAbortableError` that refuses a transaction carrying offsets of such a batch
+ * (message `A seek superseded the handler batch` or `The handler outlived its assignment`).
+ * `cause` is the loss, absent for a stale handler and for a seek. For a loss the broker reported,
  * `type`, `code` and `helpUrl` are the cause's; a synthetic loss carries no code, a poll-interval
  * loss keeps the type `POLL_INTERVAL_EXCEEDED`, and a stale handler has the type
- * `STALE_ASSIGNMENT` and no `code` or `helpUrl`, whatever its cause carries. `isLostMember` checks
- * only the broker codes; it does not recognize every reason of this class: test `instanceof` and
- * `reason`.
+ * `STALE_ASSIGNMENT` and no `code` or `helpUrl`, whatever its cause carries.
+ * `isLostMember` checks only the broker codes; it does not recognize every reason of this class:
+ * test `instanceof` and `reason`.
  */
 class KafkaJSCommitFailedError extends KafkaJSNonRetriableError {
   /**
    * @param {Error|string} e
    * @param {object} options
    * @param {'membership-lost'|'poll-interval-exceeded'|'stale-assignment'} options.reason
-   * @param {Error} options.cause
+   * @param {Error} [options.cause] the loss; absent for a stale handler or a seek
    */
   constructor(e, { reason, cause } = {}) {
     super(e, { cause })
@@ -921,6 +1012,8 @@ module.exports = {
   KafkaJSBootstrapResolutionError,
   KafkaJSNoOffsetError,
   KafkaJSRebalanceListenerError,
+  KafkaJSRebalanceNotConvergedError,
+  KafkaJSTopicRecreatedError,
   KafkaJSProducerClosedError,
   KafkaJSTelemetryError,
   KafkaJSError,
@@ -942,6 +1035,7 @@ module.exports = {
   KafkaJSStaleTopicMetadataAssignment,
   KafkaJSDeleteGroupsError,
   KafkaJSTimeout,
+  KafkaJSUnknownOutcomeError,
   KafkaJSLockTimeout,
   KafkaJSServerDoesNotSupportApiKey,
   KafkaJSShareGroupsNotSupportedError,

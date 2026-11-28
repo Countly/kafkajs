@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -2061,7 +2061,7 @@
+ 
+       if (round) {
+         try {
+-          await round.delay(STALE_EPOCH_POLL_INTERVAL)
++          await sleep(STALE_EPOCH_POLL_INTERVAL)
+         } catch (_) {
+           return false
+         }

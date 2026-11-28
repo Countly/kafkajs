@@ -1,0 +1,11 @@
+--- a/scripts/benchmarks/consumeThroughput.js
++++ b/scripts/benchmarks/consumeThroughput.js
+@@ -125,7 +125,7 @@
+   observe(partition) {
+     if (!Number.isInteger(partition) || partition < 0 || partition >= this.partitions)
+       throw new Error(`Unexpected partition ${partition}`)
+-    this.seen.add(partition)
++    this.seen.add(0)
+     this.samplePeak()
+   }
+ 

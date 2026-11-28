@@ -497,6 +497,38 @@ describe('admin invocation deadlines', () => {
     expect(createTopics).toHaveBeenCalledTimes(2)
   })
 
+  it('a read-only timeout says a mutation, if any, may have been applied', async () => {
+    const response = held()
+    const admin = createAdmin({ logger, cluster: { metadata: () => response.promise } })
+    const result = observe(admin.listTopics({ apiTimeout: 10 }))
+    await jest.advanceTimersByTimeAsync(10)
+    expect(result.error).toBeInstanceOf(KafkaJSTimeout)
+    expect(result.error.message).toBe(
+      'listTopics did not complete within 10 ms; outcome is unknown; a mutation, if any, may have been applied'
+    )
+    response.resolve({ topicMetadata: [] })
+    await flush()
+  })
+
+  it('a write timeout has the same text', async () => {
+    const response = held()
+    const cluster = {
+      refreshMetadata: async () => {},
+      findControllerBroker: async () => ({ createTopics: () => response.promise }),
+    }
+    const admin = createAdmin({ cluster, logger, retry: { retries: 0 } })
+    const result = observe(
+      admin.createTopics({ topics: [{ topic: 't' }], waitForLeaders: false, apiTimeout: 10 })
+    )
+    await jest.advanceTimersByTimeAsync(10)
+    expect(result.error).toBeInstanceOf(KafkaJSTimeout)
+    expect(result.error.message).toBe(
+      'createTopics did not complete within 10 ms; outcome is unknown; a mutation, if any, may have been applied'
+    )
+    response.resolve()
+    await flush()
+  })
+
   it('retains the last typed broker item error on exhaustion and the original late transport error', async () => {
     const { itemRetry } = require('../itemRetry')
     const options = {
@@ -523,6 +555,89 @@ describe('admin invocation deadlines', () => {
     expect(result.value[0].errorCode).toBe(0)
     expect(result.value[1].errorCode).toBe(-1)
     expect(result.value[1].error).toBe(transport)
+  })
+
+  it('settled waits and polls leave only the invocation cleanup registered', async () => {
+    const { runWithDeadline, currentDeadline, waitForOf } = require('../deadline')
+    const sizes = []
+    const result = observe(
+      runWithDeadline('settled', 1000, async () => {
+        const deadline = currentDeadline()
+        sizes.push(deadline.cleanups.size)
+        for (let n = 0; n < 50; n++) await deadline.wait(() => n)
+        sizes.push(deadline.cleanups.size)
+        await waitForOf(() => true, { delay: 1 })
+        sizes.push(deadline.cleanups.size)
+        return 'done'
+      })
+    )
+    await jest.advanceTimersByTimeAsync(1)
+    expect(result.value).toBe('done')
+    expect(sizes).toEqual([1, 1, 1])
+  })
+
+  it('keeps the next metadata discovery shared when an abandoned episode settles late', async () => {
+    const { shareMetadata, runWithDeadline } = require('../deadline')
+    const first = held()
+    const second = held()
+    const work = jest
+      .fn()
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise)
+      .mockResolvedValue('third refresh')
+    const shared = shareMetadata(work)
+    const abandoned = observe(runWithDeadline('abandoned', 5, shared))
+    await jest.advanceTimersByTimeAsync(5)
+    expect(abandoned.error).toBeInstanceOf(KafkaJSTimeout)
+    expect(abandoned.error.message).toBe(
+      'abandoned did not complete within 5 ms; outcome is unknown; a mutation, if any, may have been applied'
+    )
+    const next = observe(shared())
+    await flush()
+    first.resolve('first refresh')
+    await flush()
+    const joined = observe(shared())
+    second.resolve('second refresh')
+    await flush()
+    expect(work).toHaveBeenCalledTimes(2)
+    expect(next.value).toBe('second refresh')
+    expect(joined.value).toBe('second refresh')
+  })
+
+  it('a caller whose budget ended before it joined leaves no unhandled rejection', () => {
+    const { execFileSync } = require('node:child_process')
+    const script = `
+      const { runWithDeadline, shareMetadata } = require('./src/admin/deadline')
+      const { KafkaJSTimeout } = require('./src/errors')
+      const unhandled = []
+      process.on('unhandledRejection', (error) => unhandled.push(error.message))
+      let now = 0
+      performance.now = () => now
+      const work = () => Promise.reject(new Error('refresh failed'))
+      const shared = shareMetadata(work)
+      runWithDeadline('late', 5, () => {
+        now = 5
+        return shared()
+      }).then(
+        () => 'resolved',
+        (error) => ({ timeout: error instanceof KafkaJSTimeout, message: error.message })
+      ).then((outcome) => setImmediate(() => {
+        process.stdout.write(JSON.stringify({ outcome, unhandled }))
+      }))
+    `
+    const report = execFileSync(process.execPath, ['-e', script], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+    expect(JSON.parse(report)).toEqual({
+      outcome: {
+        timeout: true,
+        message:
+          'late did not complete within 5 ms; outcome is unknown; a mutation, if any, may have been applied',
+      },
+      unhandled: [],
+    })
   })
 })
 
@@ -1056,5 +1171,199 @@ describe('polling enrollment and recovery publication', () => {
     expect(predicate.mock.calls).toEqual([[10], [20]])
     expect(result.value).toBe('ready')
     expect(jest.getTimerCount()).toBe(0)
+  })
+})
+
+describe('replay latch', () => {
+  const {
+    currentDeadline,
+    currentMutation,
+    endsCall,
+    isAnsweredError,
+    retrierOf,
+    runWithDeadline,
+    settleMutations,
+    wrapAdmin,
+  } = require('../deadline')
+  const { DeleteGroups } = require('../../protocol/requests/apiKeys')
+  const { createErrorFromCode } = require('../../protocol/error')
+  const { attachResponseSource } = require('../../broker/failureSource')
+  const { KafkaJSUnknownOutcomeError, KafkaJSPartialMessageError } = require('../../errors')
+
+  /** Creates a built request without involving a different invocation. */
+  const request = (groupId) => ({
+    request: { apiKey: DeleteGroups, apiName: 'DeleteGroups', apiVersion: 3 },
+    args: [groupId],
+  })
+
+  /** Writes the named item through the latch's private transport hook. */
+  const write = (groupId) => {
+    const latch = currentMutation().latch(request(groupId), 0)
+    latch.request.onWrite()
+    return latch
+  }
+
+  beforeEach(() => jest.useFakeTimers())
+  afterEach(() => jest.useRealTimers())
+
+  it('a nested public admin call can write both a different item and the same item', async () => {
+    const calls = []
+    const admin = wrapAdmin(
+      {
+        outer: async () => {
+          const latch = write('first')
+          latch.request.onDecoded()
+          calls.push(currentDeadline())
+          await admin.inner({ groupId: 'second' })
+          await admin.inner({ groupId: 'first' })
+          expect(() => write('first')).toThrow('an earlier request of this call')
+        },
+        inner: async ({ groupId }) => {
+          calls.push(currentDeadline())
+          write(groupId).request.onDecoded()
+        },
+      },
+      { outer: 0, inner: 0 },
+      100
+    )
+    await admin.outer()
+    expect(calls).toEqual([calls[0], calls[0], calls[0]])
+  })
+
+  it('a second write within one invocation is refused', async () => {
+    await runWithDeadline('deleteGroups', 100, () => {
+      write('first').request.onDecoded()
+      expect(() => write('first')).toThrow('an earlier request of this call')
+    })
+  })
+
+  it('a refusal made before applying lets the call write only the refused items again', async () => {
+    const { DeleteTopics, OffsetDelete } = require('../../protocol/requests/apiKeys')
+    const deletion = (selection) => ({
+      request: { apiKey: DeleteTopics, apiName: 'DeleteTopics', apiVersion: 6 },
+      args: Array.isArray(selection) ? { topics: selection } : selection,
+    })
+    const offsets = {
+      request: { apiKey: OffsetDelete, apiName: 'OffsetDelete', apiVersion: 0 },
+      args: { groupId: 'g' },
+    }
+    const writeOf = (built) => () => currentMutation().latch(built, 0).request.onWrite()
+    await runWithDeadline('deleteTopics', 100, () => {
+      const first = currentMutation().latch(deletion(['a', 't']), 0)
+      first.request.onWrite()
+      first.request.onDecoded({
+        topicErrors: [
+          { topic: 'a', topicId: 'id-a', errorCode: 0 },
+          { topic: 't', topicId: 'id-t', errorCode: 89 },
+        ],
+      })
+      const refusal = createErrorFromCode(89)
+      expect(first.failed(refusal)).toBe(refusal)
+      expect(isAnsweredError(refusal)).toBe(false)
+      expect(writeOf(deletion(['a', 't']))).toThrow('an earlier request of this call')
+      expect(writeOf(deletion(['t']))).toThrow('an earlier request of this call')
+      expect(writeOf(deletion({ topicIds: ['id-a', 'id-t'] }))).toThrow(
+        'an earlier request of this call'
+      )
+      const second = currentMutation().latch(deletion({ topicIds: ['id-t'] }), 0)
+      second.request.onWrite()
+      second.request.onDecoded({ topicErrors: [{ topic: 't', topicId: 'id-t', errorCode: 0 }] })
+      expect(writeOf(deletion({ topicIds: ['id-t'] }))).toThrow('an earlier request of this call')
+    })
+    await runWithDeadline('deleteTopics', 100, () => {
+      const latch = currentMutation().latch(deletion(['t']), 0)
+      latch.request.onWrite()
+      latch.request.onDecoded({ topicErrors: [{ topic: 't', topicId: null, errorCode: 89 }] })
+      const refusal = createErrorFromCode(89)
+      expect(latch.failed(refusal)).toBe(refusal)
+      expect(isAnsweredError(refusal)).toBe(true)
+      expect(writeOf(deletion({ topicIds: ['id-t'] }))).toThrow('an earlier request of this call')
+    })
+    await runWithDeadline('deleteTopics', 100, () => {
+      const latch = currentMutation().latch(deletion(['t']), 0)
+      latch.request.onWrite()
+      latch.request.onDecoded({ topicErrors: [{ topic: 't', topicId: 'id-t', errorCode: 89 }] })
+      const other = new KafkaJSError('not the refusal')
+      expect(latch.failed(other)).toBe(other)
+      expect(isAnsweredError(other)).toBe(true)
+      expect(writeOf(deletion({ topicIds: ['id-t'] }))).toThrow('an earlier request of this call')
+    })
+    await runWithDeadline('deleteOffsets', 100, () => {
+      const loading = currentMutation().latch(offsets, 0)
+      loading.request.onWrite()
+      loading.request.onDecoded({ errorCode: 14, topics: [] })
+      const moved = currentMutation().latch(offsets, 0)
+      moved.request.onWrite()
+      moved.request.onDecoded({ errorCode: 16, topics: [] })
+      expect(writeOf(offsets)).toThrow('an earlier request of this call')
+    })
+  })
+
+  it('a send that fails before its write leaves no record and the retry sends once', async () => {
+    const error = new KafkaJSError('dial failed')
+    await runWithDeadline('deleteGroups', 100, () => {
+      const unsent = currentMutation().latch(request('first'), 0)
+      expect(unsent.failed(error)).toBe(error)
+      write('first').request.onDecoded()
+      expect(() => write('first')).toThrow('an earlier request of this call')
+    })
+  })
+
+  it('a decoded error of a written request and a replay refusal end the retries unwrapped', async () => {
+    await runWithDeadline('deleteGroups', 100, async () => {
+      const latch = write('first')
+      latch.request.onDecoded()
+      const answered = createErrorFromCode(41)
+      expect(latch.failed(answered)).toBe(answered)
+      const retry = retrierOf({ retries: 1 })
+      const action = jest.fn(async () => {
+        throw answered
+      })
+      await expect(retry(action)).rejects.toBe(answered)
+      expect(action).toHaveBeenCalledTimes(1)
+      const replay = jest.fn(async () => write('first'))
+      await expect(retry(replay)).rejects.toMatchObject({ cause: answered })
+      expect(replay).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  it('latch.failed counts a broker code thrown inside decode() as an answer and a malformed body as an unknown outcome', async () => {
+    await runWithDeadline('deleteGroups', 100, () => {
+      const answered = createErrorFromCode(35)
+      attachResponseSource(answered, DeleteGroups)
+      expect(write('first').failed(answered)).toBe(answered)
+      expect(isAnsweredError(answered)).toBe(true)
+      const malformed = new KafkaJSPartialMessageError('incomplete response')
+      attachResponseSource(malformed, DeleteGroups)
+      const failure = write('second').failed(malformed)
+      expect(failure).toBeInstanceOf(KafkaJSUnknownOutcomeError)
+      expect(failure.cause).toBe(malformed)
+      expect(endsCall(failure)).toBe(true)
+    })
+  })
+
+  it('settleMutations orders deadline or close, unknown, final decoded, retry candidate, whatever the input and completion order', async () => {
+    await runWithDeadline('deleteGroups', 100, async () => {
+      const retry = new KafkaJSError('dial failed')
+      const latch = write('answered')
+      latch.request.onDecoded()
+      const answered = latch.failed(createErrorFromCode(41))
+      const unknown = write('lost').failed(new KafkaJSError('lost'))
+      for (const reasons of [
+        [retry, answered, unknown],
+        [unknown, answered, retry],
+      ]) {
+        await expect(settleMutations(reasons.map((error) => Promise.reject(error)))).rejects.toBe(
+          unknown
+        )
+      }
+      await expect(settleMutations([Promise.reject(retry), Promise.reject(answered)])).rejects.toBe(
+        answered
+      )
+      const deadline = currentDeadline()
+      const close = new KafkaJSError('closed')
+      deadline.stop(close)
+      await expect(settleMutations([Promise.reject(unknown)])).rejects.toBe(close)
+    }).catch((error) => expect(error.message).toBe('closed'))
   })
 })

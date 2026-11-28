@@ -2,6 +2,9 @@ const createAdmin = require('..')
 const { KafkaJSNonRetriableError, KafkaJSInvalidConfigurationError } = require('../../errors')
 const { currentDeadline, checked, waitOf } = require('../deadline')
 const { createResourceProbe } = require('../../../testHelpers/resourceProbe')
+const Cluster = require('../../cluster')
+const { Kafka } = require('../../../index')
+const { createScriptedCluster } = require('../../../testHelpers/scriptedCluster')
 
 const logger = { namespace: () => logger, warn: jest.fn(), debug() {}, info() {}, error() {} }
 
@@ -126,6 +129,41 @@ describe('admin lifecycle', () => {
     expect(cluster.disconnect).toHaveBeenCalledExactlyOnceWith()
   })
 
+  test('a natural close requested while a call reads its input waits for that call', async () => {
+    const answer = held()
+    const broker = { deleteRecords: jest.fn(async () => {}) }
+    const { admin, cluster } = fixture({
+      addTargetTopic: jest.fn(() => answer.promise),
+      refreshMetadataIfNecessary: jest.fn(async () => {}),
+      findTopicPartitionMetadata: jest.fn(() => [{ partitionId: 0 }]),
+      fetchTopicsOffset: jest.fn(async () => [
+        { topic: 'records', partitions: [{ partition: 0, offset: '0' }] },
+      ]),
+      findLeaderForPartitions: jest.fn((topic, partitions) => ({ 0: partitions })),
+      findBroker: jest.fn(async () => broker),
+    })
+    let close
+    const call = observe(
+      admin.deleteTopicRecords({
+        topic: 'records',
+        get partitions() {
+          close = observe(admin.disconnect())
+          return [{ partition: 0, offset: '5' }]
+        },
+      })
+    )
+    await until(() => cluster.addTargetTopic.mock.calls.length === 1)
+    await flush()
+    expect(close.state).toBe('pending')
+    expect(cluster.disconnect).not.toHaveBeenCalled()
+    answer.resolve()
+    await until(() => close.state !== 'pending')
+    expect(call.state).toBe('fulfilled')
+    expect(broker.deleteRecords).toHaveBeenCalledTimes(1)
+    expect(close.state).toBe('fulfilled')
+    expect(cluster.disconnect).toHaveBeenCalledExactlyOnceWith()
+  })
+
   test('the first concurrent close owns the deadline and cleanup Promise', async () => {
     const answer = held()
     const { admin, cluster } = fixture({ metadata: jest.fn(() => answer.promise) })
@@ -145,6 +183,21 @@ describe('admin lifecycle', () => {
     expect(cluster.disconnect).toHaveBeenCalledExactlyOnceWith({ drainTimeout: 0 })
     await admin.disconnect({ timeout: 0 })
     expect(cluster.disconnect).toHaveBeenCalledTimes(1)
+    answer.resolve({ topicMetadata: [] })
+    await flush()
+  })
+
+  test('forced close text says a mutation, if any, may have been applied', async () => {
+    const answer = held()
+    const { admin } = fixture({ metadata: jest.fn(() => answer.promise) })
+    const call = observe(admin.listTopics())
+    await flush()
+    await admin.disconnect({ timeout: 0 })
+    await flush()
+    expect(call.error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(call.error.message).toBe(
+      'The admin was closed; outcome is unknown; a mutation, if any, may have been applied'
+    )
     answer.resolve({ topicMetadata: [] })
     await flush()
   })
@@ -578,5 +631,185 @@ describe('admin real resource closure', () => {
     expect(after.activeResources.TCPSocketWrap || 0).toBe(
       baseline.activeResources.TCPSocketWrap || 0
     )
+  })
+})
+
+describe('admin connect() queued behind a close, then a later disconnect()', () => {
+  let admins = []
+  beforeEach(() => jest.useFakeTimers({ now: 0, doNotFake: ['nextTick', 'setImmediate'] }))
+  afterEach(async () => {
+    jest.restoreAllMocks()
+    await Promise.allSettled(admins.map((admin) => admin.disconnect({ timeout: 0 })))
+    admins = []
+    jest.useRealTimers()
+  })
+
+  /** @returns {object} an admin on a scripted wire, its wire and its CONNECT/DISCONNECT events */
+  const scripted = () => {
+    const wire = createScriptedCluster({ nodes: [{ id: 0, host: 'node0', port: 9092 }] })
+    const admin = new Kafka(wire.kafkaOptions()).admin()
+    admins.push(admin)
+    const events = []
+    for (const name of ['CONNECT', 'DISCONNECT'])
+      admin.on(admin.events[name], () => events.push(name))
+    return { wire, admin, events }
+  }
+
+  /** Lets queued work and `ms` of fake time run. */
+  const pump = async (ms = 0) => {
+    for (let i = 0; i <= ms; i += 1) {
+      await jest.advanceTimersByTimeAsync(i === 0 ? 0 : 1)
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+  }
+
+  test.each([
+    ['a natural', 'a natural', undefined, undefined, 0],
+    ['a natural', 'a zero-timeout', undefined, { timeout: 0 }, 0],
+    ['a timed', 'a natural', { timeout: 1000 }, undefined, 0],
+    ['a timed', 'a zero-timeout', { timeout: 1000 }, { timeout: 0 }, 0],
+    ['an expired', 'a natural', { timeout: 50 }, undefined, 60],
+    ['an expired', 'a zero-timeout', { timeout: 50 }, { timeout: 0 }, 60],
+  ])(
+    'after %s close, %s disconnect() arranged before the queued connect() refuses it and leaves no socket or timer',
+    async (_, __, firstOptions, secondOptions, expireAfter) => {
+      const { wire, admin, events } = scripted()
+      await admin.connect()
+
+      const teardown = held()
+      let teardowns = 0
+      const original = Cluster.prototype.disconnect
+      jest.spyOn(Cluster.prototype, 'disconnect').mockImplementation(async function (...args) {
+        if (++teardowns === 1) await teardown.promise
+        return original.apply(this, args)
+      })
+      const first = admin.disconnect(firstOptions)
+      await pump()
+      expect(teardowns).toBe(1)
+      const second = first.then(() => admin.disconnect(secondOptions))
+      const queued = observe(admin.connect())
+      if (expireAfter) await pump(expireAfter)
+      teardown.resolve()
+      await second
+      await pump(100)
+
+      expect(queued).toMatchObject({
+        state: 'rejected',
+        error: { name: 'KafkaJSNonRetriableError', message: expect.stringMatching(/disconnect/) },
+      })
+      expect(events).toEqual(['CONNECT', 'DISCONNECT'])
+      expect(wire.sockets().filter((socket) => !socket.destroyed)).toEqual([])
+      expect(jest.getTimerCount()).toBe(0)
+      await expect(admin.listTopics()).rejects.toBeInstanceOf(KafkaJSNonRetriableError)
+      wire.assertClean()
+    }
+  )
+
+  test('a disconnect() joining the close a connect() is queued behind refuses that connect()', async () => {
+    const { wire, admin, events } = scripted()
+    await admin.connect()
+
+    const first = admin.disconnect()
+    const queued = observe(admin.connect())
+    const joined = admin.disconnect()
+    expect(joined).toBe(first)
+    await joined
+    await pump(100)
+
+    expect(queued).toMatchObject({
+      state: 'rejected',
+      error: { name: 'KafkaJSNonRetriableError', message: expect.stringMatching(/disconnect/) },
+    })
+    expect(events).toEqual(['CONNECT', 'DISCONNECT'])
+    expect(wire.sockets().filter((socket) => !socket.destroyed)).toEqual([])
+    expect(jest.getTimerCount()).toBe(0)
+    wire.assertClean()
+  })
+
+  /**
+   * Holds the first close's transport teardown, queues a connect() behind it and only then
+   * arranges the later disconnect(), so the connect() resumes first.
+   * @returns {Promise<object>} the queued connect()'s observed state, its events and its wire
+   */
+  const reverseOrder = async (firstOptions, secondOptions, expireAfter) => {
+    const { wire, admin, events } = scripted()
+    await admin.connect()
+
+    const teardown = held()
+    let teardowns = 0
+    const original = Cluster.prototype.disconnect
+    jest.spyOn(Cluster.prototype, 'disconnect').mockImplementation(async function (...args) {
+      if (++teardowns === 1) await teardown.promise
+      return original.apply(this, args)
+    })
+    const first = admin.disconnect(firstOptions)
+    const closed = observe(first)
+    await pump()
+    expect(teardowns).toBe(1)
+    const queued = observe(admin.connect())
+    const second = first.then(() => admin.disconnect(secondOptions))
+    try {
+      if (expireAfter) await pump(expireAfter)
+      // A forced close still owns its cleanup until the transport teardown ends.
+      expect(closed.state).toBe('pending')
+      expect(queued.state).toBe('pending')
+    } finally {
+      teardown.resolve()
+    }
+    await second
+    await pump(100)
+
+    expect(teardowns).toBe(2)
+    expect(wire.sockets().filter((socket) => !socket.destroyed)).toEqual([])
+    expect(jest.getTimerCount()).toBe(0)
+    wire.assertClean()
+    return { queued, events }
+  }
+
+  test.each([
+    ['a timed', { timeout: 1000 }, 0],
+    ['an expired', { timeout: 50 }, 60],
+  ])(
+    'after %s close, a queued connect() arranged before a natural later disconnect() reconnects and that close leaves no socket or timer',
+    async (_, firstOptions, expireAfter) => {
+      const { queued, events } = await reverseOrder(firstOptions, undefined, expireAfter)
+
+      expect(queued.state).toBe('fulfilled')
+      expect(events).toEqual(['CONNECT', 'DISCONNECT', 'CONNECT', 'DISCONNECT'])
+    }
+  )
+
+  test.each([
+    ['a natural', undefined, 0],
+    ['a timed', { timeout: 1000 }, 0],
+    ['an expired', { timeout: 50 }, 60],
+  ])(
+    'after %s close, a queued connect() arranged before a zero-timeout later disconnect() is ended by that forced close and leaves no socket or timer',
+    async (_, firstOptions, expireAfter) => {
+      const { queued, events } = await reverseOrder(firstOptions, { timeout: 0 }, expireAfter)
+
+      expect(queued).toMatchObject({
+        state: 'rejected',
+        error: { name: 'KafkaJSNonRetriableError', message: expect.stringMatching(/was closed/) },
+      })
+      expect(events).toEqual(['CONNECT', 'DISCONNECT', 'DISCONNECT'])
+    }
+  )
+
+  test('a queued connect() arranged before the later disconnect() reconnects and that close leaves no socket', async () => {
+    const { wire, admin, events } = scripted()
+    await admin.connect()
+
+    const first = admin.disconnect()
+    const queued = observe(admin.connect())
+    const second = first.then(() => admin.disconnect())
+    await second
+    await pump(100)
+
+    expect(queued.state).toBe('fulfilled')
+    expect(events).toEqual(['CONNECT', 'DISCONNECT', 'CONNECT', 'DISCONNECT'])
+    expect(wire.sockets().filter((socket) => !socket.destroyed)).toEqual([])
+    expect(jest.getTimerCount()).toBe(0)
+    wire.assertClean()
   })
 })

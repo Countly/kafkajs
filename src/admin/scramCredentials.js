@@ -99,7 +99,10 @@ class ScramCredentials {
         throw new KafkaJSInvariantViolation('Invalid SCRAM result identity')
       if (initial.length === 0) return []
     }
-    const items = (users ?? initial.map(({ user }) => user)).map((user) => ({ user }))
+    const items = (users ?? initial.map(({ user }) => user)).map((user) => ({
+      user,
+      credentials: [],
+    }))
     return itemRetry(
       {
         items,
@@ -225,7 +228,7 @@ class ScramCredentials {
           items: [...users.values()],
           keyOf: ({ user }) => user,
           retry: this.retry,
-          retryable: (row) => row.errorCode === 41 || row.errorCode === 7,
+          retryable: () => false,
           callFailure,
           sanitize: () => null,
         },

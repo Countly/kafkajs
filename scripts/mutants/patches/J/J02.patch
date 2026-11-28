@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -4020,7 +4020,7 @@
+           // Valid entry, check whether it is not offline
+           // Note that we don't delete the preference here, and rather hope that eventually that replica comes online again
+           const offlineReplicas = metadata.offlineReplicas
+-          if (Array.isArray(offlineReplicas) && offlineReplicas.includes(preferredReadReplica)) {
++          if (Array.isArray(offlineReplicas) && offlineReplicas.includes(nodeId)) {
+             this.logger.debug('Preferred read replica is offline, using leader', {
+               topic,
+               partitionId,

@@ -1,10 +1,20 @@
 const ConsumerGroup = require('../consumerGroup')
+const IdleWait = require('../idleWait')
+const Generation = require('../../producer/generation')
 const Runner = require('../runner')
 const Cluster = require('../../cluster')
 const createFetcher = require('../fetcher')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { newLogger } = require('testHelpers')
-const { createFetchGroup, fetchResponse, NODE_ID, TOPIC } = require('./fixtures/fetchHarness')
+const {
+  createFetchGroup,
+  fetchResponse,
+  trackFixtures,
+  NODE_ID,
+  TOPIC,
+} = require('./fixtures/fetchHarness')
+
+trackFixtures()
 
 /** @returns {object} an idle group with no transport or offset work */
 const idleGroup = () => {
@@ -247,10 +257,9 @@ const trackRegistrations = (fence) => {
 
 describe('idle wait on a real fetch round', () => {
   let h
-  afterEach(async () => {
+  afterEach(() => {
     jest.clearAllTimers()
     jest.useRealTimers()
-    if (h) await h.broker.disconnect()
   })
 
   /** @returns {Promise<object>} a group whose every partition is paused, ready for idle rounds */
@@ -663,7 +672,6 @@ describe('idle wait on a real fetch round', () => {
         timers.mockRestore()
         h.group.onStopRequested()
         await h.broker.disconnect()
-        h = null
         expect(name).toEqual(expect.any(String))
       }
     } finally {
@@ -770,10 +778,9 @@ describe('idle wait on a real fetch round', () => {
 
 describe('bounded fetch preparation', () => {
   let h
-  afterEach(async () => {
+  afterEach(() => {
     jest.clearAllTimers()
     jest.useRealTimers()
-    if (h) await h.broker.disconnect()
   })
 
   /** Stops a runaway preparation so a regression fails an assertion instead of hanging. */
@@ -987,11 +994,10 @@ describe('stop during an unresolved preparation', () => {
     unhandled.length = 0
     process.on('unhandledRejection', onUnhandled)
   })
-  afterEach(async () => {
+  afterEach(() => {
     process.off('unhandledRejection', onUnhandled)
     jest.clearAllTimers()
     jest.useRealTimers()
-    if (h) await h.broker.disconnect()
   })
 
   const kinds = {
@@ -1019,7 +1025,7 @@ describe('stop during an unresolved preparation', () => {
         const gates = [gate(), gate()]
         const queue = [...gates]
         h.broker.offsetForLeaderEpoch = jest.fn(() => queue.shift().promise)
-        jest.spyOn(h.offsetManager, 'seek')
+        jest.spyOn(h.offsetManager, 'reposition')
         return {
           late: {
             topics: [
@@ -1030,7 +1036,7 @@ describe('stop during an unresolved preparation', () => {
             ],
           },
           gates,
-          effect: () => h.offsetManager.seek.mock.calls.length,
+          effect: () => h.offsetManager.reposition.mock.calls.length,
           untouched: 0,
         }
       },
@@ -1169,10 +1175,9 @@ describe('stop during an unresolved preparation', () => {
 
 describe('idle registration boundary', () => {
   let h
-  afterEach(async () => {
+  afterEach(() => {
     jest.clearAllTimers()
     jest.useRealTimers()
-    if (h) await h.broker.disconnect()
   })
 
   const pausedRound = async () => {
@@ -1392,11 +1397,6 @@ describe('run fence and preparation snapshot', () => {
 })
 
 describe('a refused guard stops the broker request before it is written', () => {
-  let h
-  afterEach(async () => {
-    if (h) await h.broker.disconnect()
-  })
-
   it.each([
     ['fetch', { topics: [{ topic: TOPIC, partitions: [{ partition: 0, fetchOffset: '0' }] }] }],
     ['listOffsets', { topics: [{ topic: TOPIC, partitions: [{ partition: 0 }] }] }],
@@ -1406,7 +1406,7 @@ describe('a refused guard stops the broker request before it is written', () => 
       { topics: [{ topic: TOPIC, partitions: [{ partition: 0, leaderEpoch: 1 }] }] },
     ],
   ])('%s', async (method, request) => {
-    h = await createFetchGroup()
+    const h = await createFetchGroup()
     const refusal = new Error('refused by the round')
     const written = h.requests().length
     await expect(h.broker[method]({ ...request, guard: () => refusal })).rejects.toBe(refusal)
@@ -1422,11 +1422,10 @@ describe('terminal run cancellation of work started by a run', () => {
     unhandled.length = 0
     process.on('unhandledRejection', onUnhandled)
   })
-  afterEach(async () => {
+  afterEach(() => {
     process.off('unhandledRejection', onUnhandled)
     jest.clearAllTimers()
     jest.useRealTimers()
-    if (h) await h.broker.disconnect()
   })
 
   /** Retires the running run and starts its replacement, as a stop and restart do. */
@@ -1635,9 +1634,9 @@ describe('validation response continuation', () => {
     group.offsetManager.committedOffsets = () => ({ orders: { 0: '0', 1: '0' } })
     group.offsetManager.heldOffsetAt = (topic, partition) =>
       group.offsetManager.committedOffsets()[topic][partition]
-    group.offsetManager.nextOffset = () => ({ toString: () => '0' })
+    group.offsetManager.peekNextOffset = () => ({ toString: () => '0' })
     group.offsetManager.lastConsumedEpoch = () => 1
-    group.offsetManager.seek = async () => true
+    group.offsetManager.reposition = async () => true
     group.markChanged = () => {}
     group.logger.warn = jest.fn()
     jest
@@ -1684,5 +1683,67 @@ describe('validation response continuation', () => {
     expect(disable).not.toHaveBeenCalled()
     expect(markAll).not.toHaveBeenCalled()
     group.onStopRequested()
+  })
+})
+
+describe('IdleWait without a timer', () => {
+  test('an infinite wait arms no timer and ends only with a wake', async () => {
+    jest.useFakeTimers()
+    try {
+      const run = new IdleWait()
+      let ended = false
+      const waiting = run.wait(Infinity).then(() => {
+        ended = true
+      })
+      expect(jest.getTimerCount()).toBe(0)
+      jest.advanceTimersByTime(24 * 60 * 60 * 1000)
+      await Promise.resolve()
+      expect(ended).toBe(false)
+
+      run.wake()
+      await waiting
+
+      expect(ended).toBe(true)
+      expect(run.waiters.size).toBe(0)
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  test("a closed caller fence ends the wait and removes the waiter and the fence's registration", async () => {
+    const run = new IdleWait()
+    const fence = new Generation()
+    const register = jest.spyOn(fence, 'register')
+    const waiting = run.wait(Infinity, () => true, fence)
+    expect(run.waiters.size).toBe(1)
+    const unregister = register.mock.results[0].value
+
+    fence.close(new Error('the caller ended'))
+    await waiting
+
+    expect(run.waiters.size).toBe(0)
+    expect(unregister()).toBe(false)
+  })
+
+  test('a wait ended by a wake unregisters from the caller fence', async () => {
+    const run = new IdleWait()
+    const fence = new Generation()
+    const register = jest.spyOn(fence, 'register')
+    const waiting = run.wait(Infinity, () => true, fence)
+
+    run.wake()
+    await waiting
+
+    expect(register.mock.results[0].value()).toBe(false)
+  })
+
+  test('a disposed run, or a closed caller fence, does not wait at all', async () => {
+    const run = new IdleWait()
+    const fence = new Generation()
+    fence.close(new Error('closed'))
+    await run.wait(Infinity, () => true, fence)
+    run.dispose()
+    await run.wait(Infinity)
+    expect(run.waiters.size).toBe(0)
   })
 })

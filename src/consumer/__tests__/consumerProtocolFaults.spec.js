@@ -1349,6 +1349,7 @@ describe('Consumer > seam fault episodes', () => {
 })
 
 const { KafkaJSCommitFailedError } = require('../../errors')
+const createRetry = require('../../retry')
 
 /**
  * @param {object} options
@@ -1404,11 +1405,11 @@ describe('Consumer > stale member epoch commits through the real sender', () => 
       throw staleEpoch()
     })
     const { manager } = staleEpochHarness({ epoch: 7, offsetCommit })
-    manager.lastCommit = 0
+    manager.lastCommit = -1
     await expect(manager.commitOffsets({}, { auto: true })).resolves.toBeUndefined()
     await new Promise((resolve) => setTimeout(resolve, 150))
     expect(offsetCommit).toHaveBeenCalledTimes(1)
-    expect(manager.lastCommit).toBeGreaterThan(0)
+    expect(manager.lastCommit).toBeGreaterThanOrEqual(0)
   })
 
   test('rejects a stale-epoch explicit commit', async () => {
@@ -1419,6 +1420,30 @@ describe('Consumer > stale member epoch commits through the real sender', () => 
     const caught = await manager.commitOffsets().catch((error) => error)
     expect(caught).toMatchObject({ type: 'STALE_MEMBER_EPOCH', retriable: false })
     expect(offsetCommit).toHaveBeenCalledTimes(1)
+  })
+
+  test('commits under an epoch a heartbeat advanced with the same assignment', async () => {
+    const offsetCommit = jest.fn(async ({ groupGenerationId }) => {
+      if (groupGenerationId !== 8) throw staleEpoch()
+    })
+    const { group, manager } = staleEpochHarness({ epoch: 7, offsetCommit })
+    group.groupMembership.onSuccess({ memberEpoch: 8, heartbeatIntervalMs: 0, assignment: null })
+    expect(group.groupMembership.memberEpoch).toBe(8)
+
+    manager.lastCommit = 0
+    await manager.commitOffsets({}, { auto: true })
+    manager.resolveOffset({ topic: 'topic', partition: 0, offset: '6' })
+    await manager.commitOffsets({}, { auto: true })
+    manager.resolveOffset({ topic: 'topic', partition: 0, offset: '7' })
+    await expect(manager.commitOffsets()).resolves.toBeUndefined()
+
+    expect(offsetCommit.mock.calls.map(([payload]) => payload.groupGenerationId)).toEqual([8, 8, 8])
+    expect(offsetCommit.mock.calls[2][0].topics).toEqual([
+      expect.objectContaining({
+        topic: 'topic',
+        partitions: [expect.objectContaining({ partition: '0', offset: '8' })],
+      }),
+    ])
   })
 
   test('waits for a newer epoch before pre-release commit', async () => {
@@ -1437,4 +1462,158 @@ describe('Consumer > stale member epoch commits through the real sender', () => 
     await expect(manager.commitOffsets()).rejects.toBeInstanceOf(KafkaJSCommitFailedError)
     expect(offsetCommit).toHaveBeenCalledTimes(2)
   })
+
+  // The leave epoch is installed before the leave heartbeat is answered, and a coordinator can
+  // accept a commit under it, so a retry still backing off would overwrite the final commit.
+  test.each([
+    ['dynamic', null, -1],
+    ['static', 'instance-a', -2],
+  ])(
+    'refuses a detached commit retry after a %s leave without a request, keeping the final commit',
+    async (_kind, groupInstanceId, leaveEpoch) => {
+      jest.useFakeTimers()
+      try {
+        const stored = {}
+        const offsetCommit = jest
+          .fn(async ({ topics }) => {
+            for (const { partitions } of topics) {
+              for (const { partition, offset } of partitions) stored[partition] = offset
+            }
+          })
+          .mockRejectedValueOnce(new KafkaJSProtocolError(createErrorFromCode(3)))
+        const { group } = staleEpochHarness({ epoch: 7, offsetCommit })
+        const membership = group.groupMembership
+        membership.groupInstanceId = groupInstanceId
+        membership.ownedPartitions = [{ topic: 'topic', partitions: [0] }]
+        membership.commitBeforeRelease = (...args) => group.commitBeforeRelease(...args)
+        let answerLeave
+        membership.coordinator.consumerGroupHeartbeat = jest.fn(
+          () =>
+            new Promise((resolve) => {
+              answerLeave = resolve
+            })
+        )
+        const retrier = createRetry({ retries: 1, initialRetryTime: 1000, factor: 0 })
+        const detached = retrier(async (bail) => {
+          try {
+            await group.commitOffsets({
+              topics: [{ topic: 'topic', partitions: [{ partition: '0', offset: '3' }] }],
+            })
+          } catch (error) {
+            if (error instanceof KafkaJSCommitFailedError) return bail(error)
+            throw error
+          }
+        }).catch((error) => error)
+        await jest.advanceTimersByTimeAsync(10)
+        expect(offsetCommit).toHaveBeenCalledTimes(1)
+
+        const leaving = membership.leave()
+        await jest.advanceTimersByTimeAsync(10)
+        expect(membership.coordinator.consumerGroupHeartbeat).toHaveBeenCalledWith(
+          expect.objectContaining({ memberEpoch: leaveEpoch })
+        )
+        expect(group.generationId).toBe(leaveEpoch)
+        expect(stored).toEqual({ 0: '6' })
+
+        await jest.advanceTimersByTimeAsync(1000)
+        const caught = await detached
+        answerLeave({})
+        await leaving
+
+        expect(caught).toBeInstanceOf(KafkaJSCommitFailedError)
+        expect(caught.reason).toBe('stale-assignment')
+        const epochs = offsetCommit.mock.calls.map(([payload]) => payload.groupGenerationId)
+        expect(epochs).toEqual([7, 7])
+        expect(stored).toEqual({ 0: '6' })
+      } finally {
+        jest.useRealTimers()
+      }
+    }
+  )
+})
+
+const { createGroupApiBroker } = require('../../broker/__tests__/fixtures/groupApiHarness')
+const apiKeys = require('../../protocol/requests/apiKeys')
+const heartbeatWire = require('../../../testHelpers/wire/consumerGroupHeartbeatV1')
+const { KafkaJSPartialMessageError } = require('../../errors')
+
+describe('Consumer > malformed heartbeat answers through the real decoder', () => {
+  let harness
+
+  afterEach(async () => {
+    if (harness) await harness.pool.destroy()
+    harness = null
+  })
+
+  /**
+   * @param {Buffer[]} answers encoded ConsumerGroupHeartbeat answers, one per request, in order
+   * @param {string} [state] the member state `build` starts in
+   * @returns {object} `build`'s membership, sending through a real Broker and Connection
+   */
+  const member = (answers, state = 'RECONCILING') => {
+    harness = createGroupApiBroker({
+      versions: { [apiKeys.ConsumerGroupHeartbeat]: { minVersion: 0, maxVersion: 1 } },
+      respond: () => answers.shift(),
+    })
+    const h = build(state, new Error('not sent'))
+    h.p.coordinator = harness.broker
+    h.cluster.findGroupCoordinator.mockResolvedValue(harness.broker)
+    return h
+  }
+
+  /** @param {object} assignment @returns {Buffer} a code-0 answer at epoch 7 */
+  const answerWith = (assignment) => heartbeatWire.buildResponse({ memberEpoch: 7, assignment })
+
+  test('an assignment with a partition twice is refused: the target is unchanged, the heartbeat backs off, and the next valid answer is adopted', async () => {
+    const h = member([
+      answerWith({ topicPartitions: [{ topicId: ID, partitions: [0, 0] }] }),
+      answerWith({ topicPartitions: [{ topicId: ID, partitions: [0, 1] }] }),
+    ])
+
+    await expect(h.p.sendHeartbeat({})).rejects.toBeInstanceOf(KafkaJSPartialMessageError)
+    expect(h.p.target.byTopicId.get(ID)).toEqual([0])
+    expect(h.p.memberEpoch).toBe(7)
+    expect(h.p.state).toBe('RECONCILING')
+    expect(h.p.coordinator).toBeNull()
+    expect(h.p.backoff.pending(Date.now())).toBe(true)
+
+    await h.p.sendHeartbeat({})
+    expect(harness.requests).toHaveLength(2)
+    expect(h.p.target.byTopicId.get(ID)).toEqual([0, 1])
+  })
+
+  test('a null Partitions array is refused as a malformed answer, not a TypeError, and leaves the target', async () => {
+    const h = member([answerWith({ topicPartitions: [{ topicId: ID, partitions: null }] })])
+
+    await expect(h.p.sendHeartbeat({})).rejects.toBeInstanceOf(KafkaJSPartialMessageError)
+    expect(h.p.target.byTopicId.get(ID)).toEqual([0])
+    expect(h.p.backoff.pending(Date.now())).toBe(true)
+  })
+
+  test.each([
+    ['dynamic', null, -1],
+    ['static', 'instance-a', -2],
+  ])(
+    'a %s leave answered code 0 with its own negative epoch and interval 0 ends as before, with no warning',
+    async (_kind, groupInstanceId, leaveEpoch) => {
+      const h = member(
+        [
+          heartbeatWire.buildResponse({
+            memberEpoch: leaveEpoch,
+            heartbeatIntervalMs: 0,
+            assignment: null,
+          }),
+        ],
+        'PREPARE_LEAVING'
+      )
+      h.p.groupInstanceId = groupInstanceId
+
+      await h.p.sendLeaveHeartbeat()
+
+      expect(harness.requests).toHaveLength(1)
+      expect(h.p.state).toBe('UNSUBSCRIBED')
+      expect(h.p.memberEpoch).toBe(leaveEpoch)
+      expect(h.log.warn).not.toHaveBeenCalled()
+    }
+  )
 })

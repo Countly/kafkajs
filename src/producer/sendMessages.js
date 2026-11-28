@@ -4,6 +4,7 @@ const createRetry = require('../retry')
 const {
   KafkaJSError,
   KafkaJSNonRetriableError,
+  KafkaJSInvalidConfigurationError,
   KafkaJSMetadataNotLoaded,
   KafkaJSInvariantViolation,
   KafkaJSDeliveryTimeout,
@@ -24,12 +25,13 @@ const { Deadline, ExpiryTimer, MAX_DELAY } = require('./deadline')
 const { Types: Compression } = require('../protocol/message/compression')
 const Accumulator = require('./state/accumulator')
 const { RequestBudget, recordsBytes } = require('./state/recordSize')
+const { seeAnswers, answerOccurrence, unresolvedIndices } = require('./state/recordErrors')
 
 const { keys } = Object
 
-// The last Produce version that keys topics by name, and the highest a transactional send uses:
-// from v12 a produce inside a transaction implicitly adds the partition to the transaction.
-// @see clients/src/main/resources/common/message/ProduceRequest.json (Apache Kafka 4.3.1)
+// v11 is the retained ceiling for a request that carries no topic ids (safe for transaction
+// version 1); v12 is still name-keyed, v13+ uses TopicId.
+// @see clients/src/main/resources/common/message/ProduceRequest.json (Apache Kafka 4.4.0)
 const PRODUCE_TOPIC_NAMES_MAX_VERSION = 11
 
 const NO_PARTITION_METADATA = 'Producing to a partition without metadata'
@@ -50,41 +52,6 @@ const connectionStatusError = (status) => {
       return new KafkaJSError('The producer is disconnected')
     default:
       return null
-  }
-}
-
-/**
- * Resolves each `batchIndex` the broker reported (KIP-467, Produce v8+) to the record it refers
- * to: `BatchIndex` indexes the records of that partition's batch.
- * @param {Error} e the partition's produce error
- * @param {object[]} messages the records that partition's batch carried
- * @returns {void}
- */
-const resolveFailingRecords = (e, messages) => {
-  if (!Array.isArray(e.recordErrors) || e.recordErrors.length === 0) {
-    return
-  }
-
-  e.recordErrors = e.recordErrors.map((recordError) => {
-    const record = messages[recordError.batchIndex]
-    return record === undefined ? recordError : { ...recordError, record }
-  })
-}
-
-/**
- * Resolves the failing records of an error thrown by a whole produce request, through the topic
- * data that request carried.
- * @param {Error} e the error thrown by the produce request
- * @param {{topic: string, partitions: {partition: number, messages: object[]}[]}[]} topicData
- * @returns {void}
- */
-const attachFailingRecords = (e, topicData) => {
-  const matchedTopic = topicData.find(({ topic }) => topic === e.topic)
-  const matchedPartition =
-    matchedTopic && matchedTopic.partitions.find(({ partition }) => partition === e.partition)
-
-  if (matchedPartition) {
-    resolveFailingRecords(e, matchedPartition.messages)
   }
 }
 
@@ -253,18 +220,57 @@ const resolveBatch = (batch, metadata) => {
 }
 
 /**
- * Settles every caller of a batch with the same error, once, as `resolveBatch` does.
- * @param {import('./state/partitionSequencer').PartitionBatch} batch
+ * Rejects one settler with the batch's error and, for its owner, detached failure data.
+ * @param {{ reject: Function }} settler
  * @param {Error} error
+ * @param {Map<object, object>|null} [projected]
  * @returns {void}
  */
-const rejectBatch = (batch, error) => {
+const rejectSettler = (settler, error, projected) => {
+  const failure = projected?.get(settler)
+  if (failure === undefined) settler.reject(error)
+  else settler.reject(error, failure)
+}
+
+/**
+ * Settles every caller of a batch with `error`, once, as `resolveBatch` does. Only a settlement
+ * given the answer occurrence it settles with can give each accumulator send its own error,
+ * carrying the records that send owns (see `Accumulator.projectionsFor`); every other settler, and
+ * every settler of any other settlement, gets `error` itself.
+ * @param {import('./state/partitionSequencer').PartitionBatch} batch
+ * @param {Error} error
+ * @param {{ error: Error, token: object }|null} [occurrence=null]
+ * @returns {void}
+ */
+const rejectBatch = (batch, error, occurrence = null) => {
   if (deliveryOf(batch).settled) {
     return
   }
+  const projected =
+    occurrence === null ? null : Accumulator.projectionsFor(batch, error, occurrence)
   for (const settler of batch.settlers) {
-    settler.reject(error)
+    rejectSettler(settler, error, projected)
   }
+}
+
+/**
+ * The occurrence of a partition's answer error matched to the batch it answers; each reported
+ * index that names no record of that batch is logged once at warn level.
+ * @param {Error} error
+ * @param {{ topic: string, partition: number, messages: object[] }} batch an unsettled batch
+ * @param {import("../../types").Logger} logger
+ * @returns {{ error: Error, token: object }}
+ */
+const occurrenceOf = (error, batch, logger) => {
+  const { topic, partition } = batch
+  for (const batchIndex of unresolvedIndices(error, batch.messages.length)) {
+    logger.warn(`A record error of ${topic} partition ${partition} names no record of its batch`, {
+      topic,
+      partition,
+      batchIndex,
+    })
+  }
+  return answerOccurrence(error, batch)
 }
 
 /** An internal, uncounted refusal of one request that has never been written. */
@@ -437,14 +443,20 @@ class Send {
   }
 }
 
+/** A delivery's failure record before anything failed. */
+const NO_FAILURE = Object.freeze({ error: undefined, occurrence: null })
+
 /**
  * The drain loop's own settler of one batch, and what the loop knows about it: whether it is
- * settled or on the wire, its deadline, its last error and its last backoff. A batch is resolved
+ * settled or on the wire, its deadline, its last failure and its last backoff. A batch is resolved
  * only by its request's answer and then retires (see the accumulator's `retire`); one rejected while
  * no request carries it retires at once, and one rejected on the wire when its request's answer or
  * failure arrives.
  */
 class Delivery {
+  /** @type {Readonly<{ error: Error|undefined, occurrence: object|null }>} */
+  #failure = NO_FAILURE
+
   /**
    * @param {Send} send
    * @param {number} deadline when the batch's delivery timeout runs out; Infinity without one
@@ -464,11 +476,30 @@ class Delivery {
     this.everWritten = false
     this.expired = false
     this.currentAttempt = null
-    /** @type {Error|undefined} */
-    this.lastError = undefined
     /** @type {number|undefined} the last backoff, in ms */
     this.retryTime = undefined
     this.routingFailures = 0
+  }
+
+  /** @returns {Error|undefined} the error of the last failure, the cause of a delivery timeout */
+  get lastError() {
+    return this.#failure.error
+  }
+
+  /** @returns {Readonly<{ error: Error|undefined, occurrence: object|null }>} the last failure */
+  get failure() {
+    return this.#failure
+  }
+
+  /**
+   * Replaces the last failure: its error and the answer occurrence it came with, together, so a
+   * later failure never leaves an earlier answer's occurrence behind.
+   * @param {Error|undefined} error
+   * @param {{ error: Error, token: object }|null} [occurrence=null] only for a matched answer
+   * @returns {void}
+   */
+  recordFailure(error, occurrence = null) {
+    this.#failure = Object.freeze({ error, occurrence })
   }
 
   /**
@@ -580,7 +611,7 @@ class DrainLoop {
   #queues = new Map()
   /** @type {Map<string, number>} Produce requests sent to a broker and not yet answered */
   #outstanding = new Map()
-  /** @type {Map<string, Promise<void>>} per broker, settles once the last request was handed on */
+  /** @type {Map<string, Promise<void>>} per broker with a hand-off not yet settled; an entry leaves when its last hand-off settles */
   #handoffs = new Map()
   /** @type {Promise<void>[]} leader hints to apply before the next drain */
   #hints = []
@@ -1140,7 +1171,7 @@ class DrainLoop {
 
     this.#refresh = true
     head.routingFailures += 1
-    head.lastError = error
+    head.recordFailure(error)
     batch.backoffUntil = now + this.#nextRetryTime(head)
     this.#wakeAt = Math.min(this.#wakeAt, batch.backoffUntil)
   }
@@ -1168,7 +1199,11 @@ class DrainLoop {
     const handed = (this.#handoffs.get(nodeId) ?? RESOLVED).then(() =>
       this.#handOff(nodeId, batches, attempt)
     )
-    this.#handoffs.set(nodeId, handed.then(ignore, ignore))
+    const tail = handed.then(ignore, ignore)
+    this.#handoffs.set(nodeId, tail)
+    tail.then(() => {
+      if (this.#handoffs.get(nodeId) === tail) this.#handoffs.delete(nodeId)
+    })
     handed
       .then(({ answer }) => answer)
       .then(
@@ -1245,7 +1280,9 @@ class DrainLoop {
 
   /**
    * Settles each batch of a request from its partition's result. A partition the response does
-   * not carry - or carries under a topic id the request did not ask for - failed retriably.
+   * not carry - or carries under a topic id the request did not ask for - failed retriably. At the
+   * first failing result every partition error of the response is recorded (`seeAnswers`), before
+   * any failing batch settles, so an error object the response reuses is never projected.
    * @param {string} nodeId
    * @param {import('./state/partitionSequencer').PartitionBatch[]} batches
    * @param {import('../protocol/requests/produce/partitionResults').PartitionResult[]} answer
@@ -1268,6 +1305,7 @@ class DrainLoop {
       deliveryOf(batch).dispatched = false
     }
 
+    let seen = false
     batches.forEach((batch, index) => {
       const result = resultFor(results, index, batch)
       if (deliveryOf(batch).settled) {
@@ -1288,9 +1326,10 @@ class DrainLoop {
         manager.complete(batch, result)
         resolveBatch(batch, metadataOf(result))
       } else {
-        resolveFailingRecords(result.error, batch.messages)
+        seen ||= seeAnswers(results)
+        const occurrence = occurrenceOf(result.error, batch, this.#logger)
         this.#sideChannels(result.error)
-        this.#failed(manager, batch, result.error, result)
+        this.#failed(manager, batch, result.error, result, occurrence)
       }
     })
   }
@@ -1367,7 +1406,9 @@ class DrainLoop {
   /**
    * Cuts a batch never written in two at its middle record: the batch keeps the second half and
    * its delivery, and a new batch with a delivery of its own, in the same send, takes the first
-   * and goes ahead of it in its partition's queues. Each half is a part of its own.
+   * and goes ahead of it in its partition's queues. Each half is a part of its own, keeps the
+   * batch's last error and no answer occurrence: an answer to the whole batch names no record of
+   * a half.
    * @param {import('./state')} manager
    * @param {import('./state/partitionSequencer').PartitionBatch} batch
    * @returns {void}
@@ -1380,7 +1421,8 @@ class DrainLoop {
       Math.floor(batch.messages.length / 2)
     )
     const delivery = new Delivery(own.send, own.deadline, this.#detachDeadline)
-    delivery.lastError = own.lastError
+    delivery.recordFailure(own.lastError)
+    own.recordFailure(own.lastError)
     delivery.retryTime = own.retryTime
     delivery.batch = { ...batch, ...first, id: this.#nextId++, child: {} }
     delivery.batch.settlers.push(delivery)
@@ -1459,14 +1501,17 @@ class DrainLoop {
    * A batch the broker did not accept: the manager decides, and the loop acts on its verdict. A
    * re-send waits out its backoff in its queue, where a pass expires it once its deadline passes:
    * the deadline bounds every re-send, and no other failure. A batch a fault already settled (see
-   * `DrainLoop#fault`) is not re-sent: it leaves the sequencer as an abandoned batch does.
+   * `DrainLoop#fault`) is not re-sent: it leaves the sequencer as an abandoned batch does. A re-sent
+   * batch keeps the answer's occurrence with its error, for a deadline that ends it; a batch that
+   * fails for good passes it on only when it rejects with the answer itself.
    * @param {import('./state')} manager
    * @param {import('./state/partitionSequencer').PartitionBatch} batch
    * @param {Error} error
    * @param {import('../protocol/requests/produce/partitionResults').PartitionResult} [result]
+   * @param {{ error: Error, token: object }|null} [occurrence=null] the occurrence of `result`
    * @returns {void}
    */
-  #failed(manager, batch, error, result) {
+  #failed(manager, batch, error, result, occurrence = null) {
     const delivery = deliveryOf(batch)
     const verdict = manager.fail(batch, error, result)
 
@@ -1481,14 +1526,16 @@ class DrainLoop {
           this.#abandon(manager, delivery, error)
           return
         }
-        delivery.lastError = error
+        delivery.recordFailure(error, occurrence)
         manager.sequencer.requeue(batch, Date.now() + this.#nextRetryTime(delivery))
         return
-      default:
-        rejectBatch(
-          batch,
-          this.#inTransaction(manager, this.#exhausted(batch, error, delivery) ?? error)
+      default: {
+        const delivered = this.#inTransaction(
+          manager,
+          this.#exhausted(batch, error, delivery) ?? error
         )
+        rejectBatch(batch, delivered, delivered === error ? occurrence : null)
+      }
     }
   }
 
@@ -1518,6 +1565,8 @@ class DrainLoop {
    * other callers are dropped so that arming a transaction cannot reject them a second time; the
    * delivery stays, and ignores that second call (see `Delivery#reject`). An attempt of the batch
    * that has not written is revoked; one on the wire keeps its request until its terminal callback.
+   * A timeout around the delivery's last failure is given that failure's answer occurrence; a
+   * forced close is not.
    * @param {Delivery} delivery
    * @param {KafkaJSProducerClosedError} [closedError] this child's forced outcome
    * @param {Error} [surfaced] what the callers reject with instead of `closedError`
@@ -1526,10 +1575,11 @@ class DrainLoop {
   #expire(delivery, closedError, surfaced) {
     if (delivery.settled) return
     delivery.currentAttempt?.revoke()
-    const error = closedError || this.#timedOut(delivery.batch, delivery.lastError)
+    const { failure } = delivery
+    const error = closedError || this.#timedOut(delivery.batch, failure.error)
     this.#expired.push({ batch: delivery.batch, error, transmitted: delivery.everWritten })
     delivery.expired = true
-    rejectBatch(delivery.batch, surfaced ?? error)
+    rejectBatch(delivery.batch, surfaced ?? error, closedError ? null : failure.occurrence)
     delivery.batch.settlers = [delivery]
   }
 
@@ -1885,12 +1935,23 @@ const createSendMessages = ({
 
   /**
    * Assigns each record to a partition once, after making sure the topics' metadata is loaded:
-   * the partitioner never runs again for these records. Retried while the metadata cannot be
-   * loaded, within the send's delivery budget. The records are read from `send` after each await:
-   * a send that settled meanwhile has none, and the wait ends without enqueuing anything. A
-   * failure that arrives after the send settled is ignored: it refreshes no metadata, is not
-   * retried and arms no transaction. Otherwise a transactional producer's failure arms the
-   * transaction as `inTransaction` says.
+   * the partitioner never runs again for these records. Metadata that names every target and is
+   * only past `metadataMaxAge` is used as it is while it refreshes in the background. Retried
+   * while the metadata cannot be loaded, within the send's delivery budget. The records are read
+   * from `send` after each await: a send that settled meanwhile has none, and the wait ends without
+   * enqueuing anything. A failure that arrives after the send settled is ignored: it refreshes no
+   * metadata, is not retried and arms no transaction. Otherwise a transactional producer's failure
+   * arms the transaction as `inTransaction` says, except a failure of the partitioner call itself:
+   * it threw, whatever it threw, or returned something that is not a partition id (that is a
+   * `KafkaJSInvalidConfigurationError`). Such a send rejects with that error, or with the retry
+   * budget's or delivery deadline's error around a retriable one, refreshes no metadata and leaves
+   * the transaction usable: none of its records was queued. The grouping marks the send `refused`
+   * at that call, and each attempt clears the mark when it starts, so it covers only the backoff
+   * after a partitioner failure: the accumulator reads it when the delivery deadline ends the
+   * send, and a metadata failure or wait in a later attempt arms as before. A falsy value the
+   * partitioner throws reaches the caller as `Error('Aborted')`; it arms nothing either. Only a
+   * partitioner's `null` or `undefined` is bailed with here: the same value rejected by anything
+   * else is read as it always was.
    * @param {{ records: ?object[], deadline?: import('./deadline').Deadline }|object[]} source a
    *   send waiting to be partitioned (see the accumulator's `PendingSend`), or a plain list of
    *   `{ topic, messages }` for a caller with no deadline
@@ -1903,6 +1964,7 @@ const createSendMessages = ({
   const partition = (source, fence = getGeneration()) => {
     const send = Array.isArray(source) ? { records: source } : source
     const attempt = async (bail) => {
+      send.refused = false
       try {
         fence?.check()
         await cluster.addMultipleTargetTopics(
@@ -1911,7 +1973,7 @@ const createSendMessages = ({
         )
         fence?.check()
         recordsOf(send)
-        await cluster.refreshMetadataIfNecessary(...fenceArgs(fence))
+        await cluster.refreshMetadataIfNecessary({ fence, background: true })
         fence?.check()
 
         const entries = []
@@ -1926,6 +1988,7 @@ const createSendMessages = ({
             partitionMetadata,
             messages,
             partitioner,
+            send,
           })
           for (const id of keys(grouped)) {
             entries.push({ topic, partition: Number(id), messages: grouped[id] })
@@ -1935,7 +1998,7 @@ const createSendMessages = ({
       } catch (e) {
         if (send.settled) return bail(e)
         fence?.check()
-        if (refreshesMetadata(e)) {
+        if (!send.refused && refreshesMetadata(e)) {
           await Promise.resolve(cluster.refreshMetadata(...fenceArgs(fence))).catch(
             (refreshError) => {
               logger.debug(`Best-effort metadata refresh failed: ${refreshError.message}`)
@@ -1944,6 +2007,7 @@ const createSendMessages = ({
         }
         if (send.settled) return bail(e)
         fence?.check()
+        if (send.refused && e == null) return bail(e)
         if (e.retriable) throw e
         bail(e)
       }
@@ -1959,7 +2023,12 @@ const createSendMessages = ({
       send,
       fence
     )(pinned).catch((error) => {
-      throw send.settled || fence?.closed ? error : inTransaction(error)
+      throw send.settled ||
+        fence?.closed ||
+        send.refused ||
+        error instanceof KafkaJSInvalidConfigurationError
+        ? error
+        : inTransaction(error)
     })
   }
 
@@ -2101,9 +2170,13 @@ const createSendMessages = ({
      * @param {object} batch
      * @param {object|undefined} value acknowledgement metadata
      * @param {Error} [error] a terminal failure
+     * @param {Map<object, object>|null} [projected] each accumulator send's detached failure data
+     *   (see `Accumulator.projectionsFor`), made from the answer `error` is before the batch
+     *   detaches here; the send's own error is built from it when its append promise settles.
+     *   Given only by the result loop's terminal answer
      * @returns {void}
      */
-    const settle = (batch, value, error) => {
+    const settle = (batch, value, error, projected) => {
       if (!unsettled.delete(batch)) return
       const delivery = deliveries.get(batch)
       delivery.settled = true
@@ -2112,7 +2185,7 @@ const createSendMessages = ({
       if (error !== undefined) failure = failure || error
       else if (value !== undefined) metadata.push(value)
       batch.settlers?.forEach((settler) =>
-        error === undefined ? settler.resolve(value) : settler.reject(error)
+        error === undefined ? settler.resolve(value) : rejectSettler(settler, error, projected)
       )
       finish()
     }
@@ -2366,7 +2439,6 @@ const createSendMessages = ({
         results = await broker.produce(requestOf(sent, attempt))
       } catch (error) {
         const refused = error instanceof ProduceAttemptRefused
-        if (!refused) attachFailingRecords(error, topicDataOf(sent))
         ended()
         if (generation?.closed) return null
         if (error instanceof ProduceAttemptTooLarge) repartition(sent, error)
@@ -2387,6 +2459,7 @@ const createSendMessages = ({
         return null
       }
       let retriable = null
+      let seen = false
       for (let index = 0; index < sent.length; index += 1) {
         const batch = sent[index]
         const result = resultFor(results, index, batch)
@@ -2401,9 +2474,14 @@ const createSendMessages = ({
         if (error === null) settle(batch, metadataOf(result))
         else {
           deliveries.get(batch).lastError = error
-          resolveFailingRecords(error, batch.messages)
           if (error.retriable) retriable = retriable || error
-          else settle(batch, undefined, error)
+          if (result !== undefined) {
+            seen ||= seeAnswers(results)
+            const occurrence = occurrenceOf(error, batch, logger)
+            if (!error.retriable) {
+              settle(batch, undefined, error, Accumulator.projectionsFor(batch, error, occurrence))
+            }
+          }
         }
       }
       return retriable
@@ -2445,7 +2523,7 @@ const createSendMessages = ({
             generation?.check()
             if (unsettled.size === 0) return
             try {
-              await cluster.refreshMetadataIfNecessary(...fenceArgs(generation))
+              await cluster.refreshMetadataIfNecessary({ fence: generation, background: true })
               generation?.check()
               if (unsettled.size === 0) return
               const left = []

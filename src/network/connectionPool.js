@@ -74,7 +74,9 @@ module.exports = class ConnectionPool {
   /**
    * Called when a Connection reports SASL_AUTHENTICATION_FAILED (code 58). Blacks this
    * broker out for `max(authenticationTimeout, 1000ms)`, so getConnection() refuses to
-   * (re)authenticate immediately and turn a bad credential into a reconnect storm.
+   * (re)authenticate immediately and turn a bad credential into a reconnect storm. Entries of
+   * other addresses whose pause has ended are dropped first, so the shared map holds only live
+   * pauses.
    * @public
    * @param {string} errorMessage A sanitized description of the failure (mechanism, broker,
    *                              stage), surfaced again if a later attempt is refused during
@@ -82,8 +84,12 @@ module.exports = class ConnectionPool {
    */
   recordAuthenticationFailure(errorMessage) {
     const blackoutMs = Math.max(this.authenticationTimeout || 0, MIN_AUTHENTICATION_BLACKOUT_MS)
+    const now = Date.now()
+    for (const [address, entry] of this.authenticationBlackout) {
+      if (entry.until <= now) this.authenticationBlackout.delete(address)
+    }
     this.authenticationBlackout.set(this.brokerAddress, {
-      until: Date.now() + blackoutMs,
+      until: now + blackoutMs,
       errorMessage,
     })
   }
@@ -313,13 +319,16 @@ module.exports = class ConnectionPool {
 
   /**
    * Closes every connection, each after its requests finished or `drainTimeout` passed. The pool
-   * stays reusable unless it was retired.
+   * stays reusable unless it was retired. Settles once every connection has; a failure rejects
+   * only then, with the first one.
    * @public
    * @param {object} [options]
    * @param {number} [options.drainTimeout] ms to wait for requests; the pool's own when omitted
    * @returns {Promise<void>}
    */
   async destroy({ drainTimeout = this.drainTimeout } = {}) {
-    await Promise.all(this.map((c) => c.disconnect({ drainTimeout })))
+    const results = await Promise.allSettled(this.map((c) => c.disconnect({ drainTimeout })))
+    const failure = results.find(({ status }) => status === 'rejected')
+    if (failure) throw failure.reason
   }
 }

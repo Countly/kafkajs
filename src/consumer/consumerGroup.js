@@ -17,6 +17,41 @@ const Subscription = require('./subscription')
 const IdleWait = require('./idleWait')
 const LeaderUnionWatch = require('./leaderUnionWatch')
 const { FetchPreparation, InvocationPreparation, fencedDelay } = require('./fetchPreparation')
+
+/** Stands for an acquisition that ended before a batch prepared under it was stamped. */
+const RETIRED_ACQUISITION = Object.freeze({
+  acquiredAt: 0,
+  changedAt: 0,
+  recreatedAt: 0,
+  soughtAt: 0,
+  retired: true,
+})
+
+/**
+ * @param {import('./handlerContext').Acquisition} acquired
+ * @param {number} clock
+ * @returns {boolean} whether the partition was acquired again, sought, reset or recreated after
+ *   `clock`
+ */
+const isChangedSince = (acquired, clock) => acquired.changedAt > clock || acquired.soughtAt > clock
+
+/**
+ * Indexes items by one field, keeping the first item for a repeated key, so a lookup answers
+ * exactly what `Array#find` on the same field would.
+ * @template T
+ * @param {T[]} items
+ * @param {string} field
+ * @returns {Map<*, T>}
+ */
+const indexFirstBy = (items, field) => {
+  const index = new Map()
+  for (const item of items) if (!index.has(item[field])) index.set(item[field], item)
+  return index
+}
+
+/** Metadata arrays up to this length are searched; longer ones are indexed. */
+const SHORT_METADATA = 8
+
 const { FetchSessions } = require('./fetchSession')
 const PositionValidator = require('./positionValidator')
 const Outage = require('./outage')
@@ -51,11 +86,13 @@ const ConsumerGroupProtocol = require('./groupProtocol/consumer')
 const ManualGroupProtocol = require('./groupProtocol/manual')
 const {
   sentGeneration,
+  isHeartbeatFatal,
   isStaleMembershipVerdict,
   stampOwnership,
   obsoleteOwnership,
   consumerStoppingError,
   joinDeadlineError,
+  isFatalTopicError,
   REBALANCE_PATHS,
 } = require('./rebalanceErrorContract')
 const { EAGER } = require('./groupProtocol/interface')
@@ -91,10 +128,13 @@ const STALE_METADATA_ERRORS = [
   'FETCH_SESSION_TOPIC_ID_ERROR',
 ]
 
-// The last Fetch version that keys topics by name. A request whose topics are not all known by id
-// is capped here rather than being split across two versions.
+// The last Fetch version that keys topics by name: the ceiling of a removal-only request for a
+// session that was built by name.
 // @see clients/src/main/resources/common/message/FetchRequest.json (Apache Kafka 4.3.1)
 const FETCH_TOPIC_NAMES_MAX_VERSION = 12
+
+// Recorded for a partition left out of a fetch round because its topic id is not known yet.
+const UNKNOWN_TOPIC_ID_CODE = 100
 
 /** The first Fetch version that carries a session ID and epoch (KIP-227). */
 const FETCH_SESSION_MIN_VERSION = 7
@@ -291,8 +331,13 @@ module.exports = class ConsumerGroup {
       : null
     /** @type {WeakMap<object, Error>} the first ordinary callback failure of each round */
     this.listenerFailures = new WeakMap()
+    /** @type {Map<string, import('./handlerContext').Acquisition>} one per owned partition */
     this.acquired = new Map()
     this.acquireClock = 0
+    /** The latest `soughtAt` stamped, so a check finds "nothing sought since" in constant time. */
+    this.lastSoughtAt = 0
+    /** The latest `acquiredAt` stamped, for the same constant-time check of reacquisitions. */
+    this.lastAcquiredAt = 0
     /**
      * The partitions a structurally corrupt Fetch batch halted, keyed by `topic|partition`: the
      * first offset of that batch, its reason and the error. A halted partition is left out of every
@@ -303,6 +348,7 @@ module.exports = class ConsumerGroup {
     this.haltedPartitions = new Map()
     this.obligations = obligations
     this.obligations.attachTo(this.operations)
+    this.obligations.claimSubscription(this.topicsSubscribed)
 
     this.rebalanceTimeout = rebalanceTimeout
     this.subscribedTopicRegex = subscribedTopicRegex
@@ -436,8 +482,9 @@ module.exports = class ConsumerGroup {
     this.preparationEpoch = 0
     /**
      * The pending metadata refresh for partitions without a leader, shared by every node's fetcher
-     * of the current run, and when the last one started (`performance.now()`).
-     * @type {{ promise: Promise<void> }|null}
+     * of the current run, and when the last one started (`performance.now()`). `error` is its
+     * failure, once it failed.
+     * @type {{ promise: Promise<void>, error?: Error }|null}
      */
     this.leaderlessRefresh = null
     this.leaderlessRefreshAt = -Infinity
@@ -471,14 +518,17 @@ module.exports = class ConsumerGroup {
    *
    * The membership is also given the pre-release commit, because a leave at epoch > 0 has to
    * commit before it gives its partitions up and the membership cannot reach an offset manager.
-   * @param {{ rebalanceCoordinator: Object, heartbeatManager: Object }} deps
+   * @param {{ rebalanceCoordinator: Object, heartbeatManager: Object,
+   *   onHeartbeatFatal?: (error: Error) => void }} deps `onHeartbeatFatal` is forwarded to a
+   *   membership that hands its fatal heartbeat answers to the run
    * @returns {void}
    */
-  attach({ rebalanceCoordinator, heartbeatManager }) {
+  attach({ rebalanceCoordinator, heartbeatManager, onHeartbeatFatal }) {
     this.rebalanceCoordinator = rebalanceCoordinator
     this.groupMembership.attach({
       rebalanceCoordinator,
       heartbeatManager,
+      onHeartbeatFatal,
       commitBeforeRelease: (...args) => this.commitBeforeRelease(...args),
     })
   }
@@ -636,9 +686,20 @@ module.exports = class ConsumerGroup {
   }
 
   /**
+   * Whether a heartbeat call would do nothing now: none in flight to join and none due. Only the
+   * classic membership answers; any other is never idle, so its callers always make the call.
+   * @param {number} interval the interval the call would pass
+   * @returns {boolean}
+   */
+  heartbeatIdle(interval) {
+    return this.groupMembership.heartbeatIdle?.(interval) ?? false
+  }
+
+  /**
    * Whether the membership holds a target assignment that still differs from what this member
-   * owns. Always false under classic. Unresolved topic ids deliberately do NOT make it true - an
-   * id that can never resolve would otherwise spin the rebalance chain into its convergence guard.
+   * owns, counting only what a round's apply would keep. Always false under classic. Unresolved
+   * topic ids and assigned topics outside a client-pattern subscription deliberately do NOT make it
+   * true - either would otherwise keep the rebalance chain running for ever.
    * @returns {boolean}
    */
   needsReconciliation() {
@@ -671,6 +732,7 @@ module.exports = class ConsumerGroup {
       if (!run.fence.closed) this.routingChanged()
     })
     if (unsubscribe) run.fence.register(unsubscribe)
+    run.fence.register(this.operations.onRelease(() => run.wake()))
     return run
   }
 
@@ -714,8 +776,9 @@ module.exports = class ConsumerGroup {
    * Tells the membership the consumer is shutting down, so a join waiting on the coordinator is
    * rejected rather than waiting for a heartbeat chain that is about to be cancelled, and the
    * heartbeat stops waiting on the coordinator lookup. Commits already waiting on it finish under
-   * their own fence; only a forced close ends the lookup for them. Cancels queued sentinel seeks and pending sentinel
-   * resolutions for either group protocol.
+   * their own fence; only a forced close ends the lookup for them. Cancels pending sentinel
+   * resolutions for either group protocol. Queued seeks stay queued, so the final commit still
+   * leaves their partitions out; they end with the run.
    * @returns {void}
    */
   onStopRequested() {
@@ -726,11 +789,6 @@ module.exports = class ConsumerGroup {
     this.retireLeaderlessRefresh()
     this.idleWait.dispose()
     this.subscriptionState.clearPauses()
-    for (const [key, offset] of this.seekOffset) {
-      if (offset === '-2' || offset === '-1') {
-        this.seekOffset.delete(key)
-      }
-    }
     this.offsetManager?.clearPendingSeeks()
     return this.groupMembership.onStopRequested()
   }
@@ -738,10 +796,12 @@ module.exports = class ConsumerGroup {
   /**
    * The poll-expiry variant of `leave()`: no commit, no callbacks, response ignored. A no-op under
    * classic, whose poll-expiry path uses `leave()` or sends nothing at all.
+   * @param {import('./groupProtocol/interface').ConsumerOperation} [operation] refuses the leave's
+   *   write and its answer
    * @returns {Promise<void>}
    */
-  async leaveForPollExpiry() {
-    return this.groupMembership.leaveForPollExpiry()
+  async leaveForPollExpiry(operation) {
+    return this.groupMembership.leaveForPollExpiry(operation)
   }
 
   /**
@@ -831,6 +891,16 @@ module.exports = class ConsumerGroup {
    */
   retireCoordinatorLookup(error) {
     this.coordinatorLookup.retire(error)
+  }
+
+  /**
+   * Ends the current run for good and reports `error` once as its crash (see `Runner#terminate`).
+   * Does nothing without a run, or when the run already ended with an earlier cause.
+   * @param {Error} error the reason the run ends
+   * @returns {void}
+   */
+  stopRun(error) {
+    this.rebalanceCoordinator?.runner?.terminate(error)
   }
 
   /**
@@ -1004,21 +1074,29 @@ module.exports = class ConsumerGroup {
    *
    * Pause state survives either way: `subscriptionState.update()` replaces the assignment only.
    *
+   * Under the consumer protocol only the LOST round renews an ownership that carries a loss,
+   * whatever learned it (a heartbeat, a commit, a poll expiry): any other apply is refused with that
+   * loss before it changes anything, so the runner's LOST round reports and discards it first.
+   *
    * @param {{ assignment: Object, userData?: Buffer|null }} result the decoded sync result
-   * @param {{ rebuildOffsets?: boolean, round?: object, additionHold?: object }} [options]
-   *   `rebuildOffsets: false` selects the incremental apply; it still builds the first manager,
-   *   because there is nothing to keep. `additionHold` is the round's token for the partitions this
-   *   apply adds: they are held before they are published and the caller releases the token once
-   *   its assigned callback has returned.
+   * @param {{ rebuildOffsets?: boolean, lost?: boolean, round?: object, additionHold?: object }}
+   *   [options] `rebuildOffsets: false` selects the incremental apply; it still builds the first
+   *   manager, because there is nothing to keep. `lost` marks the LOST round's apply.
+   *   `additionHold` is the round's token for the partitions this apply adds: they are held before
+   *   they are published and the caller releases the token once its assigned callback has returned.
    * @returns {Promise<import('./groupProtocol/interface').RebalanceResult>}
+   * @throws {Error} the round's refusal, the fatal error, or the loss the ownership carries
    */
-  async applyRebalanceResult(result, { rebuildOffsets = true, round, additionHold } = {}) {
+  async applyRebalanceResult(
+    result,
+    { rebuildOffsets = true, lost = false, round, additionHold } = {}
+  ) {
     const check = () => {
       const membershipError =
         this.kind === 'consumer' &&
         (this.groupMembership.state === 'FATAL'
           ? this.groupMembership.fatalError
-          : this.groupMembership.state === 'FENCED'
+          : this.groupMembership.state === 'FENCED' || !lost
             ? this.ownership?.refusal(this.ownership.token())?.cause
             : null)
       const error = round?.guard() || membershipError
@@ -1076,8 +1154,9 @@ module.exports = class ConsumerGroup {
     for (const assignment of currentMemberAssignment) {
       const { topic, partitions: assignedPartitions } = assignment
       const knownPartitions = this.partitionsPerSubscribedTopic.get(topic)
+      const known = knownPartitions && new Set(knownPartitions)
       const isAwareOfAllAssignedPartitions = assignedPartitions.every((partition) =>
-        knownPartitions.includes(partition)
+        known.has(partition)
       )
 
       if (!isAwareOfAllAssignedPartitions) {
@@ -1120,10 +1199,8 @@ module.exports = class ConsumerGroup {
     this.topics = currentMemberAssignment.map(({ topic }) => topic)
     this.groupMembership.narrowOwned(currentMemberAssignment)
 
-    const memberAssignment = currentMemberAssignment.reduce(
-      (partitionsByTopic, { topic, partitions }) =>
-        Object.assign(dictionary(), partitionsByTopic, { [topic]: partitions }),
-      dictionary()
+    const memberAssignment = dictionary(
+      currentMemberAssignment.map(({ topic, partitions }) => [topic, partitions])
     )
 
     if (rebuildOffsets || !this.offsetManager) {
@@ -1151,11 +1228,11 @@ module.exports = class ConsumerGroup {
         obligations: this.obligations,
         membershipProtocol: this.kind,
         staleEpochTimeout: this.rebalanceTimeout,
-        // Live reads, not the snapshot above: the offset-fetch retry inside the manager needs the
-        // epoch the heartbeats install while it is sleeping, and it must abandon its deadline the
-        // moment the runner is asked to stop or a rebalance is waiting for this fetch round to end.
-        // The rebalance coordinator is attached after this group is built, so it is read at call
-        // time.
+        // Live reads, not the snapshot above: under the consumer protocol every commit and offset
+        // fetch needs the epoch the heartbeats install, also between applies, and the fetch retry
+        // must abandon its deadline the moment the runner is asked to stop or a rebalance is
+        // waiting for this fetch round to end. The rebalance coordinator is attached after this
+        // group is built, so it is read at call time.
         membership: () => ({
           generationId: this.generationId,
           memberId: this.memberId,
@@ -1168,6 +1245,14 @@ module.exports = class ConsumerGroup {
           return this.coordinatorLookup.find(fence)
         },
         isStopping: () => this.isStopping(),
+        stopRun: (error) => this.stopRun(error),
+        seeks: {
+          clock: () => this.acquireClock,
+          changedSince: (since) =>
+            this.lastSoughtAt > since || this.lastAcquiredAt > since || this.hasSeekGates(),
+          isStaleSince: (topic, partition, since) => this.isStaleSince(topic, partition, since),
+          isGated: (topic, partition) => this.hasSeekGates() && this.isSeekGated(topic, partition),
+        },
         isRebalancePending: () => Boolean(this.rebalanceCoordinator?.verdict),
         markPolled: () => this.rebalanceCoordinator?.pollTimer.poll(),
         captureResetContext: (topic, partition, manager, preparation) =>
@@ -1190,7 +1275,6 @@ module.exports = class ConsumerGroup {
       for (const { topic, partitions } of revoked) {
         for (const partition of partitions) {
           this.consecutiveFetchErrors.delete(`${topic}|${partition}`)
-          this.seekOffset.pop(topic, partition)
         }
       }
 
@@ -1201,21 +1285,35 @@ module.exports = class ConsumerGroup {
     this.validationUnusableLogged.clear()
 
     if (rebuildOffsets) {
+      this.retireAcquisitions()
       this.acquired.clear()
       this.haltedPartitions.clear()
     }
     for (const { topic, partitions } of revoked) {
       for (const partition of partitions) {
-        this.acquired.delete(`${topic}|${partition}`)
-        this.haltedPartitions.delete(`${topic}|${partition}`)
+        const key = `${topic}|${partition}`
+        const acquired = this.acquired.get(key)
+        if (acquired) acquired.retired = true
+        this.acquired.delete(key)
+        this.haltedPartitions.delete(key)
+        this.seekOffset.pop(topic, partition)
       }
     }
     for (const { topic, partitions } of currentMemberAssignment) {
       for (const partition of partitions) {
         const key = `${topic}|${partition}`
         if (!this.acquired.has(key)) {
-          const acquiredAt = ++this.acquireClock
-          this.acquired.set(key, { acquiredAt, changedAt: acquiredAt, recreatedAt: 0 })
+          const acquiredAt = (this.lastAcquiredAt = ++this.acquireClock)
+          this.acquired.set(key, {
+            acquiredAt,
+            changedAt: acquiredAt,
+            recreatedAt: 0,
+            soughtAt: 0,
+            retired: false,
+          })
+          if (this.seekOffset.size !== 0 && this.seekOffset.has(topic, partition)) {
+            this.markSought(topic, partition)
+          }
         }
       }
     }
@@ -1433,7 +1531,9 @@ module.exports = class ConsumerGroup {
     this.leaderUnionWatch?.clear()
     const run = this.idleWait
     const leaderAttempt = Symbol('leader attempt')
-    const roundDeadlineAt = performance.now() + this.rebalanceTimeout
+    const roundDeadlineAt =
+      performance.now() +
+      (this.groupMembership?.joinBudget?.(this.rebalanceTimeout) ?? this.rebalanceTimeout)
     const expired = joinDeadlineError({
       rebalanceTimeoutMs: this.rebalanceTimeout,
     })
@@ -1644,7 +1744,7 @@ module.exports = class ConsumerGroup {
         )
       } catch (e) {
         const refusal = attempt.guard()
-        if (refusal) return bail(e)
+        if (refusal || isHeartbeatFatal(e)) return bail(e)
         if (isRebalancing(e)) {
           throw new KafkaJSError(e)
         }
@@ -1679,12 +1779,14 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * Applies a subscription lifecycle, never a rebalance assignment.
+   * Applies a subscription lifecycle, never a rebalance assignment. The names also become the
+   * consumer's subscribed names in its group's ownership record.
    * @param {string[]} topics accepted names with configuration already installed
    * @returns {void}
    */
   retainSubscription(topics) {
     this.topicsSubscribed = [...topics]
+    this.obligations?.claimSubscription(this.topicsSubscribed)
     this.subscriptionState.retainTopics(topics)
     const live = new Set(topics)
     for (const topic of Object.keys(this.topicConfigurations)) {
@@ -1709,15 +1811,25 @@ module.exports = class ConsumerGroup {
     this.obligations.retain(new Set([...pin.names, ...this.subscription.desired.names]))
   }
 
-  /** Prunes assignment-owned routing and queued seeks after either apply. @returns {void} */
+  /**
+   * Prunes assignment-owned routing after either apply, and the queued seeks of topics that are
+   * neither assigned nor subscribed any more. A seek of a subscribed partition this member does
+   * not hold stays queued until the partition is acquired (`seek`).
+   * @returns {void}
+   */
   pruneAssignmentState() {
     const assigned = this.subscriptionState.assignedPartitionSetsByTopic
     for (const topic of Object.keys(this.preferredReadReplicasPerTopicPartition)) {
       if (!assigned.get(topic)?.size) delete this.preferredReadReplicasPerTopicPartition[topic]
     }
-    for (const [key] of this.seekOffset) {
-      const [topic, partition] = JSON.parse(key)
-      if (!assigned.get(topic)?.has(partition)) this.seekOffset.delete(key)
+    if (this.seekOffset.size !== 0) {
+      const subscribed = new Set(this.topicsSubscribed)
+      for (const [key] of this.seekOffset) {
+        const [topic, partition] = JSON.parse(key)
+        if (!assigned.get(topic)?.has(partition) && !subscribed.has(topic)) {
+          this.seekOffset.delete(key)
+        }
+      }
     }
     if (this.kind === 'consumer' && this.subscribedTopicRegex != null) {
       this.retainSubscription([
@@ -1733,39 +1845,46 @@ module.exports = class ConsumerGroup {
    * Widens the subscription with names a broker-computed assignment resolved to, before the apply
    * can filter them out as unsubscribed.
    *
-   * Three things in order, each of which something downstream would otherwise trip over: the name
-   * set, a name-keyed `topicConfigurations` entry (the offset manager indexes it positionally and
-   * destructures the result), and a cluster target topic (without which metadata is never fetched
-   * for it). A literal name subscribed before its topic existed already holds the first two and
-   * gets only the target, once.
+   * First each name is registered as a cluster target on its own (without which metadata is never
+   * fetched for it): a name a lookup by name does not know yet stays pending, and nothing else is
+   * published for it. Then, for the registered names only, the name set and a name-keyed
+   * `topicConfigurations` entry (the offset manager indexes it positionally and destructures the
+   * result). A literal name subscribed before its topic existed already holds both and gets only
+   * the target, once.
    *
    * NEVER pushes: `this.topics` and `this.topicsSubscribed` are the same array object at
    * construction, so a mutation would edit both.
    * @param {string[]} names newly resolved topic names
-   * @returns {Promise<void>}
+   * @returns {Promise<string[]>} the names now registered; the others are pending
+   * @throws {Error} a fatal topic error of the registration (17 or 29, say)
    */
   async growSubscription(names) {
     // A client-pattern member's names come from its pinned revision: an assigned name that left it
     // is filtered by the apply, never turned into a named target.
-    if (this.subscription) return
+    if (this.subscription) return names
 
-    const added = names.filter((name) => !this.topicsSubscribed.includes(name))
-    const awaiting = names.filter((name) => this.unregisteredTopics.has(name))
+    const unseen = names.filter(
+      (name) => !this.topicsSubscribed.includes(name) || this.unregisteredTopics.has(name)
+    )
+    if (!unseen.length) return names
 
-    if (!added.length && !awaiting.length) {
-      return
+    const registered = new Set(await this.cluster.registerAssignedTopics(unseen))
+    const added = unseen.filter(
+      (name) => registered.has(name) && !this.topicsSubscribed.includes(name)
+    )
+    for (const name of registered) this.unregisteredTopics.delete(name)
+
+    if (added.length) {
+      this.topicsSubscribed = [...this.topicsSubscribed, ...added]
+      this.obligations.claimSubscription(this.topicsSubscribed)
     }
-
-    this.topicsSubscribed = [...this.topicsSubscribed, ...added]
-
     for (const name of added) {
       this.topicConfigurations[name] = this.topicConfigurations[name] || {
         ...this.regexSubscription,
       }
     }
 
-    await this.cluster.addMultipleTargetTopics([...added, ...awaiting])
-    for (const name of awaiting) this.unregisteredTopics.delete(name)
+    return names.filter((name) => registered.has(name) || !unseen.includes(name))
   }
 
   /**
@@ -1787,11 +1906,21 @@ module.exports = class ConsumerGroup {
    * on the next fetch. If this API is invoked for the same topic/partition more
    * than once, the latest offset will be used on the next fetch.
    *
+   * The request also stamps an owned partition as sought (`markSought`), at once rather than when
+   * the seek is applied, so a batch fetched before it can neither resolve nor commit an offset
+   * from this moment on, while the seek is pending and after it is applied.
+   *
+   * A seek of a subscribed partition this member does not hold is kept, the latest per partition,
+   * and is applied before the first delivery once the partition is acquired, as in kafkajs 2.2.4;
+   * it is dropped once its topic is neither assigned nor subscribed. Losing a partition drops the
+   * seek queued while it was held: that seek was the previous owner's work.
+   *
    * @param {import("../../types").TopicPartitionOffset} topicPartitionOffset
    * @returns {void} queues intent and wakes idle fetchers; resolution remains next-round work
    */
   seek({ topic, partition, offset }) {
     this.seekOffset.set(topic, partition, offset)
+    this.markSought(topic, partition)
     this.idleWait.wake()
   }
 
@@ -1848,16 +1977,210 @@ module.exports = class ConsumerGroup {
   }
 
   /**
+   * Records that a seek was requested for an owned partition, by stamping `soughtAt` with the next
+   * value of the acquisition clock, so a batch fetched under an earlier clock is known to be
+   * superseded (`Runner#isSuperseded`) for good, whichever way the seek ends. Admission changes no
+   * position: the cursor, epoch, committed cache and halt stay until the seek is applied, so a
+   * seek that fails leaves the partition where it was. Only the latest stamp is kept, and it is
+   * dropped with the partition's acquisition, so the record stays bounded by the assignment. A
+   * partition this member does not own is left alone.
+   * @param {string} topic
+   * @param {number} partition
+   * @returns {void}
+   */
+  markSought(topic, partition) {
+    const key = `${topic}|${partition}`
+    const acquired = this.acquired.get(key)
+    if (!acquired) return
+    acquired.soughtAt = this.lastSoughtAt = ++this.acquireClock
+  }
+
+  /**
+   * Whether a popped seek still speaks for its partition: the acquisition it was popped under is
+   * the current one, no later seek was admitted and the topic was not recreated since. Only such
+   * a seek may write its commit or settle the partition's gate.
+   * @private
+   * @param {string} key `topic|partition`
+   * @param {import('./handlerContext').Acquisition|undefined} acquired the acquisition the seek
+   *   was popped under
+   * @param {number|undefined} admitted its `soughtAt` when popped
+   * @returns {boolean}
+   */
+  isCurrentSeek(key, acquired, admitted) {
+    return (
+      acquired !== undefined &&
+      acquired === this.acquired.get(key) &&
+      acquired.soughtAt === admitted &&
+      !(acquired.recreatedAt > admitted)
+    )
+  }
+
+  /**
+   * Whether a popped seek may still change its partition here: its run is this group's live run,
+   * its offset manager is the current one, and the acquisition it was popped under still holds the
+   * partition in the same incarnation. A newer seek admitted since does not end it; that seek
+   * replaces its effect when it applies. A seek popped with no acquisition to compare needs only
+   * the run and the manager.
+   * @private
+   * @param {string} key `topic|partition`
+   * @param {{acquired?: object, admitted?: number, run: object, manager: object}} popped
+   * @returns {boolean}
+   */
+  mayTakeEffect(key, { acquired, admitted, run, manager }) {
+    return (
+      run === this.idleWait &&
+      !run.disposed &&
+      manager === this.offsetManager &&
+      (acquired === undefined ||
+        (acquired === this.acquired.get(key) &&
+          !acquired.retired &&
+          !(acquired.recreatedAt > admitted)))
+    )
+  }
+
+  /**
+   * Settles a popped seek that reached its partition (it was applied, or the broker accepted its
+   * commit) while it may still take effect (`mayTakeEffect`): fences answers built before it,
+   * clears the partition's halt (a seek is how an application resumes a halted partition), retires
+   * the position validation of the position it replaced and wakes the idle fetcher. Runs once per
+   * seek, before its reservation is released.
+   * @private
+   * @param {string} key `topic|partition`
+   * @param {{topic: string, partition: number}} seek the popped seek
+   * @param {object} popped what `mayTakeEffect` compares
+   * @returns {void}
+   */
+  settleSeek(key, { topic, partition }, popped) {
+    if (popped.settled || !this.mayTakeEffect(key, popped)) return
+    popped.settled = true
+    if (popped.acquired) popped.acquired.changedAt = ++this.acquireClock
+    this.haltedPartitions.delete(key)
+    this.positionValidator.forgetTopic(topic, [partition])
+    this.idleWait.wake()
+  }
+
+  /**
+   * Logs the one WARN of a popped seek that failed, contained so the log cannot replace the
+   * seek's error.
+   * @private
+   * @param {{topic: string, partition: number, offset: string}} seek the failed seek
+   * @param {Error} error why it failed
+   * @returns {void}
+   */
+  warnFailedSeek({ topic, partition, offset }, error) {
+    try {
+      this.logger.warn('Seek failed; the partition continues from its position before the seek', {
+        groupId: this.groupId,
+        topic,
+        partition,
+        offset,
+        error: error?.message,
+      })
+    } catch {}
+  }
+
+  /**
+   * Whether a partition was sought after `since`, the acquisition clock read when its offset was
+   * selected: that offset is no longer the position the application asked for. Constant time
+   * while nothing was sought since.
+   * @param {string} topic
+   * @param {number|string} partition
+   * @param {number} since the acquisition clock at selection
+   * @returns {boolean}
+   */
+  isSoughtAfter(topic, partition, since) {
+    return this.lastSoughtAt > since && this.acquired.get(`${topic}|${partition}`)?.soughtAt > since
+  }
+
+  /**
+   * The per-cell authority of a default commit selected at `since`: whether the partition was
+   * sought, or acquired again, after it, or still has a seek that is not applied. A seek's
+   * admission keeps the partition's position, so this gate is what keeps a pending seek's cell
+   * out of every default commit, the final one included. Checked when the request is written and
+   * again when its answer is published, only once something was sought or acquired since or a
+   * seek is pending (`changedSince`).
+   * @param {string} topic
+   * @param {number|string} partition
+   * @param {number} since the acquisition clock at selection
+   * @returns {boolean}
+   */
+  isStaleSince(topic, partition, since) {
+    const key = `${topic}|${partition}`
+    const acquired = this.acquired.get(key)
+    return (
+      acquired !== undefined &&
+      (acquired.acquiredAt > since ||
+        acquired.soughtAt > since ||
+        this.isSeekGated(topic, partition))
+    )
+  }
+
+  /**
+   * Whether any seek could gate a partition: a seek is queued or a reservation is held. Constant
+   * time, so a round with no seek pays nothing for the per-partition check.
+   * @returns {boolean}
+   */
+  hasSeekGates() {
+    return this.seekOffset.size !== 0 || this.operations.reserved !== 0
+  }
+
+  /**
+   * Whether a seek holds an owned partition back from Fetch, validation, resolution and default
+   * commits: a seek of it is queued, or the reservation this acquisition took in this run and
+   * incarnation is held. A reservation taken by another acquisition, run, incarnation or consumer
+   * blocks only a new pop (`seekOffsets`), never this owner's fetch.
+   * @param {string} topic
+   * @param {number|string} partition
+   * @returns {boolean} false for a partition this member does not own
+   */
+  isSeekGated(topic, partition) {
+    const acquired = this.acquired.get(`${topic}|${partition}`)
+    if (acquired === undefined) return false
+    if (this.seekOffset.size !== 0 && this.seekOffset.has(topic, Number(partition))) return true
+    const owner = this.operations.reservation(topic, partition)?.owner
+    return (
+      owner !== undefined &&
+      owner.acquired === acquired &&
+      owner.run === this.idleWait &&
+      !(acquired.recreatedAt > owner.admitted)
+    )
+  }
+
+  /**
+   * The acquisition a batch prepared under `clock` was fetched under: the partition's current one,
+   * unless it was acquired after `clock` or is no longer held, in which case the batch's own
+   * acquisition has ended and a shared retired one stands for it.
+   * @param {string} key `topic|partition`
+   * @param {number} clock the preparation's acquisition clock
+   * @returns {import('./handlerContext').Acquisition}
+   */
+  acquisitionAt(key, clock) {
+    const acquired = this.acquired.get(key)
+    return acquired !== undefined && acquired.acquiredAt <= clock ? acquired : RETIRED_ACQUISITION
+  }
+
+  /**
+   * Retires every current acquisition, for a rebuild or the end of the run: a handler identity
+   * that carries one is superseded for good, whatever acquisition replaces it.
+   * @returns {void}
+   */
+  retireAcquisitions() {
+    for (const acquired of this.acquired.values()) acquired.retired = true
+  }
+
+  /**
    * Records that the topic of an owned partition was recreated: a change as `markChanged` stamps,
    * plus the same clock value as `recreatedAt`, so a batch fetched under an earlier clock is
-   * known to hold records of the old incarnation (`Runner#isRecreated`).
+   * known to hold records of the old incarnation (`Runner#isSuperseded`).
    * @param {string} topic
    * @param {number} partition
    * @returns {void}
    */
   markRecreated(topic, partition) {
-    const acquired = this.acquired.get(`${topic}|${partition}`)
-    if (acquired) acquired.changedAt = acquired.recreatedAt = ++this.acquireClock
+    const key = `${topic}|${partition}`
+    const acquired = this.acquired.get(key)
+    if (!acquired) return
+    acquired.changedAt = acquired.recreatedAt = ++this.acquireClock
   }
 
   pause(topicPartitions) {
@@ -1915,8 +2238,9 @@ module.exports = class ConsumerGroup {
   }
 
   /**
+   * Commits through the offset manager.
    * @param {import("../../types").Offsets} [offsets]
-   * @param {{ partitions?: import('./groupProtocol/interface').TopicPartitions[]|null, auto?: boolean }} [options]
+   * @param {{ partitions?: import('./groupProtocol/interface').TopicPartitions[]|null, auto?: boolean, guard?: () => Error|null }} [options]
    *   forwarded verbatim to the offset manager, which owns what each flag means
    * @returns {Promise<void>}
    */
@@ -2086,8 +2410,15 @@ module.exports = class ConsumerGroup {
     )
   }
 
-  async heartbeat({ interval, guard }) {
-    return this.groupMembership.heartbeat({ interval, guard })
+  /**
+   * One heartbeat through the membership's own gate.
+   * @param {{ interval: number, guard?: () => Error|null, onAccepted?: () => void }} options
+   *   `onAccepted` is the runner's clock effect; only the consumer protocol runs it
+   * @returns {Promise<boolean|void>} void for classic and manual; under the consumer protocol, true
+   *   only when a heartbeat was sent and answered with success for the membership the member holds
+   */
+  async heartbeat({ interval, guard, onAccepted }) {
+    return this.groupMembership.heartbeat({ interval, guard, onAccepted })
   }
 
   /**
@@ -2141,18 +2472,28 @@ module.exports = class ConsumerGroup {
       // The request is built from the positions as they stand now; a corruption marker in its
       // answer is refused if a seek, a reset or a recreation reaches the partition after this.
       prepared.check()
-      const { assignmentEpoch, acquireClock } = prepared
+      const { assignmentEpoch } = prepared
       requestClock = this.acquireClock
-      const requests = this.buildFetchRequests(prepared.parts)
+      const resolved = this.resolveTopicIds(this.buildFetchRequests(prepared.parts))
+      const { requests, missing } = resolved
+      if (missing) {
+        for (const { topic, partitions } of missing) {
+          for (const { partition } of partitions) {
+            this.recordFetchError(topic, partition, UNKNOWN_TOPIC_ID_CODE)
+          }
+        }
+      }
       const registry = this.fetchSessions
       // With sessions, a node whose last partitions just left still owes the broker one removal.
       const forgetting = requests.length === 0 ? registry?.active(nodeId) : undefined
 
-      if (!requests.length && !forgetting) return await this.idleFetchRound(prepared, run)
+      if (!requests.length && !forgetting) {
+        return await this.idleFetchRound(prepared, run, missing !== null)
+      }
 
       const { topicIds, maxVersion } = forgetting
         ? this.forgettingAddressing(forgetting)
-        : this.resolveTopicIds(requests)
+        : { topicIds: resolved.topicIds, maxVersion: undefined }
 
       if (this.logger.debugEnabled()) {
         this.logger.debug('Fetching', {
@@ -2178,7 +2519,7 @@ module.exports = class ConsumerGroup {
         const version = this.negotiatedFetchVersion(broker, maxVersion)
         if (version == null || version < FETCH_SESSION_MIN_VERSION) {
           registry.release(nodeId)
-          if (!requests.length) return await this.idleFetchRound(prepared, run)
+          if (!requests.length) return await this.idleFetchRound(prepared, run, missing !== null)
         } else {
           tracked = this.trackFetch(
             registry,
@@ -2252,6 +2593,7 @@ module.exports = class ConsumerGroup {
       // Hoisted out of the per-partition loop: the response row below is the hot path, and its
       // payload must not be built once per partition per round only to be discarded.
       const debug = this.logger.debugEnabled()
+      const requestsByTopic = indexFirstBy(requests, 'topic')
 
       for (const { topicName, topicId, partitions } of responses) {
         if (topicName == null) {
@@ -2267,7 +2609,7 @@ module.exports = class ConsumerGroup {
           continue
         }
 
-        const topicRequestData = requests.find(({ topic }) => topic === topicName)
+        const topicRequestData = requestsByTopic.get(topicName)
 
         let preferredReadReplicas = this.preferredReadReplicasPerTopicPartition[topicName]
         if (!preferredReadReplicas) {
@@ -2278,7 +2620,8 @@ module.exports = class ConsumerGroup {
         const context = {
           topicName,
           topicId: topicId ?? topicIds?.get(topicName),
-          topicRequestData,
+          requestedPartitions:
+            topicRequestData && indexFirstBy(topicRequestData.partitions, 'partition'),
           preferredReadReplicas,
           nodeEndpoints,
           batches,
@@ -2299,6 +2642,9 @@ module.exports = class ConsumerGroup {
       if (needsRefresh) {
         await this.refreshCluster({ fence: run.fence })
         run.fence.check()
+      } else if (missing) {
+        await this.refreshMissingTopicIds(run)
+        run.fence.check()
       } else if (prepared.leaderless) {
         await this.refreshLeaderlessMetadata(run)
         run.fence.check()
@@ -2306,8 +2652,9 @@ module.exports = class ConsumerGroup {
 
       for (const batch of batches) {
         batch.assignmentEpoch = assignmentEpoch
-        batch.acquireClock = acquireClock
+        batch.acquireClock = requestClock
         batch.ownershipKey = `${batch.topic}|${batch.partition}`
+        batch.acquisition = this.acquisitionAt(batch.ownershipKey, requestClock)
       }
 
       return batches
@@ -2332,14 +2679,17 @@ module.exports = class ConsumerGroup {
 
   /**
    * Waits out a round with nothing to ask this node: it sleeps while its snapshot stays current,
-   * after asking for the routing of partitions that have no leader.
+   * after asking for the metadata of partitions that have no leader or no topic id.
    * @private
    * @param {FetchPreparation} prepared the round's snapshot
    * @param {IdleWait} run the run that owns the round
+   * @param {boolean} [missingIds=false] whether a topic was left out for a missing topic id
    * @returns {Promise<Batch[]>} always empty
+   * @throws {Error} a terminal topic refusal learned for a missing id, see `refreshMissingTopicIds`
    */
-  async idleFetchRound(prepared, run) {
-    if (prepared.leaderless) await this.refreshLeaderlessMetadata(run)
+  async idleFetchRound(prepared, run, missingIds = false) {
+    if (missingIds) await this.refreshMissingTopicIds(run)
+    else if (prepared.leaderless) await this.refreshLeaderlessMetadata(run)
     // Registers only while the snapshot is current: an invalidated one returns through the
     // fetcher's yield floor and a fresh snapshot is captured next round.
     await run.wait(
@@ -2485,6 +2835,7 @@ module.exports = class ConsumerGroup {
     await run.fence.wait(this.refreshCluster({ fence: run.fence, ifNecessary: true }))
     run.fence.check()
     this.checkSubscriptionChange()
+    this.groupMembership.recheckHeldTopics?.()
     if (this.leaderUnionWatch.armed) await this.pollLeaderUnion(run.fence)
     this.checkForStaleAssignment()
 
@@ -2550,6 +2901,9 @@ module.exports = class ConsumerGroup {
    * client is not yet sure still exists. A halted partition is left out until its halt is cleared;
    * the check is skipped while nothing is halted, which is the steady state.
    *
+   * Pause and hold state is checked per requested partition, so the cost follows the node's
+   * partitions, not the whole assignment.
+   *
    * @private
    * @param {import("../../types").TopicPartitions[]} topicPartitions the node-filtered assignment
    * @returns {{topic: string, partitions: {partition: number, fetchOffset: string,
@@ -2558,7 +2912,7 @@ module.exports = class ConsumerGroup {
    */
   buildFetchRequests(topicPartitions) {
     const manager = this.offsetManager
-    const activeTopicPartitions = this.getActiveTopicPartitions()
+    const state = this.subscriptionState
 
     return topicPartitions
       .filter(({ topic }) => this.obligations.current(topic) !== null)
@@ -2568,10 +2922,13 @@ module.exports = class ConsumerGroup {
           const baseline = manager.heldOffsetAt(topic, partition)
           if (
             baseline != null &&
-            activeTopicPartitions[topic].has(partition) &&
+            state.isAssigned(topic, partition) &&
+            !state.isPaused(topic, partition) &&
+            !state.isHeld(topic, partition) &&
             !this.positionValidator.isAwaiting(topic, partition) &&
             (this.haltedPartitions.size === 0 ||
-              !this.haltedPartitions.has(`${topic}|${partition}`))
+              !this.haltedPartitions.has(`${topic}|${partition}`)) &&
+            !(this.hasSeekGates() && this.isSeekGated(topic, partition))
           ) {
             requests.push({
               partition,
@@ -2587,34 +2944,34 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * Resolves the topic ids for one round's requests, all-or-nothing.
+   * Resolves the topic ids for one round's requests and leaves out every topic without one.
    *
-   * A fetch goes out keyed by id only when every topic in it has one, otherwise the whole request
-   * falls back to the last version keyed by name. This is the rule the Java consumer applies, and
-   * it avoids splitting one round into two requests at two versions. No extra metadata refresh is
-   * issued for a missing id: the round already refreshed if necessary, and an id is only missing
-   * inside a delete/recreate window.
+   * A topic is never fetched by name: after a delete and recreate the name belongs to the new
+   * topic, and a by-name fetch would read it at the old topic's position. A topic left out is
+   * fetched again once a metadata refresh brings its id; the caller reports it and asks for that
+   * refresh. Costs one cache lookup per topic; the list is copied only when a topic is left out.
    *
    * @private
    * @param {{topic: string}[]} requests this round's request entries
-   * @returns {{topicIds: Map<string, string>|undefined, maxVersion: number|undefined}} the
-   *   name -> id map and no ceiling when every topic has an id; `undefined` and the last
-   *   name-keyed version when any is missing
+   * @returns {{requests: object[], topicIds: Map<string, string>, missing: object[]|null}} the
+   *   entries that have an id (the same array when all do), their name -> id map, and the entries
+   *   left out, or null when none was
    */
   resolveTopicIds(requests) {
     const topicIds = new Map()
+    let missing = null
 
-    for (const { topic } of requests) {
-      const topicId = this.cluster.topicId(topic)
-
-      if (topicId === undefined) {
-        return { topicIds: undefined, maxVersion: FETCH_TOPIC_NAMES_MAX_VERSION }
-      }
-
-      topicIds.set(topic, topicId)
+    for (const request of requests) {
+      const topicId = this.cluster.topicId(request.topic)
+      if (topicId === undefined) (missing ??= []).push(request)
+      else topicIds.set(request.topic, topicId)
     }
 
-    return { topicIds, maxVersion: undefined }
+    return {
+      requests: missing ? requests.filter(({ topic }) => topicIds.has(topic)) : requests,
+      topicIds,
+      missing,
+    }
   }
 
   /**
@@ -2675,7 +3032,8 @@ module.exports = class ConsumerGroup {
    * @param {object} context this topic's state for the round
    * @param {string} context.topicName
    * @param {string} [context.topicId] the id the answer or the request keyed the topic with
-   * @param {object} context.topicRequestData the request entry this topic was fetched with
+   * @param {Map<number, {fetchOffset: string}>} context.requestedPartitions this topic's request
+   *   entries by partition
    * @param {object} context.preferredReadReplicas this topic's preferred-replica map, written here
    * @param {object[]} [context.nodeEndpoints] the response's KIP-951 endpoints, if any
    * @param {import('./batch')[]} context.batches the round's batches, appended to
@@ -2690,7 +3048,7 @@ module.exports = class ConsumerGroup {
    * @throws {Error} the error an unclassified partition code maps to, or the fence's close error
    */
   async handleFetchedPartition(partitionData, context) {
-    const { topicName, topicRequestData, preferredReadReplicas, nodeEndpoints, batches, debug } =
+    const { topicName, requestedPartitions, preferredReadReplicas, nodeEndpoints, batches, debug } =
       context
     const { partition, errorCode, preferredReadReplica } = partitionData
 
@@ -2702,6 +3060,22 @@ module.exports = class ConsumerGroup {
         highWatermark: partitionData.highWatermark,
         messageCount: partitionData.messages ? partitionData.messages.length : 0,
       })
+    }
+
+    // An answer for a position the partition has left (another node's answer came first, or a
+    // reset cleared the offset) is not used at all: not delivered, not recovered from.
+    const requested = requestedPartitions?.get(partition)
+    if (
+      requested !== undefined &&
+      typeof this.offsetManager?.positionOf === 'function' &&
+      this.offsetManager.positionOf(topicName, partition) !== String(requested.fetchOffset)
+    ) {
+      this.logger.debug('Dropping fetched partition', {
+        topic: topicName,
+        partition,
+        reason: 'moved',
+      })
+      return false
     }
 
     if (failure(errorCode)) {
@@ -2716,7 +3090,7 @@ module.exports = class ConsumerGroup {
       if (action === 'offset-out-of-range') {
         // The existing recovery, for this partition only: drop the preferred replica if one is
         // set, otherwise reset per the topic's own fromBeginning.
-        const requested = topicRequestData.partitions.find((p) => p.partition === partition)
+        const requested = requestedPartitions.get(partition)
         await this.recoverFromOffsetOutOfRange(
           { topic: topicName, partition, offset: requested && String(requested.fetchOffset) },
           context.fence,
@@ -2799,9 +3173,7 @@ module.exports = class ConsumerGroup {
     const { corruption } = partitionData
     const halted = corruption != null && this.acceptHalt(topicName, partition, corruption, context)
 
-    const partitionRequestData = topicRequestData.partitions.find(
-      (requested) => requested.partition === partition
-    )
+    const partitionRequestData = requestedPartitions.get(partition)
 
     batches.push(new Batch(topicName, partitionRequestData.fetchOffset, partitionData))
     if (halted) this.reportHalt(topicName, partition, corruption)
@@ -2832,7 +3204,7 @@ module.exports = class ConsumerGroup {
       this.haltedPartitions.has(key) ||
       this.assignmentEpoch !== context.assignmentEpoch ||
       !acquired ||
-      acquired.changedAt > context.requestClock ||
+      isChangedSince(acquired, context.requestClock) ||
       (context.topicId !== undefined &&
         knownTopicId !== undefined &&
         context.topicId !== knownTopicId)
@@ -2904,8 +3276,48 @@ module.exports = class ConsumerGroup {
       !this.ownership.refusal(context.token) &&
       this.assignmentEpoch === context.assignmentEpoch &&
       acquired !== undefined &&
-      acquired.changedAt <= context.requestClock
+      !isChangedSince(acquired, context.requestClock)
     )
+  }
+
+  /**
+   * The identity a position-changing effect of an answer runs under: the caller's preparation
+   * (guard and fence), refused as well once the partition was acquired again, sought, reset or
+   * recreated after the request was built (`isChangedSince`), so an answer older than a seek
+   * changes nothing, however late inside its own work the seek arrives.
+   * @private
+   * @param {string} topic
+   * @param {number} partition
+   * @param {number} requestClock the acquisition clock when the request was built
+   * @param {{guard: () => Error|null, fence?: import('../producer/generation')}} [preparation]
+   * @returns {{guard: () => Error|null, fence?: import('../producer/generation')}}
+   */
+  boundToRequest(topic, partition, requestClock, preparation) {
+    return {
+      guard: () =>
+        preparation?.guard() ||
+        (this.isRequestStale(topic, partition, requestClock)
+          ? new KafkaJSCommitFailedError('A seek superseded the answer', {
+              reason: 'stale-assignment',
+            })
+          : null),
+      fence: preparation?.fence,
+    }
+  }
+
+  /**
+   * Whether an answer to a request built at `requestClock` is older than the partition's current
+   * position: the partition is no longer held, or was acquired again, sought, reset or recreated
+   * since.
+   * @private
+   * @param {string} topic
+   * @param {number} partition
+   * @param {number} requestClock
+   * @returns {boolean}
+   */
+  isRequestStale(topic, partition, requestClock) {
+    const acquired = this.acquired.get(`${topic}|${partition}`)
+    return acquired === undefined || isChangedSince(acquired, requestClock)
   }
 
   /**
@@ -2950,9 +3362,9 @@ module.exports = class ConsumerGroup {
 
   /**
    * Reports an accepted halt with optional nextOffset, codec and limit copied from its error.
-   * Emits one `consumer.partition_halted` event and one error log. Both are
-   * contained, so a listener or a logger that throws neither undoes the halt nor reaches the other
-   * partitions of the round; a listener's error is named in the log.
+   * Emits one `consumer.partition_halted` event and one error log. Neither can throw: `Consumer.on`
+   * contains its listeners and the logger contains its sink, so the halt stands and the other
+   * partitions of the round go on.
    * @private
    * @param {string} topic
    * @param {number} partition
@@ -2966,13 +3378,7 @@ module.exports = class ConsumerGroup {
     if (nextOffset !== undefined) payload.nextOffset = nextOffset
     if (codec !== undefined) payload.codec = codec
     if (limit !== undefined) payload.limit = limit
-    let listenerError
-
-    try {
-      this.instrumentationEmitter.emit(PARTITION_HALTED, payload)
-    } catch (e) {
-      listenerError = e
-    }
+    this.instrumentationEmitter.emit(PARTITION_HALTED, payload)
 
     try {
       this.logger.error('Halted a partition; seek it to resume', {
@@ -2983,7 +3389,6 @@ module.exports = class ConsumerGroup {
         offset,
         reason,
         error: error.message,
-        ...(listenerError !== undefined && { listenerError: describeThrown(listenerError) }),
       })
     } catch {}
   }
@@ -3215,6 +3620,8 @@ module.exports = class ConsumerGroup {
         context
       )
     } else {
+      const stale = () => context && this.isRequestStale(e.topic, e.partition, context.requestClock)
+      if (stale()) return
       this.logger.error('Offset out of range, resetting to default offset', {
         topic: e.topic,
         partition: e.partition,
@@ -3222,11 +3629,17 @@ module.exports = class ConsumerGroup {
         memberId: this.memberId,
       })
 
+      const caller = fence ? { guard: fence.guard, fence } : undefined
       await this.offsetManager.setDefaultOffset(
         { topic: e.topic, partition: e.partition },
-        ...(fence ? [{ guard: fence.guard, fence }] : [])
+        ...(context
+          ? [this.boundToRequest(e.topic, e.partition, context.requestClock, caller)]
+          : caller
+            ? [caller]
+            : [])
       )
       fence?.check()
+      if (stale()) return
       this.markChanged(e.topic, e.partition)
     }
   }
@@ -3263,13 +3676,17 @@ module.exports = class ConsumerGroup {
    * A leader also reports a topic that only other members subscribe to once its union watch has
    * seen that topic gain partitions.
    *
+   * Classic only: a manual assignment is fixed, and under the consumer protocol the coordinator
+   * sees a topic's partitions change and sends the new assignment itself, so a rejoin would only
+   * repeat the round it already has (a topic that was missing at the last round and is back, say).
+   *
    * @returns {void}
    * @throws {KafkaJSStaleTopicMetadataAssignment} when a subscribed or union-only topic gained
    *   partitions
    */
   checkForStaleAssignment() {
     if (
-      this.kind === 'manual' ||
+      this.kind !== 'classic' ||
       !this.partitionsPerSubscribedTopic ||
       this.staleAssignmentPending
     ) {
@@ -3316,19 +3733,27 @@ module.exports = class ConsumerGroup {
   /**
    * Resolves pending seek/reset work through the ordinary resolver, then reads the latest position.
    * A seek changes position without changing acquisition; revoke/reacquire and rebuild retire it.
-   * A rebalance callback may read while a stop is under way, so a close-time revoked callback sees
-   * the quiescent position. A read from a callback carries that invocation's guard and fence through
-   * seek, resolution and the answer, so a callback that settled, expired or was retired meanwhile
-   * publishes nothing and gets its refusal; a lost caller's read is refused too.
+   * A rebalance callback may read while a stop is under way: it then applies and waits for no
+   * seek and returns the established position, and a queued seek dies with the run. Otherwise,
+   * while a seek of the partition is queued or in flight (`isSeekGated`) and its cell's
+   * reservation is held, the read waits for the release with no timer (`awaitSeekRelease`), so
+   * it never returns the position a seek in flight is replacing; a halt is reported only once no
+   * seek gates the partition, so a queued seek that repairs it is waited for. A read from a
+   * callback carries that invocation's guard and fence through seek, resolution and the answer,
+   * so a callback that settled, expired or was retired meanwhile publishes nothing and gets its
+   * refusal; a lost caller's read is refused too.
    * With a public-call `operation`, its one deadline and identity guard are carried the same way: its
    * close ends the reads and delays, and an expired call publishes and answers nothing.
    * @param {{topic: string, partition: number}} entry validated public partition
-   * @param {{ operation?: import('./groupProtocol/interface').ConsumerOperation }} [context]
-   * @returns {Promise<string>} current nonnegative decimal next position, including sparse offsets
+   * @param {{ operation?: import('./groupProtocol/interface').ConsumerOperation, invocation?: object|null }} [context]
+   *   `invocation` is the calling rebalance callback's invocation, `null` for none; the ambient one
+   *   by default
+   * @returns {Promise<string>} current nonnegative decimal next position, including sparse offsets;
+   *   a committed offset the cache holds as a `Long` (a deliberate commit) is read as its decimal
    * @throws {Error} on ownership retirement, reset refusal, the operation's refusal or unresolved
    *   bounded resolution
    */
-  async position(entry, { operation } = {}) {
+  async position(entry, { operation, invocation = RebalanceHooks.current() } = {}) {
     ManualGroupProtocol.validateTopicPartition(entry)
     const { topic, partition } = entry
     const key = `${topic}|${partition}`
@@ -3337,11 +3762,10 @@ module.exports = class ConsumerGroup {
     const epoch = this.assignmentEpoch
     const token = this.ownership.token()
     const topicId = this.cluster.topicId(topic)
-    const invocation = RebalanceHooks.current()
     const current = () =>
       acquiredAt !== undefined &&
       manager &&
-      (invocation !== undefined || !this.isStopping()) &&
+      (invocation || !this.isStopping()) &&
       this.offsetManager === manager &&
       this.assignmentEpoch === epoch &&
       this.acquired.get(key)?.acquiredAt === acquiredAt &&
@@ -3366,17 +3790,55 @@ module.exports = class ConsumerGroup {
       if (error) throw error
     }
     check()
-    for (let pass = 0; pass < MAX_RESOLUTION_PASSES; pass++) {
-      await this.seekOffsets([{ topic, partitions: [partition] }], preparation)
+    const quiescent = Boolean(invocation) && this.isStopping()
+    for (let pass = 0; pass < MAX_RESOLUTION_PASSES;) {
+      if (!quiescent) await this.seekOffsets([{ topic, partitions: [partition] }], preparation)
       check()
+      if (!quiescent && this.isSeekGated(topic, partition)) {
+        const held = this.operations.reservation(topic, partition)
+        if (held !== null) await this.awaitSeekRelease(entry, held, preparation?.fence, check)
+        else pass++
+        continue
+      }
       const halted = this.haltedPartitions.get(key)
       if (halted && ['no-offset', 'offset-out-of-range'].includes(halted.reason)) throw halted.error
-      if (this.hasSeekOffset({ topic, partition })) continue
-      const offset =
+      pass++
+      const offset = String(
         manager.resolvedOffsetAt(topic, partition) ?? manager.heldOffsetAt(topic, partition)
-      if (typeof offset === 'string' && /^\d+$/.test(offset)) return offset
+      )
+      if (/^\d+$/.test(offset)) return offset
     }
     throw new KafkaJSNonRetriableError(`Position is not yet resolved for ${topic}[${partition}]`)
+  }
+
+  /**
+   * Waits, with no timer, until the reservation a seek of the partition holds or is blocked on is
+   * released, or the run, the caller or the partition's authority changes.
+   * @private
+   * @param {{topic: string, partition: number}} entry the partition `position()` reads
+   * @param {import('./offsetManager/offsetOperations').Reservation} held the observed reservation
+   * @param {import('../producer/generation')|undefined} fence the caller's lifetime, if any
+   * @param {() => void} check throws the caller's refusal
+   * @returns {Promise<void>} once the wait ended; the caller rechecks before it reads
+   * @throws {Error} the caller's refusal, or the stopping error once the run is disposed
+   */
+  async awaitSeekRelease({ topic, partition }, held, fence, check) {
+    const run = this.idleWait
+    if (run.disposed) throw consumerStoppingError()
+    await run.wait(
+      Infinity,
+      () => {
+        try {
+          check()
+        } catch {
+          return false
+        }
+        return this.operations.reservation(topic, partition) === held
+      },
+      fence
+    )
+    if (run.disposed) throw consumerStoppingError()
+    check()
   }
 
   /**
@@ -3396,6 +3858,29 @@ module.exports = class ConsumerGroup {
    * before each pass and after a pass returns, so no further pass starts once the round is about to
    * be discarded. A pass already in flight is not cancelled.
    *
+   * A popped seek is attempted once, as in kafkajs 2.2.4: whatever happens to its commit, it is
+   * settled and never sent again. One the broker accepted is settled as applied (clearing its
+   * halt), whatever refused the caller afterwards or whichever newer commit took its cell. One that
+   * failed (refused before its write, rejected, or written with no answer) changes no position:
+   * the partition keeps its cursor, committed cache, pending sentinel and halt, nothing is looked
+   * up because of it, one WARN is logged and the error reaches the caller (`position()`, or the
+   * fetch loop's error policy). The application seeks again if it still wants the position. A
+   * popped seek that is no longer current (`isCurrentSeek`) is refused before its write and
+   * settles nothing; one popped with no acquisition to compare (a partition assigned without one)
+   * is never refused for it. Its identity is captured in the step that pops it, before any
+   * observer runs, and every later step, its DEBUG log included, ends in its settlement, so a
+   * throwing log is a failed seek and a seek admitted from inside the log supersedes it: the
+   * attempt's admission is checked once more after the log, before any local or wire effect. The
+   * log gets a copy of the popped seek, so a log creator that edits it changes nothing applied.
+   *
+   * A seek is popped only together with its cell's reservation in the group's ledger, taken in
+   * the same synchronous step; while another seek of the cell holds it (any consumer, acquisition
+   * or run of the group) the intent stays queued and this call moves on to the next partition.
+   * The reservation is released when the seek's one commit request settles on the wire, before
+   * any recovery or diagnostic, and at the latest when this attempt ends. A seek the broker
+   * accepted is published (its position, committed offset and halt) in that same step, before the
+   * release, so whatever the release wakes reads the seek's position and nothing is read back.
+   *
    * Given a preparation, every step uses its captured offset manager and checks its guard before
    * popping an intent, after every await, before the resolution retry and its yield, and before
    * any local effect, so a late continuation of a retired or replaced preparation changes nothing.
@@ -3410,24 +3895,53 @@ module.exports = class ConsumerGroup {
     for (const { topic, partitions } of topicPartitions) {
       for (const partition of partitions) {
         preparation?.check()
-        const seekEntry = this.seekOffset.pop(topic, partition)
-        if (!seekEntry) {
-          continue
-        }
-
-        this.logger.debug('Seek offset', {
-          groupId: this.groupId,
-          memberId: this.memberId,
-          seek: seekEntry,
+        if (!this.hasSeekOffset({ topic, partition })) continue
+        const key = `${topic}|${partition}`
+        const acquired = this.acquired.get(key)
+        const admitted = acquired?.soughtAt
+        const reservation = this.operations.reserve(topic, partition, {
+          acquired,
+          admitted,
+          run: this.idleWait,
         })
-
-        const applied = await manager.seek(seekEntry, preparation)
-        preparation?.check()
-        if (applied) {
-          this.markChanged(topic, partition)
-          this.haltedPartitions.delete(`${topic}|${partition}`)
-          this.idleWait.wake()
+        if (reservation === null) continue
+        const seekEntry = this.seekOffset.pop(topic, partition)
+        const popped = { acquired, admitted, run: this.idleWait, manager, settled: false }
+        const attempt = {
+          release: () => this.operations.release(reservation),
+          refusal: () => {
+            if (acquired === undefined || this.isCurrentSeek(key, acquired, admitted)) return null
+            const message = 'A newer seek superseded this one'
+            attempt.superseded ??= new KafkaJSCommitFailedError(message, {
+              reason: 'stale-assignment',
+            })
+            return attempt.superseded
+          },
+          mayTakeEffect: () => this.mayTakeEffect(key, popped),
+          settle: () => this.settleSeek(key, seekEntry, popped),
         }
+        let applied = false
+        let failure = null
+        try {
+          this.logger.debug('Seek offset', {
+            groupId: this.groupId,
+            memberId: this.memberId,
+            seek: { ...seekEntry },
+          })
+          if (attempt.refusal() === null) {
+            applied = await manager.seek(seekEntry, preparation, attempt)
+          }
+          if (applied) attempt.settle()
+        } catch (error) {
+          failure = { error }
+        } finally {
+          attempt.release()
+        }
+        if (failure) {
+          if (attempt.accepted !== true) this.warnFailedSeek(seekEntry, failure.error)
+          throw failure.error
+        }
+        preparation?.check()
       }
     }
 
@@ -3476,11 +3990,14 @@ module.exports = class ConsumerGroup {
    * is marked validated, and the round proceeds - validation is an optimisation over
    * correctness-on-the-next-round, never a reason to crash a consumer.
    *
+   * Positions are read without seeding (`peekNextOffset`): validation observes a position and
+   * never makes the committed offset count as resolved progress, which a seek being applied has
+   * just forgotten.
+   *
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-320%3A+Allow+fetchers+to+detect+and+handle+log+truncation
    * @param {import("../../types").TopicPartitions[]} topicPartitions the node-filtered assignment,
    *   which is a superset of what the request keeps: it also contains partitions with no committed
-   *   offset, which are skipped here - there is no position to check, and reading one would create
-   *   a resolved offset holding `undefined`.
+   *   offset, which are skipped here - there is no position to check.
    * @param {FetchPreparation} [preparation] the fetch round's identity. Its refusal is never
    *   swallowed by the fail-open policy above: it is rethrown, and the entries this call put in
    *   flight are returned to unvalidated by identity, also at once when the run's fence closes,
@@ -3496,10 +4013,10 @@ module.exports = class ConsumerGroup {
     try {
       for (const { topic, partitions } of topicPartitions) {
         for (const partition of partitions) {
-          // A queued user seek is newer, more specific intent than anything validation could
-          // conclude. seekOffsets() has just popped this round's seeks, so the only entries this
-          // can find are seeks that arrived while validation itself was awaiting.
-          if (this.seekOffset.size !== 0 && this.seekOffset.has(topic, partition)) {
+          // A user seek, queued or still being applied, is newer, more specific intent than
+          // anything validation could conclude, and the position it replaces is not worth asking
+          // about.
+          if (this.hasSeekGates() && this.isSeekGated(topic, partition)) {
             continue
           }
 
@@ -3511,9 +4028,8 @@ module.exports = class ConsumerGroup {
             continue
           }
 
-          // The same filter the request build applies. `nextOffset()` writes the committed offset
-          // into the resolved ones, so calling it for a partition whose offset was just cleared
-          // would store `undefined` there and break the next commit.
+          // The same filter the request build applies: with no committed offset there is no
+          // position to check.
           if (manager.heldOffsetAt(topic, partition) == null) {
             continue
           }
@@ -3525,7 +4041,7 @@ module.exports = class ConsumerGroup {
           // old leader is not a safe place to keep reading from, whether or not this client is
           // still asking the leader about its position.
           const { action, generation } = this.positionValidator.request(topic, partition, {
-            offset: manager.nextOffset(topic, partition).toString(),
+            offset: manager.peekNextOffset(topic, partition).toString(),
             trackedEpoch,
             currentLeaderEpoch,
           })
@@ -3778,15 +4294,14 @@ module.exports = class ConsumerGroup {
 
         // The partition lost its committed offset while the request was in flight - a concurrent
         // OffsetOutOfRange recovery cleared it. There is no position left to compare the reply
-        // with, and reading one would store `undefined` as its resolved offset. Left to the
-        // caller's awaiting sweep, like a partition the reply never mentioned.
+        // with. Left to the caller's awaiting sweep, like a partition the reply never mentioned.
         if (manager.heldOffsetAt(topic, entry.partition) == null) {
           continue
         }
 
         // Read again now, not the pair captured when the request was made: comparing the captured
         // pair with itself could never detect a position that moved under the request.
-        const offset = manager.nextOffset(topic, entry.partition).toString()
+        const offset = manager.peekNextOffset(topic, entry.partition).toString()
         const outcome = this.positionValidator.complete(
           topic,
           entry.partition,
@@ -3795,7 +4310,9 @@ module.exports = class ConsumerGroup {
             errorCode: reply.errorCode,
             endOffset: reply.endOffset,
             leaderEpoch: reply.leaderEpoch,
-            seekQueued: this.seekOffset.has(topic, entry.partition),
+            seekQueued:
+              this.seekOffset.has(topic, entry.partition) ||
+              this.isSoughtAfter(topic, entry.partition, entry.requestClock),
             generation: entry.generation,
           }
         )
@@ -3886,6 +4403,11 @@ module.exports = class ConsumerGroup {
   /**
    * Applies one validation outcome that concluded the log diverged, and announces it.
    *
+   * A truncation is marked changed and announced with `LOG_TRUNCATION` unless its reposition
+   * applied nothing and the partition has since left the validated position: it is no longer
+   * owned, or a seek, reset or other position change took the rewind's place. A reposition that
+   * applied nothing while the position is still the validated one is announced as before.
+   *
    * @private
    * @param {string} topic
    * @param {number} partition
@@ -3899,8 +4421,15 @@ module.exports = class ConsumerGroup {
    * @throws {Error} the preparation's refusal
    */
   async applyValidationOutcome(topic, partition, offset, outcome, preparation, requestClock) {
+    const manager = preparation?.manager ?? this.offsetManager
+    const bound =
+      requestClock === undefined
+        ? preparation
+        : this.boundToRequest(topic, partition, requestClock, preparation)
+    const stale = () =>
+      requestClock !== undefined && this.isRequestStale(topic, partition, requestClock)
     if (outcome.action === 'truncated') {
-      this.logger.warn('Log truncation detected, repositioning the partition', {
+      this.logger.warn('Log truncation detected, rewinding the partition to the divergence point', {
         groupId: this.groupId,
         topic,
         partition,
@@ -3910,11 +4439,18 @@ module.exports = class ConsumerGroup {
       // Applied inline, not through the seek queue: the queue is drained at the top of a round, so
       // a queued seek would land one round late - and would overwrite a user seek queued in the
       // same window, since the queue is last-writer-wins per key.
-      await (preparation?.manager ?? this.offsetManager).seek(
+      const applied = await manager.reposition(
         { topic, partition, offset: outcome.divergingOffset },
-        preparation
+        bound
       )
       preparation?.check()
+      // Compared by value: a participant may have published the same offset in another spelling.
+      const moved = () => {
+        const position = manager.positionOf(topic, partition)
+        return position == null || BigInt(position) !== BigInt(offset)
+      }
+      const overtaken = !applied && (!manager.owns(topic, partition) || moved())
+      if (overtaken || stale()) return
       this.markChanged(topic, partition)
     } else if (outcome.action === 'reset') {
       this.logger.warn('Log truncation detected but the divergence point is unknown, resetting', {
@@ -3939,11 +4475,9 @@ module.exports = class ConsumerGroup {
           preparation && this.fetchedResetContext(preparation, requestClock)
         )
       } else {
-        await (preparation?.manager ?? this.offsetManager).setDefaultOffset(
-          { topic, partition },
-          preparation
-        )
+        await manager.setDefaultOffset({ topic, partition }, bound)
         preparation?.check()
+        if (stale()) return
         this.markChanged(topic, partition)
       }
     } else {
@@ -3971,6 +4505,9 @@ module.exports = class ConsumerGroup {
    * in the partition's `offlineReplicas`; otherwise the leader is. Only the preferred replica's
    * state matters: a leader listed as offline does not exclude an online preferred follower.
    *
+   * The metadata rows are indexed by id for this call only, so the cost is linear in the topic's
+   * partitions and nothing outlives the call: the next call reads the metadata as it is then.
+   *
    * @param {string} topic
    * @param {number[]} partitions
    * @param {{expiresAt?: number, leaderless?: boolean}} [routing] an optional observation:
@@ -3985,12 +4522,20 @@ module.exports = class ConsumerGroup {
   // Invariant: The resulting object has each partition referenced exactly once
   findReadReplicaForPartitions(topic, partitions, routing) {
     const partitionMetadata = this.cluster.findTopicPartitionMetadata(topic)
+    // A short array is searched faster than it is indexed.
+    const rows =
+      partitionMetadata.length > SHORT_METADATA
+        ? indexFirstBy(partitionMetadata, 'partitionId')
+        : null
     const preferredReadReplicas = this.preferredReadReplicasPerTopicPartition[topic]
-    return partitions.reduce((result, id) => {
+    const result = {}
+    for (const id of partitions) {
       const partitionId = parseInt(id, 10)
-      const metadata = partitionMetadata.find((p) => p.partitionId === partitionId)
+      const metadata = rows
+        ? rows.get(partitionId)
+        : partitionMetadata.find((p) => p.partitionId === partitionId)
       if (!metadata) {
-        return result
+        continue
       }
 
       if (metadata.leader == null) {
@@ -3999,7 +4544,7 @@ module.exports = class ConsumerGroup {
 
       if (metadata.leader < 0) {
         if (routing) routing.leaderless = true
-        return result
+        continue
       }
 
       // Pick the preferred replica if there is one, and it isn't known to be offline, otherwise the leader.
@@ -4037,9 +4582,9 @@ module.exports = class ConsumerGroup {
           }
         }
       }
-      const current = result[nodeId] || []
-      return { ...result, [nodeId]: [...current, partitionId] }
-    }, {})
+      ;(result[nodeId] ||= []).push(partitionId)
+    }
+    return result
   }
 
   /**
@@ -4068,18 +4613,20 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * Refreshes the metadata because a partition has no leader, once for all the nodes' fetchers of
-   * a run. Callers share the pending refresh, and a new one starts at most once per initial retry
-   * interval, measured start to start; a due caller waits for its own refresh, an early one
-   * returns at once. There is no retry timer: the next round that finds a leader missing and the
-   * interval elapsed asks again.
+   * Refreshes the metadata because a partition has no leader or a topic has no id, once for all
+   * the nodes' fetchers of a run. Callers share the pending refresh, and a new one starts at most
+   * once per initial retry interval, measured start to start; a due caller waits for its own
+   * refresh, an early one returns at once. There is no retry timer: the next round that finds a
+   * leader or an id missing and the interval elapsed asks again.
    *
    * The refresh is bound to the run's fence, so a stop or restart settles every caller and the
    * refresh publishes nothing afterwards. A failure is logged at debug level and never becomes a
-   * membership verdict or discards the round's healthy batches.
+   * membership verdict by itself; it is returned to every caller that waited for it, so a caller
+   * can judge it for its own reason.
    * @private
    * @param {IdleWait} run the run that owns the calling round, captured before any await
-   * @returns {Promise<void>} resolves when the refresh settled, was not due, or the run stopped
+   * @returns {Promise<Error|undefined>} the failure of the refresh this caller waited for, if it
+   *   failed; undefined when it succeeded or was not due
    */
   async refreshLeaderlessMetadata(run) {
     if (run.fence.closed) return
@@ -4098,6 +4645,7 @@ module.exports = class ConsumerGroup {
               error: describeThrown(error),
             })
           }
+          attempt.error = error
         })
         .finally(() => {
           if (this.leaderlessRefresh === attempt) this.leaderlessRefresh = null
@@ -4105,16 +4653,21 @@ module.exports = class ConsumerGroup {
       this.leaderlessRefresh = attempt
     }
     await run.fence.wait(attempt.promise).catch(() => {})
+    return attempt.error
   }
 
-  getActiveTopicPartitions() {
-    const activeSubscriptionState = this.subscriptionState.active()
-
-    const activeTopicPartitions = dictionary()
-    activeSubscriptionState.forEach(({ topic, partitions }) => {
-      activeTopicPartitions[topic] = new Set(partitions)
-    })
-
-    return activeTopicPartitions
+  /**
+   * Refreshes the metadata for a round that left a topic out for a missing id, and fails the
+   * round when the refresh learned a refusal that will not clear (`TOPIC_AUTHORIZATION_FAILED`,
+   * `INVALID_TOPIC_EXCEPTION`), as a conditional refresh before the round would. Other failures
+   * are waited out: the next refresh may bring the id.
+   * @private
+   * @param {IdleWait} run the run that owns the calling round
+   * @returns {Promise<void>}
+   * @throws {Error} the refresh's terminal topic refusal
+   */
+  async refreshMissingTopicIds(run) {
+    const error = await this.refreshLeaderlessMetadata(run)
+    if (isFatalTopicError(error)) throw error
   }
 }

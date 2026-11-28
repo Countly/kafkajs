@@ -3,6 +3,7 @@ const Broker = require('../../../broker')
 const ConnectionPool = require('../../../network/connectionPool')
 const Cluster = require('../../../cluster')
 const { createErrorFromCode } = require('../../../protocol/error')
+const { KafkaJSPartialMessageError } = require('../../../errors')
 const { ShareMembership, SharePollView } = require('../shareMembership')
 const { newLogger } = require('testHelpers')
 const { createScriptedCluster } = require('../../../../testHelpers/scriptedCluster')
@@ -609,6 +610,103 @@ describe('share membership', () => {
     })
     expect(f.member.heartbeatInterval()).toBe(1000)
   })
+  test('a join answered code 0 with epoch 0 and an assignment adopts nothing: still joining, no target, nothing published', async () => {
+    f = await fixture()
+    const warn = jest.spyOn(f.member.logger, 'warn')
+    f.response.memberEpoch = 0
+    f.response.assignment = { topicPartitions: [{ topicId: A, partitions: [1] }] }
+    await f.member.heartbeat()
+    expect(f.member.snapshot()).toMatchObject({
+      memberEpoch: 0,
+      state: 'JOINING',
+      assignment: [],
+      unresolved: [],
+    })
+    expect(f.member.target).toEqual([])
+    expect(f.onAssignment).not.toHaveBeenCalled()
+    expect(warn).toHaveBeenCalledWith(
+      'Ignoring a share heartbeat answer whose member epoch this member cannot hold',
+      { groupId: 'group', memberEpoch: 0, currentEpoch: 0 }
+    )
+  })
+  test.each([0, -1])(
+    'a regular answer with interval %s keeps the current interval',
+    async (interval) => {
+      f = await fixture()
+      f.response.heartbeatIntervalMs = 2700
+      await f.member.heartbeat()
+      f.response.heartbeatIntervalMs = interval
+      await f.member.heartbeat()
+      expect(f.member.heartbeatInterval()).toBe(2700)
+      expect(f.member.snapshot()).toMatchObject({ memberEpoch: 1, state: 'STABLE' })
+    }
+  )
+  test('leave() answered code 0, epoch -1 and interval 0 completes as before', async () => {
+    const logger = { error: jest.fn(), warn: jest.fn() }
+    f = await fixture({ logger })
+    await f.member.heartbeat()
+    f.response.memberEpoch = -1
+    f.response.heartbeatIntervalMs = 0
+    await f.member.leave()
+    expect(f.frames().map((x) => x.memberEpoch)).toEqual([0, -1])
+    expect(f.member.state).toBe('UNSUBSCRIBED')
+    expect(logger.error).not.toHaveBeenCalled()
+    expect(logger.warn).not.toHaveBeenCalled()
+    expect(f.onFatal).not.toHaveBeenCalled()
+  })
+  test('an answer with an all-zero topic id beside a valid one is refused and retried: nothing adopted or published, the heartbeat backs off, and the next valid answer is adopted', async () => {
+    f = await fixture({ retry: { initialRetryTime: 100, multiplier: 2, factor: 0 } })
+    let now = 0
+    jest.spyOn(performance, 'now').mockImplementation(() => now)
+    f.response.assignment = { topicPartitions: [{ topicId: A, partitions: [0] }] }
+    await f.member.heartbeat()
+    const target = f.member.target
+    const revision = f.member.targetRevision
+    expect(f.onAssignment).toHaveBeenCalledTimes(1)
+
+    f.response.memberEpoch = 2
+    f.response.assignment = {
+      topicPartitions: [
+        { topicId: null, partitions: [0] },
+        { topicId: B, partitions: [1] },
+      ],
+    }
+    const error = await rejected(f.member.heartbeat())
+    expect(error).toBeInstanceOf(KafkaJSPartialMessageError)
+    expect(f.member.snapshot()).toMatchObject({
+      memberEpoch: 1,
+      state: 'STABLE',
+      assignment: [{ topicId: A, topic: '__proto__', partitions: [0] }],
+      unresolved: [],
+    })
+    expect(f.member.target).toBe(target)
+    expect(f.member.targetRevision).toBe(revision)
+    expect(f.onAssignment).toHaveBeenCalledTimes(1)
+    expect(f.cluster.refreshMetadataForTopicIds).not.toHaveBeenCalled()
+    expect(f.member.heartbeatInterval()).toBe(100)
+
+    now = 99
+    await f.member.heartbeat()
+    expect(f.frames()).toHaveLength(2)
+
+    now = 100
+    f.response.assignment = { topicPartitions: [{ topicId: A, partitions: [0, 1] }] }
+    await f.member.heartbeat()
+    expect(f.frames()).toHaveLength(3)
+    expect(f.frames()[2]).toMatchObject({
+      memberEpoch: 1,
+      rackId: 'rack',
+      subscribedTopicNames: ['__proto__'],
+    })
+    expect(f.cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
+    expect(f.member.snapshot()).toMatchObject({
+      memberEpoch: 2,
+      state: 'STABLE',
+      assignment: [{ topicId: A, topic: '__proto__', partitions: [0, 1] }],
+    })
+    expect(f.onAssignment).toHaveBeenCalledTimes(2)
+    expect(f.onFatal).not.toHaveBeenCalled()
+  })
   test('keeps retrying unresolved IDs under its own elapsed backoff without blocking heartbeats', async () => {
     f = await fixture({
       retry: { initialRetryTime: 100, multiplier: 2, factor: 0 },
@@ -634,6 +732,115 @@ describe('share membership', () => {
     await settled()
     expect(f.member.snapshot().assignment).toEqual([{ topicId: B, topic: 'late', partitions: [1] }])
     expect(f.member.snapshot().unresolved).toEqual([])
+  })
+  test('warns once per target that stays unresolved, naming its topic IDs', async () => {
+    f = await fixture({ retry: { initialRetryTime: 100, multiplier: 2, factor: 0 } })
+    const warn = jest.spyOn(f.member.logger, 'warn')
+    const unresolvedWarnings = () =>
+      warn.mock.calls.filter(([message]) =>
+        message.startsWith('Assigned topic IDs are still unresolved')
+      )
+    let now = 0
+    jest.spyOn(performance, 'now').mockImplementation(() => now)
+    f.response.assignment = { topicPartitions: [{ topicId: B, partitions: [1] }] }
+    await f.member.heartbeat()
+    await settled()
+    f.response.assignment = null
+    for (let i = 0; i < 5; i++) {
+      now += 1000
+      await f.member.heartbeat()
+      await settled()
+    }
+    expect(f.cluster.refreshMetadataForTopicIds).toHaveBeenCalledTimes(6)
+    expect(unresolvedWarnings()).toEqual([
+      [
+        'Assigned topic IDs are still unresolved; their partitions are not fetched until metadata names them',
+        { groupId: 'group', topicIds: [B] },
+      ],
+    ])
+
+    f.cluster.refreshMetadataForTopicIds.mockImplementation(async () => ({
+      resolved: [],
+      unresolved: [C],
+    }))
+    f.response.assignment = { topicPartitions: [{ topicId: C, partitions: [2] }] }
+    for (let i = 0; i < 3; i++) {
+      now += 1000
+      await f.member.heartbeat()
+      await settled()
+      f.response.assignment = null
+    }
+    expect(unresolvedWarnings()).toHaveLength(2)
+    expect(unresolvedWarnings()[1][1]).toEqual({ groupId: 'group', topicIds: [C] })
+  })
+  test.each([
+    ['after the first one resolves', true],
+    ['while the first one stays unresolved', false],
+  ])(
+    'names a second topic ID that goes unresolved later in the same target once, %s, and never names the first again',
+    async (_, firstResolves) => {
+      f = await fixture({ retry: { initialRetryTime: 100, multiplier: 2, factor: 0 } })
+      const warn = jest.spyOn(f.member.logger, 'warn')
+      const named = () =>
+        warn.mock.calls
+          .filter(([message]) => message.startsWith('Assigned topic IDs are still unresolved'))
+          .map(([, extra]) => extra.topicIds)
+      let now = 0
+      jest.spyOn(performance, 'now').mockImplementation(() => now)
+      f.response.assignment = {
+        topicPartitions: [
+          { topicId: A, partitions: [0] },
+          { topicId: B, partitions: [1] },
+        ],
+      }
+      await f.member.heartbeat()
+      await settled()
+      f.response.assignment = null
+      for (let i = 0; i < 4; i++) {
+        now += 1000
+        await f.member.heartbeat()
+        await settled()
+      }
+      expect(named()).toEqual([[B]])
+
+      if (firstResolves) f.names.set(B, 'topic-b')
+      f.names.delete(A)
+      for (let i = 0; i < 12; i++) {
+        now += 5000
+        await f.member.heartbeat()
+        await settled()
+      }
+      expect(f.member.snapshot().unresolved).toEqual(firstResolves ? [A] : [A, B])
+      expect(f.cluster.refreshMetadataForTopicIds.mock.calls.length).toBeGreaterThan(8)
+      expect(named()).toEqual([[B], [A]])
+    }
+  )
+  test('names a topic ID that stays unresolved again for a new target', async () => {
+    f = await fixture({ retry: { initialRetryTime: 100, multiplier: 2, factor: 0 } })
+    const warn = jest.spyOn(f.member.logger, 'warn')
+    const named = () =>
+      warn.mock.calls
+        .filter(([message]) => message.startsWith('Assigned topic IDs are still unresolved'))
+        .map(([, extra]) => extra.topicIds)
+    let now = 0
+    jest.spyOn(performance, 'now').mockImplementation(() => now)
+    f.response.assignment = { topicPartitions: [{ topicId: B, partitions: [1] }] }
+    for (let i = 0; i < 4; i++) {
+      now += 1000
+      await f.member.heartbeat()
+      await settled()
+      f.response.assignment = null
+    }
+    expect(named()).toEqual([[B]])
+
+    f.response.assignment = { topicPartitions: [{ topicId: B, partitions: [1, 2] }] }
+    for (let i = 0; i < 6; i++) {
+      now += 5000
+      await f.member.heartbeat()
+      await settled()
+      f.response.assignment = null
+    }
+    expect(named()).toEqual([[B], [B]])
   })
   test('permits only one metadata flight and respects its next retry deadline', async () => {
     f = await fixture({ retry: { initialRetryTime: 100, multiplier: 2, factor: 0 } })

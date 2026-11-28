@@ -1,6 +1,10 @@
 const Broker = require('../../broker')
 const { Kafka, logLevel } = require('../../../index')
-const { KafkaJSApplicationRecoverableError } = require('../../errors')
+const {
+  KafkaJSApplicationRecoverableError,
+  KafkaJSCommitFailedError,
+  KafkaJSTransactionAbortableError,
+} = require('../../errors')
 const { errorCodeOf } = require('../../../scripts/e2e/idempotentAuthzProbe')
 const { createTopic, plainTextBrokers, secureRandom, writeEvidence } = require('testHelpers')
 const {
@@ -34,6 +38,32 @@ const TRANSACTIONS = 10
 // timed-out transactions every 10 s (`transaction.abort.timed.out.transaction.cleanup.interval.ms`).
 const SHORT_TRANSACTION_TIMEOUT_MS = 2000
 const COORDINATOR_ABORT_BUDGET = { attempts: 120, delay: 250 } // 30 s
+// Group join and the first fetch, inside the scenario budget so the stage, not Jest, reports it.
+const HOLD_BUDGET_MS = 60000
+
+/**
+ * Resolves with what `promise` resolves to, or rejects naming `name` when `ms` elapses first.
+ * The timer is always cleared.
+ * @template T
+ * @param {Promise<T>} promise
+ * @param {number} ms
+ * @param {string} name the stage awaited, for the timeout message
+ * @returns {Promise<T>}
+ * @throws {Error} when the deadline wins, or whatever `promise` rejects with
+ */
+const stage = async (promise, ms, name) => {
+  let timer
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Timed out after ${ms} ms: ${name}`)), ms)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
 const INVALID_TXN_STATE = 48
 const PRODUCER_FENCED = 90
 
@@ -388,4 +418,266 @@ describeTransactionVersion('Producer > transaction protocol versions (live)', ()
       SCENARIO_BUDGET_MS
     )
   })
+})
+
+/**
+ * Live proof of the transactional seek fence on the cluster's own transaction version: a
+ * `sendOffsets` from a consumer handler ties the transaction to that batch, so a seek of its
+ * partition before the commit EndTxn is written leaves the transaction abort-only, and neither its
+ * output records nor its input offsets become visible. A read_committed reader and a fresh admin
+ * read are the oracles; the shared committed-offset cache is not.
+ */
+describeTransactionVersion('Producer > transactional seek fence (live)', () => {
+  const GROUP_PREFIX = 'e2e-seek-fence'
+  const ended = []
+  let cluster
+  let kafka
+  let clients
+
+  beforeAll(async () => {
+    cluster = await settledTransactionVersion()
+    const { endTxn } = Broker.prototype
+    jest.spyOn(Broker.prototype, 'endTxn').mockImplementation(async function (request) {
+      const record = { transactionResult: request.transactionResult, error: null }
+      ended.push(record)
+      try {
+        return await endTxn.call(this, request)
+      } catch (e) {
+        record.error = e.type || e.name
+        throw e
+      }
+    })
+  }, FEATURE_HOOK_BUDGET_MS)
+
+  afterAll(() => {
+    jest.restoreAllMocks()
+  })
+
+  beforeEach(() => {
+    ended.length = 0
+    kafka = new Kafka({
+      clientId: `${GROUP_PREFIX}-${secureRandom()}`,
+      brokers: plainTextBrokers(),
+      retry: RETRY,
+      logLevel: logLevel.NOTHING,
+    })
+    clients = []
+  })
+
+  afterEach(async () => {
+    for (const client of clients.reverse()) {
+      await withTimeout(
+        client.disconnect().catch(() => {}),
+        DISCONNECT_BUDGET_MS
+      )
+    }
+  }, HOOK_BUDGET_MS)
+
+  const connected = async (client) => {
+    clients.push(client)
+    await client.connect()
+    return client
+  }
+
+  /**
+   * An input topic with two records on each of its two partitions, an output topic, and a
+   * consumer whose first partition-0 batch handler stays open: `inHandler` runs work in its async
+   * context until the test ends.
+   */
+  const scenario = async () => {
+    const input = `${GROUP_PREFIX}-in-${secureRandom()}`
+    const output = `${GROUP_PREFIX}-out-${secureRandom()}`
+    const groupId = `${GROUP_PREFIX}-group-${secureRandom()}`
+    await createTopic({ topic: input, partitions: 2 })
+    await createTopic({ topic: output, partitions: 1 })
+    const seed = await connected(kafka.producer())
+    await seed.send({
+      topic: input,
+      messages: [0, 1, 0, 1].map((partition, n) => ({ partition, value: `in-${n}` })),
+    })
+
+    const consumer = await connected(kafka.consumer({ groupId }))
+    await consumer.subscribe({ topics: [input], fromBeginning: true })
+    const tasks = []
+    let wake = null
+    let closed = false
+    let entered
+    const held = new Promise((resolve) => (entered = resolve))
+    await consumer.run({
+      autoCommit: false,
+      eachBatch: async ({ batch }) => {
+        if (batch.partition !== 0 || entered === null) return
+        const enter = entered
+        entered = null
+        enter({ next: String(Number(batch.lastOffset()) + 1) })
+        for (;;) {
+          for (const task of tasks.splice(0)) {
+            Promise.resolve().then(task.work).then(task.resolve, task.reject)
+          }
+          if (closed) return
+          await new Promise((resolve) => (wake = resolve))
+        }
+      },
+    })
+    clients.push({
+      disconnect: async () => {
+        closed = true
+        wake?.()
+      },
+    })
+    const { next } = await stage(held, HOLD_BUDGET_MS, 'the first partition-0 batch handler')
+    const inHandler = (work) =>
+      new Promise((resolve, reject) => {
+        tasks.push({ work, resolve, reject })
+        wake?.()
+      })
+
+    const producer = await connected(
+      kafka.producer({ transactionalId: `${GROUP_PREFIX}-${secureRandom()}`, retry: RETRY })
+    )
+    const requests = []
+    producer.on(producer.events.REQUEST, ({ payload }) => requests.push(payload.apiName))
+    const admin = await connected(kafka.admin())
+    return { input, output, groupId, next, consumer, producer, requests, admin, inHandler }
+  }
+
+  /**
+   * The group's committed offsets of the input topic, read from the broker, by partition. A
+   * transaction's offsets become visible only once its commit marker is applied, which the
+   * coordinator does after it answers EndTxn, so the read repeats until it shows `expected`.
+   */
+  const committedOffsets = async ({ admin, groupId, input }, expected) => {
+    let offsets
+    await waitForCondition(async () => {
+      const [{ partitions }] = await admin.fetchOffsets({ groupId, topics: [input] })
+      offsets = Object.fromEntries(partitions.map(({ partition, offset }) => [partition, offset]))
+      return Object.entries(expected).every(([partition, offset]) => offsets[partition] === offset)
+    }, WAIT_BUDGET)
+    return offsets
+  }
+
+  /** Every value a read_committed reader sees on `topic` once it has gone quiet. */
+  const readCommitted = async (topic, expected) => {
+    const reader = await connected(
+      kafka.consumer({ groupId: `${GROUP_PREFIX}-reader-${secureRandom()}` })
+    )
+    const values = []
+    await reader.subscribe({ topics: [topic], fromBeginning: true })
+    await reader.run({ eachMessage: async ({ message }) => values.push(message.value.toString()) })
+    if (expected > 0) await waitForCondition(() => values.length >= expected, WAIT_BUDGET)
+    await sleep(QUIET_MS)
+    return values
+  }
+
+  const expectFenced = (error) => {
+    expect(error).toBeInstanceOf(KafkaJSTransactionAbortableError)
+    expect(error.cause).toBeInstanceOf(KafkaJSCommitFailedError)
+    expect(error.cause.reason).toBe('stale-assignment')
+  }
+
+  test(
+    'without a seek a handler transaction commits its output and both input offsets',
+    async () => {
+      const run = await scenario()
+      const transaction = await run.producer.transaction()
+      await run.inHandler(async () => {
+        await transaction.send({ topic: run.output, messages: [{ value: 'out' }] })
+        await transaction.sendOffsets({
+          consumerGroupId: run.groupId,
+          topics: [
+            {
+              topic: run.input,
+              partitions: [
+                { partition: 0, offset: run.next },
+                { partition: 1, offset: '1' },
+              ],
+            },
+          ],
+        })
+      })
+      await transaction.commit()
+
+      const offsets = await committedOffsets(run, { 0: run.next, 1: '1' })
+      writeEvidence(EVIDENCE, { scenario: 'seek-fence-control', cluster, offsets, ended })
+      expect(ended).toEqual([{ transactionResult: true, error: null }])
+      expect(offsets).toEqual({ 0: run.next, 1: '1' })
+      expect(await readCommitted(run.output, 1)).toEqual(['out'])
+      expect(run.requests.includes('AddOffsetsToTxn')).toBe(cluster.level === 1)
+    },
+    SCENARIO_BUDGET_MS
+  )
+
+  test(
+    'a seek before sendOffsets refuses the call, and the abort leaves output and input offsets unchanged',
+    async () => {
+      const run = await scenario()
+      const transaction = await run.producer.transaction()
+      await run.inHandler(() =>
+        transaction.send({ topic: run.output, messages: [{ value: 'stale' }] })
+      )
+      run.consumer.seek({ topic: run.input, partition: 0, offset: '0' })
+      const { error } = await outcomeOf(
+        run.inHandler(() =>
+          transaction.sendOffsets({
+            consumerGroupMetadata: run.consumer.groupMetadata(),
+            topics: [{ topic: run.input, partitions: [{ partition: 0, offset: run.next }] }],
+          })
+        )
+      )
+      expectFenced(error)
+      expect(run.requests).not.toContain('TxnOffsetCommit')
+      await transaction.abort()
+
+      const offsets = await committedOffsets(run, { 0: '-1', 1: '-1' })
+      writeEvidence(EVIDENCE, { scenario: 'seek-fence-before', cluster, offsets, ended })
+      expect(ended.map(({ transactionResult }) => transactionResult)).toEqual([false])
+      expect(offsets).toEqual({ 0: '-1', 1: '-1' })
+      expect(await readCommitted(run.output, 0)).toEqual([])
+    },
+    SCENARIO_BUDGET_MS
+  )
+
+  test(
+    'a seek after acknowledged offsets refuses the commit, a healthy second partition aborts with it, and the next transaction commits',
+    async () => {
+      const run = await scenario()
+      const transaction = await run.producer.transaction()
+      await run.inHandler(async () => {
+        await transaction.send({ topic: run.output, messages: [{ value: 'stale' }] })
+        await transaction.sendOffsets({
+          consumerGroupId: run.groupId,
+          topics: [
+            {
+              topic: run.input,
+              partitions: [
+                { partition: 0, offset: run.next },
+                { partition: 1, offset: '1' },
+              ],
+            },
+          ],
+        })
+      })
+      expect(run.requests).toContain('TxnOffsetCommit')
+      run.consumer.seek({ topic: run.input, partition: 0, offset: '0' })
+      const { error } = await outcomeOf(transaction.commit())
+      expectFenced(error)
+      await transaction.abort()
+
+      // Outside any handler the same offsets are explicit and commit.
+      const next = await run.producer.transaction()
+      await next.send({ topic: run.output, messages: [{ value: 'fresh' }] })
+      await next.sendOffsets({
+        consumerGroupId: run.groupId,
+        topics: [{ topic: run.input, partitions: [{ partition: 1, offset: '1' }] }],
+      })
+      await next.commit()
+
+      const offsets = await committedOffsets(run, { 0: '-1', 1: '1' })
+      writeEvidence(EVIDENCE, { scenario: 'seek-fence-after', cluster, offsets, ended })
+      expect(ended.map(({ transactionResult }) => transactionResult)).toEqual([false, true])
+      expect(offsets).toEqual({ 0: '-1', 1: '1' })
+      expect(await readCommitted(run.output, 1)).toEqual(['fresh'])
+    },
+    SCENARIO_BUDGET_MS
+  )
 })

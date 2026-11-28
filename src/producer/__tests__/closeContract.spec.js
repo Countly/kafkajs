@@ -12,12 +12,26 @@ const {
   KafkaJSConnectionError,
   KafkaJSInvalidConfigurationError,
   KafkaJSNonRetriableError,
+  KafkaJSProducerClosedError,
 } = require('../../errors')
 const { Kafka } = require('../../../index')
 const { newLogger } = require('testHelpers')
 const { Schedule } = require('../../../testHelpers/schedule')
 const { createScriptedCluster, producerScript } = require('../../../testHelpers/scriptedCluster')
 const { TOPIC } = require('../../consumer/__tests__/fixtures/fetchHarness')
+
+/**
+ * Consults the write guard every Produce request carries, as the connection does at a frame of 100
+ * bytes. A request without a callable guard fails loudly instead of passing as allowed.
+ * @param {object} request
+ * @returns {Error|null} the refusal, or null when the write is allowed
+ */
+const consultGuard = (request) => {
+  if (typeof request.guard !== 'function') {
+    throw new Error('The Produce request carries no write guard')
+  }
+  return request.guard(100)
+}
 
 describe('producer close cancellation', () => {
   beforeEach(() => jest.useFakeTimers({ doNotFake: ['setImmediate'] }))
@@ -148,6 +162,200 @@ describe('forced producer close on the wire', () => {
       }
     }
   )
+
+  /**
+   * A producer over two fake brokers: node 0 leads partition 0 and answers at once, node 1 leads
+   * partition 1 and answers with `produce`.
+   * @param {boolean} idempotent
+   * @param {(request: object) => Promise<object[]>} produce
+   * @param {object} [options] producer options
+   * @returns {{ producer: object, cluster: object, second: object }}
+   */
+  const twoLeaders = (idempotent, produce, options = {}) => {
+    const fixture = bufferedProducer({
+      idempotent,
+      partitions: 2,
+      deliveryTimeout: 60000,
+      ...options,
+    })
+    const { cluster } = fixture
+    const second = { ...cluster.broker, nodeId: 1, produce: jest.fn(produce) }
+    cluster.findBroker.mockImplementation(async ({ nodeId } = {}) =>
+      Number(nodeId) === 1 ? second : cluster.broker
+    )
+    cluster.findLeaderForPartitions = (_, ids) =>
+      Object.fromEntries(ids.map(Number).map((id) => [id, [id]]))
+    return { ...fixture, second }
+  }
+
+  /** A forced close, run until it has ended. */
+  const forceClose = async (producer) => {
+    const closed = watch(producer.disconnect({ timeout: 0 }))
+    await flushAll()
+    expect(closed.state).toBe('fulfilled')
+  }
+
+  test.each([true, false])(
+    'disconnect({ timeout: 0 }) after one partition was acknowledged rejects the send with KafkaJSProducerClosedError outcome unknown, idempotent %s',
+    async (idempotent) => {
+      const held = deferred()
+      const refusals = []
+      const { producer, cluster, second } = twoLeaders(idempotent, async (request) => {
+        await held.promise
+        const refusal = consultGuard(request)
+        refusals.push(refusal)
+        if (refusal) throw refusal
+        return succeeded(request)
+      })
+      await producer.connect()
+      const sent = watch(
+        producer.send({
+          topic: TOPIC,
+          messages: [
+            { partition: 0, value: 'a' },
+            { partition: 1, value: 'b' },
+          ],
+        })
+      )
+      try {
+        await flushAll()
+        expect(cluster.broker.produce).toHaveBeenCalledTimes(1)
+        expect(second.produce).toHaveBeenCalledTimes(1)
+        expect(sent.state).toBe('pending')
+
+        await forceClose(producer)
+
+        expect(sent.state).toBe('rejected')
+        expect(sent.value).toBeInstanceOf(KafkaJSProducerClosedError)
+        expect(sent.value.outcome).toBe('unknown')
+        expect(sent.value.cause).toBeInstanceOf(KafkaJSProducerClosedError)
+        expect(sent.value.cause.outcome).toBe('unsent')
+      } finally {
+        held.resolve()
+        await flushAll()
+      }
+      expect(typeof second.produce.mock.calls[0][0].guard).toBe('function')
+      expect(refusals).toHaveLength(1)
+      expect(refusals[0]).toBeInstanceOf(Error)
+      expect(refusals[0].message).toBe('The Produce attempt was revoked')
+    }
+  )
+
+  test.each([true, false])(
+    'a forced close while a Produce call is held before it consults the write guard reports outcome unsent, idempotent %s',
+    async (idempotent) => {
+      const held = deferred()
+      const refusals = []
+      const { producer, second } = twoLeaders(idempotent, async (request) => {
+        await held.promise
+        const refusal = consultGuard(request)
+        refusals.push(refusal)
+        if (refusal) throw refusal
+        return succeeded(request)
+      })
+      await producer.connect()
+      const sent = watch(producer.send({ topic: TOPIC, messages: [{ partition: 1, value: 'b' }] }))
+      try {
+        await flushAll()
+        expect(second.produce).toHaveBeenCalledTimes(1)
+
+        await forceClose(producer)
+
+        expect(sent.state).toBe('rejected')
+        expect(sent.value).toBeInstanceOf(KafkaJSProducerClosedError)
+        expect(sent.value.outcome).toBe('unsent')
+      } finally {
+        held.resolve()
+        await flushAll()
+      }
+      expect(typeof second.produce.mock.calls[0][0].guard).toBe('function')
+      expect(refusals).toHaveLength(1)
+      expect(refusals[0]).toBeInstanceOf(Error)
+      expect(refusals[0].message).toBe('The Produce attempt was revoked')
+    }
+  )
+
+  test.each([true, false])(
+    'a forced close while a Produce call is held after the write guard accepted it reports outcome unknown, idempotent %s',
+    async (idempotent) => {
+      const held = deferred()
+      const accepted = []
+      const { producer, second } = twoLeaders(idempotent, async (request) => {
+        const refusal = consultGuard(request)
+        accepted.push(refusal)
+        if (refusal) throw refusal
+        await held.promise
+        return succeeded(request)
+      })
+      await producer.connect()
+      const sent = watch(producer.send({ topic: TOPIC, messages: [{ partition: 1, value: 'b' }] }))
+      try {
+        await flushAll()
+        expect(second.produce).toHaveBeenCalledTimes(1)
+
+        await forceClose(producer)
+
+        expect(sent.state).toBe('rejected')
+        expect(sent.value).toBeInstanceOf(KafkaJSProducerClosedError)
+        expect(sent.value.outcome).toBe('unknown')
+      } finally {
+        held.resolve()
+        await flushAll()
+      }
+      expect(accepted).toEqual([null])
+      const { guard } = second.produce.mock.calls[0][0]
+      expect(typeof guard).toBe('function')
+      expect(guard(100)).toBeInstanceOf(KafkaJSProducerClosedError)
+    }
+  )
+
+  test.each([true, false])(
+    'a forced close after a retry requeued a written delivery still reports outcome unknown, idempotent %s',
+    async (idempotent) => {
+      const held = deferred()
+      const refusals = []
+      const { producer, second } = twoLeaders(
+        idempotent,
+        async (request) => {
+          const retried = second.produce.mock.calls.length > 1
+          if (retried) await held.promise
+          const refusal = consultGuard(request)
+          refusals.push(refusal)
+          if (refusal) throw refusal
+          if (!retried) throw new KafkaJSConnectionError('Connection error')
+          return succeeded(request)
+        },
+        { retry: { retries: 5, initialRetryTime: 10, maxRetryTime: 10, factor: 0 } }
+      )
+      await producer.connect()
+      const sent = watch(producer.send({ topic: TOPIC, messages: [{ partition: 1, value: 'b' }] }))
+      try {
+        for (let i = 0; i < 50 && second.produce.mock.calls.length < 2; i += 1) {
+          await jest.advanceTimersByTimeAsync(10)
+          await flushAll()
+        }
+        expect(second.produce).toHaveBeenCalledTimes(2)
+        expect(sent.state).toBe('pending')
+
+        await forceClose(producer)
+
+        expect(sent.state).toBe('rejected')
+        expect(sent.value).toBeInstanceOf(KafkaJSProducerClosedError)
+        expect(sent.value.outcome).toBe('unknown')
+      } finally {
+        held.resolve()
+        await flushAll()
+      }
+      expect(second.produce.mock.calls.map(([request]) => typeof request.guard)).toEqual([
+        'function',
+        'function',
+      ])
+      expect(refusals).toHaveLength(2)
+      expect(refusals[0]).toBeNull()
+      expect(refusals[1]).toBeInstanceOf(Error)
+      expect(refusals[1].message).toBe('The Produce attempt was revoked')
+    }
+  )
 })
 
 describe('producer close contract', () => {
@@ -165,7 +373,7 @@ describe('producer close contract', () => {
     const fixture = bufferedProducer({ idempotent: false, ...options })
     const held = deferred()
     fixture.cluster.broker.produce.mockImplementationOnce(async (request) => {
-      const refusal = request.guard?.(100)
+      const refusal = consultGuard(request)
       if (refusal) throw refusal
       await held.promise
       return succeeded(request)
@@ -271,11 +479,49 @@ describe('producer close contract', () => {
       await pump(10)
       await first
       expect(send.value).toMatchObject({ name: 'KafkaJSProducerClosedError', outcome: 'unknown' })
+      const { guard } = cluster.broker.produce.mock.calls[0][0]
+      expect(typeof guard).toBe('function')
+      expect(guard(100)).toBeInstanceOf(KafkaJSProducerClosedError)
       expect(third.state).toBe('fulfilled')
       expect(cluster.disconnect).toHaveBeenCalledTimes(1)
     } finally {
       held.resolve()
       await producer.disconnect({ timeout: 0 })
+    }
+  })
+
+  test('a forced close ends the written send of a producer that turned idempotence off for acks 1', async () => {
+    const { producer, cluster } = bufferedProducer({ deliveryTimeout: 60000 })
+    const held = deferred()
+    cluster.broker.produce.mockImplementationOnce(async (request) => {
+      const refusal = consultGuard(request)
+      if (refusal) throw refusal
+      await held.promise
+      return succeeded(request)
+    })
+    await producer.connect()
+    expect(cluster.broker.initProducerId).toHaveBeenCalledTimes(1)
+    const send = watch(producer.send({ acks: 1, topic: 'topic', messages: [{ value: 'a' }] }))
+    try {
+      await pump()
+      expect(producer.isIdempotent()).toBe(false)
+      expect(cluster.broker.produce).toHaveBeenCalledTimes(1)
+      expect(cluster.broker.produce.mock.calls[0][0]).toMatchObject({ producerId: -1 })
+
+      const closed = watch(producer.disconnect({ timeout: 0 }))
+      await pump()
+
+      expect(closed.state).toBe('fulfilled')
+      expect(send).toMatchObject({
+        state: 'rejected',
+        value: { name: 'KafkaJSProducerClosedError', outcome: 'unknown' },
+      })
+      const { guard } = cluster.broker.produce.mock.calls[0][0]
+      expect(typeof guard).toBe('function')
+      expect(guard(100)).toBeInstanceOf(KafkaJSProducerClosedError)
+    } finally {
+      held.resolve()
+      await pump()
     }
   })
 
@@ -553,5 +799,199 @@ describe('a closed lifecycle opens nothing on the wire', () => {
     expect(wire.sockets()).toHaveLength(sockets)
     expect(jest.getTimerCount()).toBe(0)
     wire.assertClean()
+  })
+})
+
+describe('a connect() queued behind a close, then a later disconnect()', () => {
+  let producers = []
+  /** Registers a producer for a forced close after the test, so a failing case leaves nothing open. */
+  const open = (producer) => {
+    producers.push(producer)
+    return producer
+  }
+  beforeEach(() => jest.useFakeTimers({ now: 0, doNotFake: ['nextTick', 'setImmediate'] }))
+  afterEach(async () => {
+    jest.restoreAllMocks()
+    await Promise.allSettled(producers.map((producer) => producer.disconnect({ timeout: 0 })))
+    producers = []
+    jest.useRealTimers()
+  })
+
+  const KINDS = {
+    plain: { profile: 'default', options: { idempotent: false } },
+    idempotent: { profile: 'default', options: { idempotent: true } },
+    transactional: { profile: 'tv1', options: { transactionalId: 'queued-connect' } },
+  }
+
+  /** Lets queued work and `ms` of fake time run. */
+  const pump = async (ms = 0) => {
+    for (let i = 0; i <= ms; i += 1) {
+      await jest.advanceTimersByTimeAsync(i === 0 ? 0 : 1)
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+  }
+
+  describe.each(Object.keys(KINDS))('a %s producer', (kind) => {
+    test.each([
+      ['a natural', 'a natural', undefined, undefined, 0],
+      ['a natural', 'a zero-timeout', undefined, { timeout: 0 }, 0],
+      ['a timed', 'a natural', { timeout: 1000 }, undefined, 0],
+      ['a timed', 'a zero-timeout', { timeout: 1000 }, { timeout: 0 }, 0],
+      ['an expired', 'a natural', { timeout: 50 }, undefined, 60],
+      ['an expired', 'a zero-timeout', { timeout: 50 }, { timeout: 0 }, 60],
+    ])(
+      'after %s close, %s disconnect() arranged before the queued connect() refuses it and leaves no socket, timer or request',
+      async (_, __, firstOptions, secondOptions, expireAfter) => {
+        const { profile, options } = KINDS[kind]
+        const wire = producerScript(
+          createScriptedCluster({ nodes: [{ id: 0, host: 'node0', port: 9092 }], profile })
+        )
+        const producer = open(new Kafka(wire.kafkaOptions()).producer({ linger: 0, ...options }))
+        const events = []
+        for (const name of ['CONNECT', 'DISCONNECT'])
+          producer.on(producer.events[name], () => events.push(name))
+        await producer.connect()
+        const inits = wire.requests().filter(({ api }) => api === 'InitProducerId').length
+
+        const teardown = deferred()
+        let teardowns = 0
+        const original = Cluster.prototype.disconnect
+        jest.spyOn(Cluster.prototype, 'disconnect').mockImplementation(async function (...args) {
+          if (++teardowns === 1) await teardown.promise
+          return original.apply(this, args)
+        })
+        const first = producer.disconnect(firstOptions)
+        await pump()
+        expect(teardowns).toBe(1)
+        const second = first.then(() => producer.disconnect(secondOptions))
+        const queued = watch(producer.connect())
+        if (expireAfter) await pump(expireAfter)
+        teardown.resolve()
+        await second
+        await pump(100)
+
+        expect(queued).toMatchObject({
+          state: 'rejected',
+          value: { name: 'KafkaJSNonRetriableError', message: expect.stringMatching(/disconnect/) },
+        })
+        expect(events).toEqual(['CONNECT', 'DISCONNECT'])
+        expect(wire.sockets().filter((socket) => !socket.destroyed)).toEqual([])
+        expect(wire.requests().filter(({ api }) => api === 'InitProducerId')).toHaveLength(inits)
+        expect(jest.getTimerCount()).toBe(0)
+        wire.assertClean()
+      }
+    )
+
+    test('a disconnect() joining the close a connect() is queued behind refuses that connect()', async () => {
+      const { profile, options } = KINDS[kind]
+      const wire = producerScript(
+        createScriptedCluster({ nodes: [{ id: 0, host: 'node0', port: 9092 }], profile })
+      )
+      const producer = open(new Kafka(wire.kafkaOptions()).producer({ linger: 0, ...options }))
+      const events = []
+      for (const name of ['CONNECT', 'DISCONNECT'])
+        producer.on(producer.events[name], () => events.push(name))
+      await producer.connect()
+
+      const first = producer.disconnect()
+      const queued = watch(producer.connect())
+      const joined = producer.disconnect()
+      expect(joined).toBe(first)
+      await joined
+      await pump(100)
+
+      expect(queued).toMatchObject({
+        state: 'rejected',
+        value: { name: 'KafkaJSNonRetriableError', message: expect.stringMatching(/disconnect/) },
+      })
+      expect(events).toEqual(['CONNECT', 'DISCONNECT'])
+      expect(wire.sockets().filter((socket) => !socket.destroyed)).toEqual([])
+      expect(jest.getTimerCount()).toBe(0)
+      wire.assertClean()
+    })
+
+    test.each([
+      ['a natural', 'a zero-timeout', undefined, { timeout: 0 }, 0],
+      ['a timed', 'a natural', { timeout: 1000 }, undefined, 0],
+      ['a timed', 'a zero-timeout', { timeout: 1000 }, { timeout: 0 }, 0],
+      ['an expired', 'a natural', { timeout: 50 }, undefined, 60],
+      ['an expired', 'a zero-timeout', { timeout: 50 }, { timeout: 0 }, 60],
+    ])(
+      'after %s close, a queued connect() arranged before %s later disconnect() is ended by that close and leaves no socket, timer or request',
+      async (_, __, firstOptions, secondOptions, expireAfter) => {
+        const { profile, options } = KINDS[kind]
+        const wire = producerScript(
+          createScriptedCluster({ nodes: [{ id: 0, host: 'node0', port: 9092 }], profile })
+        )
+        const producer = open(new Kafka(wire.kafkaOptions()).producer({ linger: 0, ...options }))
+        const events = []
+        for (const name of ['CONNECT', 'DISCONNECT'])
+          producer.on(producer.events[name], () => events.push(name))
+        await producer.connect()
+        const inits = wire.requests().filter(({ api }) => api === 'InitProducerId').length
+
+        const teardown = deferred()
+        let teardowns = 0
+        const original = Cluster.prototype.disconnect
+        jest.spyOn(Cluster.prototype, 'disconnect').mockImplementation(async function (...args) {
+          if (++teardowns === 1) await teardown.promise
+          return original.apply(this, args)
+        })
+        const first = producer.disconnect(firstOptions)
+        const closed = watch(first)
+        await pump()
+        expect(teardowns).toBe(1)
+        const queued = watch(producer.connect())
+        const second = first.then(() => producer.disconnect(secondOptions))
+        try {
+          if (expireAfter) await pump(expireAfter)
+          // A forced close still owns its cleanup until the transport teardown ends.
+          expect(closed.state).toBe('pending')
+          expect(queued.state).toBe('pending')
+        } finally {
+          teardown.resolve()
+        }
+        await second
+        await pump(100)
+
+        expect(queued).toMatchObject({
+          state: 'rejected',
+          value: { name: 'KafkaJSProducerClosedError', outcome: 'unknown' },
+        })
+        expect(events).toEqual(['CONNECT', 'DISCONNECT', 'DISCONNECT'])
+        expect(teardowns).toBe(2)
+        expect(wire.sockets().filter((socket) => !socket.destroyed)).toEqual([])
+        expect(wire.requests().filter(({ api }) => api === 'InitProducerId')).toHaveLength(inits)
+        expect(jest.getTimerCount()).toBe(0)
+        wire.assertClean()
+      }
+    )
+
+    test('a queued connect() arranged before the later disconnect() is ended by that close and leaves no socket', async () => {
+      const { profile, options } = KINDS[kind]
+      const wire = producerScript(
+        createScriptedCluster({ nodes: [{ id: 0, host: 'node0', port: 9092 }], profile })
+      )
+      const producer = open(new Kafka(wire.kafkaOptions()).producer({ linger: 0, ...options }))
+      const events = []
+      for (const name of ['CONNECT', 'DISCONNECT'])
+        producer.on(producer.events[name], () => events.push(name))
+      await producer.connect()
+
+      const first = producer.disconnect()
+      const queued = watch(producer.connect())
+      const second = first.then(() => producer.disconnect())
+      await second
+      await pump(100)
+
+      expect(queued).toMatchObject({
+        state: 'rejected',
+        value: { name: 'KafkaJSProducerClosedError', outcome: 'unknown' },
+      })
+      expect(events).toEqual(['CONNECT', 'DISCONNECT', 'DISCONNECT'])
+      expect(wire.sockets().filter((socket) => !socket.destroyed)).toEqual([])
+      expect(jest.getTimerCount()).toBe(0)
+      wire.assertClean()
+    })
   })
 })

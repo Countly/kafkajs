@@ -1,13 +1,27 @@
 const Runner = require('../runner')
+const ConsumerGroup = require('../consumerGroup')
 const Batch = require('../batch')
+const createWorker = require('../worker')
+const createWorkerQueue = require('../workerQueue')
+const {
+  events: { START_BATCH_PROCESS, END_BATCH_PROCESS },
+} = require('../instrumentationEvents')
+const Decoder = require('../../protocol/decoder')
+const decodeMessages = require('../../protocol/requests/fetch/v4/decodeMessages')
+const {
+  batch: batchBytes,
+  record: recordBytes,
+} = require('../../protocol/requests/fetch/__tests__/fixtures/recordBatchBytes')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { newLogger, secureRandom, waitFor } = require('testHelpers')
 const sleep = require('../../utils/sleep')
 const {
+  KafkaJSError,
   KafkaJSProtocolError,
   KafkaJSNotImplemented,
   KafkaJSNumberOfRetriesExceeded,
   KafkaJSDeliveryTimeout,
+  KafkaJSCommitFailedError,
 } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 const { stampOffsetCommit, stampMembership } = require('../rebalanceErrorContract')
@@ -153,6 +167,131 @@ describe('Consumer > Runner', () => {
     )
   })
 
+  describe('a heartbeat the group reports idle', () => {
+    it('ends the heartbeat outage without calling the group heartbeat', async () => {
+      consumerGroup.heartbeatIdle = jest.fn(() => true)
+      runner.running = true
+      runner.outages.heartbeat.since = 5
+
+      await expect(runner.heartbeat()).resolves.toBeUndefined()
+
+      expect(consumerGroup.heartbeatIdle).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.heartbeatIdle).toHaveBeenCalledWith(3000)
+      expect(consumerGroup.heartbeat).not.toHaveBeenCalled()
+      expect(runner.outages.heartbeat.since).toBeNull()
+    })
+
+    it('still calls the group heartbeat, with the same interval, and rejects with its error when the group reports it not idle', async () => {
+      const failure = new Error('the joined heartbeat failed')
+      consumerGroup.heartbeatIdle = jest.fn(() => false)
+      consumerGroup.heartbeat.mockRejectedValueOnce(failure)
+      runner.running = true
+      runner.outages.heartbeat.since = 5
+
+      await expect(runner.heartbeat()).rejects.toBe(failure)
+
+      expect(consumerGroup.heartbeat).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.heartbeat).toHaveBeenCalledWith(
+        expect.objectContaining({ interval: 3000 })
+      )
+      expect(runner.outages.heartbeat.since).toBe(5)
+    })
+
+    it('rejects with the retirement reason before asking the group whether it is idle', async () => {
+      consumerGroup.heartbeatIdle = jest.fn(() => true)
+      runner.running = true
+      runner.outages.heartbeat.since = 5
+      const reason = new Error('the run was retired')
+      runner.retire(reason)
+
+      await expect(runner.heartbeat()).rejects.toBe(reason)
+
+      expect(consumerGroup.heartbeatIdle).not.toHaveBeenCalled()
+      expect(consumerGroup.heartbeat).not.toHaveBeenCalled()
+      expect(runner.outages.heartbeat.since).toBe(5)
+    })
+
+    it('does nothing once stop is latched, before asking the group whether it is idle', async () => {
+      consumerGroup.heartbeatIdle = jest.fn(() => true)
+      runner.running = true
+      runner.outages.heartbeat.since = 5
+      runner.latchStop()
+
+      await expect(runner.heartbeat()).resolves.toBeUndefined()
+
+      expect(consumerGroup.heartbeatIdle).not.toHaveBeenCalled()
+      expect(consumerGroup.heartbeat).not.toHaveBeenCalled()
+      expect(runner.outages.heartbeat.since).toBe(5)
+    })
+  })
+
+  describe('pause from "eachMessage" while no heartbeat is due', () => {
+    const twoMessages = () =>
+      new Batch(topicName, 0, {
+        partition,
+        highWatermark: 5,
+        messages: [
+          { offset: '4', key: '1', value: '2' },
+          { offset: '5', key: '3', value: '4' },
+        ],
+      })
+
+    /** Runs one two-message batch through `eachMessage` and returns the offsets it was handed. */
+    const deliveredOffsets = async (eachMessage) => {
+      runner = createTestRunner({ eachBatch: undefined, eachMessage })
+      runner.scheduleFetchManager = jest.fn()
+      await runner.start()
+      await runner.handleBatch(twoMessages())
+      return eachMessage.mock.calls.map(([{ message }]) => message.offset)
+    }
+
+    beforeEach(() => {
+      const paused = new Set()
+      consumerGroup.heartbeatIdle = jest.fn(() => true)
+      consumerGroup.pause = jest.fn((topicPartitions) => {
+        for (const { topic, partitions } of topicPartitions) {
+          for (const p of partitions) paused.add(`${topic}|${p}`)
+        }
+      })
+      consumerGroup.isPaused = jest.fn((topic, p) => paused.has(`${topic}|${p}`))
+    })
+
+    it('delivers both messages when the handler does not pause', async () => {
+      const offsets = await deliveredOffsets(jest.fn(async () => {}))
+
+      expect(offsets).toEqual(['4', '5'])
+      expect(consumerGroup.heartbeatIdle).toHaveBeenCalled()
+      expect(consumerGroup.heartbeat).not.toHaveBeenCalled()
+    })
+
+    it('stops before the second message when the handler pauses synchronously', async () => {
+      const offsets = await deliveredOffsets(
+        jest.fn(async ({ pause }) => {
+          pause()
+        })
+      )
+
+      expect(offsets).toEqual(['4'])
+      expect(consumerGroup.resolveOffset).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.heartbeatIdle).toHaveBeenCalled()
+      expect(consumerGroup.heartbeat).not.toHaveBeenCalled()
+    })
+
+    it('stops before the second message when the handler pauses after an awaited operation', async () => {
+      const offsets = await deliveredOffsets(
+        jest.fn(async ({ pause }) => {
+          await new Promise((resolve) => setImmediate(resolve))
+          pause()
+        })
+      )
+
+      expect(offsets).toEqual(['4'])
+      expect(consumerGroup.resolveOffset).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.heartbeatIdle).toHaveBeenCalled()
+      expect(consumerGroup.heartbeat).not.toHaveBeenCalled()
+    })
+  })
+
   describe('when the group is rebalancing before the new consumer has joined', () => {
     it('recovers from rebalance in progress and re-join the group', async () => {
       consumerGroup.sync
@@ -230,6 +369,31 @@ describe('Consumer > Runner', () => {
       expect(consumerGroup.commitOffsets).toHaveBeenCalledWith(offsets, {
         guard: expect.any(Function),
       })
+    })
+
+    it('pauses the partition of the batch through "pause", and resumes it through what it returns', async () => {
+      const batch = new Batch(topicName, 0, {
+        partition,
+        highWatermark: 5,
+        messages: [{ offset: 4, key: '1', value: '2' }],
+      })
+      consumerGroup.pause = jest.fn()
+      consumerGroup.resume = jest.fn()
+      let resume
+      eachBatch.mockImplementation(async ({ pause }) => {
+        resume = pause()
+      })
+
+      runner.scheduleFetchManager = jest.fn()
+      await runner.start()
+      await runner.handleBatch(batch)
+
+      const entry = [{ topic: topicName, partitions: [partition] }]
+      expect(consumerGroup.pause).toHaveBeenCalledWith(entry)
+      expect(consumerGroup.resume).not.toHaveBeenCalled()
+
+      resume()
+      expect(consumerGroup.resume).toHaveBeenCalledWith(entry)
     })
   })
 
@@ -310,6 +474,21 @@ describe('Consumer > Runner', () => {
 
     await waitFor(() => onCrash.mock.calls.length > 0)
     expect(onCrash).toHaveBeenCalledWith(notImplementedError)
+  })
+
+  it('crashes once the retries are spent when every Fetch round is refused with a retriable error', async () => {
+    runner = createTestRunner({ retry: { retries: 2, initialRetryTime: 1, maxRetryTime: 5 } })
+    const refusal = new KafkaJSError(
+      'Fetch response carries session id 43, which cannot answer session 42 at epoch 1',
+      { retriable: true }
+    )
+    consumerGroup.fetch.mockImplementation(() => Promise.reject(refusal))
+
+    await runner.start()
+
+    await waitFor(() => onCrash.mock.calls.length > 0)
+    expect(onCrash.mock.calls[0][0]).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+    expect(onCrash.mock.calls[0][0]).toMatchObject({ message: refusal.message, cause: refusal })
   })
 
   it('retries a fetch loop failure in place after the client retry.maxTotalTime has passed', async () => {
@@ -570,6 +749,36 @@ describe('Consumer > Runner', () => {
       expect(consumerGroup.commitOffsets).toHaveBeenCalled()
     })
 
+    it('refuses the per-batch commit when the epoch moves while it is in flight', async () => {
+      let refusal = null
+      consumerGroup.commitOffsets.mockImplementation(async (offsets, { guard }) => {
+        consumerGroup.assignmentEpoch += 1
+        refusal = guard()
+      })
+      runner.scheduleFetchManager = jest.fn()
+      await runner.start()
+      await runner.handleBatch(batchWithEpoch(0))
+
+      expect(consumerGroup.commitOffsets).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.commitOffsets.mock.calls[0][1].auto).toBe(true)
+      expect(refusal).toBeInstanceOf(KafkaJSCommitFailedError)
+      expect(refusal.message).toBe('The handler outlived its assignment')
+    })
+
+    it('fences the per-batch commit by the membership once its ownership is lost', async () => {
+      runner.scheduleFetchManager = jest.fn()
+      await runner.start()
+      await runner.handleBatch(batchWithEpoch(0))
+      const lost = new Error('the membership was lost')
+      consumerGroup.ownership = { token: () => 7, refusal: (token) => (token === 7 ? lost : null) }
+
+      try {
+        expect(consumerGroup.commitOffsets.mock.calls[0][1].guard()).toBe(lost)
+      } finally {
+        delete consumerGroup.ownership
+      }
+    })
+
     it('stops "eachMessage" after the message it was inside, resolving only that offset', async () => {
       const eachMessage = jest.fn(async () => {
         consumerGroup.assignmentEpoch += 1
@@ -636,7 +845,7 @@ describe('Consumer > Runner', () => {
 
       expect(calls).toEqual(['fetchManager.stop', 'closeFetchSessions', 'leave'])
       const [scope] = consumerGroup.closeFetchSessions.mock.calls[0]
-      expect(scope).toEqual({ deadlineAt: operation.deadlineAt, guard: operation.guard })
+      expect(scope).toEqual({ deadlineAt: operation.deadlineAt, guard: runner.stopScope.guard })
     })
 
     it('passes no finite deadline when the stop has none, and still closes', async () => {
@@ -761,6 +970,7 @@ describe('Consumer > Runner', () => {
       expect(consumerGroup.heartbeat).toHaveBeenCalledWith({
         interval: 500,
         guard: expect.any(Function),
+        onAccepted: expect.any(Function),
       })
     })
 
@@ -1175,7 +1385,7 @@ describe('Consumer > Runner', () => {
     it('expires a quiescence once even when the round reports its own join deadline later', async () => {
       jest.useFakeTimers()
       let now = 0
-      jest.spyOn(require('node:perf_hooks').performance, 'now').mockImplementation(() => now)
+      jest.spyOn(performance, 'now').mockImplementation(() => now)
       try {
         const lose = jest.fn()
         consumerGroup.ownership = { lose }
@@ -1214,17 +1424,24 @@ describe('Consumer > Runner', () => {
 
     it('settles on an early timer callback once the handlers are no longer busy', async () => {
       jest.useFakeTimers()
-      jest.spyOn(require('node:perf_hooks').performance, 'now').mockImplementation(() => 0)
+      jest.spyOn(performance, 'now').mockImplementation(() => 0)
       try {
         let busy = true
         const baseline = jest.getTimerCount()
-        const done = runner.awaitQuiescence(() => busy, {
-          deadlineAt: 20,
-          identity: { round: roundOf() },
-        })
+        let outcome = 'pending'
+        const done = runner
+          .awaitQuiescence(() => busy, {
+            deadlineAt: 20,
+            identity: { round: roundOf() },
+          })
+          .then(
+            () => (outcome = 'resolved'),
+            (error) => (outcome = error)
+          )
         busy = false
         await jest.advanceTimersByTimeAsync(20)
-        await expect(done).resolves.toBeUndefined()
+        expect(outcome).toBe('resolved')
+        await done
         expect(runner.hookWaiters.size).toBe(0)
         expect(jest.getTimerCount()).toBe(baseline)
       } finally {
@@ -1282,5 +1499,496 @@ describe('Consumer > Runner', () => {
       expect(round.guard()).toMatchObject({ type: 'CONSUMER_STOPPING' })
       expect(consumerGroup.rebalanceHooks.retire).toHaveBeenCalledTimes(1)
     })
+  })
+
+  describe('a queued batch of a paused partition', () => {
+    let paused, handled, gate
+
+    const batchOf = (partitionId, offsets, fetchedOffset = offsets[0]) =>
+      new Batch(topicName, fetchedOffset, {
+        partition: partitionId,
+        highWatermark: 100,
+        messages: offsets.map((offset) => ({ offset: String(offset), key: 'k', value: 'v' })),
+      })
+
+    const pauseOf = (...partitions) => consumerGroup.pause([{ topic: topicName, partitions }])
+
+    /** A handler that records what it is given and holds partitions 0 and 2 until `gate` opens. */
+    const recordingHandler = () =>
+      jest.fn(async ({ partition: partitionId, message, batch }) => {
+        const id = partitionId ?? batch.partition
+        handled.push({ partition: id, offset: message?.offset })
+        if (id !== 1) await gate.promise
+      })
+
+    const start = async (partial) => {
+      runner = createTestRunner(partial)
+      runner.scheduleFetchManager = jest.fn()
+      await runner.start()
+    }
+
+    /** The queue and workers the fetch manager gives a runner, over its real `handleBatch`. */
+    const queueWith = (workerCount) =>
+      createWorkerQueue({
+        workers: Array.from({ length: workerCount }, (_, workerId) =>
+          createWorker({ handler: (batch) => runner.handleBatch(batch), workerId })
+        ),
+      })
+
+    const until = async (condition) => {
+      for (let turns = 0; turns < 500 && !condition(); turns++) {
+        await new Promise(setImmediate)
+      }
+      if (!condition()) throw new Error('the schedule never reached its hold point')
+    }
+
+    const resolvedOf = (partitionId) =>
+      consumerGroup.resolveOffset.mock.calls
+        .map(([resolved]) => resolved)
+        .filter((resolved) => resolved.partition === partitionId)
+        .map(({ offset }) => offset)
+
+    beforeEach(() => {
+      paused = new Set()
+      handled = []
+      let open
+      gate = { promise: new Promise((resolve) => (open = resolve)), open: () => open() }
+      consumerGroup.pause = jest.fn((topicPartitions) => {
+        for (const { topic, partitions } of topicPartitions) {
+          for (const p of partitions) paused.add(`${topic}|${p}`)
+        }
+      })
+      consumerGroup.resume = jest.fn((topicPartitions) => {
+        for (const { topic, partitions } of topicPartitions) {
+          for (const p of partitions) paused.delete(`${topic}|${p}`)
+        }
+      })
+      consumerGroup.isPaused = jest.fn((topic, p) => paused.has(`${topic}|${p}`))
+      consumerGroup.heartbeatIdle = jest.fn(() => true)
+    })
+
+    it.each([
+      ['eachMessage', (handler) => ({ eachBatch: undefined, eachMessage: handler })],
+      ['eachBatch', (handler) => ({ eachBatch: handler })],
+    ])(
+      "pause p1 while p0's handler runs: p1's queued batch reaches no handler and resolves nothing with %s",
+      async (_name, handlers) => {
+        await start(handlers(recordingHandler()))
+        const done = queueWith(1).push(batchOf(0, [4, 5]), batchOf(1, [4, 5]))
+        await until(() => handled.length === 1)
+
+        pauseOf(1)
+        gate.open()
+        await done
+
+        expect(handled.filter(({ partition: id }) => id === 1)).toEqual([])
+        expect(resolvedOf(1)).toEqual([])
+      }
+    )
+
+    it('after resume, a replacement batch handed to the worker for p1 is delivered once, in order, and the queued batch delivered nothing', async () => {
+      await start({ eachBatch: undefined, eachMessage: recordingHandler() })
+      const queue = queueWith(1)
+      const first = queue.push(batchOf(0, [4, 5]), batchOf(1, [4, 5]))
+      await until(() => handled.length === 1)
+      pauseOf(1)
+      gate.open()
+      await first
+      expect(handled.filter(({ partition: id }) => id === 1)).toEqual([])
+      expect(resolvedOf(1)).toEqual([])
+
+      consumerGroup.resume([{ topic: topicName, partitions: [1] }])
+      await queue.push(batchOf(1, [4, 5]))
+
+      const delivered = handled.filter(({ partition: id }) => id === 1).map(({ offset }) => offset)
+      expect(delivered).toEqual(['4', '5'])
+      expect(resolvedOf(1)).toEqual(['4', '5'])
+    })
+
+    it('concurrency 2 with two other partitions blocked keeps p1 queued, and a pause keeps it from a handler', async () => {
+      await start({ eachBatch: undefined, eachMessage: recordingHandler() })
+      const done = queueWith(2).push(batchOf(0, [4]), batchOf(2, [4]), batchOf(1, [4, 5]))
+      await until(() => handled.length === 2)
+
+      pauseOf(1)
+      gate.open()
+      await done
+
+      expect(handled.map(({ partition: id }) => id).sort()).toEqual([0, 2])
+      expect(resolvedOf(1)).toEqual([])
+    })
+
+    describe('a start_batch_process listener that pauses the partition', () => {
+      /** Pauses the partition of the first batch that starts, and records the events in order. */
+      const pauseOnStart = () => {
+        const events = []
+        instrumentationEmitter.addListener(START_BATCH_PROCESS, ({ payload }) => {
+          events.push('start')
+          if (events.length === 1) pauseOf(payload.partition)
+        })
+        instrumentationEmitter.addListener(END_BATCH_PROCESS, () => events.push('end'))
+        return events
+      }
+
+      it('keeps the batch from the handler, and end_batch_process still fires', async () => {
+        const eachMessage = jest.fn()
+        await start({ eachBatch: undefined, eachMessage })
+        const events = pauseOnStart()
+
+        await runner.handleBatch(batchOf(1, [4, 5]))
+
+        expect(eachMessage).not.toHaveBeenCalled()
+        expect(resolvedOf(1)).toEqual([])
+        expect(events).toEqual(['start', 'end'])
+      })
+
+      it('resolves nothing for a control-only batch while paused, and moves past the record after resume', async () => {
+        await start()
+        const control = () =>
+          new Batch(topicName, '5', {
+            partition: 1,
+            highWatermark: 100,
+            messages: [{ offset: '5', isControlRecord: true }],
+          })
+
+        const events = pauseOnStart()
+        await runner.handleBatch(control())
+        expect(resolvedOf(1)).toEqual([])
+        expect(events).toEqual(['start', 'end'])
+
+        consumerGroup.resume([{ topic: topicName, partitions: [1] }])
+        await runner.handleBatch(control())
+        expect(resolvedOf(1)).toEqual(['5'])
+        expect(events).toEqual(['start', 'end', 'start', 'end'])
+      })
+
+      it('resolves nothing for a batch whose records are all below the fetch offset', async () => {
+        await start()
+        const events = pauseOnStart()
+        const compacted = () =>
+          new Batch(topicName, '10', {
+            partition: 1,
+            highWatermark: 100,
+            messages: [{ offset: '3', key: 'k', value: 'v' }],
+          })
+
+        await runner.handleBatch(compacted())
+        expect(resolvedOf(1)).toEqual([])
+        expect(events).toEqual(['start', 'end'])
+
+        consumerGroup.resume([{ topic: topicName, partitions: [1] }])
+        await runner.handleBatch(compacted())
+        expect(resolvedOf(1)).toEqual(['10'])
+        expect(events).toEqual(['start', 'end', 'start', 'end'])
+      })
+    })
+
+    it('does not stop a handler that already runs: eachMessage stops after the current message', async () => {
+      await start({ eachBatch: undefined, eachMessage: recordingHandler() })
+      const done = queueWith(1).push(batchOf(0, [4, 5]))
+      await until(() => handled.length === 1)
+
+      pauseOf(0)
+      gate.open()
+      await done
+
+      expect(handled.map(({ offset }) => offset)).toEqual(['4'])
+      expect(resolvedOf(0)).toEqual(['4'])
+    })
+
+    it('admits and delivers the batch as today for a group double without isPaused', async () => {
+      delete consumerGroup.isPaused
+      const handler = jest.fn()
+      await start({ eachBatch: handler })
+
+      await runner.handleBatch(batchOf(1, [4, 5]))
+
+      expect(handler).toHaveBeenCalledTimes(1)
+      expect(resolvedOf(1)).toEqual(['5'])
+    })
+  })
+
+  describe('a compacted batch that decoding left without records to deliver', () => {
+    const EPOCH = 5
+
+    /** A Batch built from what the Fetch decoder returns for these record batches. */
+    const decoded = async (fetchedOffset, ...batches) => {
+      const body = Buffer.concat(batches)
+      const size = Buffer.alloc(4)
+      size.writeInt32BE(body.length)
+      const partitionData = await decodeMessages(new Decoder(Buffer.concat([size, body])))
+      return new Batch(topicName, fetchedOffset, {
+        partition,
+        highWatermark: '500',
+        ...partitionData,
+      })
+    }
+    const emptyCompacted = () =>
+      batchBytes({ baseOffset: 0n, partitionLeaderEpoch: EPOCH, lastOffsetDelta: 99 })
+
+    const start = async (partial) => {
+      runner = createTestRunner(partial)
+      runner.scheduleFetchManager = jest.fn()
+      await runner.start()
+    }
+
+    it('moves the position to the end of an empty batch, with its epoch, and delivers the later record', async () => {
+      await start()
+
+      await runner.handleBatch(await decoded(0, emptyCompacted()))
+
+      expect(consumerGroup.resolveOffset).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.resolveOffset).toHaveBeenCalledWith({
+        topic: topicName,
+        partition,
+        offset: '99',
+        leaderEpoch: EPOCH,
+      })
+      expect(eachBatch).not.toHaveBeenCalled()
+
+      const later = batchBytes({
+        baseOffset: 100n,
+        partitionLeaderEpoch: EPOCH,
+        records: [recordBytes({ key: 'k', value: 'v' })],
+      })
+      await runner.handleBatch(await decoded(100, later))
+
+      expect(eachBatch).toHaveBeenCalledTimes(1)
+      expect(eachBatch.mock.calls[0][0].batch.messages.map(({ offset }) => offset)).toEqual(['100'])
+    })
+
+    it('reaches the end of a batch whose only retained record is behind the fetch offset in one step', async () => {
+      await start()
+      const compacted = batchBytes({
+        baseOffset: 0n,
+        partitionLeaderEpoch: EPOCH,
+        lastOffsetDelta: 99,
+        records: [recordBytes({ offsetDelta: 1 })],
+      })
+
+      await runner.handleBatch(await decoded(2, compacted))
+
+      expect(consumerGroup.resolveOffset).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.resolveOffset).toHaveBeenCalledWith({
+        topic: topicName,
+        partition,
+        offset: '99',
+        leaderEpoch: EPOCH,
+      })
+    })
+
+    it.each([
+      ['eachMessage', { eachBatch: undefined, eachMessage: jest.fn() }],
+      ['eachBatch', { eachBatch: jest.fn() }],
+      ['eachBatch with auto-resolve off', { eachBatch: jest.fn(), eachBatchAutoResolve: false }],
+    ])('is resolved without calling %s', async (_name, handlers) => {
+      await start(handlers)
+
+      await runner.handleBatch(await decoded(0, emptyCompacted()))
+
+      expect(consumerGroup.resolveOffset).toHaveBeenCalledWith(
+        expect.objectContaining({ offset: '99', leaderEpoch: EPOCH })
+      )
+      expect(handlers.eachMessage || handlers.eachBatch).not.toHaveBeenCalled()
+    })
+
+    it('leaves a handler that resolves explicitly with its own resolution', async () => {
+      const handler = jest.fn(async ({ resolveOffset }) => resolveOffset('100'))
+      await start({ eachBatch: handler, eachBatchAutoResolve: false })
+      const retained = batchBytes({
+        baseOffset: 100n,
+        partitionLeaderEpoch: EPOCH,
+        lastOffsetDelta: 99,
+        records: [recordBytes({ key: 'k', value: 'v' })],
+      })
+
+      await runner.handleBatch(await decoded(100, retained))
+
+      expect(handler).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.resolveOffset).toHaveBeenCalledTimes(1)
+      expect(consumerGroup.resolveOffset).toHaveBeenCalledWith(
+        expect.objectContaining({ offset: '100', leaderEpoch: EPOCH })
+      )
+    })
+  })
+})
+
+describe('Consumer > Runner > heartbeat through a real group membership', () => {
+  const INTERVAL = 3000
+  let now, wire, group, runner
+
+  /**
+   * A real `ConsumerGroup` and runner over a coordinator double whose heartbeat answers with
+   * `answer()`. A classic member is joined, its interval just restarted.
+   */
+  const build = ({ groupProtocol = 'classic', answer = async () => {} } = {}) => {
+    wire = {
+      nodeId: 0,
+      isConnected: () => true,
+      heartbeat: jest.fn(answer),
+      consumerGroupHeartbeat: jest.fn(async () => {
+        throw new Error('no consumer-protocol heartbeat is expected on the wire')
+      }),
+    }
+    group = new ConsumerGroup({
+      retry: { retries: 1, initialRetryTime: 1, maxRetryTime: 2 },
+      cluster: {
+        connect: jest.fn(async () => {}),
+        refreshMetadata: jest.fn(async () => {}),
+        refreshMetadataIfNecessary: jest.fn(async () => {}),
+        committedOffsets: () => ({}),
+        topicName: () => undefined,
+        topicId: () => undefined,
+        findTopicPartitionMetadata: () => [],
+        findGroupCoordinator: jest.fn(async () => wire),
+        addMultipleTargetTopics: jest.fn(async () => {}),
+      },
+      groupId: 'heartbeat-group',
+      groupProtocol,
+      topics: ['topic-a'],
+      topicConfigurations: { 'topic-a': {} },
+      logger: newLogger(),
+      instrumentationEmitter: new InstrumentationEventEmitter(),
+      assigners: [],
+      sessionTimeout: 10000,
+      rebalanceTimeout: 60000,
+      heartbeatInterval: INTERVAL,
+      maxBytesPerPartition: 1048576,
+      minBytes: 1,
+      maxBytes: 1048576,
+      maxWaitTimeInMs: 1000,
+      autoCommit: true,
+      autoCommitInterval: null,
+      autoCommitThreshold: null,
+      isolationLevel: 0,
+      rackId: '',
+      checkCrcs: true,
+      metadataMaxAge: 300000,
+    })
+    group.coordinator = wire
+    if (groupProtocol === 'classic') {
+      group.memberId = 'member-1'
+      group.generationId = 1
+      group.lastRequest = now
+    }
+    runner = new Runner({
+      consumerGroup: group,
+      instrumentationEmitter: new InstrumentationEventEmitter(),
+      logger: newLogger(),
+      concurrency: 1,
+      heartbeatInterval: INTERVAL,
+      maxPollInterval: 300000,
+      autoCommit: true,
+      onCrash: jest.fn(),
+      eachMessage: async () => {},
+    })
+    runner.running = true
+  }
+
+  /** A heartbeat answer held until the test fails it, and a signal that it reached the wire. */
+  const heldAnswer = () => {
+    const held = {}
+    held.written = new Promise((resolve) => (held.onWire = resolve))
+    held.answer = () =>
+      new Promise((_resolve, reject) => {
+        held.fail = reject
+        held.onWire()
+      })
+    return held
+  }
+
+  /** @returns {Promise<unknown>} the call's rejection reason, or 'resolved' */
+  const outcome = (call) =>
+    call.then(
+      () => 'resolved',
+      (e) => e
+    )
+
+  beforeEach(() => {
+    now = 1_000_000
+    jest.spyOn(Date, 'now').mockImplementation(() => now)
+  })
+
+  afterEach(() => jest.restoreAllMocks())
+
+  it('sends the classic heartbeat exactly at the deadline, and ends the heartbeat outage on the calls before it', async () => {
+    build()
+    runner.outages.heartbeat.since = 5
+
+    now += INTERVAL - 1
+    await expect(runner.heartbeat()).resolves.toBeUndefined()
+    expect(wire.heartbeat).not.toHaveBeenCalled()
+    expect(runner.outages.heartbeat.since).toBeNull()
+
+    now += 1
+    await expect(runner.heartbeat()).resolves.toBeUndefined()
+    expect(wire.heartbeat).toHaveBeenCalledTimes(1)
+    expect(wire.heartbeat).toHaveBeenCalledWith(
+      expect.objectContaining({
+        groupId: 'heartbeat-group',
+        memberId: 'member-1',
+        groupGenerationId: 1,
+      })
+    )
+    expect(group.lastRequest).toBe(now)
+
+    await runner.heartbeat()
+    expect(wire.heartbeat).toHaveBeenCalledTimes(1)
+  })
+
+  it('joins a classic heartbeat in flight, even once the interval reads not due, and its rejection reaches both callers', async () => {
+    const held = heldAnswer()
+    build({ answer: held.answer })
+    const failure = new Error('the heartbeat connection broke')
+
+    now += INTERVAL
+    const first = runner.heartbeat()
+    await held.written
+    // Nothing else restarts the interval in production; this isolates the in-flight check.
+    group.lastRequest = now
+    const second = runner.heartbeat()
+    const firstOutcome = outcome(first)
+    const secondOutcome = outcome(second)
+    held.fail(failure)
+
+    expect(await firstOutcome).toBe(failure)
+    expect(await secondOutcome).toBe(failure)
+    expect(wire.heartbeat).toHaveBeenCalledTimes(1)
+  })
+
+  it('sends one classic heartbeat for two calls in one turn that straddle the deadline, and a third caller joins it and sees its rejection', async () => {
+    const held = heldAnswer()
+    build({ answer: held.answer })
+    const failure = new Error('the heartbeat connection broke')
+
+    now += INTERVAL - 1
+    const before = runner.heartbeat()
+    now += 1
+    const due = runner.heartbeat()
+    await held.written
+    const joined = runner.heartbeat()
+    const dueOutcome = outcome(due)
+    const joinedOutcome = outcome(joined)
+    held.fail(failure)
+
+    await expect(before).resolves.toBeUndefined()
+    expect(await dueOutcome).toBe(failure)
+    expect(await joinedOutcome).toBe(failure)
+    expect(wire.heartbeat).toHaveBeenCalledTimes(1)
+  })
+
+  it('makes the full group heartbeat call on every consumer-protocol heartbeat', async () => {
+    build({ groupProtocol: 'consumer' })
+    const membershipHeartbeat = jest
+      .spyOn(group.groupMembership, 'heartbeat')
+      .mockResolvedValue(undefined)
+    const interval = group.heartbeatInterval()
+
+    await runner.heartbeat()
+    await runner.heartbeat()
+
+    expect(group.heartbeatIdle(interval)).toBe(false)
+    expect(membershipHeartbeat).toHaveBeenCalledTimes(2)
+    expect(membershipHeartbeat).toHaveBeenCalledWith(expect.objectContaining({ interval }))
   })
 })

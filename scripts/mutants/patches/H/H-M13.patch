@@ -1,0 +1,10 @@
+--- a/src/consumer/subscriptionState.js
++++ b/src/consumer/subscriptionState.js
+@@ -200,6 +200,7 @@
+    */
+   release(token) {
+     if (!this.admissionHolds?.delete(token)) return false
++    this.admissionHolds.clear()
+     if (this.admissionHolds.size === 0) this.admissionHolds = null
+     return true
+   }

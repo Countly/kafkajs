@@ -543,6 +543,35 @@ describe('disconnect validation before cleanup', () => {
   })
 })
 
+describe('a forced close whose cluster disconnect fails', () => {
+  const createConsumer = require('../index')
+  const { createLogger, LEVELS } = require('../../loggers')
+
+  test('a rejection with undefined is contained: the close resolves and logs it as a warning', async () => {
+    const entries = []
+    const nothing = undefined
+    const disconnect = jest.fn().mockRejectedValue(nothing)
+    const consumer = createConsumer({
+      groupId: 'g',
+      partitionAssigners: [],
+      logger: createLogger({
+        level: LEVELS.WARN,
+        logCreator: () => (entry) => entries.push(entry),
+      }),
+      cluster: { onTopicRecreated: () => () => {}, disconnect },
+    })
+
+    await expect(consumer.disconnect({ timeout: 0 })).resolves.toBeUndefined()
+
+    expect(disconnect.mock.calls).toEqual([[{ drainTimeout: 0 }]])
+    expect(
+      entries
+        .filter(({ log }) => log.message === 'Disconnecting the cluster failed')
+        .map(({ log }) => log.error)
+    ).toEqual(['undefined'])
+  })
+})
+
 const NODE = { id: 0, host: 'node-0', port: 9092 }
 const WAIT_MS = 10000
 const BOUND_MS = 300
@@ -838,6 +867,77 @@ describe('a consumer close over a scripted broker', () => {
     await until(() => outcome.length === 1, 'the detached commit')
     expect(outcome[0]).toBe('CONSUMER_STOPPING')
     expect(frames(rig.cluster, 'OffsetCommit')).toHaveLength(before)
+  })
+
+  test('a classic close waits for a held handler, then calls the close callback, makes the final commit and leaves, with STOP and DISCONNECT and no CRASH', async () => {
+    await open()
+    const release = gate()
+    const order = []
+    let entered = false
+    const { consumer, events } = await started({
+      delivered: 0,
+      run: {
+        eachMessage: async () => {
+          if (entered) return
+          entered = true
+          await release.promise
+          order.push('handler:end')
+        },
+        rebalanceListener: {
+          // Every eager round revokes the empty assignment first; only the owned one is recorded.
+          onPartitionsRevoked: async ({ partitions }) => {
+            if (partitions.length === 0) return
+            order.push(`revoked:${frames(rig.cluster, 'OffsetCommit').length}`)
+          },
+        },
+      },
+    })
+    consumer.on(consumer.events.CRASH, () => events.push('CRASH'))
+    await until(() => entered, 'the handler')
+    const closing = consumer.disconnect()
+    await pause(2 * BOUND_MS)
+
+    expect(order).toEqual([])
+
+    release.resolve()
+    await closing
+    const apis = rig.cluster.requests().map(({ api }) => api)
+
+    expect(order).toEqual(['handler:end', 'revoked:0'])
+    expect(frames(rig.cluster, 'OffsetCommit')).toHaveLength(1)
+    expect(frames(rig.cluster, 'LeaveGroup')).toHaveLength(1)
+    expect(apis.indexOf('OffsetCommit')).toBeLessThan(apis.indexOf('LeaveGroup'))
+    expect(events).toEqual(['STOP', 'DISCONNECT'])
+  })
+
+  test('a timed classic close ends the wait for a held close callback at its deadline and sends no leave, with STOP and DISCONNECT and no CRASH', async () => {
+    await open()
+    const hookGate = gate()
+    let hookHeld = false
+    const { consumer, events } = await started({
+      run: {
+        rebalanceListener: {
+          onPartitionsRevoked: async ({ partitions }) => {
+            if (partitions.length === 0) return
+            hookHeld = true
+            await hookGate.promise
+          },
+        },
+      },
+    })
+    consumer.on(consumer.events.CRASH, () => events.push('CRASH'))
+    const startedAt = Date.now()
+    await consumer.disconnect({ timeout: BOUND_MS })
+
+    expect(hookHeld).toBe(true)
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(BOUND_MS - 50)
+    expect(Date.now() - startedAt).toBeLessThan(BOUND_MS + 2700)
+
+    hookGate.resolve()
+    await pause(100)
+
+    expect(frames(rig.cluster, 'LeaveGroup')).toHaveLength(0)
+    expect(events).toEqual(['STOP', 'DISCONNECT'])
   })
 
   test('a replacement run starts after a held handler and a held hook are each detached', async () => {
@@ -1201,6 +1301,8 @@ describe('a runner stopped while its connection is held', () => {
       beginRebalanceRound: jest.fn(),
       clearAssignerState: jest.fn(),
       leave: jest.fn(),
+      retireCoordinatorLookup: jest.fn(),
+      retireFetchSessions: jest.fn(),
     }
     const onCrash = jest.fn()
     const runner = new Runner({
@@ -1249,5 +1351,23 @@ describe('a runner stopped while its connection is held', () => {
     await starting
     expect(onCrash).not.toHaveBeenCalled()
     expect(runner.rebalanceCoordinator.runRound).not.toHaveBeenCalled()
+  })
+
+  test('a run retired while its connection is held, then stopped, owes the next run no assigner clear', async () => {
+    const connect = gate()
+    const { runner, group, onCrash } = buildRunner(connect)
+    const starting = runner.start()
+    await flush()
+    expect(group.connect).toHaveBeenCalledTimes(1)
+    runner.retire(Object.assign(new Error('stopping'), { type: 'CONSUMER_STOPPING' }))
+    expect(runner.retirement).not.toBeNull()
+    await runner.stop()
+    connect.resolve()
+    await starting
+    expect(runner.running).toBe(false)
+    expect(runner.assignersOwed).toBe(false)
+    expect(group.clearAssignerState).not.toHaveBeenCalled()
+    expect(runner.rebalanceCoordinator.runRound).not.toHaveBeenCalled()
+    expect(onCrash).not.toHaveBeenCalled()
   })
 })

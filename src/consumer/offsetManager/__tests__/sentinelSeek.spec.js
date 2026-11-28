@@ -177,6 +177,22 @@ test('a failed concrete seek commit preserves the pending sentinel', async () =>
   expect(ctx.next()).toBe('37')
 })
 
+test('an applied sentinel stays pending through a failed replacement and an accepted one retires it', async () => {
+  const ctx = fixture({ autoCommit: true, listOffset: '37' })
+  await seek(ctx, '-1')
+  const pending = ctx.manager.pendingSeeks.get(TOPIC).get(0)
+  const error = new Error('commit rejected')
+  ctx.coordinator.offsetCommit.mockRejectedValueOnce(error)
+
+  await expect(seek(ctx, '44')).rejects.toBe(error)
+  expect(ctx.manager.pendingSeeks.get(TOPIC).get(0)).toBe(pending)
+
+  await expect(seek(ctx, '45')).resolves.toBe(true)
+  expect(ctx.manager.pendingSeeks.size).toBe(0)
+  await ctx.manager.resolveOffsets()
+  expect(ctx.next()).toBe('45')
+})
+
 for (const during of [false, true]) {
   test(`revocation clears pending intent ${during ? 'during' : 'before'} resolution`, async () => {
     const ctx = fixture()
@@ -201,7 +217,7 @@ for (const during of [false, true]) {
   })
 }
 
-test('stop clears queued and applied sentinel seeks and fences their answers', async () => {
+test('stop clears applied sentinel seeks and fences their answers, and queued seeks stay queued for the final commit to leave out', async () => {
   const ctx = fixture()
   const group = groupOver(ctx)
   group.seek({ topic: TOPIC, partition: 0, offset: '-2' })
@@ -211,7 +227,8 @@ test('stop clears queued and applied sentinel seeks and fences their answers', a
   const resolving = ctx.manager.resolveOffsets()
   await held.arrived()
   group.onStopRequested()
-  expect(group.seekOffset.size).toBe(1)
+  expect(group.seekOffset.size).toBe(2)
+  expect(group.seekOffset.pop(TOPIC, 0)).toEqual({ topic: TOPIC, partition: 0, offset: '-2' })
   expect(group.seekOffset.pop('other-topic', 0)).toEqual({
     topic: 'other-topic',
     partition: 0,

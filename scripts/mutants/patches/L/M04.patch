@@ -1,0 +1,10 @@
+--- a/testHelpers/lifecycle.js
++++ b/testHelpers/lifecycle.js
+@@ -18,7 +18,6 @@
+   'pre-release-commit',
+   'hook:revoked',
+   'hook:assigned',
+-  'hook:lost',
+   'session:initial',
+   'session:inflight',
+ ]

@@ -1,4 +1,5 @@
 const Encoder = require('../../../encoder')
+const { KafkaJSPartialMessageError } = require('../../../../errors')
 const responseV2 = require('./response')
 const { protocol } = require('../index')
 
@@ -80,9 +81,21 @@ describe('Protocol > Requests > DeleteRecords > v2 response', () => {
     })
   })
 
-  test('reads a compact null count as no topics, never as a native error', async () => {
-    const body = new Encoder().writeInt32(25).writeUVarIntArray(null).writeTaggedFields().buffer
+  test('refuses a null topic list', async () => {
+    const error = await decode(Buffer.from('000000000000', 'hex')).then(
+      () => null,
+      (rejection) => rejection
+    )
 
-    expect(await decode(body)).toEqual({ throttleTime: 0, clientSideThrottleTime: 25, topics: [] })
+    expect(error).toBeInstanceOf(KafkaJSPartialMessageError)
+    expect(error.message).toContain('DeleteRecordsResponse.Topics is a null array')
+  })
+
+  test('keeps an empty topic list (control)', async () => {
+    expect(await decode(Buffer.from('000000000100', 'hex'))).toEqual({
+      throttleTime: 0,
+      clientSideThrottleTime: 0,
+      topics: [],
+    })
   })
 })

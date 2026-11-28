@@ -1,0 +1,11 @@
+--- a/src/consumer/fetcher.js
++++ b/src/consumer/fetcher.js
+@@ -67,7 +67,7 @@
+           if (availableBatches.length > 0) {
+             availableBatches.forEach(assignTopicPartition)
+             try {
+-              await workerQueue.push(...availableBatches)
++              void workerQueue.push(...availableBatches)
+             } finally {
+               availableBatches.forEach(unassignTopicPartition)
+             }

@@ -1,5 +1,9 @@
 const Decoder = require('../../decoder')
-const { KafkaJSCorruptRecordError, KafkaJSPartialMessageError } = require('../../../errors')
+const {
+  KafkaJSCorruptRecordError,
+  KafkaJSInvalidVarIntError,
+  KafkaJSPartialMessageError,
+} = require('../../../errors')
 const {
   batch,
   record,
@@ -211,6 +215,69 @@ describe('Protocol > RecordBatch > v0 > bounds inside a record batch', () => {
       expect(messages[1].key).toEqual(Buffer.from('k'))
       expect(messages[1].headers).toEqual({ x: Buffer.from('y') })
       expect(readName).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('overlong signed varints', () => {
+    /**
+     * A 6-byte signed varint that a reader without the 5-byte cap wraps to `value`: five
+     * continuation bytes, then a sixth whose shift by 35 is taken modulo 32.
+     * @param {number} value a multiple of 4 from 0 to 508
+     * @returns {Buffer}
+     */
+    const wrapsTo = (value) => Buffer.from([0x80, 0x80, 0x80, 0x80, 0x80, value / 4])
+
+    /** @returns {Buffer} a CRC-valid batch at offset 0 holding two valid records */
+    const validPrefix = () =>
+      batch({ records: [record({ key: 'a' }), record({ offsetDelta: 1, key: 'b' })] })
+
+    /**
+     * Decodes the valid prefix followed by a CRC-valid batch at offset 2 holding `malformed`.
+     * @param {Buffer} malformed one record, its length varint first
+     * @returns {Promise<{ messages: object[], corruption?: object }>}
+     */
+    const decodeAfterPrefix = (malformed) =>
+      decodeField(recordsField(validPrefix(), batch({ baseOffset: 2n, records: [malformed] })))
+
+    /** @param {{ messages: object[], corruption?: object }} outcome */
+    const expectLocatedVarIntCorruption = ({ messages, corruption }) => {
+      expect(messages.map(({ offset, key }) => [offset, String(key)])).toEqual([
+        ['0', 'a'],
+        ['1', 'b'],
+      ])
+      expect(corruption).toMatchObject({ reason: 'length', offset: '2' })
+      expect(corruption.error).toBeInstanceOf(KafkaJSCorruptRecordError)
+      expect(corruption.error).toMatchObject({ reason: 'length', offset: '2', nextOffset: '3' })
+      expect(corruption.error.message).toBe(
+        'Record batch body is malformed: Invalid VarInt, must contain 5 bytes or less'
+      )
+      expect(corruption.error.cause).toBeInstanceOf(KafkaJSInvalidVarIntError)
+    }
+
+    test('an overlong record length varint is a located corruption that keeps the valid prefix', async () => {
+      const valid = record({ value: 'abcdef' })
+      const body = valid.subarray(1)
+      expect(valid[0]).toBe(varint(body.length)[0])
+      expect(body.length).toBe(12)
+
+      expectLocatedVarIntCorruption(
+        await decodeAfterPrefix(Buffer.concat([wrapsTo(body.length), body]))
+      )
+    })
+
+    test('an overlong offset-delta varint is a located corruption that keeps the valid prefix', async () => {
+      const body = Buffer.concat([
+        Buffer.from([0]),
+        varint(0),
+        wrapsTo(4),
+        varint(-1),
+        varint(-1),
+        varint(0),
+      ])
+
+      expectLocatedVarIntCorruption(
+        await decodeAfterPrefix(Buffer.concat([varint(body.length), body]))
+      )
     })
   })
 

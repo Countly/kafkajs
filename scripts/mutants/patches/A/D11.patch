@@ -1,0 +1,11 @@
+--- a/src/consumer/index.js
++++ b/src/consumer/index.js
+@@ -254,7 +254,7 @@
+     minBytes = 1,
+     maxBytes = 10485760, // 10MB
+     maxWaitTimeInMs = 5000,
+-    isolationLevel = ISOLATION_LEVEL.READ_COMMITTED,
++    isolationLevel = ISOLATION_LEVEL.READ_UNCOMMITTED,
+     rackId = '',
+     rackAwareAssignment = false,
+     checkCrcs = true,

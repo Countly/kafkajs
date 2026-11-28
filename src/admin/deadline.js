@@ -1,15 +1,179 @@
 const { AsyncLocalStorage } = require('node:async_hooks')
 const createRetry = require('../retry')
 const plainWaitFor = require('../utils/waitFor')
+const { responseSourceOf } = require('../broker/failureSource')
+const {
+  itemsOf,
+  keyOf,
+  resendable,
+  mayResend,
+  REFUSED_BEFORE_APPLYING,
+} = require('./unknownOutcome')
 const {
   KafkaJSTimeout,
   KafkaJSInvalidConfigurationError,
   KafkaJSNonRetriableError,
+  KafkaJSProtocolError,
+  KafkaJSUnknownOutcomeError,
 } = require('../errors')
 
 const context = new AsyncLocalStorage()
 const DEFAULT_API_TIMEOUT = 60000
 const MAX_API_TIMEOUT = 2147483647
+
+/** Errors from decoded broker answers and errors that terminate a whole admin call. */
+const answered = new WeakSet()
+const wholeCall = new WeakSet()
+
+/** @param {unknown} error @returns {boolean} whether this is a final broker answer */
+const isAnsweredError = (error) => answered.has(error)
+/** @param {unknown} error @returns {boolean} whether the entire call must reject */
+const endsCall = (error) => error instanceof KafkaJSUnknownOutcomeError || wholeCall.has(error)
+
+const mutations = new AsyncLocalStorage()
+
+/** @param {string} method @param {object[]} requests @param {Error} cause
+ * @returns {KafkaJSUnknownOutcomeError} the failure for the written, unanswered requests
+ */
+const unknownOutcome = (method, requests, cause) =>
+  new KafkaJSUnknownOutcomeError(`${method}: no usable answer to a written request`, {
+    requests,
+    cause,
+  })
+
+/** The writes of one public invocation, independent of its deadline. */
+class MutationHistory {
+  /** @param {string} method invocation name @param {AdminDeadline} deadline its deadline */
+  constructor(method, deadline) {
+    this.method = method
+    this.deadline = deadline
+    this.apis = new Map()
+    this.closed = false
+  }
+
+  /** Releases the written records and prevents later continuations from adding to them. */
+  close() {
+    this.closed = true
+    this.apis.clear()
+  }
+
+  /** @param {object} protocolRequest built wire request @param {number} nodeId target broker
+   * @returns {{request:object,failed:Function}} transport hooks and failure classifier
+   */
+  latch(protocolRequest, nodeId) {
+    const { apiKey, apiName: api, apiVersion } = protocolRequest.request
+    const items = itemsOf(protocolRequest, nodeId)
+    const description = { api, apiVersion, nodeId, items }
+    const keys = items?.map(keyOf)
+    const record = {
+      description,
+      decoded: false,
+      resendable: null,
+      cause: undefined,
+      failure: undefined,
+    }
+    let written = false
+    return {
+      request: {
+        ...protocolRequest,
+        onWrite: () => {
+          this.deadline.check()
+          if (this.closed)
+            throw new KafkaJSNonRetriableError(`${this.method}: admin call completed`)
+          let history = this.apis.get(apiKey)
+          if (!history) {
+            history = { first: null, unnamed: null, byKey: new Map() }
+            this.apis.set(apiKey, history)
+          }
+          const blocked =
+            history.unnamed ||
+            (keys ? keys.map((key) => history.byKey.get(key)).find(Boolean) : history.first)
+          if (blocked && !mayResend(blocked.resendable, protocolRequest.args)) {
+            if (!blocked.decoded) {
+              blocked.failure ??= unknownOutcome(this.method, [blocked.description], blocked.cause)
+              throw blocked.failure
+            }
+            const error = new KafkaJSNonRetriableError(
+              `${this.method}: a ${api} request was not sent: an earlier request of this call carried the same items`,
+              { cause: blocked.cause }
+            )
+            wholeCall.add(error)
+            throw error
+          }
+          protocolRequest.onWrite?.()
+          history.first ??= record
+          if (keys) {
+            for (const key of keys) history.byKey.set(key, record)
+          } else {
+            history.unnamed = record
+          }
+          written = true
+        },
+        onDecoded: (response) => {
+          record.decoded = true
+          record.resendable = resendable(apiKey, response)
+          protocolRequest.onDecoded?.(response)
+        },
+      },
+      failed: (error) => {
+        const refusal = this.deadline.guard()
+        if (refusal) return refusal
+        if (!written) return error
+        record.cause = error
+        if (
+          record.decoded ||
+          (responseSourceOf(error) === apiKey && error instanceof KafkaJSProtocolError)
+        ) {
+          record.decoded = true
+          if (record.resendable && error.code === REFUSED_BEFORE_APPLYING.get(apiKey)) return error
+          record.resendable = null
+          answered.add(error)
+          return error
+        }
+        record.failure ??= unknownOutcome(this.method, [description], error)
+        return record.failure
+      },
+    }
+  }
+}
+
+/** @returns {MutationHistory|undefined} the invocation allowed to enroll a mutation */
+const currentMutation = () => {
+  const history = mutations.getStore()
+  return history?.deadline === currentDeadline() ? history : undefined
+}
+
+/** @param {Promise[]} work sends in this attempt
+ * @param {(value:any, index:number) => void} [accept] retains answered work across retries
+ * @returns {Promise<any[]>} resolved values in input order
+ * @throws {Error} the highest priority failure, after all sends settle
+ */
+const settleMutations = async (work, accept) => {
+  const outcomes = await Promise.allSettled(work)
+  checked(null)
+  const failures = outcomes.flatMap((outcome) =>
+    outcome.status === 'rejected' ? [outcome.reason] : []
+  )
+  const unknowns = [
+    ...new Set(failures.filter((error) => error instanceof KafkaJSUnknownOutcomeError)),
+  ]
+  if (unknowns.length === 1) throw unknowns[0]
+  if (unknowns.length > 1) {
+    const requests = [...new Set(unknowns.flatMap((error) => error.requests))]
+    throw unknownOutcome(currentMutation()?.method ?? 'Admin mutation', requests, unknowns[0].cause)
+  }
+  const whole = failures.find(endsCall)
+  if (whole) throw whole
+  const answer = failures.find(isAnsweredError)
+  if (answer) throw answer
+  if (accept) {
+    outcomes.forEach((outcome, index) => {
+      if (outcome.status === 'fulfilled') accept(outcome.value, index)
+    })
+  }
+  if (failures.length > 0) throw failures[0]
+  return outcomes.map(({ value }) => value)
+}
 
 /**
  * Validates a caller's admin budget before any work starts. Undefined means the supplied default.
@@ -57,7 +221,7 @@ class AdminDeadline {
   /** @returns {KafkaJSTimeout} one stable error naming the original method and unknown outcome */
   timeout() {
     this.timeoutError ??= new KafkaJSTimeout(
-      `${this.method} did not complete within ${this.timeoutMs} ms; outcome is unknown; a mutation may have been applied`
+      `${this.method} did not complete within ${this.timeoutMs} ms; outcome is unknown; a mutation, if any, may have been applied`
     )
     return this.timeoutError
   }
@@ -192,21 +356,37 @@ class AdminDeadline {
    */
   retrier(retryOptions) {
     const retry = createRetry(retryOptions)
-    return (fn) => retry(fn, this)
+    return (fn) =>
+      retry(async (bail, ...attempt) => {
+        try {
+          return await fn(bail, ...attempt)
+        } catch (error) {
+          this.check()
+          if (endsCall(error) || isAnsweredError(error)) return bail(error)
+          throw error
+        }
+      }, this)
   }
 }
+
+/** The generation of a discovery whose work has not started. */
+const UNSTARTED = Symbol('unstarted')
 
 /** Shared metadata work owns its retries; individual callers only own their wait. */
 class MetadataDiscovery extends AdminDeadline {
   /**
    * @param {() => Promise<any>} work one metadata refresh
    * @param {() => void} remove deletes only this episode from its owning map
+   * @param {any} [epoch] the epoch it started in, see `shareMetadata`
    * @returns {MetadataDiscovery} not started until its first caller is enrolled
    */
-  constructor(work, remove) {
+  constructor(work, remove, epoch) {
     super('metadata discovery', null)
     this.work = work
     this.remove = remove
+    this.epoch = epoch
+    /** Taken when the work starts: an episode not started yet is joined in any generation. */
+    this.generation = UNSTARTED
     this.callers = new Set()
     this.running = null
     this.settled = false
@@ -266,6 +446,22 @@ class MetadataDiscovery extends AdminDeadline {
 const currentDeadline = () => context.getStore()
 
 /**
+ * Runs a call with its own write history and releases it on settlement.
+ * @param {string} method invocation name
+ * @param {AdminDeadline} deadline inherited or newly created budget
+ * @param {Function} work admitted invocation
+ * @returns {Promise<any>} the result under the invocation's deadline
+ */
+const runMutation = async (method, deadline, work) => {
+  const history = new MutationHistory(method, deadline)
+  try {
+    return await mutations.run(history, () => deadline.wait(work))
+  } finally {
+    history.close()
+  }
+}
+
+/**
  * Captures one outer deadline; nested public helpers inherit its original token and budget.
  * @template T
  * @param {string} method public method name
@@ -273,6 +469,7 @@ const currentDeadline = () => context.getStore()
  * @param {() => Promise<T>|T} work unstarted method body
  * @param {import('../producer/generation')|null} [lifecycle] original lifecycle, never renewed
  * @param {number} [startedAt] monotonic public invocation entry, before lazy admission
+ * @param {boolean} [publicCall=false] whether this entry owns a new mutation history
  * @returns {Promise<T>}
  * @throws {Error} original failure or KafkaJSTimeout
  */
@@ -281,18 +478,19 @@ const runWithDeadline = async (
   timeoutMs,
   work,
   lifecycle = null,
-  startedAt = performance.now()
+  startedAt = performance.now(),
+  publicCall = false
 ) => {
   const inherited = currentDeadline()
   if (inherited && (!lifecycle || inherited.lifecycle === lifecycle)) {
-    const result = await inherited.wait(work)
+    const result = await (publicCall ? runMutation(method, inherited, work) : inherited.wait(work))
     inherited.check()
     return result
   }
   const deadline = new AdminDeadline(method, timeoutMs, lifecycle, startedAt)
   const unregister = lifecycle?.register((error) => deadline.stop(error))
   try {
-    const result = await context.run(deadline, () => deadline.wait(work))
+    const result = await context.run(deadline, () => runMutation(method, deadline, work))
     deadline.check()
     return result
   } finally {
@@ -305,19 +503,39 @@ const runWithDeadline = async (
  * Creates a metadata-only coalescer. Key identity preserves existing producer/consumer scoping.
  * @param {Function} work original refresh implementation
  * @param {Function} [keyOf] existing scope key selector
+ * @param {() => any} [epochOf] a call never joins an episode started in another epoch, and an
+ *   episode whose epoch moved before its deferred start skips the work and resolves undefined
+ * @param {() => any} [generationOf] a call never joins an episode whose work started in another
+ *   generation; an episode not started yet takes the generation its work starts in
  * @returns {Function} enrollment wrapper; each argument list is captured once per episode
  */
-const shareMetadata = (work, keyOf = () => undefined) => {
+const shareMetadata = (
+  work,
+  keyOf = () => undefined,
+  epochOf = () => undefined,
+  generationOf = () => undefined
+) => {
   const entries = new Map()
   return function (...args) {
     const key = keyOf(...args)
+    const epoch = epochOf()
     let episode = entries.get(key)
-    if (!episode || episode.refusal()) {
+    if (
+      !episode ||
+      episode.epoch !== epoch ||
+      (episode.generation !== UNSTARTED && episode.generation !== generationOf()) ||
+      episode.refusal()
+    ) {
       episode = new MetadataDiscovery(
-        () => work.apply(this, args),
+        () => {
+          if (epochOf() !== epoch) return undefined
+          episode.generation = generationOf()
+          return work.apply(this, args)
+        },
         () => {
           if (entries.get(key) === episode) entries.delete(key)
-        }
+        },
+        epoch
       )
       entries.set(key, episode)
     }
@@ -356,12 +574,14 @@ const waitOf = (work) => currentDeadline()?.wait(work) ?? work()
 
 /**
  * Runs shared physical setup or observer notifications outside caller ownership.
- * The caller's continuation retains its original scope.
+ * The caller's continuation retains its original scope. The store is masked rather than the
+ * instance disabled, so a nested invocation entered synchronously by `work` cannot bring the
+ * caller's scope back before `work` returns.
  * @template T
  * @param {() => T|Promise<T>} work shared setup or observers with an independent lifetime
  * @returns {Promise<T>|T} shared work's result
  */
-const sharedSetup = (work) => context.exit(work)
+const sharedSetup = (work) => context.run(undefined, work)
 
 /** the consumer's captured consumer operation adapted only at the GroupDescriptions boundary. */
 class ConsumerDescriptionScope {
@@ -490,19 +710,23 @@ const withAdminGuard = (guard, deadline = currentDeadline()) =>
  * @param {object} optionsAt method to index of its public options argument
  * @param {number} defaultTimeout validated AdminConfig budget
  * @param {import('./lifecycle')} [lifecycle] admission and shared close owner
+ * @param {Object<string, (...args: any[]) => any[]>} [inputs] per method, reads and checks the
+ *   call's arguments when the call is admitted and returns the copy the method runs with
  * @returns {object} wrapped admin surface
  * @throws {KafkaJSInvalidConfigurationError} per-call invalid apiTimeout, before method work
  */
-const wrapAdmin = (methods, optionsAt, defaultTimeout, lifecycle) => {
+const wrapAdmin = (methods, optionsAt, defaultTimeout, lifecycle, inputs = {}) => {
   for (const [method, index] of Object.entries(optionsAt)) {
     const work = methods[method]
     if (typeof work !== 'function') throw new Error(`Missing admin operation ${method}`)
+    const inputOf = inputs[method]
     methods[method] = async (...args) => {
       const startedAt = performance.now()
       const timeoutMs = validateApiTimeout(args[index]?.apiTimeout, defaultTimeout)
-      const run = (generation) =>
-        runWithDeadline(method, timeoutMs, () => work(...args), generation, startedAt)
-      return lifecycle ? lifecycle.run(run) : run(null)
+      const admit = inputOf && (() => inputOf(...args))
+      const run = (generation, admitted = args) =>
+        runWithDeadline(method, timeoutMs, () => work(...admitted), generation, startedAt, true)
+      return lifecycle ? lifecycle.run(run, admit) : run(null, admit?.())
     }
   }
   return methods
@@ -513,6 +737,10 @@ module.exports = {
   runWithDeadline,
   retrierOf,
   currentDeadline,
+  currentMutation,
+  endsCall,
+  isAnsweredError,
+  settleMutations,
   checked,
   waitOf,
   shareMetadata,

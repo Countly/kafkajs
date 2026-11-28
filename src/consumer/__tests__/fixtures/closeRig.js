@@ -204,6 +204,7 @@ class CloseRig {
    * @param {number} [options.partitions=1]
    * @param {Record<number, string>} [options.committed] committed offsets by partition
    * @param {Record<string, Buffer>} [options.log] raw batches by `partition|offset`, over the default log
+   * @param {string} [options.profile] the scripted cluster's profile; by default the protocol's own
    * @returns {Promise<CloseRig>}
    */
   static async open({
@@ -214,6 +215,7 @@ class CloseRig {
     partitions = 1,
     committed,
     log,
+    profile = protocol === 'consumer' ? 'consumer' : 'default',
   } = {}) {
     const batches = {}
     for (let offset = 0; offset <= last; offset++) batches[`0|${offset}`] = await batchAt(offset)
@@ -222,7 +224,7 @@ class CloseRig {
     const cluster = script(
       createScriptedCluster({
         nodes: [NODE],
-        profile: protocol === 'consumer' ? 'consumer' : 'default',
+        profile,
       }),
       { partitions, committed }
     ).answer('Fetch', async ({ maxWaitMs, topics }) => {

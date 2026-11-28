@@ -1,5 +1,8 @@
+const { fetchBodyWithRecords } = require('../__tests__/fixtures/fetchBodyWithRecords')
 const { decode, parse } = require('./response')
 const { decode: decodeV17, parse: parseV17 } = require('../v17/response')
+
+const writeTopicId = (encoder) => encoder.writeUuid('01020304-0506-0708-090a-0b0c0d0e0f10')
 
 describe('Protocol > Requests > Fetch > v18', () => {
   test('decodes identically to v17 — v18 adds no response fields', async () => {
@@ -34,5 +37,22 @@ describe('Protocol > Requests > Fetch > v18', () => {
     expect(data.nodeEndpoints).toEqual([])
 
     await expect(parse(data)).resolves.toBeTruthy()
+  })
+
+  test('refuses a records block that claims more bytes than the answer holds', async () => {
+    // Records 65 claims 100 bytes; only the three tag buffers (00 00 00) follow
+    const body = fetchBodyWithRecords(writeTopicId, Buffer.from('65', 'hex'))
+
+    await expect(decode(body)).rejects.toMatchObject({
+      name: 'KafkaJSPartialMessageError',
+      message: expect.stringContaining('FetchResponse.Records'),
+    })
+  })
+
+  test('decodes a records block of length zero written as bytes', async () => {
+    // Records 01 is the compact empty block; the same body as above otherwise
+    const data = await decode(fetchBodyWithRecords(writeTopicId, Buffer.from('01', 'hex')))
+
+    expect(data.responses[0].partitions[0].messages).toEqual([])
   })
 })

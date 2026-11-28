@@ -1,0 +1,10 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -2335,7 +2335,6 @@
+    * @returns {Promise<Batch[]>} always empty
+    */
+   async idleFetchRound(prepared, run) {
+-    if (prepared.leaderless) await this.refreshLeaderlessMetadata(run)
+     // Registers only while the snapshot is current: an invalidated one returns through the
+     // fetcher's yield floor and a fresh snapshot is captured next round.
+     await run.wait(

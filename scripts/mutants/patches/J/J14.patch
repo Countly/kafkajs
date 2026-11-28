@@ -1,0 +1,28 @@
+--- a/src/consumer/__tests__/fixtures/classicCoordinatorFaults.json
++++ b/src/consumer/__tests__/fixtures/classicCoordinatorFaults.json
+@@ -978,25 +978,5 @@
+       "committed": "confirmed-only",
+       "handler": "none"
+     }
+-  },
+-  {
+-    "api": "OffsetCommit",
+-    "fault": 25,
+-    "step": "old-generation-answer",
+-    "expectedState": "unchanged",
+-    "expectedWire": {
+-      "afterLossOffsetCommits": 0,
+-      "duplicateAssignments": 0,
+-      "extraRejoins": 0
+-    },
+-    "maxRounds": 0,
+-    "config": {
+-      "groupProtocol": "classic"
+-    },
+-    "replay": {
+-      "log": "n/a",
+-      "committed": "confirmed-only",
+-      "handler": "none"
+-    }
+   }
+ ]

@@ -1,0 +1,95 @@
+name: Final soak smoke (diagnostic)
+# Runs the final soak runbook in smoke mode (or, when a dispatch selects it, rehearsal mode: the
+# first three hours of the 12-hour acceptance plan, so the heap row is judged on three quiet boundaries) against
+# the repository's three-broker Kafka 4.4.0 telemetry Compose cluster on a hosted runner. A smoke
+# job takes about 35 minutes, a rehearsal about 3.5 hours. Diagnostic only: a hosted runner cannot
+# meet the quiet-host floors, so preflight records those checks without failing on them and the
+# artifact is marked diagnostic. It closes no evidence row and gates nothing; it is how the driver's live parts
+# get exercised against a real cluster. A push to a branch that matches the `push` trigger below runs it
+# with every default, since a dispatch-only workflow must first exist on the default branch.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Run mode (smoke 30 min; rehearsal 3 h of the acceptance plan)
+        type: choice
+        options: ['smoke', 'rehearsal']
+        default: 'smoke'
+      node:
+        description: Node.js major version
+        type: choice
+        options: ['26', '24', '22']
+        default: '26'
+  push:
+    branches: ['p11/soak-smoke*']
+permissions:
+  contents: read
+concurrency:
+  group: final-soak-smoke-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    # The runbook step's limit is the mode's window, the matrix's 15 min teardown allowance, setup,
+    # dumps, check and archive, and a cleanup grace after a timeout; the job limit covers every
+    # step's own limit and stays inside a hosted runner's six hours.
+    timeout-minutes: 335
+    env:
+      FINAL_SOAK_MODE: ${{ inputs.mode || 'smoke' }}
+      KAFKA_VERSION: '4.4.0'
+      FINAL_SOAK_DIAGNOSTIC: '1'
+      FINAL_SOAK_ARTIFACTS: ${{ github.workspace }}/.tmp/final-soak
+      TF1_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
+      TELEMETRY_JAVA_CACHE: ${{ github.workspace }}/.tmp/telemetry-cache
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 2
+      - uses: actions/setup-node@v4
+        timeout-minutes: 2
+        with:
+          node-version: ${{ inputs.node || '26' }}
+          cache: npm
+      - uses: actions/setup-java@v4
+        timeout-minutes: 2
+        with: { distribution: temurin, java-version: '21' }
+      - name: Fetch the pinned reporter build inputs
+        timeout-minutes: 5
+        run: timeout -k 5s 240s bash scripts/e2e/telemetry/fetch.sh
+      - name: Pull the broker image
+        timeout-minutes: 4
+        run: timeout -k 5s 210s docker pull "apache/kafka:$KAFKA_VERSION"
+      - name: Run the soak runbook
+        timeout-minutes: 295
+        run: |
+          case "$FINAL_SOAK_MODE" in
+            smoke) limit=4200 ;;
+            rehearsal) limit=17400 ;;
+            *) echo "unknown mode $FINAL_SOAK_MODE" >&2; exit 2 ;;
+          esac
+          timeout -k 120s "${limit}s" bash scripts/soak/finalSoakNode.sh "$(git rev-parse HEAD)" "$FINAL_SOAK_MODE"
+      - name: Print the runbook receipt and the driver summary
+        if: always()
+        timeout-minutes: 2
+        run: |
+          shopt -s nullglob
+          receipts=("$FINAL_SOAK_ARTIFACTS"/*.runbook.json)
+          summaries=("$FINAL_SOAK_ARTIFACTS"/*.summary.json)
+          ((${#receipts[@]} > 0)) || echo "no runbook receipt: the runbook stopped before its artifact directory existed"
+          for receipt in "${receipts[@]}"; do cat "$receipt"; done
+          ((${#summaries[@]} > 0)) || echo "no driver summary: the runbook stopped before the driver finished (see the receipt's failedStage)"
+          for summary in "${summaries[@]}"; do cat "$summary"; done
+          for log in "$FINAL_SOAK_ARTIFACTS"/*/driver.log; do tail -n 200 "$log"; done
+      - name: Stop the cluster
+        if: always()
+        timeout-minutes: 3
+        run: docker compose -p kafkajs -f docker-compose.telemetry.yml down --volumes || true
+      - name: Upload the artifact
+        if: always()
+        timeout-minutes: 15
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-soak-${{ env.FINAL_SOAK_MODE }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .tmp/final-soak/
+          if-no-files-found: error
+          include-hidden-files: true

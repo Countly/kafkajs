@@ -141,6 +141,10 @@
     {
       "publicName": "consumer.stop",
       "internalName": "consumer.stop"
+    },
+    {
+      "publicName": "consumer.topic_metadata_status",
+      "internalName": "consumer.topic_metadata_status"
     }
   ],
   "admin": [
@@ -486,6 +490,15 @@
     },
     "consumer.stop": {
       "type": "consumer.stop",
+      "keys": [
+        "id",
+        "payload",
+        "timestamp",
+        "type"
+      ]
+    },
+    "consumer.topic_metadata_status": {
+      "type": "consumer.topic_metadata_status",
       "keys": [
         "id",
         "payload",

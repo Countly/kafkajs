@@ -118,6 +118,18 @@ describe('scripts/assertCleanTarball.sh', () => {
     expect(result.stderr).toContain('test files')
   })
 
+  it.each([
+    ['a mutation record copy', '.tmp/mutants/record-abc123/tree/src/index.js'],
+    ['a mutation record report', '.tmp/mutants/record-abc123/mutant.json'],
+    ['the local run-state directory alone', '.tmp/'],
+  ])('fails on %s', (_, file) => {
+    const result = run(pack(['index.js', 'docs/ShareConsumer.md', 'docs/ClientTelemetry.md', file]))
+
+    expect(result.status).toBe(1)
+    expect(result.stdout).toContain(`package/${file}`)
+    expect(result.stderr).toContain('local run state')
+  })
+
   it('fails without a tarball argument', () => {
     const result = run()
 

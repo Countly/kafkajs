@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -2555,7 +2555,7 @@
+       // Hoisted out of the per-partition loop: the response row below is the hot path, and its
+       // payload must not be built once per partition per round only to be discarded.
+       const debug = this.logger.debugEnabled()
+-      const requestsByTopic = indexFirstBy(requests, 'topic')
++      const requestsByTopic = indexFirstBy(tracked ? tracked.wire.topics : requests, 'topic')
+ 
+       for (const { topicName, topicId, partitions } of responses) {
+         if (topicName == null) {

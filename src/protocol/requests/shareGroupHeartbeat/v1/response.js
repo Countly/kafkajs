@@ -39,7 +39,8 @@ const decodeBody = (decoder, options) => {
  * @param {Buffer} rawData Message body after the response header.
  * @param {{checkCrcs?: boolean}} [options] Inherited record decoder options.
  * @returns {Promise<object>} Exact field domains; int64 offsets/lag remain decimal strings.
- * @throws {KafkaJSPartialMessageError} on malformed or truncated fields.
+ * @throws {KafkaJSPartialMessageError} on malformed or truncated fields. The assignment's values
+ *   are not checked here: the share membership refuses one no coordinator writes and retries.
  */
 const decode = async (rawData, options = {}) => {
   const decoder = new Decoder(rawData)

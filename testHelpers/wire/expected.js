@@ -2263,3 +2263,159 @@ module.exports.securityAdmin = {
       '00000205557365720b746573742d6f776e657205557365720b746573742d6f776e657200200000000000010020000000000001002000000000000109746f6b656e2d696416686d61632d6d61726b65722d6f6e6c792d746573740205557365720b746573742d6f776e657200000000000000',
   },
 }
+
+module.exports.deleteRecordsV2 = {
+  request: {
+    topics: [
+      {
+        topic: 't',
+        partitions: [
+          {
+            partition: 1,
+            offset: '-1',
+          },
+        ],
+      },
+    ],
+    timeout: 5000,
+  },
+  response: {
+    throttleTime: 0,
+    topics: [
+      {
+        topic: 't',
+        partitions: [
+          {
+            partition: 1,
+            lowWatermark: '2',
+            errorCode: 0,
+          },
+        ],
+      },
+    ],
+  },
+}
+
+module.exports.deleteGroupsV3 = {
+  request: ['group'],
+  response: {
+    throttleTime: 0,
+    results: [
+      {
+        groupId: 'group',
+        errorCode: 0,
+        errorMessage: null,
+      },
+    ],
+  },
+}
+
+module.exports.alterConfigsV2 = {
+  request: {
+    resources: [
+      {
+        type: 2,
+        name: 't',
+        configEntries: [
+          {
+            name: 'retention.ms',
+            value: '10',
+          },
+        ],
+      },
+    ],
+    validateOnly: false,
+  },
+  response: {
+    throttleTime: 0,
+    resources: [
+      {
+        errorCode: 0,
+        errorMessage: null,
+        resourceType: 2,
+        resourceName: 't',
+      },
+    ],
+  },
+}
+
+module.exports.incrementalAlterConfigsV1 = {
+  request: {
+    resources: [
+      {
+        type: 2,
+        name: 't',
+        configEntries: [
+          {
+            name: 'retention.ms',
+            operation: 0,
+            value: '10',
+          },
+        ],
+      },
+    ],
+    validateOnly: false,
+  },
+  response: {
+    throttleTime: 0,
+    resources: [
+      {
+        errorCode: 0,
+        errorMessage: null,
+        resourceType: 2,
+        resourceName: 't',
+      },
+    ],
+  },
+}
+
+module.exports.createAclsV3 = {
+  request: {
+    creations: [
+      {
+        resourceType: 2,
+        resourceName: 't',
+        resourcePatternType: 3,
+        principal: 'User:u',
+        host: '*',
+        operation: 3,
+        permissionType: 3,
+      },
+    ],
+  },
+  response: {
+    throttleTime: 0,
+    creationResponses: [
+      {
+        errorCode: 0,
+        errorMessage: null,
+      },
+    ],
+  },
+}
+
+module.exports.deleteAclsV3 = {
+  request: {
+    filters: [
+      {
+        resourceType: 2,
+        resourceName: 't',
+        resourcePatternType: 3,
+        principal: 'User:u',
+        host: '*',
+        operation: 3,
+        permissionType: 3,
+      },
+    ],
+  },
+  response: {
+    throttleTime: 0,
+    filterResponses: [
+      {
+        errorCode: 0,
+        errorMessage: null,
+        matchingAcls: [],
+      },
+    ],
+  },
+}

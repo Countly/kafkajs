@@ -5,6 +5,8 @@ coverage/
 __tests__
 __snapshots__
 fixtures
+src/protocol/requests/*/layout.json
+src/protocol/recordBatch/record/v0/decoderEquality.reference.json
 testHelpers/
 scripts/
 /otel/
@@ -27,6 +29,8 @@ types/tests.ts
 types/tsconfig.json
 types/tests.node16.ts
 types/tsconfig.node16.json
+types/tests.exact.ts
+types/tsconfig.exact.json
 types/package-exports.mts
 .github/
 .agents/

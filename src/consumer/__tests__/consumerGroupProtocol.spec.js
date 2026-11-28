@@ -435,6 +435,80 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
     })
   })
 
+  describe('An acknowledgement owed after the heartbeat was built', () => {
+    /**
+     * Owns topic-a of a target that also names topic-b before topic-b can be named, then holds the
+     * heartbeat that acknowledges topic-a and names topic-b while it is in flight.
+     * @param {object} heldAnswer what the held heartbeat is answered with
+     * @returns {Promise<object>} the harness, the held heartbeat and its release
+     */
+    const ackInFlight = async (heldAnswer) => {
+      const names = { [TOPIC_ID_A]: 'topic-a' }
+      let release
+      const held = new Promise((resolve) => (release = () => resolve(heldAnswer)))
+      const h = build({
+        names,
+        answers: [
+          heartbeatResponse({
+            assignment: assignmentOf([
+              [TOPIC_ID_A, [0]],
+              [TOPIC_ID_B, [0]],
+            ]),
+          }),
+          () => held,
+          heartbeatResponse(),
+        ],
+      })
+      await await startStep(h)
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+      const inFlight = h.manager.tick()
+      await flushRefresh()
+      expect(partitionsSentOn(h.sent[1])).toEqual([[TOPIC_ID_A, [0]]])
+
+      names[TOPIC_ID_B] = 'topic-b'
+      const result = await h.protocol.rebalance(context())
+      h.protocol.setOwned(
+        Object.entries(result.assignment).map(([topic, partitions]) => ({ topic, partitions }))
+      )
+      expect(h.protocol.state).toEqual(ACKNOWLEDGING)
+      return { h, inFlight, release }
+    }
+
+    it('a heartbeat built before an apply does not consume the acknowledgement that apply owes: the next one carries the applied set before STABLE', async () => {
+      const { h, inFlight, release } = await ackInFlight(heartbeatResponse())
+
+      release()
+      await inFlight
+
+      expect(h.protocol.state).toEqual(ACKNOWLEDGING)
+      await h.manager.tick()
+      expect(partitionsSentOn(h.sent[2])).toEqual([
+        [TOPIC_ID_A, [0]],
+        [TOPIC_ID_B, [0]],
+      ])
+      expect(h.protocol.state).toEqual(STABLE)
+    })
+
+    it('a withdrawal answering a heartbeat built before an apply is applied still lets the next round release it and acknowledge what is left', async () => {
+      const { h, inFlight, release } = await ackInFlight(
+        heartbeatResponse({ memberEpoch: 2, assignment: assignmentOf([[TOPIC_ID_A, [0]]]) })
+      )
+      h.rebalanceCoordinator.requestRejoin.mockClear()
+
+      release()
+      await inFlight
+
+      expect(h.protocol.state).toEqual(RECONCILING)
+      expect(h.rebalanceCoordinator.requestRejoin).toHaveBeenCalledTimes(1)
+      const result = await h.protocol.rebalance(context())
+      expect(result.assignment).toEqual({ 'topic-a': [0] })
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+      await h.manager.tick()
+      expect(partitionsSentOn(h.sent[h.sent.length - 1])).toEqual([[TOPIC_ID_A, [0]]])
+      expect(h.protocol.state).toEqual(STABLE)
+    })
+  })
+
   describe('The target changes mid-round', () => {
     it('applies the snapshot the step took, and the next step applies the new target', async () => {
       const h = build({
@@ -548,6 +622,52 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       expect(h.refreshedIds).toHaveLength(6)
       expect(h.protocol.needsReconciliation()).toBe(false)
     })
+
+    it('warns once per episode, naming the assigned topic ids that stay unresolved', async () => {
+      const names = { [TOPIC_ID_A]: 'topic-a' }
+      let answer = heartbeatResponse({
+        assignment: assignmentOf([
+          [TOPIC_ID_A, [0]],
+          [TOPIC_ID_B, [0]],
+        ]),
+      })
+      const h = build({ names, metadataMaxAge: 1000, answers: [() => answer] })
+      const unresolvedWarnings = () =>
+        h.logged.warn.mock.calls.filter(([message]) =>
+          message.startsWith('Assigned topic ids are still unresolved')
+        )
+      await await startStep(h)
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+      await h.manager.tick()
+      for (let i = 0; i < 4; i++) {
+        jest.advanceTimersByTime(5000)
+        await h.manager.tick()
+      }
+
+      expect(h.refreshedIds.length).toBeGreaterThan(3)
+      const warning = [
+        'Assigned topic ids are still unresolved; their partitions are not consumed until metadata names them',
+        { groupId: GROUP_ID, topicIds: [TOPIC_ID_B] },
+      ]
+      expect(unresolvedWarnings()).toEqual([warning])
+
+      // A new target naming the same id starts a second episode, warned once again.
+      answer = heartbeatResponse({
+        memberEpoch: 2,
+        assignment: assignmentOf([
+          [TOPIC_ID_A, [0]],
+          [TOPIC_ID_B, [0, 1]],
+        ]),
+      })
+      const asked = h.refreshedIds.length
+      for (let i = 0; i < 6; i++) {
+        jest.advanceTimersByTime(5000)
+        await h.manager.tick()
+      }
+
+      expect(h.refreshedIds.length).toBeGreaterThan(asked + 2)
+      expect(unresolvedWarnings()).toEqual([warning, warning])
+    })
   })
 
   describe('A target naming a topic id this member has never seen', () => {
@@ -598,6 +718,7 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       // metadata max age, which is the shipped default 300000 here.
       expect(h.cluster.refreshMetadataForTopicIds).toHaveBeenCalledWith([TOPIC_ID_B], {
         isCurrent: expect.any(Function),
+        surface: true,
       })
       expect(h.sent).toHaveLength(2)
 
@@ -684,6 +805,60 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       )
     })
 
+    it.each([
+      ['INVALID_TOPIC_EXCEPTION (17)', 17],
+      ['TOPIC_AUTHORIZATION_FAILED (29)', 29],
+    ])(
+      'a lookup by id of a newly assigned topic answered %s ends the membership with that error, and the next round fails with it',
+      async (_, code) => {
+        const h = await memberOwningTopicA({
+          names: { [TOPIC_ID_A]: 'topic-a' },
+          later: heartbeatResponse({ memberEpoch: 2, assignment: TARGET_A_AND_B }),
+        })
+        const answered = createErrorFromCode(code)
+        h.cluster.refreshMetadataForTopicIds.mockRejectedValue(answered)
+
+        await h.manager.tick()
+        await flushRefresh()
+
+        expect(h.cluster.refreshMetadataForTopicIds).toHaveBeenCalledWith(
+          [TOPIC_ID_B],
+          expect.anything()
+        )
+        expect(h.protocol.state).toEqual(FATAL)
+        expect(h.protocol.target).toBeNull()
+        expect(h.rebalanceCoordinator.requestRejoin).toHaveBeenCalledTimes(1)
+        await expect(h.protocol.rebalance(context())).rejects.toBe(answered)
+      }
+    )
+
+    it('a lookup by id answered TOPIC_AUTHORIZATION_FAILED after the target was cleared changes nothing', async () => {
+      const h = await memberOwningTopicA({
+        names: { [TOPIC_ID_A]: 'topic-a' },
+        later: heartbeatResponse({ memberEpoch: 2, assignment: TARGET_A_AND_B }),
+      })
+      const rejects = []
+      h.cluster.refreshMetadataForTopicIds.mockImplementation(
+        () => new Promise((_resolve, reject) => rejects.push(reject))
+      )
+
+      await h.manager.tick()
+      expect(rejects).toHaveLength(1)
+      h.protocol.onMembershipError(createErrorFromCode(25))
+      expect(h.protocol.state).toEqual(FENCED)
+
+      rejects[0](createErrorFromCode(29))
+      await flushRefresh()
+
+      expect(h.protocol.state).toEqual(FENCED)
+      expect(h.protocol.fatalError).toBeFalsy()
+      expect(h.rebalanceCoordinator.requestRejoin).not.toHaveBeenCalled()
+      expect(h.logged.debug).not.toHaveBeenCalledWith(
+        'Could not re-read the target after refreshing its topic ids',
+        expect.anything()
+      )
+    })
+
     it('drops a refresh that lands after the target was cleared', async () => {
       const names = { [TOPIC_ID_A]: 'topic-a' }
       const h = await memberOwningTopicA({
@@ -744,13 +919,84 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       await flushRefresh()
 
       // The stale refresh resolved a name the current target also wants, so re-reading it would
-      // ask for a round under an epoch that is no longer this member's.
+      // ask for a round under an epoch that is no longer this member's. The newer target's resolvable
+      // part equals what the member owns, so it is still owed its acknowledgement.
       expect(h.rebalanceCoordinator.requestRejoin).not.toHaveBeenCalled()
-      expect(h.protocol.state).toEqual(STABLE)
+      expect(h.protocol.state).toEqual(ACKNOWLEDGING)
+    })
+
+    it('a step whose target a newer one replaced while it resolved fails with the round refusal instead of resolving again', async () => {
+      const names = { [TOPIC_ID_A]: 'topic-a' }
+      let answer = heartbeatResponse({
+        memberEpoch: 2,
+        assignment: assignmentOf([
+          [TOPIC_ID_A, [0, 1]],
+          [TOPIC_ID_B, [0]],
+        ]),
+      })
+      const h = await memberOwningTopicA({ names, later: () => answer })
+      await h.manager.tick()
+      await flushRefresh()
+      expect(h.protocol.state).toEqual(RECONCILING)
+
+      const releases = []
+      h.cluster.refreshMetadataForTopicIds.mockImplementation(async (ids) => {
+        await new Promise((resolve) => releases.push(resolve))
+        return { resolved: [], unresolved: ids }
+      })
+      const refusal = new Error('the round was retired')
+      let refused = false
+      const round = { guard: jest.fn(() => (refused ? refusal : null)) }
+      const step = h.protocol.rebalance(context({ round }))
+      step.catch(() => {})
+      await flushRefresh()
+      expect(releases).toHaveLength(1)
+
+      answer = heartbeatResponse({
+        memberEpoch: 3,
+        assignment: assignmentOf([
+          [TOPIC_ID_A, [0, 1]],
+          [TOPIC_ID_B, [0, 1]],
+        ]),
+      })
+      jest.advanceTimersByTime(5000)
+      await h.manager.tick()
+      refused = true
+      releases[0]()
+
+      await expect(step).rejects.toBe(refusal)
+      expect(releases).toHaveLength(1)
     })
   })
 
   describe('Fencing on the heartbeat path', () => {
+    it('a HEARTBEAT listener that retires the run keeps the answer it reports from applying', async () => {
+      const h = build({
+        answers: [
+          heartbeatResponse({ memberEpoch: 1, assignment: assignmentOf([[TOPIC_ID_A, [0]]]) }),
+          heartbeatResponse({ memberEpoch: 1 }),
+          heartbeatResponse({ memberEpoch: 2, assignment: assignmentOf([[TOPIC_ID_A, [0, 1]]]) }),
+        ],
+      })
+      await await startStep(h)
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+      await h.manager.tick()
+      expect(h.protocol.state).toEqual(STABLE)
+      let retired = false
+      const guard = () => (retired ? new Error('the run was stopped') : null)
+      h.protocol.instrumentationEmitter.addListener(events.HEARTBEAT, () => (retired = true))
+      h.rebalanceCoordinator.requestRejoin.mockClear()
+
+      jest.advanceTimersByTime(5000)
+      const accepted = await h.protocol.heartbeat({ interval: 5000, guard })
+
+      expect(accepted).toBe(false)
+      expect(h.heartbeats).toHaveLength(3)
+      expect(h.protocol.state).toEqual(STABLE)
+      expect(h.protocol.memberEpoch).toEqual(1)
+      expect(h.rebalanceCoordinator.requestRejoin).not.toHaveBeenCalled()
+    })
+
     it('goes to FENCED, keeps the epoch and the member id, resets the sent fields and rejoins', async () => {
       const fenced = createErrorFromCode(110)
       const h = build({
@@ -1045,6 +1291,33 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
   })
 
   describe('Leaving', () => {
+    it('a fatal error learned while the leave heartbeat is in flight leaves the member FATAL when the leave is answered', async () => {
+      let answerLeave
+      const h = build({
+        answers: [
+          heartbeatResponse({ memberEpoch: 3, assignment: assignmentOf([[TOPIC_ID_A, [0]]]) }),
+          () => new Promise((resolve) => (answerLeave = resolve)),
+        ],
+      })
+      await await startStep(h)
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+      h.manager.stop()
+
+      const leaving = h.protocol.leave()
+      await flushRefresh()
+      expect(h.sent.at(-1).memberEpoch).toEqual(-1)
+      expect(h.protocol.state).toEqual(LEAVING)
+
+      const fatal = createErrorFromCode(30)
+      h.protocol.onMembershipError(fatal)
+      expect(h.protocol.state).toEqual(FATAL)
+      answerLeave(heartbeatResponse({ memberEpoch: -1 }))
+      await leaving
+
+      expect(h.protocol.state).toEqual(FATAL)
+      expect(h.protocol.fatalError).toBe(fatal)
+    })
+
     it('commits, reports the partitions as revoked and sends epoch -1', async () => {
       const commitBeforeRelease = jest.fn(async () => {})
       const h = build({
@@ -1868,24 +2141,22 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
         ],
       })
       await await startStep(h)
+      h.rebalanceCoordinator.requestRejoin.mockClear()
       h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
       await h.manager.tick()
-      expect(h.protocol.state).toEqual(STABLE)
+      const sentBefore = h.sent.length
 
-      jest.advanceTimersByTime(5000)
+      // The acknowledgement's answer carries the next target, whose resolvable part equals what the
+      // member owns: its local epoch is adopted and acknowledged at once, with no round, as the
+      // Java consumer does.
+      expect(h.protocol.state).toEqual(ACKNOWLEDGING)
+      expect(h.protocol.localAssignment.localEpoch).toEqual(h.protocol.target.localEpoch)
+      expect(h.rebalanceCoordinator.requestRejoin).not.toHaveBeenCalled()
+
       await h.manager.tick()
-
-      const result = await h.protocol.rebalance(context())
-      expect(result.assignment).toEqual({ 'topic-a': [0] })
-
-      // The step returned the same subset the member already owns, so the reconciliation completes
-      // inside the step: the target's local epoch is adopted and the member stays where it is.
-      // Asserting ACKNOWLEDGING here would be asserting a round that never settles.
-      expect(h.protocol.state).toEqual(STABLE)
-
-      jest.advanceTimersByTime(5000)
-      await h.manager.tick()
+      expect(h.sent).toHaveLength(sentBefore + 1)
       expect(partitionsSentOn(h.sent[h.sent.length - 1])).toEqual([[TOPIC_ID_A, [0]]])
+      expect(h.protocol.state).toEqual(STABLE)
     })
 
     it('acknowledges what the apply kept, not what the step returned', async () => {
@@ -2018,7 +2289,7 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
   })
 
   describe('A fencing while joining', () => {
-    it('rejects the step with the fencing, and the retried step joins', async () => {
+    it('rejects the step with the fencing, and the retried step joins once the backoff the fenced join armed has elapsed', async () => {
       const h = build({
         answers: [createErrorFromCode(110), heartbeatResponse({ memberEpoch: 3 })],
       })
@@ -2030,10 +2301,36 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       await expect(fenced).rejects.toMatchObject({ code: 110 })
       expect(h.protocol.state).toEqual(FENCED)
 
-      const retried = await await startStep(h)
+      const sentAtFence = h.sent.length
+      const retrying = h.protocol.rebalance(context())
+      retrying.catch(() => {})
+      await h.manager.tick()
+      expect(h.sent).toHaveLength(sentAtFence)
+      jest.advanceTimersByTime(1000)
+      await h.manager.tick()
+      const retried = await retrying
 
       expect(retried).toEqual({ assignment: {}, userData: null })
       expect(h.protocol.memberEpoch).toEqual(3)
+    })
+
+    it('adds the backoff a fenced join armed to the deadline of the next join only, held to the longest timer delay', async () => {
+      const h = build({
+        answers: [heartbeatResponse({ assignment: assignmentOf([[TOPIC_ID_A, [0]]]) })],
+      })
+      await await startStep(h)
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+      expect(h.protocol.state).not.toEqual(JOINING)
+      h.protocol.backoff.onFailedAttempt(Date.now(), 100)
+
+      // An established member reconciles without joining.
+      expect(h.protocol.joinBudget(100)).toEqual(100)
+
+      h.protocol.onMembershipError(createErrorFromCode(110))
+      expect(h.protocol.state).toEqual(FENCED)
+
+      expect(h.protocol.joinBudget(100)).toBeGreaterThanOrEqual(200)
+      expect(h.protocol.joinBudget(2147483647)).toEqual(2147483647)
     })
 
     it('treats a second, redundant recovery as a no-op', async () => {
@@ -2044,6 +2341,7 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       fenced.catch(() => {})
       await h.manager.tick()
       await expect(fenced).rejects.toMatchObject({ code: 25 })
+      jest.advanceTimersByTime(1000)
       await await startStep(h)
 
       h.protocol.setOwned([])
@@ -2366,6 +2664,30 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
   })
 
   describe('A defect raised while handling a response', () => {
+    it('a defect raised on the request path, a duplicate correlation id, reaches the caller as itself and keeps the coordinator and the cadence', async () => {
+      const { KafkaJSInvariantViolation } = require('../../errors')
+      const h = build({
+        answers: [
+          heartbeatResponse({ memberEpoch: 3, assignment: assignmentOf([[TOPIC_ID_A, [0]]]) }),
+          heartbeatResponse({ memberEpoch: 3 }),
+        ],
+      })
+      await await startStep(h)
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+      await h.manager.tick()
+      const coordinator = h.protocol.coordinator
+      const defect = new KafkaJSInvariantViolation('Correlation id already exists')
+      h.coordinator.consumerGroupHeartbeat.mockRejectedValueOnce(defect)
+
+      jest.advanceTimersByTime(5000)
+      await h.manager.tick()
+
+      expect(h.manager.errors).toEqual([defect])
+      expect(h.protocol.coordinator).toBe(coordinator)
+      expect(h.protocol.heartbeatInterval()).toEqual(5000)
+      expect(h.protocol.state).toEqual(STABLE)
+    })
+
     it('is not mistaken for a transport failure', async () => {
       const { KafkaJSInvariantViolation } = require('../../errors')
       const h = build({
@@ -2639,6 +2961,31 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       })
     })
 
+    it('throws the assignment change when a leave starts while the names resolve, before the leave clears the target', async () => {
+      const h = build({
+        answers: [heartbeatResponse({ assignment: assignmentOf([[TOPIC_ID_A, [0]]]) })],
+      })
+      let release
+      jest
+        .spyOn(h.protocol, 'releaseOwnedPartitions')
+        .mockImplementation(() => new Promise((resolve) => (release = resolve)))
+      const resolve = h.protocol.resolveAssignmentTopicNames.bind(h.protocol)
+      let leaving
+      jest.spyOn(h.protocol, 'resolveAssignmentTopicNames').mockImplementation(async (...args) => {
+        const resolved = await resolve(...args)
+        leaving = h.protocol.leave()
+        return resolved
+      })
+
+      await expect(startStep(h).then((pending) => pending)).rejects.toMatchObject({
+        type: 'ASSIGNMENT_CHANGED',
+      })
+      expect(h.protocol.state).toEqual(PREPARE_LEAVING)
+      expect(h.protocol.target).not.toBeNull()
+      release()
+      await leaving
+    })
+
     it('throws the assignment change when the target retires right after the subscription grew', async () => {
       const h = build({
         answers: [heartbeatResponse({ assignment: assignmentOf([[TOPIC_ID_A, [0]]]) })],
@@ -2754,4 +3101,103 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       expect(h.protocol.state).toEqual(FATAL)
     })
   })
+})
+
+describe('Consumer > groupProtocol > ConsumerGroupProtocol > an apply in flight when the target converges', () => {
+  beforeEach(() => jest.useFakeTimers())
+  afterEach(() => jest.useRealTimers())
+
+  const TOPIC_ID_X = 'XXXXXXXXXXXXXXXXXXXXXg'
+
+  /**
+   * A coordinator with the Kafka group coordinator's revocation rule: a member asked to revoke
+   * keeps its epoch, and a heartbeat that reports no owned partitions still owns them. It assigns
+   * topic-a/0 and X/0, then adds topic-a/1 at epoch 2, then drops topic-a/1 and X; only a heartbeat
+   * that reports owned partitions without topic-a/1 moves the member to epoch 3.
+   * @returns {{ answer: Function, phase: (next: string) => void }}
+   */
+  const revokingCoordinator = () => {
+    let phase = 'stable'
+    const ownsRevoked = ({ topicPartitions }) =>
+      !topicPartitions ||
+      topicPartitions.some(
+        ({ topicId, partitions }) => topicId === TOPIC_ID_A && partitions.includes(1)
+      )
+    const answer = (request) => {
+      if (request.memberEpoch === 0) {
+        return heartbeatResponse({
+          memberEpoch: 1,
+          assignment: assignmentOf([
+            [TOPIC_ID_A, [0]],
+            [TOPIC_ID_X, [0]],
+          ]),
+        })
+      }
+      if (phase === 'add') {
+        phase = 'added'
+        return heartbeatResponse({
+          memberEpoch: 2,
+          assignment: assignmentOf([
+            [TOPIC_ID_A, [0, 1]],
+            [TOPIC_ID_X, [0]],
+          ]),
+        })
+      }
+      if (phase === 'drop') {
+        phase = 'unrevoked'
+        return heartbeatResponse({ memberEpoch: 2, assignment: assignmentOf([[TOPIC_ID_A, [0]]]) })
+      }
+      if (phase === 'unrevoked' && !ownsRevoked(request)) phase = 'reconciled'
+      if (phase === 'reconciled') return heartbeatResponse({ memberEpoch: 3 })
+      return heartbeatResponse({ memberEpoch: phase === 'stable' ? 1 : 2 })
+    }
+    return { answer, phase: (next) => (phase = next) }
+  }
+
+  it.each([
+    ['held at its first add', true],
+    ['with no name', false],
+  ])(
+    'a target that drops the added partition and an id %s while the apply is in flight keeps the member reconciling: the apply reports what it applied, and the next round reports the partition released',
+    async (_, held) => {
+      const coordinator = revokingCoordinator()
+      const names = held ? { ...TOPIC_NAMES, [TOPIC_ID_X]: 'topic-x' } : TOPIC_NAMES
+      const h = build({ names, answers: [coordinator.answer] })
+      if (held) h.cluster.isTopicPending = (name) => name === 'topic-x'
+      const tick = async () => {
+        jest.advanceTimersByTime(6000)
+        await h.manager.tick()
+      }
+
+      await await startStep(h, context())
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+      await tick()
+      expect(h.protocol.state).toEqual(STABLE)
+
+      coordinator.phase('add')
+      await tick()
+      expect(h.protocol.state).toEqual(RECONCILING)
+      const step = await h.protocol.rebalance(context())
+      expect(step.assignment).toEqual({ 'topic-a': [0, 1] })
+
+      coordinator.phase('drop')
+      await tick()
+      expect(h.protocol.state).toEqual(RECONCILING)
+
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0, 1] }])
+      await tick()
+      expect(partitionsSentOn(h.sent.at(-1))).toEqual([[TOPIC_ID_A, [0, 1]]])
+      expect(h.sent.at(-1).memberEpoch).toBe(2)
+      expect(h.protocol.state).toEqual(RECONCILING)
+
+      const next = await h.protocol.rebalance(context())
+      expect(next.assignment).toEqual({ 'topic-a': [0] })
+      h.protocol.setOwned([{ topic: 'topic-a', partitions: [0] }])
+      await tick()
+      expect(partitionsSentOn(h.sent.at(-1))).toEqual([[TOPIC_ID_A, [0]]])
+      await tick()
+      expect(h.sent.at(-1).memberEpoch).toBe(3)
+      expect(h.protocol.state).toEqual(STABLE)
+    }
+  )
 })

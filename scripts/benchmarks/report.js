@@ -1,17 +1,29 @@
 /**
- * Benchmark report: runs every entry of `manifest.json` once per arm and per run, takes the median
+ * Benchmark report: runs every entry of `manifest.json` that is selected (all but those marked
+ * `namedOnly` unless `--only` names them) once per arm and per run, takes the median
  * and the range of each metric, and writes `bench-report.md` and `bench-report.json`. Benchmarks are
  * reported and never judged: a crash, a non-zero exit, bad output or a bad metric is an `error` row,
  * a report is always written, and the exit code stays 0.
  *
+ * Every row has a status: `valid`, `inconclusive` (a noisy or void control), `invalid` (a control
+ * failed), `error` (the workload failed), `omitted` (not run, with its reason) or `not selected`
+ * (left out by `--only`). Only `valid` and `inconclusive` rows carry numbers. An entry's `adapter` names a module in `adapters/` that reads
+ * its output instead of the plain reader; an entry's `omitted` (`reason`, `decision`,
+ * `evidenceRun`) reports it without running it. Each run's arguments, exit, stdout and stderr, and
+ * the manifest entry, are written under `<out>/bench-raw/<entry>/` as the run ends, so the evidence
+ * survives a report that never finishes; `{raw}` in a command is a file in that directory.
+ *
  * Usage: node scripts/benchmarks/report.js --runs 3 --fork-dir <dir> --baseline-dir <dir> --out <dir>
+ *          [--only <name>[,<name>...]]
  * `--fork-dir` and `--baseline-dir` are npm install prefixes: the fork's packed tarball and
- * kafkajs@2.2.4. Exit codes: 0 a report was written, 2 a bad argument.
+ * kafkajs@2.2.4. `--only` runs just the named manifest entries; an empty value runs them all
+ * except those marked `namedOnly`, which run only when named.
+ * Exit codes: 0 a report was written, 2 a bad argument (an unknown `--only` name included).
  */
 const fs = require('node:fs')
 const path = require('node:path')
 const { spawnSync } = require('node:child_process')
-const { median } = require('./session')
+const { median, setupFailure } = require('./session')
 const defaultManifest = require('./manifest.json')
 
 const ROOT = path.resolve(__dirname, '..', '..')
@@ -20,15 +32,41 @@ const MAX_BUFFER = 16 * 1024 * 1024
 const BASELINE = 'kafkajs@2.2.4'
 const BASELINE_VERSION = '2.2.4'
 const PACKAGES = { fork: '@countly/kafkajs', [BASELINE]: 'kafkajs' }
-const HEADER = ['benchmark', 'arm', 'metric', 'median', 'range', 'unit', 'runs', 'ratio']
+const HEADER = ['benchmark', 'arm', 'metric', 'status', 'median', 'range', 'unit', 'runs', 'ratio']
+const STATUSES = ['valid', 'inconclusive', 'invalid', 'error', 'omitted', 'not selected']
+const NUMBERED = ['valid', 'inconclusive']
+const ADAPTERS = path.join(__dirname, 'adapters')
 const USAGE =
-  'usage: node scripts/benchmarks/report.js --runs <n> --fork-dir <dir> --baseline-dir <dir> --out <dir>'
+  'usage: node scripts/benchmarks/report.js --runs <n> --fork-dir <dir> --baseline-dir <dir> ' +
+  '--out <dir> [--only <name>[,<name>...]]'
 
 /**
+ * @typedef {'valid'|'inconclusive'|'invalid'|'error'|'omitted'|'not selected'} Status
  * @typedef {{ benchmark: string, arm: string, metric: string, unit: string, runs: number,
- *   median?: number, min?: number, max?: number, ratio?: number, error?: string }} Row
+ *   status: Status, reason?: string, median?: number, min?: number, max?: number,
+ *   ratio?: number }} Row
+ * @typedef {{ benchmark?: string, status: Status, reason?: string, raw?: string,
+ *   controls: { arm: string, name: string, passed: boolean, detail?: string }[],
+ *   notes: string[], table?: { caption: string, header: string[], rows: string[][] } }} Detail
+ *   what an adapter shows beside its rows: controls, notes and an optional table of text cells,
+ *   shown whatever the row's status
+ * @typedef {{ outputs: object[], error?: string, profile?: string,
+ *   diagnostic?: { output?: object, error?: string } }} Outcome what the runs of one arm gave;
+ *   `profile` is where its CPU profile is, or why it failed; `diagnostic` is the output of its one
+ *   diagnostic run, or why that run failed
+ * @typedef {{ runs?: number, timeoutMs?: number, interleave?: boolean,
+ *   read: (result: object, entry: ManifestEntry, arm: string) => object,
+ *   rows: (entry: ManifestEntry, arm: string, outcome: Outcome, runs: number) =>
+ *     { rows: Row[], detail?: Detail } }} Adapter `read` turns one spawn result into an output
+ *   or throws; `rows` turns an arm's outputs into rows; `runs` and `timeoutMs` override the
+ *   report's for every arm; `interleave` alternates the arms run by run
  * @typedef {{ name: string, command: string[], broker: boolean,
- *   metrics: { key: string, unit: string }[], arms: ('fork'|'kafkajs@2.2.4')[] }} ManifestEntry
+ *   metrics: { key: string, unit: string }[], arms: ('fork'|'kafkajs@2.2.4')[],
+ *   adapter?: string, profile?: boolean, namedOnly?: boolean,
+ *   diagnostic?: { args: string[], metrics: { key: string, unit: string }[] },
+ *   omitted?: { reason: string, decision: string, evidenceRun: string } }} ManifestEntry
+ *   `profile` adds one CPU-profiled run per arm; `diagnostic` adds one run per arm with `args`
+ *   appended to the command, whose `metrics` are reported from that run alone
  */
 
 /**
@@ -65,13 +103,22 @@ const pick = (obj, dotted) => {
 
 /**
  * @param {string[]} command manifest arguments
- * @param {{ client: string, package: string, baselinePackageDir: string }} values placeholder values
- * @returns {string[]} the arguments with `{client}`, `{package}` and `{baselinePackageDir}` replaced
+ * @param {{ client: string, package: string, baselinePackageDir: string, raw: string }} values
+ *   placeholder values
+ * @returns {string[]} the arguments with `{client}`, `{package}`, `{baselinePackageDir}` and
+ *   `{raw}` replaced
  */
 const fill = (command, values) =>
   command.map((arg) =>
-    arg.replace(/\{(client|package|baselinePackageDir)\}/g, (_, name) => values[name])
+    arg.replace(/\{(client|package|baselinePackageDir|raw)\}/g, (_, name) => values[name])
   )
+
+/**
+ * @param {string} file
+ * @param {unknown} value
+ * @returns {void} `value` written to `file` as indented JSON
+ */
+const writeJson = (file, value) => fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`)
 
 /**
  * @param {string|undefined} stderr
@@ -118,47 +165,188 @@ const readRun = (result, entry, arm) => {
 }
 
 /**
- * Runs `entry` for one arm, `runs` times in a row, and stops at the first run that fails.
+ * Runs `entry` on each of its arms `runs` times: every run of one arm before the next arm, or, for
+ * an adapter with `interleave`, one run of each arm in turn (fork, 2.2.4, fork, ...) so drift on
+ * the runner reaches both arms alike. An arm stops at its first failed run; the others go on.
+ * After each run, every run of that arm so far (arguments, exit, stdout, stderr) is rewritten to
+ * `<rawDir>/<arm>.json`. An entry with `profile` then runs each arm that did not fail once more
+ * under `node --cpu-prof`, writing the profile to `<rawDir>/<arm>-cpu-profile/`; that run's
+ * output is checked but never joins the outputs, since profiling changes the timing. An entry with
+ * `diagnostic` then runs each arm that did not fail once more with the arguments `diagnostic.args`
+ * added; that run's output is kept apart as the arm's `diagnostic`, since what it measures
+ * changes the timing too, and a failed diagnostic run leaves the measured outputs as they are.
  * @param {ManifestEntry} entry
- * @param {string} arm
- * @param {{ runs: number, forkDir: string, baselineDir: string, spawn: Function }} options
- * @returns {{ outputs: object[], error?: string }} the JSON lines of the runs that succeeded
+ * @param {Adapter} adapter reads each run's result
+ * @param {{ runs: number, forkDir: string, baselineDir: string, spawn: Function,
+ *   rawDir: string }} options `rawDir` is the entry's evidence directory
+ * @returns {Map<string, Outcome>} by arm, what the runs that succeeded gave
  */
-const runArm = (entry, arm, { runs, forkDir, baselineDir, spawn }) => {
-  const args = fill(entry.command, {
-    client: arm === 'fork' ? forkDir : baselineDir,
-    package: PACKAGES[arm],
-    baselinePackageDir: path.join(baselineDir, 'node_modules', 'kafkajs'),
-  })
-  const outputs = []
-  for (let n = 1; n <= runs; n++) {
-    const options = { cwd: ROOT, encoding: 'utf8', timeout: RUN_TIMEOUT_MS, maxBuffer: MAX_BUFFER }
+const runArms = (entry, adapter, { runs, forkDir, baselineDir, spawn, rawDir }) => {
+  const state = new Map(
+    entry.arms.map((arm) => [arm, { evidence: { arm, runs: [] }, outputs: [] }])
+  )
+  const numbers = Array.from({ length: runs }, (_, i) => i + 1)
+  const schedule = adapter.interleave
+    ? numbers.flatMap((n) => entry.arms.map((arm) => [arm, n]))
+    : entry.arms.flatMap((arm) => numbers.map((n) => [arm, n]))
+  const timeout = adapter.timeoutMs ?? RUN_TIMEOUT_MS
+  const options = { cwd: ROOT, encoding: 'utf8', timeout, maxBuffer: MAX_BUFFER }
+  const run = (arm, n, nodeArgs = [], extraArgs = []) => {
+    const args = [
+      ...fill(entry.command, {
+        client: arm === 'fork' ? forkDir : baselineDir,
+        package: PACKAGES[arm],
+        baselinePackageDir: path.join(baselineDir, 'node_modules', 'kafkajs'),
+        raw: path.join(rawDir, `${arm}-run-${n}.jsonl`),
+      }),
+      ...extraArgs,
+    ]
+    const result = spawn(process.execPath, [...nodeArgs, ...args], options)
+    const { evidence } = state.get(arm)
+    evidence.runs.push({
+      run: n,
+      args: [...nodeArgs, ...args],
+      status: result.status,
+      signal: result.signal ?? null,
+      error: result.error?.message ?? null,
+      stdout: result.stdout ?? '',
+      stderr: result.stderr ?? '',
+    })
+    writeJson(path.join(rawDir, `${arm}.json`), evidence)
+    return adapter.read(result, entry, arm)
+  }
+  for (const [arm, n] of schedule) {
+    const arms = state.get(arm)
+    if (arms.error) continue
     try {
-      outputs.push(readRun(spawn(process.execPath, args, options), entry, arm))
-    } catch (error) {
-      return { outputs, error: `run ${n} of ${runs}: ${error.message}` }
+      arms.outputs.push(run(arm, n))
+    } catch (err) {
+      arms.error = `run ${n} of ${runs}: ${err.message}`
     }
   }
-  return { outputs }
+  for (const [arm, arms] of entry.profile ? state : []) {
+    if (arms.error) continue
+    const dir = `${arm}-cpu-profile`
+    try {
+      run(arm, 'profile', ['--cpu-prof', '--cpu-prof-dir', path.join(rawDir, dir)])
+      arms.profile = `bench-raw/${entry.name}/${dir}/`
+    } catch (err) {
+      arms.profile = `failed: ${err.message}`
+    }
+  }
+  for (const [arm, arms] of entry.diagnostic ? state : []) {
+    if (arms.error) continue
+    try {
+      arms.diagnostic = { output: run(arm, 'diagnostic', [], entry.diagnostic.args) }
+    } catch (err) {
+      arms.diagnostic = { error: `diagnostic run: ${err.message}` }
+    }
+  }
+  return new Map(
+    [...state].map(([arm, { outputs, error, profile, diagnostic }]) => [
+      arm,
+      {
+        outputs,
+        ...(error && { error }),
+        ...(profile && { profile }),
+        ...(diagnostic && { diagnostic }),
+      },
+    ])
+  )
 }
 
 /**
  * @param {ManifestEntry} entry
  * @param {string} arm
- * @param {{ outputs: object[], error?: string }} outcome
+ * @param {Outcome} outcome
  * @param {number} runs
- * @returns {Row[]} one row per metric
+ * @returns {Row[]} one row per metric: `valid` with numbers, or `error` with its reason
  */
 const rowsOf = (entry, arm, { outputs, error }, runs) =>
   entry.metrics.map(({ key, unit }) => {
     const row = { benchmark: entry.name, arm, metric: key, unit, runs: outputs.length }
-    if (error) return { ...row, error }
+    if (error) return { ...row, status: 'error', reason: error }
     const values = outputs.map((output) => pick(output, key))
     const bad = values.indexOf(undefined)
-    if (bad !== -1)
-      return { ...row, error: `run ${bad + 1} of ${runs}: ${key} is not a finite number` }
-    return { ...row, median: median(values), min: Math.min(...values), max: Math.max(...values) }
+    if (bad !== -1) {
+      const reason = `run ${bad + 1} of ${runs}: ${key} is not a finite number`
+      return { ...row, status: 'error', reason }
+    }
+    const stats = { median: median(values), min: Math.min(...values), max: Math.max(...values) }
+    return { ...row, status: 'valid', ...stats }
   })
+
+/** The reader of an entry without an `adapter`: one JSON line of numbers per run. */
+const plain = {
+  read: readRun,
+  rows: (entry, arm, outcome, runs) => ({ rows: rowsOf(entry, arm, outcome, runs) }),
+}
+
+/**
+ * @param {string|undefined} name an entry's `adapter`
+ * @returns {Adapter} `adapters/<name>.js`, or the plain reader without a name
+ * @throws {Error} for a name that is not a plain module name or names no adapter
+ */
+const loadAdapter = (name) => {
+  if (name === undefined) return plain
+  const file = path.join(ADAPTERS, `${name}.js`)
+  if (!/^[A-Za-z0-9]+$/.test(name) || !fs.existsSync(file)) {
+    throw new Error(`no adapter ${name} in scripts/benchmarks/adapters`)
+  }
+  return require(file)
+}
+
+/**
+ * @param {ManifestEntry} entry
+ * @param {Status} status
+ * @param {string} reason
+ * @param {number} [runs]
+ * @returns {Row} the one row of an entry that has no numbers to show
+ */
+const entryRow = (entry, status, reason, runs = 0) => ({
+  benchmark: entry.name,
+  arm: '-',
+  metric: '-',
+  unit: '-',
+  runs,
+  status,
+  reason,
+})
+
+/**
+ * @param {ManifestEntry} entry an entry with `omitted`
+ * @returns {Row} its `omitted` row, or an `error` row when it lacks its reason, decision or
+ *   evidence run
+ */
+const omittedRow = (entry) => {
+  const { reason, decision, evidenceRun } = entry.omitted
+  const named = [reason, decision, evidenceRun].every((text) => typeof text === 'string' && text)
+  return named
+    ? entryRow(entry, 'omitted', `${reason} under ${decision}, evidence run ${evidenceRun}`)
+    : entryRow(entry, 'error', 'an omitted entry needs its reason, decision and evidenceRun')
+}
+
+/**
+ * Keeps the status rules whatever an adapter returned: a known status, and numbers only on a
+ * `valid` or `inconclusive` row, which must have a finite median. An `inconclusive` row with a
+ * reason and no numbers at all stays as it is: a session whose observations formed no
+ * measurement.
+ * @param {Row} row
+ * @returns {Row}
+ */
+const finalize = (row) => {
+  const { median: m, min, max, ratio, ...bare } = row
+  if (!STATUSES.includes(row.status)) {
+    return { ...bare, status: 'error', reason: `unknown status ${row.status}` }
+  }
+  if (!NUMBERED.includes(row.status)) return bare
+  const bareInconclusive = row.status === 'inconclusive' && row.reason
+  if (bareInconclusive && [m, min, max, ratio].every((n) => n === undefined)) return bare
+  if (![m, min, max].every(Number.isFinite)) {
+    return { ...bare, status: 'error', reason: `a ${row.status} row without its numbers` }
+  }
+  return row
+}
 
 /**
  * Sets `ratio` (fork median over the 2.2.4 median) on the fork rows that have a 2.2.4 counterpart.
@@ -177,21 +365,63 @@ const addRatios = (rows) => {
 }
 
 /**
- * Runs one manifest entry on each of its arms.
- * `{client}` is the arm's install prefix, `{package}` its package name and `{baselinePackageDir}`
- * `<baselineDir>/node_modules/kafkajs`, the installed 2.2.4 package (not the fork's scoped one).
+ * Runs one manifest entry on each of its arms, unless it is `omitted`, and writes the entry to
+ * `<rawDir>/<name>/entry.json` first.
+ * `{client}` is the arm's install prefix, `{package}` its package name, `{baselinePackageDir}`
+ * `<baselineDir>/node_modules/kafkajs`, the installed 2.2.4 package (not the fork's scoped one),
+ * and `{raw}` a file of the run in the entry's evidence directory.
  * A two-arm entry's output must name the package it loaded, the arm's own.
  * @param {ManifestEntry} entry
- * @param {{ runs: number, forkDir: string, baselineDir: string, spawn: Function }} options `spawn`
- *   has the signature of `child_process.spawnSync`; the directories are install prefixes
- * @returns {Row[]} one row per (arm, metric); a failed run or metric gives an `error` row
+ * @param {{ runs: number, forkDir: string, baselineDir: string, spawn: Function,
+ *   rawDir: string }} options `spawn` has the signature of `child_process.spawnSync`; the
+ *   directories are install prefixes; `rawDir` holds every entry's evidence
+ * @returns {{ rows: Row[], details: Detail[] }} the rows, one per (arm, metric) unless the
+ *   adapter says otherwise, and what the adapter shows beside them
  */
 const runEntry = (entry, options) => {
-  const rows = entry.arms.flatMap((arm) =>
-    rowsOf(entry, arm, runArm(entry, arm, options), options.runs)
-  )
+  const rawDir = path.join(options.rawDir, entry.name)
+  fs.mkdirSync(rawDir, { recursive: true })
+  writeJson(path.join(rawDir, 'entry.json'), entry)
+  if (entry.omitted !== undefined) return { rows: [omittedRow(entry)], details: [] }
+  let adapter
+  try {
+    adapter = loadAdapter(entry.adapter)
+  } catch (error) {
+    return { rows: [entryRow(entry, 'error', error.message)], details: [] }
+  }
+  const runs = adapter.runs ?? options.runs
+  const outcomes = runArms(entry, adapter, { ...options, runs, rawDir })
+  const results = entry.arms.map((arm) => {
+    try {
+      return adapter.rows(entry, arm, outcomes.get(arm), runs)
+    } catch (error) {
+      return { rows: [entryRow(entry, 'error', `the ${arm} rows failed: ${error.message}`)] }
+    }
+  })
+  const rows = results.flatMap((result) => result.rows).map(finalize)
   addRatios(rows)
-  return rows
+  const raw = `bench-raw/${entry.name}/`
+  const details = results.flatMap(({ detail }) =>
+    detail ? [{ benchmark: entry.name, ...detail, raw }] : []
+  )
+  return { rows, details }
+}
+
+/**
+ * The row of an entry its workflow job could not prepare: written to its evidence directory with
+ * the setup outcomes, and never run.
+ * @param {ManifestEntry} entry
+ * @param {string} reason what `setupFailure` returned
+ * @param {string} setup the job's `BENCH_SETUP`
+ * @param {string} rawDir every entry's evidence directory
+ * @returns {{ rows: Row[], details: Detail[] }}
+ */
+const setupRow = (entry, reason, setup, rawDir) => {
+  const dir = path.join(rawDir, entry.name)
+  fs.mkdirSync(dir, { recursive: true })
+  writeJson(path.join(dir, 'entry.json'), entry)
+  writeJson(path.join(dir, 'setup.json'), { setup, reason })
+  return { rows: [entryRow(entry, 'error', reason)], details: [] }
 }
 
 /**
@@ -207,29 +437,62 @@ const cell = (text) => String(text).replace(/\s+/g, ' ').replace(/\|/g, '\\|')
 const fmt = (n) => String(Number(n.toPrecision(6)))
 
 /**
+ * @param {Detail} detail
+ * @returns {string[]} the Markdown section of one adapter's controls, notes and table
+ */
+const renderDetail = ({ benchmark, status, reason, raw, controls, notes, table }) => [
+  '',
+  `### ${cell(benchmark)}: ${status}`,
+  '',
+  ...(reason ? [`- ${cell(reason)}`] : []),
+  `- raw evidence: ${raw}`,
+  ...controls.map(
+    ({ arm, name, passed, detail }) =>
+      `- ${cell(`control ${arm} ${name}: ${passed ? 'passed' : 'FAILED'}${detail ? ` (${detail})` : ''}`)}`
+  ),
+  ...notes.map((note) => `- ${cell(note)}`),
+  ...(table
+    ? [
+        '',
+        cell(table.caption),
+        '',
+        ...[table.header, table.header.map(() => '---'), ...table.rows].map(
+          (cells) => `| ${cells.map(cell).join(' | ')} |`
+        ),
+      ]
+    : []),
+]
+
+/**
  * @param {Row[]} rows
  * @param {Record<string, string|number>} meta lines shown above the table
- * @returns {string} the report as Markdown: metadata, the table and the reason of every error row
+ * @param {Detail[]} [details] adapters' controls and notes
+ * @returns {string} the report as Markdown: metadata, the table with each row's status (numbers
+ *   only beside `valid` and `inconclusive`), every reason, and the adapters' details
  */
-const renderMarkdown = (rows, meta) => {
+const renderMarkdown = (rows, meta, details = []) => {
   const line = (cells) => `| ${cells.map(cell).join(' | ')} |`
-  const body = rows.map((row) =>
-    row.error
-      ? [row.benchmark, row.arm, row.metric, 'error', '-', row.unit, row.runs, '-']
-      : [
-          row.benchmark,
-          row.arm,
-          row.metric,
-          fmt(row.median),
-          `${fmt(row.min)} to ${fmt(row.max)}`,
-          row.unit,
-          row.runs,
-          row.ratio === undefined ? '-' : fmt(row.ratio),
-        ]
-  )
-  const errors = rows
-    .filter((row) => row.error)
-    .map((row) => `- ${cell(`${row.benchmark} / ${row.arm} / ${row.metric}: ${row.error}`)}`)
+  const body = rows.map((row) => {
+    const numbered = NUMBERED.includes(row.status) && row.median !== undefined
+    return [
+      row.benchmark,
+      row.arm,
+      row.metric,
+      row.status,
+      numbered ? fmt(row.median) : '-',
+      numbered ? `${fmt(row.min)} to ${fmt(row.max)}` : '-',
+      row.unit,
+      row.runs,
+      row.ratio === undefined ? '-' : fmt(row.ratio),
+    ]
+  })
+  const reasons = rows
+    .filter((row) => row.reason)
+    .map((row) => {
+      const where =
+        row.arm === '-' ? row.benchmark : `${row.benchmark} / ${row.arm} / ${row.metric}`
+      return `- ${cell(`${where}: ${row.status}: ${row.reason}`)}`
+    })
   return [
     '# Benchmark report',
     '',
@@ -238,21 +501,23 @@ const renderMarkdown = (rows, meta) => {
     line(HEADER),
     line(HEADER.map(() => '---')),
     ...body.map(line),
-    ...(errors.length ? ['', '## Errors', '', ...errors] : []),
+    ...(reasons.length ? ['', '## Reasons', '', ...reasons] : []),
+    ...(details.length ? ['', '## Controls and notes', ...details.flatMap(renderDetail)] : []),
     '',
   ].join('\n')
 }
 
 /**
  * @param {string[]} argv
- * @returns {{ runs: number, forkDir: string, baselineDir: string, out: string }}
+ * @returns {{ runs: number, forkDir: string, baselineDir: string, out: string,
+ *   only: string[]|null }} `only` is null when `--only` is absent or empty
  * @throws {Error} the usage line for a missing, repeated or unknown flag or a bad `--runs`
  */
 const parseArgs = (argv) => {
   const flags = {}
   for (let i = 0; i < argv.length; i += 2) {
     const name = argv[i]
-    const known = ['--runs', '--fork-dir', '--baseline-dir', '--out'].includes(name)
+    const known = ['--runs', '--fork-dir', '--baseline-dir', '--out', '--only'].includes(name)
     if (!known || argv[i + 1] === undefined || Object.hasOwn(flags, name)) throw new Error(USAGE)
     flags[name] = argv[i + 1]
   }
@@ -264,21 +529,29 @@ const parseArgs = (argv) => {
     forkDir: path.resolve(flags['--fork-dir']),
     baselineDir: path.resolve(flags['--baseline-dir']),
     out: path.resolve(flags['--out']),
+    only: flags['--only'] ? flags['--only'].split(',') : null,
   }
 }
 
 /**
- * Runs the whole manifest and writes `bench-report.md` and `bench-report.json` into `--out`.
- * @param {string[]} argv `--runs`, `--fork-dir`, `--baseline-dir` and `--out`
+ * Runs the manifest, or the entries `--only` names, and writes `bench-report.md` and
+ * `bench-report.json` into `--out`, with each run entry's raw evidence under `--out/bench-raw/`.
+ * An entry `--only` leaves out is a `not selected` row and is neither run nor given evidence.
+ * In a workflow job whose setup steps did not all succeed (`BENCH_SETUP`, space-separated
+ * `<step>=<outcome>` pairs), every selected entry is an `error` row naming those steps and is not
+ * run; its evidence directory keeps the entry and a `setup.json` receipt.
+ * @param {string[]} argv `--runs`, `--fork-dir`, `--baseline-dir`, `--out` and `--only`
  * @param {object} [deps]
  * @param {Function} [deps.spawn] `child_process.spawnSync`, replaceable in tests
  * @param {{ entries: ManifestEntry[] }} [deps.manifest] the benchmarks to run
  * @param {(line: string) => void} [deps.log] receives the usage line and one line per entry
+ * @param {Record<string, string|undefined>} [deps.env] the environment, `process.env` by default
  * @returns {number} 0 once the report is written, whatever its rows hold; 2 for a bad argument
+ *   or an `--only` name that is no manifest entry
  */
 const main = (
   argv,
-  { spawn = spawnSync, manifest = defaultManifest, log = console.error } = {}
+  { spawn = spawnSync, manifest = defaultManifest, log = console.error, env = process.env } = {}
 ) => {
   let args
   try {
@@ -287,27 +560,39 @@ const main = (
     log(error.message)
     return 2
   }
-  const rows = manifest.entries.flatMap((entry) => {
+  const unknown = args.only?.find((name) => !manifest.entries.some((entry) => entry.name === name))
+  if (unknown !== undefined) {
+    log(`--only names no manifest row ${unknown}`)
+    return 2
+  }
+  const rawDir = path.join(args.out, 'bench-raw')
+  fs.mkdirSync(rawDir, { recursive: true })
+  const setup = setupFailure(env.BENCH_SETUP)
+  const results = manifest.entries.map((entry) => {
+    if (args.only ? !args.only.includes(entry.name) : entry.namedOnly) {
+      const reason = args.only ? 'left out by --only' : 'runs only when named with --only'
+      return { rows: [entryRow(entry, 'not selected', reason)], details: [] }
+    }
     log(entry.name)
-    return runEntry(entry, { ...args, spawn })
+    if (setup) return setupRow(entry, setup, env.BENCH_SETUP, rawDir)
+    return runEntry(entry, { ...args, spawn, rawDir })
   })
+  const rows = results.flatMap((result) => result.rows)
+  const details = results.flatMap((result) => result.details)
   const meta = {
     runs: args.runs,
+    ...(args.only && { only: args.only }),
     node: process.version,
     ...(process.env.KAFKA_VERSION && { kafka: process.env.KAFKA_VERSION }),
     ...(process.env.GITHUB_SHA && { commit: process.env.GITHUB_SHA }),
     date: new Date().toISOString(),
   }
-  fs.mkdirSync(args.out, { recursive: true })
-  fs.writeFileSync(
-    path.join(args.out, 'bench-report.json'),
-    `${JSON.stringify({ meta, rows }, null, 2)}\n`
-  )
-  fs.writeFileSync(path.join(args.out, 'bench-report.md'), renderMarkdown(rows, meta))
+  writeJson(path.join(args.out, 'bench-report.json'), { meta, rows, details })
+  fs.writeFileSync(path.join(args.out, 'bench-report.md'), renderMarkdown(rows, meta, details))
   return 0
 }
 
-module.exports = { lastJsonLine, pick, runEntry, renderMarkdown, main }
+module.exports = { lastJsonLine, pick, tail, readRun, rowsOf, runEntry, renderMarkdown, main }
 
 if (require.main === module) {
   process.exitCode = main(process.argv.slice(2))

@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/consumer.js
++++ b/src/consumer/groupProtocol/consumer.js
+@@ -1340,7 +1340,7 @@
+       }
+     }
+ 
+-    const immediate = converged && this.immediateResolutionRevision !== this.targetRevision
++    const immediate = converged && targetChanged && this.immediateResolutionRevision !== this.targetRevision
+     if (converged) this.immediateResolutionRevision = this.targetRevision
+     else this.immediateResolutionRevision = null
+     this.refreshUnresolvedTopicIds({ immediate })

@@ -1,0 +1,11 @@
+--- a/scripts/soak/consumerChurn.js
++++ b/scripts/soak/consumerChurn.js
+@@ -133,7 +133,7 @@
+   }
+ 
+   async #checkpoint() {
+-    if (++this.work % YIELD_EVERY === 0) await new Promise(setImmediate)
++    if (++this.work < 0) await new Promise(setImmediate)
+   }
+ 
+   #fail(reason) {

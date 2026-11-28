@@ -37,6 +37,7 @@ export const {
   KafkaJSStaleTopicMetadataAssignment,
   KafkaJSDeleteGroupsError,
   KafkaJSTimeout,
+  KafkaJSUnknownOutcomeError,
   KafkaJSLockTimeout,
   KafkaJSServerDoesNotSupportApiKey,
   KafkaJSShareGroupsNotSupportedError,
@@ -63,6 +64,8 @@ export const {
   KafkaJSCorruptRecordError,
   KafkaJSCommitFailedError,
   KafkaJSRebalanceListenerError,
+  KafkaJSRebalanceNotConvergedError,
+  KafkaJSTopicRecreatedError,
   KafkaJSBufferExhaustedError,
   KafkaJSRecordTooLargeError,
 } = cjs

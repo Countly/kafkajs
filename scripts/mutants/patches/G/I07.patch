@@ -1,0 +1,18 @@
+--- a/src/consumer/index.js
++++ b/src/consumer/index.js
+@@ -1841,8 +1841,13 @@
+       return { topic: entry.topic, partition: entry.partition }
+     })
+     if (entries.length === 0) return []
+-    return withinCall((operation) =>
+-      new CommittedOffsetReader({ cluster, groupId, retry }).read(entries, { operation })
++    return withinCall(async () =>
++      entries.map(({ topic, partition }) => ({
++        topic,
++        partition,
++        offset: cluster.committedOffsets({ groupId })[topic]?.[partition] ?? null,
++        metadata: null,
++      }))
+     )
+   }
+ 

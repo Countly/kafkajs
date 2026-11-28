@@ -9,7 +9,6 @@ const {
   createModPartitioner,
   waitForConsumerToJoinGroup,
   generateMessages,
-  testIfKafkaAtLeast_0_11,
 } = require('testHelpers')
 const { KafkaJSNonRetriableError } = require('../../errors')
 
@@ -272,45 +271,42 @@ describe('Admin', () => {
         ])
       })
 
-      testIfKafkaAtLeast_0_11(
-        'will return the correct earliest offset when it is greater than 0',
-        async () => {
-          // simulate earliest offset = 7, by deleting first 7 messages from the topic
-          const messagesToDelete = [
-            {
-              partition: 0,
-              offset: '7',
-            },
-          ]
+      test('will return the correct earliest offset when it is greater than 0', async () => {
+        // simulate earliest offset = 7, by deleting first 7 messages from the topic
+        const messagesToDelete = [
+          {
+            partition: 0,
+            offset: '7',
+          },
+        ]
 
-          await admin.deleteTopicRecords({ topic: topicName, partitions: messagesToDelete })
-          await admin.resetOffsets({ groupId, topic: topicName, earliest: true })
+        await admin.deleteTopicRecords({ topic: topicName, partitions: messagesToDelete })
+        await admin.resetOffsets({ groupId, topic: topicName, earliest: true })
 
-          const offsetsBeforeResolving = await admin.fetchOffsets({
-            groupId,
-            topics: [topicName],
-          })
-          const offsetsUponResolving = await admin.fetchOffsets({
-            groupId,
-            topics: [topicName],
-            resolveOffsets: true,
-          })
-          const offsetsAfterResolving = await admin.fetchOffsets({
-            groupId,
-            topics: [topicName],
-          })
+        const offsetsBeforeResolving = await admin.fetchOffsets({
+          groupId,
+          topics: [topicName],
+        })
+        const offsetsUponResolving = await admin.fetchOffsets({
+          groupId,
+          topics: [topicName],
+          resolveOffsets: true,
+        })
+        const offsetsAfterResolving = await admin.fetchOffsets({
+          groupId,
+          topics: [topicName],
+        })
 
-          expect(offsetsBeforeResolving).toEqual([
-            { topic: topicName, partitions: [{ partition: 0, offset: '-2', metadata: null }] },
-          ])
-          expect(offsetsUponResolving).toEqual([
-            { topic: topicName, partitions: [{ partition: 0, offset: '7', metadata: null }] },
-          ])
-          expect(offsetsAfterResolving).toEqual([
-            { topic: topicName, partitions: [{ partition: 0, offset: '7', metadata: null }] },
-          ])
-        }
-      )
+        expect(offsetsBeforeResolving).toEqual([
+          { topic: topicName, partitions: [{ partition: 0, offset: '-2', metadata: null }] },
+        ])
+        expect(offsetsUponResolving).toEqual([
+          { topic: topicName, partitions: [{ partition: 0, offset: '7', metadata: null }] },
+        ])
+        expect(offsetsAfterResolving).toEqual([
+          { topic: topicName, partitions: [{ partition: 0, offset: '7', metadata: null }] },
+        ])
+      })
     })
   })
 })

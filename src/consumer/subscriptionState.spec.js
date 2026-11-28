@@ -71,6 +71,49 @@ describe('Consumer > SubscriptionState > pause / resume', () => {
       { topic: 'topic1', partitions: [0, 2, 3] },
     ])
   })
+
+  it('pausing a partition of a paused topic keeps every partition paused', () => {
+    subscriptionState.assign([{ topic: 'topic1', partitions: [0, 1] }])
+    subscriptionState.pause([{ topic: 'topic1' }])
+    subscriptionState.pause([{ topic: 'topic1', partitions: [0] }])
+
+    const both = [{ topic: 'topic1', partitions: [0, 1] }]
+    expect(subscriptionState.paused()).toEqual(both)
+    expect(subscriptionState.active()).toEqual([{ topic: 'topic1', partitions: [] }])
+
+    subscriptionState.update([{ topic: 'topic1', partitions: [0, 1] }])
+    expect(subscriptionState.paused()).toEqual(both)
+    expect(subscriptionState.active()).toEqual([{ topic: 'topic1', partitions: [] }])
+  })
+
+  it('pause all, resume p0, pause p0 again: every partition paused', () => {
+    subscriptionState.assign([{ topic: 'topic1', partitions: [0, 1] }])
+    subscriptionState.pause([{ topic: 'topic1' }])
+    subscriptionState.resume([{ topic: 'topic1', partitions: [0] }])
+    expect(subscriptionState.paused()).toEqual([{ topic: 'topic1', partitions: [1] }])
+
+    subscriptionState.pause([{ topic: 'topic1', partitions: [0] }])
+    expect(subscriptionState.paused()).toEqual([{ topic: 'topic1', partitions: [0, 1] }])
+  })
+
+  it('an empty partition list does not resume a paused topic', () => {
+    subscriptionState.assign([{ topic: 'topic1', partitions: [0, 1] }])
+    subscriptionState.pause([{ topic: 'topic1' }])
+    subscriptionState.pause([{ topic: 'topic1', partitions: [] }])
+
+    expect(subscriptionState.paused()).toEqual([{ topic: 'topic1', partitions: [0, 1] }])
+  })
+
+  it('resume of the topic clears a topic pause that also holds partition pauses', () => {
+    subscriptionState.assign([{ topic: 'topic1', partitions: [0, 1] }])
+    subscriptionState.pause([{ topic: 'topic1' }])
+    subscriptionState.pause([{ topic: 'topic1', partitions: [0] }])
+    subscriptionState.resume([{ topic: 'topic1' }])
+    expect(subscriptionState.paused()).toEqual([])
+
+    subscriptionState.pause([{ topic: 'topic1', partitions: [0] }])
+    expect(subscriptionState.paused()).toEqual([{ topic: 'topic1', partitions: [0] }])
+  })
 })
 
 describe('Consumer > SubscriptionState > isPaused', () => {

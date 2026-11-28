@@ -1,6 +1,9 @@
 const path = require('path')
 const { performance, PerformanceObserver } = require('perf_hooks')
 
+/** The no-GC windows a measured run may try before it is void. */
+const WINDOW_ATTEMPTS = 3
+
 /**
  * Exercises the real internal ConsumerGroup fetch path on deterministic broker stubs.
  * All measurement wrappers live on this driver-owned instance, never production prototypes.
@@ -75,7 +78,8 @@ class FetchRoundDriver {
     }))
     const cluster = {
       committedOffsets: () => cache,
-      topicId: () => undefined,
+      // A topic without an id is never fetched.
+      topicId: () => '01020304-0506-0708-090a-0b0c0d0e0f10',
       leaderEpoch: () => -1,
       refreshMetadataIfNecessary: async () => {},
       refreshMetadata: async () => {},
@@ -214,14 +218,18 @@ class FetchRoundDriver {
 /**
  * Measures one warmed complete round in an observed no-GC allocation window.
  * Site intervals overlap: lookup is nested in grouping; never sum the sites.
+ * A window that sees a collection or a negative allocation is void; up to `attempts` windows are
+ * tried, each on a fresh round after a full collection, and the result names the attempt it took.
  * @param {FetchRoundDriver} driver identical driver bytes in both trees
  * @param {object} [env] replaceable clock sources for the validity controls
  * @param {typeof PerformanceObserver} [env.Observer] gc entry observer
  * @param {{now: function(): number}} [env.clock] window clock on the entries' time base
  * @param {function(): number} [env.heapUsed] heap reader
- * @returns {Promise<object>} ns/node/round, allocated bytes/round and retained heap
- * @throws {Error} missing exposed GC, skipped work, observed GC during the window or a negative
- *   allocation; the observer is disconnected on every path
+ * @param {number} [env.attempts] windows to try before the run is void, 1 by default
+ * @returns {Promise<object>} ns/node/round, allocated bytes/round, retained heap and
+ *   `windowAttempts`
+ * @throws {Error} missing exposed GC, skipped work, or every window void (with the collections
+ *   seen and the bytes allocated); the observer is disconnected on every path
  */
 async function measure(
   driver,
@@ -229,41 +237,49 @@ async function measure(
     Observer = PerformanceObserver,
     clock = performance,
     heapUsed = () => process.memoryUsage().heapUsed,
+    attempts = 1,
   } = {}
 ) {
   if (typeof global.gc !== 'function') throw new Error('Use --expose-gc')
   await driver.round()
   global.gc()
   const retainedBefore = heapUsed()
-  const observed = []
-  const observer = new Observer((list) => observed.push(...list.getEntries()))
-  observer.observe({ entryTypes: ['gc'] })
-  const began = clock.now()
-  const heapBefore = heapUsed()
-  const start = process.hrtime.bigint()
-  let counts, elapsed, allocated, ended
-  try {
-    counts = await driver.round()
-    elapsed = Number(process.hrtime.bigint() - start)
-    allocated = heapUsed() - heapBefore
-    ended = clock.now()
-    await new Promise(setImmediate)
-    observed.push(...observer.takeRecords())
-  } finally {
-    observer.disconnect()
+  let collections, allocated
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    if (attempt > 1) global.gc()
+    const observed = []
+    const observer = new Observer((list) => observed.push(...list.getEntries()))
+    observer.observe({ entryTypes: ['gc'] })
+    const began = clock.now()
+    const heapBefore = heapUsed()
+    const start = process.hrtime.bigint()
+    let counts, elapsed, ended
+    try {
+      counts = await driver.round()
+      elapsed = Number(process.hrtime.bigint() - start)
+      allocated = heapUsed() - heapBefore
+      ended = clock.now()
+      await new Promise(setImmediate)
+      observed.push(...observer.takeRecords())
+    } finally {
+      observer.disconnect()
+    }
+    collections = observed.filter((e) => e.startTime >= began && e.startTime <= ended).length
+    if (collections === 0 && allocated >= 0) {
+      global.gc()
+      return {
+        ...counts,
+        nsPerNodeRound: elapsed / 3,
+        allocatedBytesPerRound: allocated,
+        retainedHeapDelta: heapUsed() - retainedBefore,
+        windowAttempts: attempt,
+      }
+    }
   }
-  if (
-    observed.some((entry) => entry.startTime >= began && entry.startTime <= ended) ||
-    allocated < 0
+  throw new Error(
+    `Void no-GC window in ${attempts} attempt(s): the last saw ${collections} collection(s) and ` +
+      `${allocated} allocated bytes; run with --expose-gc --max-semi-space-size=256`
   )
-    throw new Error('Void no-GC window')
-  global.gc()
-  return {
-    ...counts,
-    nsPerNodeRound: elapsed / 3,
-    allocatedBytesPerRound: allocated,
-    retainedHeapDelta: heapUsed() - retainedBefore,
-  }
 }
 
 /**
@@ -288,9 +304,10 @@ async function main(args = process.argv.slice(2)) {
   }
   const driver = new FetchRoundDriver(options)
   try {
-    process.stdout.write(
-      JSON.stringify(control ? await driver.round() : await measure(driver)) + '\n'
-    )
+    const result = control
+      ? await driver.round()
+      : await measure(driver, { attempts: WINDOW_ATTEMPTS })
+    process.stdout.write(JSON.stringify(result) + '\n')
   } finally {
     driver.close()
   }
@@ -300,4 +317,4 @@ if (require.main === module)
     process.stderr.write(error.stack + '\n')
     process.exitCode = 1
   })
-module.exports = { FetchRoundDriver, measure, main }
+module.exports = { FetchRoundDriver, measure, main, WINDOW_ATTEMPTS }

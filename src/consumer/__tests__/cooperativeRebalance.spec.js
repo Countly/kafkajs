@@ -192,7 +192,7 @@ describe('Consumer > cooperative rebalance apply', () => {
       expect(offsetManager.committedOffsets()[TOPIC_A][1]).toBeUndefined()
     })
 
-    it('keeps an empty object for a fully revoked topic, so the still-assigned ones stay indexable', async () => {
+    it("prunes a fully revoked topic's local keys and keeps the still-assigned ones indexable", async () => {
       const { group } = createGroup()
       await applyCooperative(group, { [TOPIC_A]: [0, 1], [TOPIC_B]: [0] })
 
@@ -210,9 +210,11 @@ describe('Consumer > cooperative rebalance apply', () => {
         group.resolveOffset({ topic: TOPIC_A, partition: 0, offset: '12' })
       ).not.toThrow()
 
-      expect(offsetManager.committedOffsets()[TOPIC_B]).toEqual({})
-      expect(offsetManager.resolvedOffsets[TOPIC_B]).toEqual({})
-      expect(offsetManager.resolvedEpochs[TOPIC_B]).toEqual({})
+      for (const table of ['resetPositions', 'resolvedOffsets', 'resolvedEpochs']) {
+        expect(Object.keys(offsetManager[table])).toEqual([TOPIC_A])
+      }
+      expect(offsetManager.nextOffset(TOPIC_B, 0).toString()).toEqual('0')
+      expect(offsetManager.resolvedOffsets[TOPIC_B]).toBeUndefined()
     })
 
     it('creates the topic keys a newly added topic needs', async () => {
@@ -259,7 +261,7 @@ describe('Consumer > cooperative rebalance apply', () => {
       await applyCooperative(group, { [TOPIC_A]: [0] })
 
       expect(() => group.resolveOffset({ topic: TOPIC_B, partition: 0, offset: '5' })).not.toThrow()
-      expect(group.offsetManager.resolvedOffsets[TOPIC_B]).toEqual({})
+      expect(group.offsetManager.resolvedOffsets[TOPIC_B]).toBeUndefined()
     })
 
     it('re-resolves the coordinator, so one that moved between rounds is used next', async () => {
@@ -451,11 +453,11 @@ describe('Consumer > cooperative rebalance apply', () => {
       const { coordinator, consumerGroup, applies } = createCoordinator()
 
       await coordinator.runRound('initial', 'initial')
-      expect(applies).toEqual([{ rebuildOffsets: false, round: expect.any(Object) }])
+      expect(applies).toEqual([{ rebuildOffsets: false, lost: false, round: expect.any(Object) }])
 
       consumerGroup.rebalanceProtocol = () => EAGER
       await coordinator.runRound('rebalance-in-progress', 'revoked')
-      expect(applies[1]).toEqual({ rebuildOffsets: true, round: expect.any(Object) })
+      expect(applies[1]).toEqual({ rebuildOffsets: true, lost: false, round: expect.any(Object) })
     })
 
     it('touches the fetch layer on neither side of a cooperative round', async () => {
@@ -1476,7 +1478,7 @@ describe('Consumer > cooperative rebalance > commit before release', () => {
 
     expect(offsetCommit).toHaveBeenCalledWith(
       expect.objectContaining({ groupGenerationId: 7, memberId: 'member-7' }),
-      { guard: expect.any(Function) }
+      expect.objectContaining({ guard: expect.any(Function) })
     )
   })
 

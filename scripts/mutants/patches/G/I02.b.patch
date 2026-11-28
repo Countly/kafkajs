@@ -1,0 +1,11 @@
+--- a/src/consumer/index.js
++++ b/src/consumer/index.js
+@@ -399,7 +399,7 @@
+   const privateOffsets = hasGroup ? null : dictionary()
+   const privateState = hasGroup
+     ? null
+-    : { offsets: privateOffsets, operations: new OffsetOperations(privateOffsets) }
++    : { offsets: privateOffsets, operations: new OffsetOperations(cluster.committedOffsets({ groupId })) }
+   /** @returns {OffsetOperations} the private ledger, or the group's shared one */
+   const offsetOperations = () =>
+     privateState ? privateState.operations : cluster.offsetOperations({ groupId })

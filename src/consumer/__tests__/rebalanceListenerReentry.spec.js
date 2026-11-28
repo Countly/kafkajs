@@ -40,9 +40,6 @@ describe('hook quiescence and captured reentry', () => {
   })
   it('times out a held handler without false quiescence', async () => {
     jest.useFakeTimers()
-    jest
-      .spyOn(require('node:perf_hooks').performance, 'now')
-      .mockImplementation(() => performance.now())
     const baseline = jest.getTimerCount()
     const runner = makeRunner()
     const r = round()
@@ -315,6 +312,9 @@ describe('public re-entry from a rebalance callback', () => {
   const exercise = async (hook, mode) => {
     rig = createPublicRig({ cooperative: mode === 'cooperative' })
     rig.joins.push({ assignment: { [TOPIC]: [0, 1] }, generationId: 2 })
+    // A close-time callback's detached calls can outlive this test: they must reach this
+    // consumer, never the next test's.
+    const { consumer } = rig
     const inside = {}
     const after = {}
     const detached = []
@@ -322,19 +322,19 @@ describe('public re-entry from a rebalance callback', () => {
       [hook]: async () => {
         for (const [name, call] of Object.entries(attempts)) {
           if (LIFECYCLE.includes(name) || READS.includes(name)) continue
-          inside[name] = await outcome(() => call(rig.consumer))
+          inside[name] = await outcome(() => call(consumer))
         }
         detached.push(
           new Promise((resolve) => setTimeout(resolve, 5)).then(async () => {
             for (const [name, call] of Object.entries(attempts)) {
-              after[name] = await outcome(() => call(rig.consumer))
+              after[name] = await outcome(() => call(consumer))
             }
           })
         )
       },
     }
-    await rig.consumer.subscribe({ topic: TOPIC })
-    await rig.consumer.run({ eachMessage: () => {}, rebalanceListener: listener })
+    await consumer.subscribe({ topic: TOPIC })
+    await consumer.run({ eachMessage: () => {}, rebalanceListener: listener })
     await Promise.all(detached)
     return { inside, after }
   }

@@ -1,0 +1,10 @@
+--- a/src/consumer/rebalanceHooks.js
++++ b/src/consumer/rebalanceHooks.js
+@@ -148,6 +148,7 @@
+       this.listener[name] ??
+       (name === 'onPartitionsLost' ? this.listener.onPartitionsRevoked : undefined)
+     if (!hook) return
++    deadlineAt = this.now() + 1000
+     const context = Object.freeze({
+       run: identity.run,
+       round: identity.round,

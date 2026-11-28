@@ -1,0 +1,11 @@
+--- a/src/consumer/index.js
++++ b/src/consumer/index.js
+@@ -165,7 +165,7 @@
+     timeout !== undefined &&
+     (!Number.isInteger(timeout) || timeout < 0 || timeout > 2147483647)
+   ) {
+-    throw new KafkaJSInvalidConfigurationError(
++    throw new KafkaJSNonRetriableError(
+       'Argument "timeout" must be an integer from 0 to 2147483647'
+     )
+   }

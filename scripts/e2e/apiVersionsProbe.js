@@ -5,9 +5,8 @@
  * ApiVersions probe: the version range a broker offers for each API the admin and classic-group
  * codecs target.
  *
- * Usage inside a guard-owned fixture: node scripts/e2e/apiVersionsProbe.js [--all | --record=<file>] [--record-features=<file>]
- * Run this probe only inside a fixture owned by the reviewed live guard.
- * The fixture owner selects the broker version and records evidence before teardown.
+ * Usage against a running Kafka fixture: node scripts/e2e/apiVersionsProbe.js [--all | --record=<file>] [--record-features=<file>]
+ * Whoever starts the fixture selects the broker version and records evidence before teardown.
  * Prints one JSON line, and appends it to `.tmp/e2e/api-versions-probe.jsonl`:
  *   {"event":"api-versions","kafkaVersion":"4.3.1","versions":{"Metadata":[0,13],…}}
  * where each value is `[minVersion, maxVersion]`, or `null` for an API the broker does not list.

@@ -1,0 +1,10 @@
+--- a/src/consumer/offsetManager/index.js
++++ b/src/consumer/offsetManager/index.js
+@@ -1643,6 +1643,7 @@
+         }
+       }
+ 
++      for (const partition of written) this.obligations.discharge(topic, partition, this.cluster.topicId(topic))
+       const assigned = this.assignedPartitions.get(topic)
+       if (assigned) {
+         this.obligations.settle(topic, assigned, this.knownPartitions(topic))

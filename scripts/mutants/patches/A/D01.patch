@@ -1,0 +1,11 @@
+--- a/src/consumer/index.js
++++ b/src/consumer/index.js
+@@ -246,7 +246,7 @@
+     retry,
+     logger: rootLogger,
+     partitionAssigners = [roundRobin],
+-    sessionTimeout = 45000,
++    sessionTimeout = 30000,
+     maxPollInterval,
+     rebalanceTimeout,
+     heartbeatInterval = 3000,

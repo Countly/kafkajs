@@ -1,7 +1,16 @@
+const { createHmac, pbkdf2Sync } = require('crypto')
 const { Kafka } = require('../../../index')
+const { newLogger } = require('testHelpers')
 const { KafkaJSSASLAuthenticationError } = require('../../errors')
-const { createScriptedCluster, groupScript } = require('../../../testHelpers/scriptedCluster')
+const ConnectionPool = require('../../network/connectionPool')
+const {
+  createScriptedCluster,
+  groupScript,
+  producerScript,
+} = require('../../../testHelpers/scriptedCluster')
 const { TOPIC } = require('../../consumer/__tests__/fixtures/fetchHarness')
+const Broker = require('../index')
+const { DIGESTS, SCRAM } = require('../saslAuthenticator/scram')
 
 const BLACKOUT_MS = 1000
 const RETRY_MS = 100
@@ -140,5 +149,367 @@ describe('Kafka 4.4 client fix audit', () => {
     expect(cluster.requests()).toHaveLength(written)
     expect(cluster.sockets()).toHaveLength(dials)
     expect(jest.getTimerCount()).toBe(0)
+  })
+})
+
+describe('session start', () => {
+  const PASSWORD = 'fixture-password'
+  const SESSION_LIFETIME = '1000'
+  const LOGIN_DELAY = 2000
+  let broker
+  let cluster
+
+  beforeEach(() => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] })
+  })
+
+  afterEach(async () => {
+    try {
+      cluster?.cancelReplyHolds()
+      await broker?.disconnect({ drainTimeout: 0 })
+      await jest.advanceTimersByTimeAsync(1)
+      cluster?.assertClean()
+      expect(jest.getTimerCount()).toBe(0)
+    } finally {
+      jest.restoreAllMocks()
+      jest.useRealTimers()
+      broker = null
+      cluster = null
+    }
+  })
+
+  /**
+   * Scripts a broker with a one-second session and a separate login timeout.
+   * @param {string} mechanism SASL handshake mechanism
+   * @param {(fields: { authBytes: Buffer }) => object} [answer] SASL reply fields
+   * @returns {void}
+   */
+  const arrange = (mechanism, answer = () => ({ authBytes: Buffer.alloc(0) })) => {
+    const node = { id: 0, host: 'node', port: 9092 }
+    cluster = createScriptedCluster({ nodes: [node], profile: 'sasl' })
+      .answer('SaslHandshake', () => ({ enabledMechanisms: [mechanism] }))
+      .answer('SaslAuthenticate', (fields) => ({
+        errorCode: 0,
+        errorMessage: null,
+        sessionLifetimeMs: SESSION_LIFETIME,
+        ...answer(fields),
+      }))
+    const logger = newLogger()
+    const connectionPool = new ConnectionPool({
+      ...node,
+      logger,
+      socketFactory: cluster.socketFactory,
+      connectionTimeout: 10000,
+      requestTimeout: 5000,
+      authenticationTimeout: 5000,
+      connectionsMaxIdle: 0,
+      reauthenticationThreshold: 0,
+      sasl: { mechanism, username: 'user', password: PASSWORD },
+    })
+    broker = new Broker({ connectionPool, logger, nodeId: node.id })
+  }
+
+  /**
+   * Answers both SCRAM messages using the client's nonce and a valid server signature.
+   * @param {{ type: string, length: number, minIterations: number }} digest SCRAM digest
+   * @returns {(fields: { authBytes: Buffer }) => { authBytes: Buffer }} responder
+   */
+  const scramAnswer = ({ type, length, minIterations }) => {
+    const salt = Buffer.from('fixture-salt')
+    const saltedPassword = pbkdf2Sync(PASSWORD, salt, minIterations, length, type)
+    const serverKey = createHmac(type, saltedPassword).update('Server Key').digest()
+    let clientFirstBare
+    let serverFirst
+    return ({ authBytes }) => {
+      const message = authBytes.toString()
+      if (message.startsWith('n,,')) {
+        clientFirstBare = message.slice('n,,'.length)
+        const clientNonce = clientFirstBare.slice('n=user,r='.length)
+        serverFirst = `r=${clientNonce}fixture,s=${salt.toString('base64')},i=${minIterations}`
+        return { authBytes: Buffer.from(serverFirst), sessionLifetimeMs: '0' }
+      }
+      const withoutProof = message.slice(0, message.indexOf(',p='))
+      const transcript = [clientFirstBare, serverFirst, withoutProof].join(',')
+      const signature = createHmac(type, serverKey).update(transcript).digest('base64')
+      return { authBytes: Buffer.from(`v=${signature}`) }
+    }
+  }
+
+  test('a session is counted from when its final SASL request was written', async () => {
+    arrange('PLAIN')
+    const reply = cluster.holdReply({ api: 'SaslAuthenticate' })
+    const connected = broker.connect()
+    expect(await Promise.race([reply.executed(), connected])).toMatchObject({
+      api: 'SaslAuthenticate',
+    })
+    await jest.advanceTimersByTimeAsync(LOGIN_DELAY)
+    reply.deliver()
+    await connected
+
+    await broker.metadata()
+
+    expect(cluster.requests().map(({ api }) => api)).toEqual([
+      'ApiVersions',
+      'SaslHandshake',
+      'SaslAuthenticate',
+      'SaslHandshake',
+      'SaslAuthenticate',
+      'Metadata',
+    ])
+  })
+
+  test.each([
+    ['SCRAM-SHA-256', DIGESTS.SHA256],
+    ['SCRAM-SHA-512', DIGESTS.SHA512],
+  ])(
+    'a SCRAM session whose signature check crosses the deadline re-authenticates first (%s)',
+    async (mechanism, digest) => {
+      arrange(mechanism, scramAnswer(digest))
+      const serverKey = SCRAM.prototype.serverKey
+      jest.spyOn(SCRAM.prototype, 'serverKey').mockImplementationOnce(async function (response) {
+        await jest.advanceTimersByTimeAsync(LOGIN_DELAY)
+        return serverKey.call(this, response)
+      })
+      await broker.connect()
+
+      await broker.metadata()
+
+      expect(cluster.requests().map(({ api }) => api)).toEqual([
+        'ApiVersions',
+        'SaslHandshake',
+        'SaslAuthenticate',
+        'SaslAuthenticate',
+        'SaslHandshake',
+        'SaslAuthenticate',
+        'SaslAuthenticate',
+        'Metadata',
+      ])
+    }
+  )
+
+  test('a session answered at once keeps its lifetime', async () => {
+    arrange('PLAIN')
+    await broker.connect()
+    await jest.advanceTimersByTimeAsync(900)
+
+    await broker.metadata()
+
+    expect(cluster.requests().map(({ api }) => api)).toEqual([
+      'ApiVersions',
+      'SaslHandshake',
+      'SaslAuthenticate',
+      'Metadata',
+    ])
+  })
+})
+
+describe('session at write', () => {
+  let cluster
+  let producer
+
+  // A linger-0 batch is handed on through queueMicrotask, so it stays real: a faked one would
+  // hold the second send until fake time moves past the end of the session.
+  beforeEach(() => {
+    jest.useFakeTimers({ now: 0, doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
+  })
+
+  afterEach(async () => {
+    try {
+      cluster?.cancelReplyHolds()
+      for (let i = 0; i < 50; i += 1) {
+        await jest.advanceTimersByTimeAsync(20)
+        await new Promise((resolve) => setImmediate(resolve))
+      }
+    } finally {
+      try {
+        if (producer) await producer.disconnect()
+        cluster?.assertClean()
+      } finally {
+        producer = cluster = undefined
+        jest.restoreAllMocks()
+        jest.useRealTimers()
+      }
+    }
+  })
+
+  /**
+   * An idempotent producer, one request in flight per connection, over a broker whose SASL
+   * sessions last one second and whose topic has two partitions.
+   * @param {object} producerOptions extra producer options
+   * @returns {void}
+   */
+  const start = (producerOptions) => {
+    cluster = producerScript(
+      createScriptedCluster({ nodes: [{ id: 0, host: 'node0', port: 9092 }], profile: 'sasl' }),
+      { partitions: 2 }
+    )
+      .answer('SaslHandshake', () => ({ enabledMechanisms: ['PLAIN'] }))
+      .answer('SaslAuthenticate', () => ({
+        errorCode: 0,
+        errorMessage: null,
+        authBytes: Buffer.alloc(0),
+        sessionLifetimeMs: '1000',
+      }))
+    producer = new Kafka(
+      cluster.kafkaOptions({
+        sasl: { mechanism: 'plain', username: 'user', password: 'secret' },
+        reauthenticationThreshold: 0,
+        requestTimeout: 1500,
+        enforceRequestTimeout: false,
+      })
+    ).producer({ idempotent: true, maxInFlightRequests: 1, linger: 0, ...producerOptions })
+  }
+
+  /**
+   * Moves fake time a millisecond at a time until `predicate` holds, failing after 200 ms.
+   * @param {() => boolean} predicate
+   * @returns {Promise<void>}
+   */
+  const until = async (predicate) => {
+    for (let i = 0; i < 200 && !predicate(); i += 1) {
+      await jest.advanceTimersByTimeAsync(1)
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+    expect(predicate()).toBe(true)
+  }
+
+  /**
+   * @param {Promise} promise
+   * @returns {{ settled: boolean }} set once `promise` settles; its rejection is handled
+   */
+  const watch = (promise) => {
+    const state = { settled: false }
+    promise.then(
+      () => (state.settled = true),
+      () => (state.settled = true)
+    )
+    return state
+  }
+
+  /** @returns {string[]} each request written, a Produce named with the partitions it carries */
+  const written = () =>
+    cluster
+      .requests()
+      .map(({ api, fields }) =>
+        api === 'Produce'
+          ? `Produce:${fields.topics.flatMap(({ partitions }) => partitions.map(({ partition }) => partition))}`
+          : api
+      )
+
+  /**
+   * @param {number} partition
+   * @returns {object[]} the record batch of `partition` in each Produce request that carried it
+   */
+  const batchesOf = (partition) =>
+    cluster
+      .requests()
+      .filter(({ api }) => api === 'Produce')
+      .flatMap(({ fields }) => fields.topics.flatMap(({ partitions }) => partitions))
+      .filter((entry) => entry.partition === partition)
+      .map(({ batches }) => batches[0])
+
+  const SESSION_REFUSAL =
+    'The SASL session was not valid when the request was due to be written; it was not sent'
+
+  /**
+   * @param {number} partition
+   * @returns {Promise[]} what each `Broker#produce` call whose request carried `partition` returned
+   */
+  const produceCallsFor = (partition) => {
+    const { calls, results } = Broker.prototype.produce.mock
+    return results
+      .filter((_, index) =>
+        calls[index][0].topicData.some(({ partitions }) =>
+          partitions.some((entry) => entry.partition === partition)
+        )
+      )
+      .map(({ value }) => value)
+  }
+
+  /**
+   * Sends to partition 0 and holds its answer, then sends to partition 1 while the session is
+   * valid, waits without moving fake time until that request waits in the connection's queue
+   * behind the held one, and lets the session end before the answer is delivered.
+   * @returns {Promise<{ firstResult: *, second: Promise<*>, secondState: { settled: boolean } }>}
+   *   the first send's result or error, and the second send with its settlement
+   */
+  const queuedPastTheSession = async () => {
+    jest.spyOn(Broker.prototype, 'produce')
+    await producer.connect()
+    const held = cluster.holdReply({ api: 'Produce' })
+    const firstSend = producer
+      .send({ topic: TOPIC, messages: [{ partition: 0, value: 'a' }] })
+      .catch((error) => error)
+    const first = watch(firstSend)
+    await until(() => written().includes('Produce:0'))
+    const queueSizes = []
+    producer.on(producer.events.REQUEST_QUEUE_SIZE, ({ payload }) => {
+      queueSizes.push(payload.queueSize)
+    })
+    const second = producer
+      .send({ topic: TOPIC, messages: [{ partition: 1, value: 'b' }] })
+      .catch((error) => error)
+    const secondState = watch(second)
+    for (let i = 0; i < 100 && !queueSizes.includes(1); i += 1) {
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+    expect(queueSizes).toContain(1)
+    expect(Date.now()).toBeLessThan(1000)
+    expect(produceCallsFor(1)).toHaveLength(1)
+
+    await jest.advanceTimersByTimeAsync(1200)
+    expect(written()).not.toContain('Produce:1')
+
+    held.deliver()
+    await until(() => first.settled)
+    return { firstResult: await firstSend, second, secondState }
+  }
+
+  test('a session-refused produce is never recorded as written', async () => {
+    start({
+      deliveryTimeout: 1500,
+      retry: { initialRetryTime: 5000, maxRetryTime: 5000, factor: 0 },
+    })
+    const { firstResult, second, secondState } = await queuedPastTheSession()
+
+    await jest.advanceTimersByTimeAsync(400)
+    await until(() => secondState.settled)
+
+    expect(firstResult).toEqual([expect.objectContaining({ partition: 0, errorCode: 0 })])
+    const [refused, ...resent] = produceCallsFor(1)
+    await expect(refused).rejects.toMatchObject({ message: SESSION_REFUSAL, retriable: true })
+    expect(resent).toEqual([])
+    expect(await second).toMatchObject({
+      name: 'KafkaJSDeliveryTimeout',
+      outcome: 'unsent',
+      cause: expect.objectContaining({ message: SESSION_REFUSAL }),
+    })
+    expect(written()).not.toContain('Produce:1')
+  })
+
+  test('a session-refused produce is resent once, after re-authentication', async () => {
+    start({ retry: { initialRetryTime: 10, maxRetryTime: 10, factor: 0 } })
+    const { firstResult, second, secondState } = await queuedPastTheSession()
+
+    await until(() => secondState.settled)
+
+    expect(firstResult).toEqual([expect.objectContaining({ partition: 0, errorCode: 0 })])
+    expect(await second).toEqual([expect.objectContaining({ partition: 1, errorCode: 0 })])
+    const [refused, ...resent] = produceCallsFor(1)
+    await expect(refused).rejects.toMatchObject({ message: SESSION_REFUSAL, retriable: true })
+    expect(resent).toHaveLength(1)
+    const log = written()
+    expect(log.filter((api) => api === 'Produce:1')).toHaveLength(1)
+    expect(log.slice(log.indexOf('Produce:0'), log.indexOf('Produce:1'))).toEqual(
+      expect.arrayContaining(['SaslHandshake', 'SaslAuthenticate'])
+    )
+    const [stamp] = batchesOf(0)
+    expect(batchesOf(1)).toEqual([
+      expect.objectContaining({
+        producerId: stamp.producerId,
+        producerEpoch: stamp.producerEpoch,
+        baseSequence: 0,
+      }),
+    ])
   })
 })

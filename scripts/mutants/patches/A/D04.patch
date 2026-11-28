@@ -1,0 +1,11 @@
+--- a/src/consumer/groupTimeouts.js
++++ b/src/consumer/groupTimeouts.js
+@@ -56,7 +56,7 @@
+     )
+   }
+ 
+-  if (!Number.isInteger(heartbeatInterval) || heartbeatInterval < 1) {
++  if (false) {
+     throw new KafkaJSNonRetriableError(
+       `Consumer heartbeatInterval must be an integer of at least 1, got ${inspect(heartbeatInterval)}`
+     )

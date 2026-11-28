@@ -1,0 +1,8 @@
+--- a/src/consumer/__tests__/fixtures/rebalanceAssertions.js
++++ b/src/consumer/__tests__/fixtures/rebalanceAssertions.js
+@@ -1,4 +1,4 @@
+-const ASSERTED = ['classic', 'consumer']
++const ASSERTED = ['classic']
+ 
+ /** Pure assertion and outage-boundary rules shared by the bounce scenario and broker-free controls. */
+ class RebalanceAssertions {

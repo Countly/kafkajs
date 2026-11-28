@@ -1,4 +1,7 @@
 const apiKeys = require('./apiKeys')
+const { currentMutation } = require('../../admin/deadline')
+const { MUTATING_APIS, isMutation, owned } = require('../../admin/unknownOutcome')
+const { ADMIN_MUTATION } = require('../../broker/privateOptions')
 const { KafkaJSServerDoesNotSupportApiKey, KafkaJSNotImplemented } = require('../../errors')
 
 /**
@@ -110,8 +113,9 @@ const keys = Object.values(apiKeys)
 const findApiName = (apiKey) => names[keys.indexOf(apiKey)]
 
 /**
- * Chooses the version this client will use for one API on one connection: the highest version
- * both sides implement, subject to an optional internal ceiling.
+ * Chooses the version this client will use for one API on one connection: the highest implemented
+ * version inside the broker's `[minVersion, maxVersion]` range (a missing `minVersion` is 0),
+ * subject to an optional internal ceiling.
  *
  * Extracted from `lookup()` so a caller can ask *which* version would be selected without
  * building a request — `definition.protocol({ version })` returns a builder in every API in this
@@ -123,8 +127,8 @@ const findApiName = (apiKey) => names[keys.indexOf(apiKey)]
  * @param {RequestDefinitions} definition
  * @param {{ [apiKey: number]: number }} [maxVersions] internal per-API ceiling
  * @returns {number} the selected version
- * @throws {KafkaJSServerDoesNotSupportApiKey} when the broker does not advertise the API, the two
- *   version ranges do not overlap, or the cap excludes every implemented version
+ * @throws {KafkaJSServerDoesNotSupportApiKey} when the broker does not advertise the API, no
+ *   implemented version lies inside the broker range, or the cap excludes every implemented version
  */
 const selectVersion = (versions, apiKey, definition, maxVersions = {}) => {
   const version = versions[apiKey]
@@ -148,26 +152,23 @@ const selectVersion = (versions, apiKey, definition, maxVersions = {}) => {
     )
   }
 
-  const bestImplementedVersion = Math.max(...availableVersions)
-  const lowestImplementedVersion = Math.min(...availableVersions)
   const brokerMinVersion = version.minVersion == null ? 0 : version.minVersion
+  // By membership, not by envelope: a set with a gap can straddle the broker range without
+  // having a member inside it. Kafka 4.0 raised the floor for most APIs (KIP-896/KIP-724).
+  const candidates = availableVersions.filter(
+    (available) => available >= brokerMinVersion && available <= version.maxVersion
+  )
 
-  // The client and broker version ranges must overlap. Kafka 4.0 raised the floor for most
-  // APIs (KIP-896/KIP-724) and future majors will raise it again; without this check we would
-  // send a version the broker rejects, or select a version we do not implement.
-  if (brokerMinVersion > bestImplementedVersion || version.maxVersion < lowestImplementedVersion) {
+  if (candidates.length === 0) {
     throw new KafkaJSServerDoesNotSupportApiKey(
       `The Kafka server does not support any version of ${apiName} implemented by this client: ` +
-        `client implements v${lowestImplementedVersion}-v${bestImplementedVersion}, ` +
+        `client implements v${Math.min(...availableVersions)}-v${Math.max(...availableVersions)}, ` +
         `broker supports v${brokerMinVersion}-v${version.maxVersion}`,
       { apiKey, apiName }
     )
   }
 
-  // By membership, not by `Math.min`: the highest version this client actually implements at or
-  // below the broker's maximum. An implemented set with a hole would otherwise select a version
-  // with no codec, and `definition.protocol({ version })` would return undefined.
-  return Math.max(...availableVersions.filter((available) => available <= version.maxVersion))
+  return Math.max(...candidates)
 }
 
 /**
@@ -186,6 +187,39 @@ const lookup =
   (versions, maxVersions = {}) =>
   (apiKey, definition) =>
     definition.protocol({ version: selectVersion(versions, apiKey, definition, maxVersions) })
+
+/** Wraps only mutation definitions so ordinary request lookups keep their existing path.
+ * @param {number} apiKey
+ * @param {RequestDefinitions} definition
+ * @returns {RequestDefinitions} a definition with an admin-aware builder; like the wrapped one,
+ *   its `protocol` returns undefined for a version this client does not implement
+ */
+const mutationDefinition = (apiKey, definition) => ({
+  ...definition,
+  protocol(options) {
+    const build = definition.protocol(options)
+    if (!build) return build
+    const shared = apiKey === apiKeys.InitProducerId || apiKey === apiKeys.LeaveGroup
+    return (args, ownership) => {
+      if (
+        (shared && ownership !== ADMIN_MUTATION) ||
+        !currentMutation() ||
+        !isMutation(apiKey, options.version, args)
+      ) {
+        return build(args)
+      }
+      const input = owned(args)
+      const built = build(input)
+      built.args = input
+      return built
+    }
+  },
+})
+
+for (const [name, definition] of Object.entries(requests)) {
+  const apiKey = apiKeys[name]
+  if (MUTATING_APIS.has(apiKey)) requests[name] = mutationDefinition(apiKey, definition)
+}
 
 module.exports = {
   requests,

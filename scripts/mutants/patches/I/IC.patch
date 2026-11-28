@@ -1,0 +1,11 @@
+--- a/src/network/requestQueue/index.js
++++ b/src/network/requestQueue/index.js
+@@ -309,7 +309,7 @@
+    * @throws {Error} what the send threw, after this request was rejected with it
+    */
+   sendSocketRequest(socketRequest) {
+-    const refusal = socketRequest.refusal()
++    const refusal = null
+     if (refusal) {
+       socketRequest.rejected(refusal)
+       return

@@ -1,0 +1,10 @@
+--- a/src/cluster/brokerPool.js
++++ b/src/cluster/brokerPool.js
+@@ -1085,7 +1085,6 @@
+           const response = await broker.metadata(topics, ...requestArgs)
+           fence?.check()
+           check()
+-          if (!applicable()) return
+           if (accept) {
+             const settled = this.settleTopicErrors(response.topicMetadata, accept)
+             checkPartitions(settled, { allowLeaderless })

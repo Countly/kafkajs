@@ -29,16 +29,14 @@ module.exports = class SubscriptionState {
   }
 
   /**
-   * Replace the current assignment with a new set of assignments
+   * Replace the current assignment with a new set of assignments. One pass over the entries; a
+   * repeated topic keeps its first position and its last partition list.
    *
    * @param {Array<TopicPartitions>} topicPartitions Example: [{ topic: 'topic-name', partitions: [1, 2] }]
    */
   assign(topicPartitions = []) {
-    this.assignedPartitionsByTopic = topicPartitions.reduce(
-      (assigned, { topic, partitions = [] }) => {
-        return Object.assign(dictionary(), assigned, { [topic]: { topic, partitions } })
-      },
-      dictionary()
+    this.assignedPartitionsByTopic = dictionary(
+      topicPartitions.map(({ topic, partitions = [] }) => [topic, { topic, partitions }])
     )
 
     this.assignedPartitionSetsByTopic = new Map(
@@ -64,6 +62,10 @@ module.exports = class SubscriptionState {
   }
 
   /**
+   * Pauses whole topics (no `partitions`) or the listed partitions. Pausing partitions of a topic
+   * that is paused as a whole changes nothing: only the topic form of `resume` clears a
+   * topic-wide pause.
+   *
    * @param {Array<TopicPartitions>} topicPartitions Example: [{ topic: 'topic-name', partitions: [1, 2] }]
    */
   pause(topicPartitions = []) {
@@ -79,7 +81,6 @@ module.exports = class SubscriptionState {
           state.paused.add(partition)
           state.resumed.delete(partition)
         })
-        state.pauseAll = false
       }
 
       this.subscriptionStatesByTopic[topic] = state
@@ -87,6 +88,9 @@ module.exports = class SubscriptionState {
   }
 
   /**
+   * Resumes whole topics (no `partitions`, which also clears every partition exception) or the
+   * listed partitions. Under a topic-wide pause a resumed partition is an exception to it.
+   *
    * @param {Array<TopicPartitions>} topicPartitions Example: [{ topic: 'topic-name', partitions: [1, 2] }]
    */
   resume(topicPartitions = []) {

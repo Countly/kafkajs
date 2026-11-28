@@ -9,8 +9,10 @@ const {
   fetchResponse,
   offsetForLeaderEpochResponse,
   createFetchGroup,
+  trackFixtures,
 } = require('./fixtures/fetchHarness')
 
+trackFixtures()
 beforeAll(prepareRecordBatches)
 
 /**
@@ -195,7 +197,7 @@ describe('Consumer > position validation', () => {
     const events = []
     const { group, offsetManager } = await createGroup({ validationScenario: 'truncated' })
     group.instrumentationEmitter.addListener(LOG_TRUNCATION, (e) => events.push(e.payload))
-    jest.spyOn(offsetManager, 'seek').mockRejectedValueOnce(new Error('coordinator is down'))
+    jest.spyOn(offsetManager, 'reposition').mockRejectedValueOnce(new Error('coordinator is down'))
 
     await group.fetch(NODE_ID)
 
@@ -297,6 +299,93 @@ describe('Consumer > position validation', () => {
       expect(events).toEqual([
         { topic: TOPIC, partition: 0, offset: '120', divergingOffset: null, leaderEpoch: -1 },
       ])
+    })
+
+    test('truncated: a reposition that a newer seek superseded emits no LOG_TRUNCATION and marks nothing changed, while one that applies emits exactly one', async () => {
+      const events = []
+      const { group, offsetManager, offsetCommit } = await createGroup({
+        validationScenario: 'truncated',
+        autoCommit: true,
+        partitions: [0, 1],
+      })
+      group.instrumentationEmitter.addListener(LOG_TRUNCATION, (e) => events.push(e.payload))
+      const markChanged = jest.spyOn(group, 'markChanged')
+      const reposition = jest.spyOn(offsetManager, 'reposition')
+      // Partition 0's commit is answered after a seek to the earliest offset was applied to the
+      // same partition. That newer operation supersedes the reposition, which resolves false.
+      offsetCommit.mockImplementationOnce(async () => {
+        await offsetManager.seek({ topic: TOPIC, partition: 0, offset: '-2' })
+        return { topics: [] }
+      })
+
+      await group.validatePositions([{ topic: TOPIC, partitions: [0, 1] }])
+
+      expect(reposition.mock.calls.map(([{ partition }]) => partition)).toEqual([0, 1])
+      await expect(reposition.mock.results[0].value).resolves.toBe(false)
+      await expect(reposition.mock.results[1].value).resolves.toBe(true)
+      expect(events).toEqual([
+        { topic: TOPIC, partition: 1, offset: '120', divergingOffset: '100', leaderEpoch: 4 },
+      ])
+      expect(markChanged.mock.calls).toEqual([[TOPIC, 1]])
+    })
+
+    test('truncated: a reposition superseded by a newer publication at the same position still emits LOG_TRUNCATION and marks the partition changed', async () => {
+      const events = []
+      const { group, offsetManager, offsetCommit } = await createGroup({
+        validationScenario: 'truncated',
+        autoCommit: true,
+      })
+      group.instrumentationEmitter.addListener(LOG_TRUNCATION, (e) => events.push(e.payload))
+      const markChanged = jest.spyOn(group, 'markChanged')
+      const reposition = jest.spyOn(offsetManager, 'reposition')
+      // While the rewind's commit is held, another participant of the group (a transactional
+      // producer) begins and confirms a newer offset publication for the same cell at 120, the
+      // position the truncation was detected at. It supersedes the rewind without moving it.
+      offsetCommit.mockImplementationOnce(async () => {
+        const ledger = offsetManager.operations
+        const ticket = ledger.begin([{ topic: TOPIC, partition: 0 }], { mutation: true })
+        ledger.publish(ticket, TOPIC, 0, '120')
+        ledger.apply(ticket, TOPIC, 0)
+        ledger.end(ticket)
+        return { topics: [] }
+      })
+
+      await group.validatePositions([{ topic: TOPIC, partitions: [0] }])
+
+      await expect(reposition.mock.results[0].value).resolves.toBe(false)
+      expect(offsetManager.positionOf(TOPIC, 0)).toEqual('120')
+      expect(events).toEqual([
+        { topic: TOPIC, partition: 0, offset: '120', divergingOffset: '100', leaderEpoch: 4 },
+      ])
+      expect(markChanged.mock.calls).toEqual([[TOPIC, 0]])
+    })
+
+    test('truncated: a newer publication of the same offset in another spelling still emits LOG_TRUNCATION and marks the partition changed', async () => {
+      const events = []
+      const { group, offsetManager, offsetCommit } = await createGroup({
+        validationScenario: 'truncated',
+        autoCommit: true,
+      })
+      group.instrumentationEmitter.addListener(LOG_TRUNCATION, (e) => events.push(e.payload))
+      const markChanged = jest.spyOn(group, 'markChanged')
+      const reposition = jest.spyOn(offsetManager, 'reposition')
+      offsetCommit.mockImplementationOnce(async () => {
+        const ledger = offsetManager.operations
+        const ticket = ledger.begin([{ topic: TOPIC, partition: 0 }], { mutation: true })
+        ledger.publish(ticket, TOPIC, 0, '0120')
+        ledger.apply(ticket, TOPIC, 0)
+        ledger.end(ticket)
+        return { topics: [] }
+      })
+
+      await group.validatePositions([{ topic: TOPIC, partitions: [0] }])
+
+      await expect(reposition.mock.results[0].value).resolves.toBe(false)
+      expect(BigInt(offsetManager.positionOf(TOPIC, 0))).toEqual(120n)
+      expect(events).toEqual([
+        { topic: TOPIC, partition: 0, offset: '120', divergingOffset: '100', leaderEpoch: 4 },
+      ])
+      expect(markChanged.mock.calls).toEqual([[TOPIC, 0]])
     })
 
     test('retriable exhausted: the epoch is cleared, the offset is not moved, the partition is fetched', async () => {
@@ -432,10 +521,14 @@ describe('Consumer > position validation', () => {
     // Two fetchers can compute the leader map at different moments and both claim a partition, so
     // a partition can be awaiting a reply this fetch round never asked for. That is the state
     // stubbed here: a single-fetcher round cannot produce it, because the gate blocks first.
-    const { group, fetchRequestPartitions } = await createGroup({ partitions: [0, 1] })
+    const { group, setResponse, fetchRequestPartitions } = await createGroup({
+      partitions: [0, 1],
+    })
     jest
       .spyOn(group.positionValidator, 'isAwaiting')
       .mockImplementation((topic, partition) => partition === 0)
+    // A broker answers only the partitions a full request carried.
+    setResponse(fetchResponse([{ partition: 1, errorCode: 0 }]))
 
     await group.fetch(NODE_ID)
 

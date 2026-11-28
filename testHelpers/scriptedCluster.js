@@ -1,4 +1,4 @@
-const { Schedule } = require('./schedule')
+const { Schedule, selects } = require('./schedule')
 const { createFakeSocketFactory, respondWithFrame, readRequestHeader } = require('./fakeSocket')
 const { responseHeaderVersion } = require('../src/protocol/headers')
 const apiKeys = require('../src/protocol/requests/apiKeys')
@@ -61,6 +61,30 @@ const DEFAULT = [...CLASSIC, ...PRODUCER]
  * @type {Record<'default'|'sasl'|'consumer'|'tv1'|'tv2'|'offsets'|'transactions'|'storage'|'securityAdmin'|'clusterAdmin'|'share'|'telemetry', Array<[string, number]>>}
  */
 const PROFILES = {
+  destructiveAdmin: [
+    ...DEFAULT,
+    ['DeleteRecords', 2],
+    ['DeleteGroups', 3],
+    ['AlterConfigs', 2],
+    ['IncrementalAlterConfigs', 1],
+    ['CreateAcls', 3],
+    ['DeleteAcls', 3],
+    ['DeleteTopics', 6],
+    ['OffsetDelete', 0],
+    ['AlterShareGroupOffsets', 0],
+    ['DeleteShareGroupOffsets', 0],
+    ['WriteTxnMarkers', 2],
+    ['AlterReplicaLogDirs', 2],
+    ['AlterClientQuotas', 1],
+    ['AlterUserScramCredentials', 0],
+    ['UpdateFeatures', 2],
+    ['ElectLeaders', 2],
+    ['AlterPartitionReassignments', 1],
+    ['CreateDelegationToken', 3],
+    ['RenewDelegationToken', 2],
+    ['ExpireDelegationToken', 2],
+    ['UnregisterController', 0],
+  ],
   share: [
     ['ApiVersions', 4],
     ['Metadata', 13],
@@ -150,6 +174,8 @@ const TRANSACTION_V2_FEATURES = [
  * @property {object|null} fields what the wire pair read from it; null when it could not be read
  * @property {number} order where it was written among the requests, answers and marks of the cluster
  * @property {number} [answeredOrder] where its answer was written, once it was
+ * @property {number} [executedOrder] where the broker executed it, on the same counter as `order`;
+ *   set only while an `onExecute` hook is installed (see `hook`)
  * @property {true} [discovery] set on the refused ApiVersions request `requests()` leaves out
  */
 
@@ -253,6 +279,75 @@ const targetOf = (fields) => {
 }
 
 /**
+ * The reply of one executed request, kept until the test delivers it: the broker has done the
+ * work, the client has not heard about it. Its request settles once: answered at `deliver`, or
+ * cancelled when its socket closes first or the cluster's `cancelReplyHolds` runs.
+ */
+class ReplyHold {
+  /** @param {import('./schedule').Selector} selector which request's reply to keep */
+  constructor(selector) {
+    this.selector = selector
+    this.socket = null
+    this.send = null
+    this.drop = null
+    this.arrival = new Promise((resolve) => {
+      this.announce = resolve
+    })
+  }
+
+  /**
+   * @returns {Promise<RequestRecord|null>} the request, once it executed and its reply was kept;
+   *   null when the hold was cancelled before any request matched
+   */
+  executed() {
+    return this.arrival
+  }
+
+  /**
+   * Sends the kept reply; a socket destroyed meanwhile gets nothing.
+   * @returns {void}
+   * @throws {Error} before the request executed, or once the reply was delivered or cancelled
+   */
+  deliver() {
+    if (!this.send) throw new Error('ReplyHold: no kept reply to deliver')
+    const send = this.send
+    this.send = null
+    this.drop = null
+    this.socket = null
+    send()
+  }
+
+  /**
+   * @internal
+   * @param {RequestRecord} record the executed request
+   * @param {import('events').EventEmitter} socket the socket it came in on
+   * @param {() => void} send writes its reply
+   * @param {() => void} drop settles it cancelled
+   * @returns {void}
+   */
+  keep(record, socket, send, drop) {
+    this.socket = socket
+    this.send = send
+    this.drop = drop
+    this.announce(record)
+  }
+
+  /**
+   * @internal
+   * Drops a kept reply, or ends the wait of a hold nothing matched.
+   * @returns {void}
+   */
+  cancel() {
+    const drop = this.drop
+    this.send = null
+    this.drop = null
+    this.socket = null
+    if (drop) drop()
+    else this.announce(null)
+  }
+}
+
+/**
  * A cluster that exists only as sockets: the real client connects to it through its public
  * `socketFactory` option, and every request it writes is answered in process.
  *
@@ -330,6 +425,16 @@ class ScriptedCluster {
     this.heldDials = []
     /** @type {Map<string, object>} fields laid over every object answer of an API during its outage */
     this.outages = new Map()
+    /** Opt-in observers of execution and socket closes; see `hook`. */
+    this.hooks = { onExecute: null, onSocketClosed: null }
+    /** @type {ReplyHold[]} rules that keep a reply after its request executed */
+    this.replyHolds = []
+    /** @type {Set<ReplyHold>} holds that kept a reply not yet delivered or cancelled */
+    this.keptReplies = new Set()
+    /** @type {WeakSet<object>} sockets whose client side `clientLoss` closed */
+    this.clientLost = new WeakSet()
+    /** @type {WeakSet<object>} sockets whose close the broker side has noticed */
+    this.brokerClosed = new WeakSet()
     this.advertised = new Map(PROFILES[profile].map(([api, version]) => [api, [version, version]]))
     for (const [api, range] of Object.entries(advertise)) {
       if (
@@ -587,6 +692,126 @@ class ScriptedCluster {
   }
 
   /**
+   * Installs the opt-in hooks a broker model uses; without them the cluster behaves as before.
+   * `onExecute(record, answer)` runs when a request's answer is ready, which is when the broker
+   * executes it: after any hold, before the socket is checked, so a request whose client socket
+   * already closed still executes. It sees the answer that will be encoded (scripted, default or
+   * released with a custom value) and returns the answer to send instead, or nothing to keep it;
+   * `record.executedOrder` is stamped first. It runs for scheduled requests, not for the refused
+   * ApiVersions request of a discovery. A hook that throws is a recorded failure: its request is
+   * cancelled and its socket destroyed. `onSocketClosed({ node, generation, kind })` reports
+   * `'client'` when `clientLoss` closed only the client side, and `'broker'` once the broker side
+   * noticed a close: at `brokerDisconnect`, or at once when the client or the cluster destroys
+   * the socket.
+   * @param {{ onExecute?: (record: RequestRecord, answer: object|Buffer) => object|Buffer|void,
+   *   onSocketClosed?: (closed: { node: number, generation: number, kind: 'client'|'broker' }) => void }} hooks
+   * @returns {ScriptedCluster} this
+   * @throws {Error} when hooks are already installed
+   */
+  hook({ onExecute = null, onSocketClosed = null }) {
+    if (this.hooks.onExecute || this.hooks.onSocketClosed) {
+      throw new Error('ScriptedCluster: hooks are already installed')
+    }
+    this.hooks = { onExecute, onSocketClosed }
+    return this
+  }
+
+  /**
+   * Keeps the reply of the next request the selector picks after the broker executed it, until
+   * the test calls `deliver` on the returned hold. Closing the request's socket first cancels the
+   * request instead. Hooks and holds see scheduled requests only, not the refused ApiVersions
+   * request of a discovery.
+   * @param {import('./schedule').Selector} selector matched as a schedule selector is: against the
+   *   request record with its `topic` and `partition` target
+   * @returns {ReplyHold}
+   */
+  holdReply(selector) {
+    const hold = new ReplyHold(selector)
+    this.replyHolds.push(hold)
+    return hold
+  }
+
+  /**
+   * Teardown of `holdReply`: cancels every kept reply's request and ends the wait of every hold
+   * nothing matched (its `executed()` resolves null).
+   * @returns {void}
+   */
+  cancelReplyHolds() {
+    const unmatched = this.replyHolds
+    this.replyHolds = []
+    for (const hold of [...unmatched, ...this.keptReplies]) hold.cancel()
+  }
+
+  /**
+   * Closes only the client side of a connection, as a network loss the broker has not noticed:
+   * the client sees `ECONNRESET`, and `onSocketClosed` reports `'client'`. Requests already
+   * written still execute; their replies are not delivered.
+   * @param {number} node the node's id
+   * @param {number} generation which connection of the node, counting from 1
+   * @returns {ScriptedCluster} this
+   * @throws {Error} in bounded mode, which drops a closed socket before `brokerDisconnect` could
+   *   find it, or when the cluster holds no such socket
+   */
+  clientLoss(node, generation) {
+    this.assertFullHistory('clientLoss')
+    const socket = this.socketOf(node, generation)
+    this.clientLost.add(socket)
+    socket.destroy(Object.assign(new Error('Connection lost'), { code: 'ECONNRESET' }))
+    return this
+  }
+
+  /**
+   * The broker notices that a connection closed: `onSocketClosed` reports `'broker'` once per
+   * socket, and a socket still open on the client side is closed as a peer closes it.
+   * @param {number} node the node's id
+   * @param {number} generation which connection of the node, counting from 1
+   * @returns {ScriptedCluster} this
+   * @throws {Error} when the cluster holds no such socket
+   */
+  brokerDisconnect(node, generation) {
+    const socket = this.socketOf(node, generation)
+    if (socket.destroyed) this.closed(socket, 'broker')
+    else socket.destroy()
+    return this
+  }
+
+  /**
+   * @private
+   * @param {number} node
+   * @param {number} generation
+   * @returns {import('events').EventEmitter} the answering socket of that connection
+   * @throws {Error} when there is none
+   */
+  socketOf(node, generation) {
+    const key = `${node}/${generation}`
+    const socket = this.fake.state.sockets.find(
+      (candidate) => this.socketKeys.get(candidate) === key
+    )
+    if (!socket) throw new Error(`ScriptedCluster: no socket ${key}`)
+    return socket
+  }
+
+  /**
+   * Reports a socket close to the `onSocketClosed` hook; the broker side is reported once.
+   * @private
+   * @param {import('events').EventEmitter} socket an answering socket
+   * @param {'client'|'broker'} kind which side noticed the close
+   * @returns {void}
+   */
+  closed(socket, kind) {
+    if (kind === 'broker') {
+      if (this.brokerClosed.has(socket)) return
+      this.brokerClosed.add(socket)
+    }
+    const [node, generation] = this.socketKeys.get(socket).split('/').map(Number)
+    try {
+      this.hooks.onSocketClosed?.({ node, generation, kind })
+    } catch (error) {
+      this.errors.push(error)
+    }
+  }
+
+  /**
    * @returns {Array<{ apiKey: number, minVersion: number, maxVersion: number }>} the table the
    *   cluster answers ApiVersions with: its profile's, over any `advertise` override
    */
@@ -607,7 +832,7 @@ class ScriptedCluster {
    *   and under `share` the finalized `share.version` at level 1 with feature epoch 7
    */
   apiVersionsAnswer() {
-    if (this.profile === 'share') {
+    if (this.profile === 'share' || this.profile === 'destructiveAdmin') {
       return {
         apiKeys: this.apiVersionsTable(),
         finalizedFeaturesEpoch: 7,
@@ -806,6 +1031,16 @@ class ScriptedCluster {
       const result = write(buffer, ...rest)
       this.handle(socket, node, generation, Buffer.from(buffer))
       return result
+    }
+    const destroy = socket.destroy
+    socket.destroy = (error) => {
+      const closing = !socket.destroyed
+      destroy(error)
+      if (closing) {
+        for (const hold of [...this.keptReplies]) if (hold.socket === socket) hold.cancel()
+        this.closed(socket, this.clientLost.has(socket) ? 'client' : 'broker')
+      }
+      return socket
     }
   }
 
@@ -1010,30 +1245,114 @@ class ScriptedCluster {
           // A macrotask, as the bytes of a real answer arrive: a client that loops on empty
           // answers must not be able to starve the timers behind a chain of microtasks.
           setImmediate(() => {
-            if (!socket.destroyed) {
-              const body = Buffer.isBuffer(answer)
-                ? answer
-                : pair.buildResponse({
-                    ...(this.profile === 'share' && { throttleTime: 0 }),
-                    ...answer,
-                  })
-              record.answeredOrder = this.clock++
-              respondWithFrame(
-                { socket },
-                record.correlationId,
-                responseHeaderVersion(record.apiKey, record.version),
-                body
-              )
-              this.settle(record, 'answered')
-            } else {
+            let executed
+            let hold
+            try {
+              executed = this.execute(record, answer)
+              hold = this.replyHoldFor(record)
+            } catch (error) {
+              this.errors.push(error)
               this.settle(record, 'cancelled')
+              this.cancelReplyHolds()
+              socket.destroy(error)
+              return
             }
+            const deliver = () => this.deliver(socket, record, pair, executed)
+            if (hold) this.keepReply(hold, socket, record, deliver)
+            else deliver()
           }),
         (error) => {
           socket.destroy(error)
           this.settle(record, 'cancelled')
         }
       )
+  }
+
+  /**
+   * Executes a request whose answer is ready: stamps `executedOrder` and lets the `onExecute`
+   * hook replace the answer. Without the hook the answer is returned as it is and nothing is
+   * stamped.
+   * @private
+   * @param {RequestRecord} record
+   * @param {object|Buffer} answer
+   * @returns {object|Buffer} the answer to send
+   */
+  execute(record, answer) {
+    if (!this.hooks.onExecute) return answer
+    record.executedOrder = this.clock++
+    return this.hooks.onExecute(record, answer) ?? answer
+  }
+
+  /**
+   * @private
+   * @param {RequestRecord} record an executed request
+   * @returns {ReplyHold|null} the first reply hold whose selector picks it, taken off the rules
+   * @throws {Error} what a selector's `match` throws
+   */
+  replyHoldFor(record) {
+    if (this.replyHolds.length === 0) return null
+    const target = { ...record, ...targetOf(record.fields) }
+    const index = this.replyHolds.findIndex(({ selector }) => selects(selector, target))
+    return index === -1 ? null : this.replyHolds.splice(index, 1)[0]
+  }
+
+  /**
+   * Keeps an executed request's reply in its hold until `deliver`, or cancels the request when its
+   * socket is already closed.
+   * @private
+   * @param {ReplyHold} hold
+   * @param {import('events').EventEmitter} socket
+   * @param {RequestRecord} record
+   * @param {() => void} deliver writes the reply
+   * @returns {void}
+   */
+  keepReply(hold, socket, record, deliver) {
+    this.keptReplies.add(hold)
+    hold.keep(
+      record,
+      socket,
+      () => {
+        this.keptReplies.delete(hold)
+        deliver()
+      },
+      () => {
+        this.keptReplies.delete(hold)
+        this.settle(record, 'cancelled')
+      }
+    )
+    if (socket.destroyed) hold.cancel()
+  }
+
+  /**
+   * Writes an executed request's answer, unless its socket was destroyed by then.
+   * @private
+   * @param {import('events').EventEmitter} socket the socket the request came in on
+   * @param {RequestRecord} record
+   * @param {WirePair} pair
+   * @param {object|Buffer} answer
+   * @returns {void}
+   */
+  deliver(socket, record, pair, answer) {
+    if (socket.destroyed) {
+      this.settle(record, 'cancelled')
+      return
+    }
+    const body = Buffer.isBuffer(answer)
+      ? answer
+      : pair.buildResponse({
+          ...((this.profile === 'share' || this.profile === 'destructiveAdmin') && {
+            throttleTime: 0,
+          }),
+          ...answer,
+        })
+    record.answeredOrder = this.clock++
+    respondWithFrame(
+      { socket },
+      record.correlationId,
+      responseHeaderVersion(record.apiKey, record.version),
+      body
+    )
+    this.settle(record, 'answered')
   }
 
   /**

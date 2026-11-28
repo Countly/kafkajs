@@ -117,8 +117,10 @@ describe('docs/Testing.md', () => {
       kafka: '4.4.0',
       group: 'others',
     })
-    expect(workflows[1]).toContain("kafka: ['4.0.2', '4.2.2', '4.3.2', '4.4.0']")
+    expect(workflows[1]).toContain("kafka: ['4.0.2', '4.1.2', '4.2.2', '4.3.2', '4.4.0']")
     expect(workflows[1]).toContain("- { node: 26, kafka: '4.0.2' }")
+    expect(workflows[1]).toContain("- { node: 22, kafka: '4.1.2' }")
+    expect(workflows[1]).toContain("- { node: 26, kafka: '4.1.2' }")
     expect(workflows[1]).toContain("- { node: 22, kafka: '4.2.2' }")
     expect(workflows[1]).toContain("- { node: 24, kafka: '4.3.2' }")
     expect(workflows[1]).toContain("cron: '0 3 * * 1'")
@@ -129,8 +131,14 @@ describe('docs/Testing.md', () => {
     )
     expect(ci).toContain('Three share lanes run on Node 24 against Kafka 4.4.0:')
     expect(ci).not.toContain('4.3.1')
-    expect(ci).toContain('Kafka 4.0.2, 4.2.2, 4.3.2 and 4.4.0')
-    expect(ci).toContain('leaves out Node 26 with 4.0.2, Node 22 with 4.2.2 and Node 24 with 4.3.2')
+    expect(ci).toContain('Kafka 4.0.2, 4.1.2, 4.2.2, 4.3.2 and 4.4.0')
+    expect(ci).toContain(
+      'leaves out Node 26 with 4.0.2, Nodes 22 and 26 with 4.1.2, Node 22 with 4.2.2 and Node 24 with 4.3.2'
+    )
+    expect(ci).toContain('ten Kafka-by-Node cells and 60 jobs')
+    expect(page).toContain(
+      'The weekly workflow runs the six groups on Kafka 4.0.2, 4.1.2, 4.2.2, 4.3.2 and 4.4.0'
+    )
     expect(ci).toContain('has no Kafka version input')
   })
 
@@ -138,7 +146,7 @@ describe('docs/Testing.md', () => {
     const kafka = captures(workflows[1], /'(\d+\.\d+\.\d+)'/g)
     const node = captures(workflows[1], /node: \[([\d, ]+)\]/g).flatMap((list) => list.split(/, */))
 
-    expect(kafka).toEqual(['4.0.2', '4.2.2', '4.3.2', '4.4.0'])
+    expect(kafka).toEqual(['4.0.2', '4.1.2', '4.2.2', '4.3.2', '4.4.0'])
     expect(node).toEqual(['22', '24', '26'])
     expect(kafka.filter((version) => !ci.includes(version))).toEqual([])
     expect(node.filter((version) => !ci.includes(version))).toEqual([])
@@ -229,6 +237,45 @@ describe('docs/Testing.md', () => {
       'no threshold',
     ])
       expect(block).toContain(text)
+  })
+
+  it('describes the manual mutation report, what it runs and what a survivor means', () => {
+    const start = page.indexOf('### Mutation report')
+    expect(start).toBeGreaterThan(-1)
+    const section = page.slice(start, page.indexOf('\n### ', start + 1))
+    const { inputs } = yaml.load(read('.github', 'workflows', 'mutants.yml')).on.workflow_dispatch
+
+    for (const text of [
+      '`.github/workflows/mutants.yml`',
+      '`scripts/mutants/inventory.json`',
+      '`scripts/mutants/generate.js`',
+      'dispatched by hand',
+      'gates nothing',
+      'Nominated witness specs judge every mutant',
+      'the first valid kill decides',
+      'at least one of its nominated witnesses still passed',
+      'none produced a valid kill',
+      'in their listed order',
+      'appended when the list does not name it',
+      'which replace the default',
+      'otherwise the default spec alone',
+      'starts no new mutant and no further witness of a running one',
+      'a mutant cut between two witnesses is `not-run`',
+      '`mutation-report`',
+      'does not mean that no test in the suite would fail',
+      'gates nothing by itself',
+      'the owner reads',
+    ])
+      expect(section).toContain(text)
+    for (const verdict of ['killed', 'survived', 'invalid', 'stale', 'not-run', 'excluded'])
+      expect(section).toContain(`\`${verdict}\``)
+    expect(section).not.toContain('no merge or release waits')
+    expect(section).not.toContain('A nominated witness spec')
+    expect(section).not.toContain('its nominated witness did not fail')
+    expect(section).not.toContain('means none of its nominated witnesses failed')
+    expect(section).not.toContain('followed by the default spec of its target')
+    for (const name of Object.keys(inputs)) expect(section).toContain(`\`${name}\``)
+    expect(section).not.toMatch(/\d\s?%/)
   })
 
   it('states the telemetry row counts, Kafka lines and jars the tree has', () => {
@@ -551,6 +598,7 @@ describe('documented live scenario scripts', () => {
     {
       script: 'test:e2e:offset-reset',
       flag: 'OFFSET_RESET_E2E',
+      lanes: 'fake,docker',
       spec: 'src/consumer/__tests__/offsetResetLive.spec.js',
       compose: null,
       budgetsMs: [90000],
@@ -589,12 +637,13 @@ describe('documented live scenario scripts', () => {
     {
       script: 'test:e2e:direct-consumer',
       flag: 'DIRECT_CONSUMER_E2E',
+      lanes: 'fake,docker',
       spec: 'src/consumer/__tests__/directConsumerLive.spec.js',
       compose: null,
       budgetsMs: [90000],
       wording: [
         'manual assignment with and without a group',
-        'acceptance runs use the reviewed guarded live entry',
+        'acceptance runs use the Exit gate check `e2e-direct-consumer`',
       ],
     },
     {
@@ -636,7 +685,7 @@ describe('documented live scenario scripts', () => {
       wording: [
         'duplicate static instance',
         'short and long coordinator outages',
-        'reviewed guarded live entry',
+        'Exit gate check `e2e-group-faults`',
       ],
     },
     {
@@ -648,7 +697,7 @@ describe('documented live scenario scripts', () => {
       wording: [
         'open and aborted transactions',
         'oversized first record',
-        'reviewed guarded live entry',
+        'Exit gate check `e2e-fetch-semantics`',
       ],
     },
     {
@@ -680,9 +729,10 @@ describe('documented live scenario scripts', () => {
   it.each(scenarios)('$script is one two-worker spec run through test:kafka', (row) => {
     const prefix = row.compose ? `COMPOSE_FILE=${row.compose} ` : ''
     const pattern = row.spec.replace(/\./g, '\\\\.')
+    const lanes = row.lanes ? `KAFKAJS_SCENARIO_LANES=${row.lanes} ` : ''
     expect(fs.existsSync(path.join(root, row.spec))).toBe(true)
     expect(scripts[row.script]).toBe(
-      `${prefix}npm run test:kafka -- "${row.flag}=1 npx jest --maxWorkers=2 --testPathPatterns '${pattern}'"`
+      `${prefix}npm run test:kafka -- "${row.flag}=1 ${lanes}npx jest --maxWorkers=2 --testPathPatterns '${pattern}'"`
     )
   })
 
@@ -710,7 +760,7 @@ describe('documented live scenario scripts', () => {
     expect(block).toContain('npm run test:e2e:rack-aware-producer')
     expect(block).toContain('180000 ms')
     expect(block).toContain('docker-compose.racks.yml')
-    expect(block).toContain('sole cluster guard')
+    expect(block).toContain('cluster guard script named by `P9_CLUSTER_GUARD`')
   })
 
   it('documents the consumer-churn soak profile and its script', () => {

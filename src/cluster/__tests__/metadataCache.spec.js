@@ -383,6 +383,43 @@ describe('Cluster > MetadataCache', () => {
     })
   })
 
+  test('a TOPIC_RECREATED listener that throws null does not break the metadata refresh', async () => {
+    emitter.addListener(CLUSTER_TOPIC_RECREATED, () => {
+      throw null // eslint-disable-line no-throw-literal
+    })
+    const pool = new BrokerPool({
+      connectionPoolBuilder: {},
+      logger: newLogger(),
+      retry: { retries: 0 },
+      metadataCache: cache,
+    })
+    let answer = response({ topicId: ID_A, brokers: [0] })
+    pool.seedBroker = {
+      isConnected: () => true,
+      metadata: async () => answer,
+      connectionPool: { host: '127.0.0.1', port: 9092, rack: null },
+    }
+    const published = jest.fn()
+    cache.onRoutingChange(published)
+    await pool.refreshMetadata([])
+    const errors = jest.spyOn(cache.logger, 'error')
+
+    answer = response({ topicId: ID_B, leader: 2, leaderEpoch: 6, brokers: [0] })
+    await expect(pool.refreshMetadata([])).resolves.toBeUndefined()
+
+    expect(pool.metadata).toBe(answer)
+    expect(cache.topicId('test-topic')).toEqual(ID_B)
+    expect(cache.leader('test-topic', 0)).toEqual(2)
+    expect(published).toHaveBeenCalledTimes(2)
+    expect(events).toEqual([{ topic: 'test-topic', previousTopicId: ID_A, topicId: ID_B }])
+    expect(errors).toHaveBeenCalledTimes(1)
+    expect(errors).toHaveBeenCalledWith('Instrumentation event listener threw, ignoring it', {
+      eventName: CLUSTER_TOPIC_RECREATED,
+      topic: 'test-topic',
+      error: 'undefined',
+    })
+  })
+
   test('the all-zero topic id is treated as no id at all', () => {
     cache.update(response({ topicId: '00000000-0000-0000-0000-000000000000' }))
     expect(cache.topicId('test-topic')).toBeUndefined()
@@ -439,6 +476,123 @@ describe('Cluster > MetadataCache', () => {
       expect(cached.decoded).toBe(partition0(fresh))
     })
 
+    describe('with a wanted-topic predicate', () => {
+      let wanted
+      let owned
+
+      beforeEach(() => {
+        wanted = new Set()
+        owned = new MetadataCache({
+          logger: newLogger(),
+          instrumentationEmitter: emitter,
+          isWanted: (topic) => wanted.has(topic),
+        })
+      })
+
+      const named = (topic, topicId, partitions = [0]) => {
+        const metadata = response({ topicId })
+        metadata.topicMetadata[0].topic = topic
+        metadata.topicMetadata[0].partitionMetadata = partitions.map((partitionId) => ({
+          ...partition0(response()),
+          partitionId,
+        }))
+        return metadata
+      }
+      const shortId = (i) => `00000000-0000-0000-0000-0000000000${String(i + 1).padStart(2, '0')}`
+
+      test('a scoped refresh drops every unwanted topic it does not carry, ids included', () => {
+        for (let i = 0; i < 5; i++) owned.update(named(`short-${i}`, shortId(i)))
+
+        owned.update(otherTopic({ topicId: ID_B }))
+
+        expect([...owned.topics.keys()]).toEqual(['other-topic'])
+        expect([...owned.topicIds.keys()]).toEqual([ID_B])
+        for (let i = 0; i < 5; i++) expect(owned.topicName(shortId(i))).toBeUndefined()
+      })
+
+      test('a wanted topic keeps its id across a deleted window and its recreation is detected', () => {
+        wanted.add('test-topic')
+        owned.update(response({ topicId: ID_A, leaderEpoch: 9 }))
+        owned.update(otherTopic({ topicId: ID_B }))
+        owned.update(named('test-topic', NO_TOPIC_ID, []))
+        owned.update(otherTopic({ topicId: ID_B }))
+        expect(owned.topicId('test-topic')).toEqual(ID_A)
+
+        const recreated = response({ topicId: '21222324-2526-2728-292a-2b2c2d2e2f30' })
+        owned.update(recreated)
+
+        expect(events).toEqual([
+          {
+            topic: 'test-topic',
+            previousTopicId: ID_A,
+            topicId: '21222324-2526-2728-292a-2b2c2d2e2f30',
+          },
+        ])
+      })
+
+      test('a topic only an id lookup recorded is kept until its owner registers or retires it', () => {
+        owned.updateTopicsById(response({ topicId: ID_A }))
+        owned.update(otherTopic({ topicId: ID_B }))
+
+        expect(owned.topicName(ID_A)).toEqual('test-topic')
+      })
+
+      test('an id lookup keeps a name an earlier full refresh carried until its owner registers it', () => {
+        owned.update(named('test-topic', ID_A), { full: true })
+        owned.updateTopicsById(response({ topicId: ID_A }))
+        owned.update(otherTopic({ topicId: ID_B }))
+
+        expect(owned.topicName(ID_A)).toEqual('test-topic')
+      })
+
+      test('a registered name is no longer pending: once unwanted, a scoped refresh drops it', () => {
+        owned.updateTopicsById(response({ topicId: ID_A }))
+        wanted.add('test-topic')
+        owned.update(otherTopic({ topicId: ID_B }))
+        wanted.delete('test-topic')
+        owned.update(otherTopic({ topicId: ID_B }))
+
+        expect(owned.topicName(ID_A)).toBeUndefined()
+      })
+
+      test('releasing pending names drops every unwanted one not kept and keeps the kept ones', () => {
+        const ID_K = '21222324-2526-2728-292a-2b2c2d2e2f30'
+        owned.updateTopicsById(response({ topicId: ID_A }))
+        owned.updateTopicsById(named('kept-topic', ID_K))
+        owned.releasePending(['kept-topic'])
+        owned.update(otherTopic({ topicId: ID_B }))
+
+        expect(owned.topicName(ID_A)).toBeUndefined()
+        expect(owned.topicName(ID_K)).toEqual('kept-topic')
+        owned.releasePending([])
+        expect(owned.topicName(ID_K)).toBeUndefined()
+      })
+
+      test('Cluster#retireFirstAddTopics releases the pending names its owner no longer keeps', () => {
+        const cluster = new Cluster({
+          logger: newLogger(),
+          brokers: ['localhost:9092'],
+          socketFactory: () => {},
+          retry: { retries: 0 },
+        })
+        const ID_K = '21222324-2526-2728-292a-2b2c2d2e2f30'
+        cluster.metadataCache.updateTopicsById(response({ topicId: ID_A }))
+        cluster.metadataCache.updateTopicsById(named('kept-topic', ID_K))
+        cluster.retireFirstAddTopics(['kept-topic'])
+
+        expect(cluster.topicName(ID_A)).toBeUndefined()
+        expect(cluster.topicName(ID_K)).toEqual('kept-topic')
+      })
+
+      test('a full-cluster refresh still prunes a wanted topic it does not carry', () => {
+        wanted.add('test-topic')
+        owned.update(response({ topicId: ID_A }))
+        owned.update(otherTopic({ topicId: ID_B }), { full: true })
+
+        expect(owned.topics.has('test-topic')).toBe(false)
+      })
+    })
+
     test('a hint still moves the leader for a topic whose decoded object was released', () => {
       cache.update(response({ leader: 1, leaderEpoch: 5 }))
       cache.update(otherTopic({ topicId: ID_B }))
@@ -451,6 +605,191 @@ describe('Cluster > MetadataCache', () => {
       cache.update(back)
       expect(partition0(back).leader).toEqual(3)
       expect(cache.topics.get('test-topic').partitions.get(0).decoded).toBe(partition0(back))
+    })
+  })
+
+  const ID_C = '21222324-2526-2728-292a-2b2c2d2e2f30'
+  const row = ({ topic = 'test-topic', topicId, topicErrorCode = 0 }) => ({
+    ...response({ topicId, leader: 2, leaderEpoch: 7 }).topicMetadata[0],
+    topic,
+    topicErrorCode,
+  })
+  const answer = (...rows) => ({ ...response(), topicMetadata: rows })
+
+  const noIdentity = 'rows that carry no identity, through %s'
+  describe.each(['update', 'updateTopicsById'])(noIdentity, (ingress) => {
+    let wanted
+    let owned
+
+    const apply = (metadata) => owned[ingress](metadata)
+    const state = () => ({
+      topics: [...owned.topics].map(([name, entry]) => [
+        name,
+        entry.topicId,
+        [...entry.partitions].map(([id, { leader, leaderEpoch }]) => [id, leader, leaderEpoch]),
+      ]),
+      topicIds: [...owned.topicIds],
+      pending: [...owned.pendingTopics],
+    })
+
+    beforeEach(() => {
+      wanted = new Set(['test-topic'])
+      owned = new MetadataCache({
+        logger: newLogger(),
+        instrumentationEmitter: emitter,
+        isWanted: (topic) => wanted.has(topic),
+      })
+      owned.update(response({ topicId: ID_A, leader: 1, leaderEpoch: 5 }))
+    })
+
+    test('a row with a topic error and a usable id changes no id, reverse map, partitions or pending state', () => {
+      const before = state()
+
+      apply(
+        answer(
+          row({ topicId: ID_B, topicErrorCode: 29 }),
+          row({ topic: 'ghost-topic', topicId: ID_C, topicErrorCode: 3 })
+        )
+      )
+
+      expect(state()).toEqual(before)
+      expect(events).toEqual([])
+    })
+
+    test('a row without a name changes nothing', () => {
+      const before = state()
+
+      apply(answer(row({ topic: null, topicId: ID_B })))
+
+      expect(state()).toEqual(before)
+      expect(owned.topics.has(null)).toBe(false)
+      expect(owned.topicName(ID_B)).toBeUndefined()
+    })
+
+    test('a row with the all-zero id keeps the cached id and adds no pending state', () => {
+      wanted.delete('test-topic')
+
+      apply(answer(row({ topicId: NO_TOPIC_ID })))
+
+      expect(owned.topicId('test-topic')).toEqual(ID_A)
+      expect(owned.topicName(ID_A)).toEqual('test-topic')
+      expect([...owned.pendingTopics]).toEqual([])
+      // Only identity needs a usable id: the healthy answer's leaders still apply.
+      expect(owned.leader('test-topic', 0)).toEqual(2)
+      expect(owned.leaderEpoch('test-topic', 0)).toEqual(7)
+      expect(events).toEqual([])
+    })
+
+    test('a healthy sibling in the same answer installs', () => {
+      apply(
+        answer(
+          row({ topic: 'ghost-topic', topicId: ID_B, topicErrorCode: 3 }),
+          row({ topic: 'sibling-topic', topicId: ID_C })
+        )
+      )
+
+      expect(owned.topicId('test-topic')).toEqual(ID_A)
+      expect(owned.topicId('sibling-topic')).toEqual(ID_C)
+      expect(owned.topicName(ID_C)).toEqual('sibling-topic')
+      expect(owned.leader('sibling-topic', 0)).toEqual(2)
+      expect(owned.leaderEpoch('sibling-topic', 0)).toEqual(7)
+      expect(owned.pendingTopics.has('sibling-topic')).toBe(ingress === 'updateTopicsById')
+    })
+
+    test('a healthy row without an id records its partitions but no id and no pending state', () => {
+      apply(answer(row({ topic: 'plain-topic', topicId: null })))
+
+      // Producer and share routing read leaders from the cache, so the partitions are kept; the
+      // row names no id, so an id lookup resolved nothing it must keep pending.
+      expect(owned.topics.get('plain-topic').topicId).toBeNull()
+      expect(owned.topicId('plain-topic')).toBeUndefined()
+      expect(owned.leader('plain-topic', 0)).toEqual(2)
+      expect(owned.leaderEpoch('plain-topic', 0)).toEqual(7)
+      expect([...owned.pendingTopics]).toEqual([])
+    })
+  })
+
+  describe('a routed update whose row for a cached topic carries a topic error', () => {
+    let wanted
+    let owned
+
+    const errorRow = (topicId = ID_B) => answer(row({ topicId, topicErrorCode: 3 }))
+    const own = {
+      'a target': () => {
+        wanted.add('test-topic')
+        owned.update(response({ topicId: ID_A, leader: 1, leaderEpoch: 5 }))
+      },
+      'a pending id lookup': () => {
+        owned.updateTopicsById(response({ topicId: ID_A, leader: 1, leaderEpoch: 5 }))
+      },
+    }
+
+    beforeEach(() => {
+      wanted = new Set()
+      owned = new MetadataCache({
+        logger: newLogger(),
+        instrumentationEmitter: emitter,
+        isWanted: (topic) => wanted.has(topic),
+      })
+    })
+
+    test('releases the decoded partitions of the answer it replaces', () => {
+      wanted.add('test-topic')
+      const first = response({ topicId: ID_A, leader: 1, leaderEpoch: 5 })
+      owned.update(first)
+
+      owned.update(errorRow())
+
+      expect(owned.topics.get('test-topic').partitions.get(0).decoded).toBeNull()
+      expect(owned.applyLeaderHint('test-topic', 0, { leaderId: 2, leaderEpoch: 6 })).toBe(true)
+      expect(partition0(first)).toMatchObject({ leader: 1, leaderEpoch: 5 })
+      expect(owned.topicId('test-topic')).toEqual(ID_A)
+    })
+
+    test.each([false, true])(
+      'drops a name nothing owns when only error rows carry it (full: %s)',
+      (full) => {
+        wanted.add('test-topic')
+        owned.update(response({ topicId: ID_A }))
+        wanted.delete('test-topic')
+
+        owned.update(errorRow(), { full })
+
+        expect(owned.topics.has('test-topic')).toBe(false)
+        expect(owned.topicName(ID_A)).toBeUndefined()
+        expect([...owned.topicIds.keys()]).toEqual([])
+      }
+    )
+
+    test.each(Object.keys(own))(
+      'keeps the last identity of a name owned by %s across repeated full error rows, and a later healthy row under a new id is a recreation',
+      (owner) => {
+        own[owner]()
+
+        owned.update(errorRow(), { full: true })
+        owned.update(errorRow(NO_TOPIC_ID), { full: true })
+
+        expect(owned.topicId('test-topic')).toEqual(ID_A)
+        expect(owned.topicName(ID_A)).toEqual('test-topic')
+        expect(owned.leaderEpoch('test-topic', 0)).toEqual(5)
+        expect(events).toEqual([])
+
+        owned.update(answer(row({ topicId: ID_C })), { full: true })
+
+        expect(events).toEqual([{ topic: 'test-topic', previousTopicId: ID_A, topicId: ID_C }])
+        expect(owned.topicId('test-topic')).toEqual(ID_C)
+        expect(owned.topicName(ID_A)).toBeUndefined()
+      }
+    )
+
+    test('prunes an owned name carried by error rows once a full answer omits it', () => {
+      own['a target']()
+      owned.update(errorRow(), { full: true })
+
+      owned.update(answer(row({ topic: 'other-topic', topicId: ID_C })), { full: true })
+
+      expect(owned.topics.has('test-topic')).toBe(false)
+      expect(owned.topicName(ID_A)).toBeUndefined()
     })
   })
 
@@ -754,5 +1093,25 @@ describe('Cluster > MetadataCache > routing change notifications', () => {
     cache.update(response())
     expect(listener).not.toHaveBeenCalled()
     expect(survivor).toHaveBeenCalledTimes(1)
+  })
+
+  it('a routing listener that throws undefined does not break the publication', () => {
+    const { cache, listener } = build()
+    cache.onRoutingChange(() => {
+      throw undefined // eslint-disable-line no-throw-literal
+    })
+    const survivor = jest.fn()
+    cache.onRoutingChange(survivor)
+    const errors = jest.spyOn(cache.logger, 'error')
+
+    expect(() => cache.update(response())).not.toThrow()
+
+    expect(cache.topicId('test-topic')).toEqual(ID_A)
+    expect(listener).toHaveBeenCalledTimes(1)
+    expect(survivor).toHaveBeenCalledTimes(1)
+    expect(errors).toHaveBeenCalledTimes(1)
+    expect(errors).toHaveBeenCalledWith('Routing change listener threw, ignoring it', {
+      error: 'undefined',
+    })
   })
 })

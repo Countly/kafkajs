@@ -37,7 +37,14 @@ const setup = ({ mode = 'implicit', batch = true, stopping = false, offsets } = 
     stopping: () => stopping,
     renew,
   }
-  const call = new ShareHandlerCall({ ledger, records, mode, batch, authority })
+  const call = new ShareHandlerCall({
+    ledger,
+    records,
+    offsets: ledger.offsets,
+    mode,
+    batch,
+    authority,
+  })
   return {
     token,
     messages: records,
@@ -185,6 +192,7 @@ describe('Share consumer handler decisions', () => {
     const call = new ShareHandlerCall({
       ledger: c.ledger,
       records: c.messages,
+      offsets: c.ledger.offsets,
       start: 1,
       end: 2,
       mode: 'implicit',
@@ -204,6 +212,7 @@ describe('Share consumer handler decisions', () => {
     const second = new ShareHandlerCall({
       ledger: c.ledger,
       records: c.messages,
+      offsets: c.ledger.offsets,
       mode: 'implicit',
       batch: false,
       authority: c.authority,
@@ -223,7 +232,7 @@ describe('Share consumer handler decisions', () => {
       c.call.complete()
       expect(byRange).toHaveBeenCalledTimes(1)
       expect(byRange).toHaveBeenCalledWith(
-        c.messages,
+        c.ledger.offsets,
         0,
         3,
         mode === 'explicit' ? 'release' : 'accept'
@@ -234,9 +243,7 @@ describe('Share consumer handler decisions', () => {
     }
   })
   test('counts the delivered records inside a compact range by exact int64 offset', () => {
-    const records = ['0', '1', '2', '9', '10', '100', '9007199254740993'].map((offset) => ({
-      offset,
-    }))
+    const records = ['0', '1', '2', '9', '10', '100', '9007199254740993']
     expect(countWithin(records, '1', '9')).toBe(3)
     expect(countWithin(records, '3', '8')).toBe(0)
     expect(countWithin(records, '0', '9007199254740993')).toBe(7)
@@ -254,6 +261,106 @@ describe('Share consumer handler decisions', () => {
     expect(types(c)).toEqual([3, 1])
     expect(c.call.complete()).toBeNull()
     expect(() => c.call.acknowledge(c.messages[1])).toThrow(KafkaJSNonRetriableError)
+  })
+  test('freezing a call whose acquisition was retired closes it without touching the ledger', () => {
+    const c = setup({ offsets: ['0', '1', '2'] })
+    c.call.acknowledge(c.messages[0], 'accept')
+    const retired = c.ledger.invalidate('session-lost')
+    c.retire()
+    c.call.freeze()
+    expect(
+      retired.map(({ firstOffset, lastOffset, type }) => [firstOffset, lastOffset, type])
+    ).toEqual([
+      ['0', '0', 'accept'],
+      ['1', '2', 'release'],
+    ])
+    expect(c.call.open).toBe(false)
+    expect(c.ledger.size).toBe(0)
+    expect(c.call.complete()).toBeNull()
+    expect(() => c.call.acknowledge(c.messages[1])).toThrow(KafkaJSNonRetriableError)
+  })
+  test('freezing a call that lost its authority promotes none of its choices', () => {
+    const c = setup({ offsets: ['0', '1'] })
+    c.call.acknowledge(c.messages[0], 'reject')
+    c.retire()
+    c.call.freeze()
+    expect(c.call.open).toBe(false)
+    expect(c.ledger.prepare({ token: c.token }).ticket).toBeNull()
+  })
+  test('freezing a call promotes its choice by the delivered record even after the handler changed the message offset', () => {
+    const c = setup({ offsets: ['0', '1'] })
+    c.call.acknowledge(c.messages[0], 'reject')
+    c.messages[0].offset = '7'
+    c.call.freeze()
+    expect(c.call.open).toBe(false)
+    expect(c.ledger.prepare({ token: c.token }).ticket.acknowledgementBatches).toEqual([
+      { firstOffset: '0', lastOffset: '0', acknowledgeTypes: [3] },
+    ])
+  })
+  test('a message whose offset the handler changed is still acknowledged, renewed and completed as the record acquired', async () => {
+    const c = setup({ offsets: ['0', '1', '2'] })
+    c.messages[0].offset = '1'
+    c.messages[2].offset = '0'
+    c.call.acknowledge(c.messages[0], 'reject')
+    await c.call.renew([c.messages[0]])
+    expect(c.renew).toHaveBeenCalledWith(['0'])
+    await c.call.renew()
+    expect(c.renew).toHaveBeenLastCalledWith(['0', '1', '2'])
+    expect(c.call.expiredAt(1000)).toEqual(['0', '1', '2'])
+    expect(c.call.complete()).toBeNull()
+    expect(c.ledger.prepare({ token: c.token }).ticket.acknowledgementBatches).toEqual([
+      { firstOffset: '0', lastOffset: '2', acknowledgeTypes: [3, 1, 1] },
+    ])
+  })
+  test('a delivered message is resolved by identity before its shape or offset is read', async () => {
+    const c = setup({ mode: 'explicit', offsets: ['0', '1'] })
+    const [first, second] = c.messages
+    delete first.value
+    first.offset = '1'
+    c.call.acknowledge(first, 'reject')
+    await c.call.renew([first])
+    expect(c.renew).toHaveBeenLastCalledWith(['0'])
+    const read = jest.fn(() => {
+      throw new Error('offset read')
+    })
+    Object.defineProperty(second, 'offset', { get: read })
+    await c.call.renew([second])
+    expect(c.renew).toHaveBeenLastCalledWith(['1'])
+    c.call.acknowledge({ offset: '1' }, 'accept')
+    expect(read).not.toHaveBeenCalled()
+    expect(c.call.complete()).toBeNull()
+    expect(c.ledger.prepare({ token: c.token }).ticket.acknowledgementBatches).toEqual([
+      { firstOffset: '0', lastOffset: '1', acknowledgeTypes: [3, 1] },
+    ])
+  })
+  test('a selector that revokes the call while it is read leaves no decision and queues no renewal', () => {
+    /** @param {object} c A case. @returns {object} An offset-only selector whose read revokes `c`. */
+    const revoking = (c) => ({
+      get offset() {
+        c.retire()
+        return '1'
+      },
+    })
+    const decided = setup({ offsets: ['0', '1'] })
+    expect(() => decided.call.acknowledge(revoking(decided), 'reject')).toThrow('no longer current')
+    expect(
+      decided.ledger
+        .invalidate('session-lost')
+        .map(({ firstOffset, lastOffset, type }) => [firstOffset, lastOffset, type])
+    ).toEqual([['0', '1', 'release']])
+    const renewed = setup({ offsets: ['0', '1'] })
+    expect(() => renewed.call.renew([renewed.messages[0], revoking(renewed)])).toThrow(
+      'no longer current'
+    )
+    const throwing = setup({ offsets: ['0', '1'] })
+    const unreadable = {
+      get offset() {
+        throw new Error('offset read')
+      },
+    }
+    expect(() => throwing.call.renew([throwing.messages[0], unreadable])).toThrow('offset read')
+    expect(renewed.renew).not.toHaveBeenCalled()
+    expect(throwing.renew).not.toHaveBeenCalled()
   })
 })
 
@@ -548,6 +655,40 @@ describe('public share handler contract', () => {
     })
     expect(h.crashes).toHaveLength(0)
     await until(() => h.frames(78).length >= 3, 'the node keeps fetching')
+  })
+
+  test('eachBatch: acknowledging after sorting batch.messages descending applies each choice to its own record', async () => {
+    await start()
+    h.script('ShareFetch', [answer(['a', 'b'])])
+    await h.consumer.run({
+      eachBatch: async ({ batch, acknowledge }) => {
+        batch.messages.sort((x, y) => Number(y.offset) - Number(x.offset))
+        const [one, zero] = batch.messages
+        acknowledge(one, 'accept')
+        acknowledge(zero, 'reject')
+      },
+    })
+    await until(
+      () => h.errors.length > 0 || batches().some((b) => b.length > 0),
+      'the acknowledgement or a handler error'
+    )
+    expect(h.errors).toEqual([])
+    const pairs = batches()
+      .find((b) => b.length > 0)
+      .flatMap(({ firstOffset, lastOffset, acknowledgeTypes }) => {
+        const decoded = []
+        for (let offset = BigInt(firstOffset), i = 0; offset <= BigInt(lastOffset); offset++, i++)
+          decoded.push([
+            String(offset),
+            acknowledgeTypes.length === 1 ? acknowledgeTypes[0] : acknowledgeTypes[i],
+          ])
+        return decoded
+      })
+    expect(pairs).toEqual([
+      ['0', 3],
+      ['1', 1],
+    ])
+    expect(h.crashes).toHaveLength(0)
   })
 
   test('rejects late, foreign and invalid acknowledgements', async () => {

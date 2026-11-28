@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -1671,7 +1671,7 @@
+ 
+         bail(e)
+       }
+-    }, round)
++    })
+   }
+ 
+   /**

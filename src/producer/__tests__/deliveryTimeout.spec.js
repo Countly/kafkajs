@@ -4,6 +4,7 @@ const Kafka = require('../../index')
 const Cluster = require('../../cluster')
 const createProducer = require('../index')
 const { createFakeCluster } = require('./fixtures/fakeCluster')
+const { takeSent } = require('./fixtures/bufferHarness')
 const { createErrorFromCode } = require('../../protocol/error')
 const { createLogger, LEVELS } = require('../../loggers')
 const {
@@ -23,7 +24,8 @@ describe('Producer > deliveryTimeout', () => {
 
   beforeEach(() => {
     // Delivery deadlines read Date.now(); CPU load must not spend the test's retry budget.
-    jest.useFakeTimers({ now: 0, doNotFake: ['nextTick', 'setImmediate'] })
+    // The default linger of 0 hands a batch on through queueMicrotask, which must stay real.
+    jest.useFakeTimers({ now: 0, doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
   })
 
   afterEach(async () => {
@@ -44,11 +46,11 @@ describe('Producer > deliveryTimeout', () => {
       new Kafka({ brokers: ['localhost:9092'], logLevel: LEVELS.NOTHING, ...options })
 
     test.each([
-      ['the default requestTimeout and linger', {}, {}, 30005],
-      ['requestTimeout: 1000', { requestTimeout: 1000 }, {}, 1005],
+      ['the default requestTimeout and linger', {}, {}, 30000],
+      ['requestTimeout: 1000', { requestTimeout: 1000 }, {}, 1000],
       ['linger: 20', { requestTimeout: 1000 }, { linger: 20 }, 1020],
       ['linger: 0', { requestTimeout: 1000 }, { linger: 0 }, 1000],
-      ['batchSize alone', { requestTimeout: 1000 }, { batchSize: 1 }, 1005],
+      ['batchSize alone', { requestTimeout: 1000 }, { batchSize: 1 }, 1000],
     ])('with %s it must be at least linger + requestTimeout', (_, client, producer, floor) => {
       const kafka = createKafka(client)
       const create = (deliveryTimeout) => kafka.producer({ ...producer, deliveryTimeout })
@@ -236,6 +238,71 @@ describe('Producer > deliveryTimeout', () => {
 
       expect(await sent).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
     })
+  })
+
+  test("p0 acknowledged and p1 leaderless until the deadline: the send's KafkaJSDeliveryTimeout has outcome unknown, p0's write guard accepts once", async () => {
+    const taken = []
+    const cluster = createFakeCluster({
+      partitions: 2,
+      produce: async (request) => {
+        const refusal = request.guard(100)
+        if (refusal) throw refusal
+        taken.push(takeSent(request))
+        return {
+          topics: request.topicData.map(({ topic, partitions }) => ({
+            topicName: topic,
+            partitions: partitions.map(({ partition }) => ({
+              partition,
+              errorCode: 0,
+              baseOffset: '0',
+              logAppendTime: '-1',
+              logStartOffset: '0',
+            })),
+          })),
+        }
+      },
+    })
+    cluster.findLeaderForPartitions = (_, ids) => (ids.map(Number).includes(0) ? { 0: [0] } : {})
+    const producer = createProducer({
+      cluster,
+      logger: silentLogger(),
+      idempotent: true,
+      deliveryTimeout: 100,
+      retry: { retries: 1000, initialRetryTime: 10, maxRetryTime: 20 },
+    })
+    producers.push(producer)
+    await producer.connect()
+    const sent = producer
+      .send({
+        topic: TOPIC,
+        messages: [
+          { partition: 0, value: 'value-0' },
+          { partition: 1, value: 'value-1' },
+        ],
+      })
+      .catch((e) => e)
+
+    await jest.advanceTimersByTimeAsync(150)
+    const error = await sent
+
+    expect(error).toBeInstanceOf(KafkaJSDeliveryTimeout)
+    expect(error.outcome).toBe('unknown')
+    expect(error.cause).toBeInstanceOf(KafkaJSDeliveryTimeout)
+    expect(error.cause.outcome).toBe('unsent')
+    const written = await Promise.all(
+      taken.map(async ({ batches, read }) => {
+        const decoded = await read()
+        return batches.map(({ topic, partition, firstSequence }, at) => ({
+          topic,
+          partition,
+          firstSequence,
+          values: decoded[at].records.map(({ value }) => value.toString()),
+        }))
+      })
+    )
+    expect(written.flat()).toEqual([
+      { topic: TOPIC, partition: 0, firstSequence: 0, values: ['value-0'] },
+    ])
   })
 
   test("kafka.producer({ deliveryTimeout }) bounds a send, ahead of the client's longer retry.maxTotalTime", async () => {

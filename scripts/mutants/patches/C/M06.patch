@@ -1,0 +1,11 @@
+--- a/src/consumer/subscriptionState.js
++++ b/src/consumer/subscriptionState.js
+@@ -171,7 +171,7 @@
+   retainTopics(topics) {
+     const live = new Set(topics)
+     for (const topic of Object.keys(this.subscriptionStatesByTopic)) {
+-      if (!live.has(topic)) this.retireTopic(topic)
++      if (false) this.retireTopic(topic)
+     }
+   }
+ 

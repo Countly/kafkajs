@@ -18,7 +18,8 @@ class FencedRetry {
     this.backoff = backoff
     this.fn = fn
     this.isRetriable = isRetriable
-    this.deadline = configs.maxTotalTime == null ? Infinity : Date.now() + configs.maxTotalTime
+    this.deadline =
+      configs.maxTotalTime == null ? Infinity : performance.now() + configs.maxTotalTime
     this.done = false
     this.timer = null
     this.unregister = () => {}
@@ -41,6 +42,18 @@ class FencedRetry {
   }
 
   /**
+   * @param {number} attempts how many attempts ran
+   * @param {Error} cause the error the last attempt threw
+   * @returns {KafkaJSDeliveryTimeout} the rejection for a retry that would start past the deadline
+   */
+  timedOut(attempts, cause) {
+    return new KafkaJSDeliveryTimeout(
+      `Gave up after ${attempts} attempts: the next one would start after the ${this.configs.maxTotalTime} ms deadline`,
+      { cause }
+    )
+  }
+
+  /**
    * Holds one registration while an attempt or its timer is outstanding.
    * @returns {void}
    */
@@ -49,14 +62,22 @@ class FencedRetry {
     this.unregister = this.configs.fence.register((error) => this.finish(error))
   }
 
-  /** @param {number} retryTime @param {number} retryCount @returns {void} */
-  run(retryTime, retryCount) {
+  /**
+   * Starts one attempt. A retried attempt is refused, just before it would run, when the budget
+   * is spent by then.
+   * @param {number} retryTime @param {number} retryCount
+   * @param {Error} [lastError] the error of the attempt before, the cause of a refusal
+   * @returns {void}
+   */
+  run(retryTime, retryCount, lastError) {
     this.listen()
     if (this.done) return
     const nextRetryTime = this.backoff.next(retryTime)
     Promise.resolve()
       .then(() => {
         if (this.done) return
+        if (retryCount > 0 && this.deadline !== Infinity && performance.now() > this.deadline)
+          return this.finish(this.timedOut(retryCount, lastError))
         return this.fn((error) => this.finish(error || new Error('Aborted')), retryCount, retryTime)
       })
       .then(
@@ -73,19 +94,14 @@ class FencedRetry {
                 cause: error.cause || error,
               })
             )
-          if (Date.now() + retryTime > this.deadline)
-            return this.finish(
-              new KafkaJSDeliveryTimeout(
-                `Gave up after ${retryCount + 1} attempts: the next one would start after the ${this.configs.maxTotalTime} ms deadline`,
-                { cause: error }
-              )
-            )
+          if (this.deadline !== Infinity && performance.now() + retryTime > this.deadline)
+            return this.finish(this.timedOut(retryCount + 1, error))
           this.listen()
           if (this.done) return
           this.timer = setTimeout(() => {
             this.timer = null
             this.unregister()
-            this.run(nextRetryTime, retryCount + 1)
+            this.run(nextRetryTime, retryCount + 1, error)
           }, retryTime)
         }
       )

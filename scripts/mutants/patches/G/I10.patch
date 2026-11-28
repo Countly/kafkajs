@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -3717,7 +3717,7 @@
+         continue
+       }
+       const halted = this.haltedPartitions.get(key)
+-      if (halted && ['no-offset', 'offset-out-of-range'].includes(halted.reason)) throw halted.error
++      if (halted && ['no-offset', 'offset-out-of-range'].includes(halted.reason)) return '0'
+       pass++
+       const offset = String(
+         manager.resolvedOffsetAt(topic, partition) ?? manager.heldOffsetAt(topic, partition)

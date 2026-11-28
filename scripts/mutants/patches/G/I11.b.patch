@@ -1,0 +1,11 @@
+--- a/src/consumer/offsetReset.js
++++ b/src/consumer/offsetReset.js
+@@ -155,7 +155,7 @@
+         partitions: partitions
+           .filter(
+             (p) =>
+-              p.offset === '-1' &&
++              p.offset === '-2' &&
+               durations.has(key(topic, p.partition)) &&
+               current(topic, p.partition)
+           )

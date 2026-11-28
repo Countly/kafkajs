@@ -309,6 +309,8 @@ describe('telemetry lifecycle documentation', () => {
 })
 
 describe('telemetry benchmark documentation', () => {
+  /** Acceptance, feature, benchmark-phase, decision and plan ids name planning items, never behaviour. */
+  const PLAN_ID = /\b(?:A[0-9]{2}|F[0-9]{2}|P10|D[12][0-9]{2}|E[0-9]{2}|O[0-9]{2})\b/
   const fs = require('node:fs')
   const path = require('node:path')
   const read = (name) => fs.readFileSync(path.resolve(__dirname, '../..', name), 'utf8')
@@ -331,8 +333,13 @@ describe('telemetry benchmark documentation', () => {
   test('documents actual denominators noise and independent evidence', () => {
     const text = read('docs/Testing.md')
     expect(text).toContain('### Telemetry benchmark evidence')
-    expect(text).toContain('A20/A31 measured acceptance remains pending P10 CI measurements')
-    expect(text).toContain('reviewed broker-guard adapter')
+    expect(text).toContain(
+      'Telemetry CPU, latency and throughput overhead is reported by the benchmark report, not gated'
+    )
+    expect(text).toContain('its memory bounds are gated')
+    expect(text).toContain('`telemetrySession-*` rows')
+    expect(text).not.toMatch(PLAN_ID)
+    expect(text).not.toContain('driver-only delivery')
     expect(text).toContain('CPU or throughput noise above 3%, or p99 noise above 5%')
     expect(text).toContain('completed correlated pairs')
     expect(text).toContain('128 validated custom series plus 129 built-ins')
@@ -343,8 +350,12 @@ describe('telemetry benchmark documentation', () => {
   test('retains opt in and makes no unit derived performance claim', () => {
     const text = read('docs/ClientTelemetry.md')
     expect(text).toContain('## Performance evidence')
-    expect(text).toContain('A20/A31 measured acceptance is pending P10 CI measurements')
-    expect(text).toContain('F08 configured-outcome evidence')
+    expect(text).toContain(
+      'Its CPU, latency and throughput overhead is reported by the benchmark report, not gated'
+    )
+    expect(text).toContain('its memory bounds are gated')
+    expect(text).not.toMatch(PLAN_ID)
+    expect(text).not.toContain('driver-only delivery')
     expect(text).toContain('enableMetricsPush')
     expect(text).toContain('actual encoded byte lengths')
     expect(text).toContain(
@@ -498,8 +509,8 @@ describe('telemetry resource documentation', () => {
   })
 
   test('retains the long-run obligation and the changelog lines', () => {
-    expect(telemetry).toContain('final 24-hour idle/churn obligation')
-    expect(testing).toContain('never closes the final 24-hour idle/churn gate')
+    expect(telemetry).toContain('final 12-hour idle/churn obligation')
+    expect(testing).toContain('never closes the final 12-hour idle/churn gate')
     const changelog = read('CHANGELOG.md').replace(/\s+/g, ' ')
     expect(changelog).toContain(
       'Verify bounded telemetry resources, repeated reopen and natural shutdown under subscription and connection churn.'

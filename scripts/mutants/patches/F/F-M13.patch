@@ -1,0 +1,11 @@
+--- a/src/consumer/subscription.js
++++ b/src/consumer/subscription.js
+@@ -221,7 +221,7 @@
+    * @returns {boolean}
+    */
+   needsApply() {
+-    return this.desired.revision !== this.applied.revision
++    return false
+   }
+ 
+   /**

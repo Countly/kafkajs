@@ -3,10 +3,19 @@ const ConsumerGroup = require('../consumerGroup')
 const OffsetManager = require('../offsetManager')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const apiKeys = require('../../protocol/requests/apiKeys')
+const { createErrorFromCode } = require('../../protocol/error')
+const { KafkaJSNonRetriableError } = require('../../errors')
 const { newLogger, readRequestHeader } = require('testHelpers')
 // The wire decoder and the fake broker are shared with the other fetch specs: two copies of a
 // hand-written request decoder would drift the first time the request layout changes.
-const { apiVersionsBody, decodeFetchRequest, createFakeBroker } = require('./fixtures/fetchHarness')
+const {
+  apiVersionsBody,
+  decodeFetchRequest,
+  createFakeBroker,
+  trackFixtures,
+} = require('./fixtures/fetchHarness')
+
+trackFixtures()
 
 const TOPIC = 'test-topic'
 const OTHER_TOPIC = 'other-topic'
@@ -19,13 +28,14 @@ const NODE_ID = 0
  * A flexible (v12+) Fetch response body: one empty partition per topic, keyed by whichever of
  * name or id the caller supplies, so the same builder serves both sides of the downgrade.
  * @param {{ topicId?: string, topicName?: string }[]} topics
+ * @param {number} [sessionId=0] the Fetch session the broker answers under
  * @returns {Buffer}
  */
-const flexibleFetchResponse = (topics) =>
+const flexibleFetchResponse = (topics, sessionId = 0) =>
   new Encoder()
     .writeInt32(0) // clientSideThrottleTime
     .writeInt16(0) // errorCode
-    .writeInt32(0) // sessionId
+    .writeInt32(sessionId)
     .writeUVarIntArray(
       topics.map(({ topicId, topicName }) => {
         const topic = new Encoder()
@@ -60,7 +70,9 @@ const flexibleFetchResponse = (topics) =>
  * @param {{[topic: string]: string}} [options.topicIds] what `cluster.topicId` answers
  * @param {{[partition: number]: number}} [options.leaderEpochs] what `cluster.leaderEpoch` answers
  * @param {Function} [options.refreshMetadata] the `cluster.refreshMetadata` stub, for assertions
- * @param {() => Buffer} options.respond the Fetch response body to play back
+ * @param {boolean} [options.fetchSessions=false] the group's `fetchSessions` option
+ * @param {(header: {apiVersion: number}) => Buffer} options.respond the Fetch response body to
+ *   play back, given the request header
  */
 const createGroup = async ({
   fetchMaxVersion,
@@ -69,10 +81,13 @@ const createGroup = async ({
   topicIds = {},
   leaderEpochs = {},
   refreshMetadata = jest.fn(async () => {}),
+  fetchSessions = false,
   respond,
 }) => {
   const { broker, state } = createFakeBroker((header) =>
-    header.apiKey === apiKeys.ApiVersions ? apiVersionsBody(fetchMaxVersion, false) : respond()
+    header.apiKey === apiKeys.ApiVersions
+      ? apiVersionsBody(fetchMaxVersion, false)
+      : respond(header)
   )
   await broker.connect()
 
@@ -122,6 +137,7 @@ const createGroup = async ({
     rackId: '',
     checkCrcs: true,
     metadataMaxAge: 300000,
+    fetchSessions,
   })
 
   group.subscriptionState.assign(topics.map((topic) => ({ topic, partitions })))
@@ -182,43 +198,217 @@ describe('Consumer > fetch topic ids', () => {
     ])
   })
 
-  test('supplying ids is what lifts the cap: the same round with one id missing drops to v12', async () => {
-    const { group, requests, lastFetchRequest } = await createGroup({
-      fetchMaxVersion: 18,
-      topicIds: {},
-      respond: () => flexibleFetchResponse([{ topicName: TOPIC }]),
-    })
+  describe('a topic whose id is unknown', () => {
+    const REPEATED = 'Partition has produced consecutive fetch errors'
 
-    await group.fetch(NODE_ID)
+    // A request keyed by name (v12) gets both topics back by name, one keyed by id gets only the
+    // topic it asked for: each round is answered in the shape it was sent.
+    const answerBoth =
+      (sessionId = 0) =>
+      (header) =>
+        header.apiVersion >= 13
+          ? flexibleFetchResponse([{ topicId: TOPIC_ID }], sessionId)
+          : flexibleFetchResponse([{ topicName: TOPIC }, { topicName: OTHER_TOPIC }], sessionId)
 
-    expect(requests().find(({ apiKey }) => apiKey === apiKeys.Fetch).apiVersion).toEqual(12)
-    // Keyed by name on the wire: the name is there and no uuid was written.
-    expect(lastFetchRequest().topics).toEqual([
-      expect.objectContaining({ topic: TOPIC, topicId: null }),
-    ])
-  })
+    const repeatedWarnings = (warn) => warn.mock.calls.filter(([message]) => message === REPEATED)
 
-  test('a fetch with one unknown topic id is sent at v12 with topic names, in one request', async () => {
-    const { group, requests, lastFetchRequest } = await createGroup({
-      fetchMaxVersion: 18,
-      topics: [TOPIC, OTHER_TOPIC],
-      // OTHER_TOPIC has no id: the whole request falls back, rather than being split.
-      topicIds: { [TOPIC]: TOPIC_ID },
-      respond: () => flexibleFetchResponse([{ topicName: TOPIC }, { topicName: OTHER_TOPIC }]),
-    })
+    test('a round where one topic has no id sends the others keyed by id and leaves it out', async () => {
+      const { group, requests, lastFetchRequest } = await createGroup({
+        fetchMaxVersion: 18,
+        topics: [TOPIC, OTHER_TOPIC],
+        topicIds: { [TOPIC]: TOPIC_ID },
+        fetchSessions: true,
+        respond: answerBoth(7),
+      })
 
-    await group.fetch(NODE_ID)
+      await group.fetch(NODE_ID)
 
-    const fetchRequests = requests().filter(({ apiKey }) => apiKey === apiKeys.Fetch)
-    expect(fetchRequests).toHaveLength(1)
-    expect(fetchRequests[0].apiVersion).toEqual(12)
-    // The topic that *does* have an id is sent by name too: the fallback is per request.
-    expect(lastFetchRequest().topics.map(({ topic, topicId }) => ({ topic, topicId }))).toEqual(
-      expect.arrayContaining([
-        { topic: TOPIC, topicId: null },
-        { topic: OTHER_TOPIC, topicId: null },
+      const fetchRequests = requests().filter(({ apiKey }) => apiKey === apiKeys.Fetch)
+      expect(fetchRequests.map(({ apiVersion }) => apiVersion)).toEqual([18])
+      // Read off the wire: one topic, keyed by its uuid, no name written.
+      expect(lastFetchRequest().topics.map(({ topic, topicId }) => ({ topic, topicId }))).toEqual([
+        { topic: null, topicId: TOPIC_ID },
       ])
-    )
+      const cells = [...group.fetchSessions.active(NODE_ID).partitions.values()]
+      expect(cells.map(({ topic, topicId, partition }) => ({ topic, topicId, partition }))).toEqual(
+        [{ topic: TOPIC, topicId: TOPIC_ID, partition: 0 }]
+      )
+    })
+
+    test('a topic left out while a sibling keeps fetching is refreshed and reported', async () => {
+      const refreshMetadata = jest.fn(async () => {})
+      const { group, logger, requests } = await createGroup({
+        fetchMaxVersion: 18,
+        topics: [TOPIC, OTHER_TOPIC],
+        topicIds: { [TOPIC]: TOPIC_ID },
+        refreshMetadata,
+        respond: answerBoth(),
+      })
+      // Long enough that every round below falls inside one refresh interval.
+      group.leaderlessRefreshInterval = 60000
+      const warn = jest.spyOn(logger, 'warn')
+
+      const delivered = []
+      for (let round = 1; round <= 4; round++) {
+        delivered.push((await group.fetch(NODE_ID)).map(({ topic }) => topic))
+      }
+      expect(repeatedWarnings(warn)).toEqual([])
+      delivered.push((await group.fetch(NODE_ID)).map(({ topic }) => topic))
+
+      expect(delivered).toEqual([[TOPIC], [TOPIC], [TOPIC], [TOPIC], [TOPIC]])
+      expect(
+        requests()
+          .filter(({ apiKey }) => apiKey === apiKeys.Fetch)
+          .map(({ apiVersion }) => apiVersion)
+      ).toEqual([18, 18, 18, 18, 18])
+      expect(refreshMetadata).toHaveBeenCalledTimes(1)
+      expect(repeatedWarnings(warn)).toEqual([
+        [
+          REPEATED,
+          expect.objectContaining({
+            topic: OTHER_TOPIC,
+            partition: 0,
+            errorCode: 100,
+            consecutiveRounds: 5,
+          }),
+        ],
+      ])
+    })
+
+    test('a round where no topic has an id sends no Fetch, refreshes and reports', async () => {
+      const refreshMetadata = jest.fn(async () => {})
+      const { group, logger, requests } = await createGroup({
+        fetchMaxVersion: 18,
+        topicIds: {},
+        refreshMetadata,
+        respond: () => flexibleFetchResponse([{ topicName: TOPIC }]),
+      })
+      group.leaderlessRefreshInterval = 60000
+      // The idle sleep between rounds is not under test: each round returns at once.
+      jest.spyOn(group.idleWait, 'wait').mockResolvedValue(undefined)
+      const warn = jest.spyOn(logger, 'warn')
+
+      const rounds = []
+      for (let round = 1; round <= 5; round++) rounds.push(await group.fetch(NODE_ID))
+
+      expect(rounds).toEqual([[], [], [], [], []])
+      expect(requests().filter(({ apiKey }) => apiKey === apiKeys.Fetch)).toEqual([])
+      expect(refreshMetadata).toHaveBeenCalledTimes(1)
+      expect(repeatedWarnings(warn)).toEqual([
+        [
+          REPEATED,
+          expect.objectContaining({
+            topic: TOPIC,
+            partition: 0,
+            errorCode: 100,
+            consecutiveRounds: 5,
+          }),
+        ],
+      ])
+    })
+
+    test('a node whose last partitions are left out still forgets them in its fetch session', async () => {
+      const topicIds = { [TOPIC]: TOPIC_ID }
+      const { group, lastFetchRequest } = await createGroup({
+        fetchMaxVersion: 18,
+        topicIds,
+        fetchSessions: true,
+        respond: (header) =>
+          header.apiVersion >= 13 && lastFetchRequest().topics.length === 0
+            ? flexibleFetchResponse([], 7)
+            : flexibleFetchResponse(
+                [header.apiVersion >= 13 ? { topicId: TOPIC_ID } : { topicName: TOPIC }],
+                7
+              ),
+      })
+
+      await group.fetch(NODE_ID)
+      expect(lastFetchRequest()).toMatchObject({ apiVersion: 18, sessionId: 0, sessionEpoch: 0 })
+
+      // The id is gone, as after a rebootstrap cleared the cache.
+      delete topicIds[TOPIC]
+      await group.fetch(NODE_ID)
+
+      expect(lastFetchRequest()).toMatchObject({
+        apiVersion: 18,
+        sessionId: 7,
+        sessionEpoch: 1,
+        topics: [],
+        forgottenTopics: [{ topic: null, topicId: TOPIC_ID, partitions: [0] }],
+      })
+    })
+
+    // The current metadata is fresh, so only the refresh asked for the left-out topic learns the
+    // refusal; the retrier hands a non-retriable code over wrapped, its type kept.
+    test.each([
+      ['code 29 while a sibling fetches', 29, { [TOPIC]: TOPIC_ID }],
+      ['code 17 while a sibling fetches', 17, { [TOPIC]: TOPIC_ID }],
+      ['code 29 with no topic left to fetch', 29, {}],
+    ])('a refresh refused for good fails the round: %s', async (_, code, topicIds) => {
+      const cause = createErrorFromCode(code)
+      const refusal = new KafkaJSNonRetriableError(cause, { cause })
+      const refreshMetadata = jest.fn(async () => {
+        throw refusal
+      })
+      const { group, requests } = await createGroup({
+        fetchMaxVersion: 18,
+        topics: [TOPIC, OTHER_TOPIC],
+        topicIds,
+        refreshMetadata,
+        respond: () => flexibleFetchResponse([{ topicId: TOPIC_ID }]),
+      })
+      jest.spyOn(group.idleWait, 'wait').mockResolvedValue(undefined)
+
+      await expect(group.fetch(NODE_ID)).rejects.toBe(refusal)
+
+      expect(refusal.type).toBe(cause.type)
+      expect(refreshMetadata).toHaveBeenCalledTimes(1)
+      expect(
+        requests()
+          .filter(({ apiKey }) => apiKey === apiKeys.Fetch)
+          .map(({ apiVersion }) => apiVersion)
+      ).toEqual(topicIds[TOPIC] ? [18] : [])
+    })
+
+    test('a refresh refusal that can clear is waited out, and the id it brings puts the topic back', async () => {
+      const topicIds = { [TOPIC]: TOPIC_ID }
+      const refreshMetadata = jest
+        .fn()
+        .mockRejectedValueOnce(createErrorFromCode(3))
+        .mockImplementationOnce(async () => {
+          topicIds[OTHER_TOPIC] = OTHER_TOPIC_ID
+        })
+      const { group, requests, lastFetchRequest } = await createGroup({
+        fetchMaxVersion: 18,
+        topics: [TOPIC, OTHER_TOPIC],
+        topicIds,
+        refreshMetadata,
+        respond: () =>
+          flexibleFetchResponse(lastFetchRequest().topics.map(({ topicId }) => ({ topicId }))),
+      })
+      // Every round is due for its own refresh.
+      group.leaderlessRefreshInterval = 0
+
+      const delivered = []
+      for (let round = 1; round <= 3; round++) {
+        delivered.push((await group.fetch(NODE_ID)).map(({ topic }) => topic).sort())
+      }
+
+      expect(delivered).toEqual([[TOPIC], [TOPIC], [OTHER_TOPIC, TOPIC]])
+      expect(refreshMetadata).toHaveBeenCalledTimes(2)
+      expect(
+        requests()
+          .filter(({ apiKey }) => apiKey === apiKeys.Fetch)
+          .map(({ apiVersion }) => apiVersion)
+      ).toEqual([18, 18, 18])
+      expect(lastFetchRequest().topics.map(({ topic, topicId }) => ({ topic, topicId }))).toEqual(
+        expect.arrayContaining([
+          { topic: null, topicId: TOPIC_ID },
+          { topic: null, topicId: OTHER_TOPIC_ID },
+        ])
+      )
+      expect(lastFetchRequest().topics).toHaveLength(2)
+    })
   })
 
   test('response topic ids resolve through the request map, not through the metadata cache', async () => {

@@ -1,0 +1,11 @@
+--- a/src/protocol/recordBatch/v0/decoder.js
++++ b/src/protocol/recordBatch/v0/decoder.js
+@@ -233,7 +233,7 @@
+ 
+   const crc = decoder.readInt32()
+ 
+-  if (checkCrcs) {
++  if (false) {
+     // The CRC32C covers every byte after the CRC field itself, i.e. Attributes onwards.
+     // @see https://kafka.apache.org/43/implementation/message-format
+     const covered = decoder.buffer.slice(decoder.offset)

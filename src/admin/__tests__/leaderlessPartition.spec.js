@@ -434,7 +434,7 @@ describe('Admin > a partition with no leader', () => {
       })
     })
 
-    test('a partition error that says the metadata is stale still refreshes it', async () => {
+    test('a partition error that says the metadata is stale is final, with no refresh', async () => {
       const { admin, cluster } = await cachedLeaderless()
       const broker = await cluster.findBroker({ nodeId: 1 })
       broker.deleteRecords.mockRejectedValueOnce(
@@ -445,10 +445,19 @@ describe('Admin > a partition with no leader', () => {
         })
       )
 
-      await admin.deleteTopicRecords({ topic: HEALTHY, partitions: records })
+      const error = await admin
+        .deleteTopicRecords({ topic: HEALTHY, partitions: records })
+        .catch((e) => e)
 
-      expect(cluster.refreshMetadata).toHaveBeenCalledTimes(1)
-      expect(broker.deleteRecords).toHaveBeenCalledTimes(2)
+      expect(error).toMatchObject({ name: 'KafkaJSNonRetriableError', retriable: false })
+      expect(error.cause.partitions).toEqual([
+        expect.objectContaining({
+          partition: 0,
+          error: expect.objectContaining({ code: NOT_LEADER_OR_FOLLOWER }),
+        }),
+      ])
+      expect(cluster.refreshMetadata).not.toHaveBeenCalled()
+      expect(broker.deleteRecords).toHaveBeenCalledTimes(1)
     })
 
     test('a partition refused for good fails the call at once, with no refresh, even beside a stale one', async () => {

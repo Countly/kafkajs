@@ -1,0 +1,10 @@
+--- a/src/consumer/subscriptionState.js
++++ b/src/consumer/subscriptionState.js
+@@ -224,6 +224,7 @@
+   }
+ 
+   isPaused(topic, partition) {
++    if (this.isHeld(topic, partition)) return true
+     const state = this.subscriptionStatesByTopic[topic]
+ 
+     if (!state) {

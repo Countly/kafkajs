@@ -1,0 +1,11 @@
+--- a/src/consumer/runner.js
++++ b/src/consumer/runner.js
+@@ -713,7 +713,7 @@
+       // The fetch layer goes first: with `running` already false every fetch returns [] without
+       // awaiting anything, so a fetcher left spinning would resolve in microtasks only and starve
+       // the event loop the background round needs to make progress on the wire.
+-      await scope.wait(() => this.fetchManager.stop())
++      scope.wait(() => this.fetchManager.stop()).catch(() => {})
+       // Fetch sessions close only once no fetcher can still send, and within this close's budget.
+       await scope.wait(() =>
+         this.consumerGroup.closeFetchSessions({

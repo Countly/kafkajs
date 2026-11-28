@@ -1,0 +1,11 @@
+--- a/testHelpers/wire/consumerGroupHeartbeatV1.js
++++ b/testHelpers/wire/consumerGroupHeartbeatV1.js
+@@ -52,7 +52,7 @@
+ 
+     return new Encoder()
+       .writeInt32(response.throttleTime)
+-      .writeInt16(response.errorCode)
++      .writeInt16(0)
+       .writeUVarIntString(response.errorMessage)
+       .writeUVarIntString(response.memberId)
+       .writeInt32(response.memberEpoch)

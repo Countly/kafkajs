@@ -101,7 +101,8 @@ export interface KafkaConfig extends ClientTelemetryConfig {
 export interface ISocketFactoryArgs {
   host: string
   port: number
-  ssl: tls.ConnectionOptions
+  /** The configured `ssl` as given: `true`, an options object, `false` or `null` (no TLS). */
+  ssl: tls.ConnectionOptions | boolean | null
   onConnect: () => void
 }
 
@@ -215,7 +216,11 @@ type SASLMechanismOptionsMap = {
     secretAccessKey: string
     sessionToken?: string
   }
-  oauthbearer: { oauthBearerProvider: () => Promise<OauthbearerProviderResponse> }
+  oauthbearer: {
+    oauthBearerProvider: () => Promise<OauthbearerProviderResponse>
+    /** SASL authorization identity; Apache Kafka requires it to equal the token's principal name. Empty means none. */
+    authorizationIdentity?: string
+  }
 }
 
 export type SASLMechanism = keyof SASLMechanismOptionsMap
@@ -263,9 +268,10 @@ export interface ProducerConfig extends ClientTelemetryConfig {
   maxInFlightRequests?: number | null
   /**
    * ms a partition's batch waits for records of further sends before it goes out. An integer
-   * from 0 to 2147483647; defaults to 5 (Java parity). A lone send waits up to this long; 0 sends
-   * at once - on an idempotent producer still merging the sends that queue behind a partition's
-   * batch in flight.
+   * from 0 to 2147483647; defaults to 0, which sends at once. Sends made in the same turn of the
+   * event loop still merge into one request, and an idempotent producer still merges the sends
+   * that queue behind a partition's batch in flight. Above 0, a lone send waits up to this long
+   * for more records; use it to batch more under many independent callers.
    */
   linger?: number
   /**
@@ -277,8 +283,8 @@ export interface ProducerConfig extends ClientTelemetryConfig {
    * Bound, in ms, on the waiting and the retries of one send (KIP-91); past it the send rejects
    * with `KafkaJSDeliveryTimeout`. Defaults to `retry.maxTotalTime` when that is set, else to
    * 120000 (Java parity), raised to `linger + requestTimeout` when that is larger. An explicit
-   * value is an integer of at least `linger + requestTimeout` (5 ms more than `requestTimeout` at
-   * the default `linger`) and at most 2147483647. The bound runs from the send and includes the
+   * value is an integer of at least `linger + requestTimeout` (`requestTimeout` at the default
+   * `linger`) and at most 2147483647. The bound runs from the send and includes the
    * wait for `linger` and, on an idempotent producer, for the producer id. A queued or on-wire
    * request settles at the deadline; a late answer cannot settle the send again.
    */
@@ -320,7 +326,8 @@ export interface Message {
   value: Buffer | string | null
   partition?: number
   headers?: IHeaders
-  timestamp?: string
+  /** Milliseconds since the epoch: a string, number, `Date` or `bigint`; a `Long` is accepted too. */
+  timestamp?: string | number | Date | bigint
 }
 
 export interface PartitionerArgs {
@@ -345,7 +352,7 @@ export const Partitioners: {
   JavaCompatiblePartitioner: DefaultPartitioner
   /**
    * KIP-794 uniform sticky partitioner, the producer's default when `createPartitioner` is
-   * omitted (sticking for `batchSize` bytes): keyless records stick to a partition for
+   * omitted (adaptive, sticking for `batchSize` bytes): keyless records stick to a partition for
    * `stickyBytes`, each record counting its wire size, keyed ones keep `DefaultPartitioner`'s
    * mapping unless `ignoreKeys`.
    */
@@ -355,7 +362,9 @@ export const Partitioners: {
     /**
      * Weight the choice of the next partition by queue depth (KIP-794). A boolean (a non-boolean
      * throws KafkaJSInvalidConfigurationError); default false for a partitioner you construct. The
-     * producer's built-in default uses it when the measured gate of the release passed.
+     * producer's default partitioner is adaptive. For the previous non-adaptive sticky behavior pass
+     * `createPartitioner: Partitioners.UniformStickyPartitioner({ stickyBytes: batchSize, adaptive:
+     * false })` with the producer's `batchSize` (16384 by default).
      */
     adaptive?: boolean
   }) => ICustomPartitioner
@@ -414,8 +423,10 @@ export interface ConsumerConfig extends ClientTelemetryConfig {
   /**
    * The maximum time between two batches handed to your handler, in milliseconds, and the
    * rebalance timeout sent on the wire. Default 300000, matching the Java client's
-   * `max.poll.interval.ms`. A handler that exceeds it loses its partitions and the consumer
-   * rejoins.
+   * `max.poll.interval.ms`. An integer from 1 to 2147483647; any other value throws when the
+   * consumer is created. The deadline is global progress across partitions, checked on heartbeat
+   * opportunities, not a separate deadline per handler; when it passes, the consumer gives up its
+   * partitions and rejoins.
    */
   maxPollInterval?: number
   /**
@@ -453,7 +464,11 @@ export interface ConsumerConfig extends ClientTelemetryConfig {
    * derived ceiling of `max(1, floor(value / 512))` records per batch, checked before any record
    * is allocated; a batch can pass the byte limit and still exceed the record ceiling (it then
    * halts the partition the same way), and raising this option raises both. Decoded records
-   * measure 208 to 321 bytes of heap each; header objects and concurrent fetches are extra.
+   * measure 208 to 321 bytes of heap each. It also sets a header ceiling of
+   * `max(1, floor(value / 256))` record headers across all records of a batch; a record whose
+   * headers would cross it halts the partition with reason `count` before they are decoded. The
+   * header ceiling limits how many headers a batch decodes, not their heap: key sizes, a
+   * decode's temporary allocations and concurrent fetches still add to it.
    */
   maxDecompressedBatchBytes?: number
   retry?: RetryOptions & { restartOnFailure?: (err: Error) => Promise<boolean> }
@@ -578,7 +593,12 @@ export type Assigner = {
   supportedProtocols?(): Array<'eager' | 'cooperative'>
   /** Optional bytes for the subscription. An assigner that defines `protocol()` calls this itself. */
   subscriptionUserData?(topics: string[]): Buffer | null
-  /** Invoked after every successful sync, and with `null` when the member leaves or resets. */
+  /**
+   * Invoked when a classic assignment is applied. Receives `null` once for the stop of a running
+   * classic consumer, including a static member that stays in the group, and when a poll-interval
+   * expiry resets the generation. If a bounded close prevents the stop-time clear, it runs during
+   * the next classic startup, before JoinGroup.
+   */
   onAssignment?(
     assignment: {
       partitions: Array<{ topic: string; partitions: number[] }>
@@ -758,7 +778,8 @@ export interface ResourceConfigQuery {
 
 export interface ConfigEntries {
   configName: string
-  configValue: string
+  /** `null` for a sensitive config, and for one that has no value. */
+  configValue: string | null
   isDefault: boolean
   configSource: ConfigSource
   isSensitive: boolean
@@ -772,7 +793,7 @@ export interface ConfigEntries {
 
 export interface ConfigSynonyms {
   configName: string
-  configValue: string
+  configValue: string | null
   configSource: ConfigSource
 }
 
@@ -780,11 +801,13 @@ export interface DescribeConfigResponse {
   resources: {
     configEntries: ConfigEntries[]
     errorCode: number
-    errorMessage: string
+    /** `null` when the resource has no error. */
+    errorMessage: string | null
     resourceName: string
     resourceType: ConfigResourceTypes
   }[]
-  throttleTime: number
+  /** @deprecated Never set. */
+  throttleTime?: undefined
 }
 
 export interface IResourceConfigEntry {
@@ -933,9 +956,12 @@ export type DescribeAclResource = AclResource & {
 }
 
 export interface DescribeAclResponse {
-  throttleTime: number
-  errorCode: number
-  errorMessage?: string
+  /** @deprecated Never set. */
+  throttleTime?: undefined
+  /** @deprecated Never set. */
+  errorCode?: undefined
+  /** @deprecated Never set. */
+  errorMessage?: undefined
   resources: DescribeAclResource[]
 }
 
@@ -951,7 +977,7 @@ export interface AclFilter {
 
 export interface MatchingAcl {
   errorCode: number
-  errorMessage?: string
+  errorMessage?: string | null
   resourceType: AclResourceTypes
   resourceName: string
   resourcePatternType: ResourcePatternTypes
@@ -963,12 +989,13 @@ export interface MatchingAcl {
 
 export interface DeleteAclFilterResponses {
   errorCode: number
-  errorMessage?: string
+  errorMessage?: string | null
   matchingAcls: MatchingAcl[]
 }
 
 export interface DeleteAclResponse {
-  throttleTime: number
+  /** @deprecated Never set. */
+  throttleTime?: undefined
   filterResponses: DeleteAclFilterResponses[]
 }
 
@@ -977,15 +1004,15 @@ export interface ListPartitionReassignmentsResponse {
 }
 
 export interface OngoingTopicReassignment {
-  topic: string
+  name: string
   partitions: OngoingPartitionReassignment[]
 }
 
 export interface OngoingPartitionReassignment {
-  partitionIndex: number
+  partition: number
   replicas: number[]
-  addingReplicas?: number[]
-  removingReplicas?: number[]
+  addingReplicas: number[]
+  removingReplicas: number[]
 }
 
 /** Producer state observed on a partition replica; int64 fields are decimal strings. */
@@ -1073,7 +1100,7 @@ listTopics(): Promise<string[]>
     validateOnly?: boolean
     timeout?: number
     topicPartitions: ITopicPartitionConfig[]
-  }) & ApiTimeoutOption): Promise<boolean>
+  }) & ApiTimeoutOption): Promise<void>
   /**
    * With `useDescribeTopicPartitions` and at least one topic the topics are read through
    * DescribeTopicPartitions (KIP-966); without topics, or on a broker that lacks the API, through
@@ -1108,11 +1135,12 @@ listTopics(): Promise<string[]>
   describeReplicaLogDirs(options:{replicas:Array<{topic:string;partition:number;brokerId:number}>} & ApiTimeoutOption):Promise<Array<{topic:string;partition:number;brokerId:number;currentLogDir:string|null;futureLogDir:string|null;currentOffsetLag:string|null;futureOffsetLag:string|null} & AdminItemResult>>
   fetchTopicOffsets(topic: string, options?: ApiTimeoutOption & { isolationLevel?: 'read_committed' | 'read_uncommitted' }): Promise<Array<SeekEntry & { high: string; low: string }>>
 fetchTopicOffsets(topic: string): Promise<Array<SeekEntry & { high: string; low: string }>>
-  fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number | OffsetSpecName, options?: ApiTimeoutOption & { isolationLevel?: 'read_committed' | 'read_uncommitted' }): Promise<Array<SeekEntry>>
+  /** `timestamp` is milliseconds, a decimal string of milliseconds, or a named offset spec. */
+  fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number | OffsetSpecName | `${number}`, options?: ApiTimeoutOption & { isolationLevel?: 'read_committed' | 'read_uncommitted' }): Promise<Array<SeekEntry>>
 fetchTopicOffsetsByTimestamp(topic: string, timestamp?: number): Promise<Array<SeekEntry>>
   /** Elects preferred or unclean leaders; retries only unresolved partitions. */
   electLeaders(
-    options: {
+    options?: {
       electionType?: 'preferred' | 'unclean'
       topicPartitions?: TopicPartitionList | null
     } & ApiTimeoutOption,
@@ -1227,7 +1255,7 @@ describeGroups(groupIds: string[]): Promise<GroupDescriptions>
     allowReplicationFactorChange?: boolean
   }) & ApiTimeoutOption): Promise<void>
   listPartitionReassignments(request: ({
-    topics?: TopicPartitions[]
+    topics?: TopicPartitions[] | null
     timeout?: number
   }) & ApiTimeoutOption): Promise<ListPartitionReassignmentsResponse>
   /** Security administration; apiTimeout inherits the original call budget.
@@ -1235,7 +1263,7 @@ describeGroups(groupIds: string[]): Promise<GroupDescriptions>
    * @returns the documented token, item results or quota entities
    * @throws typed validation, capability, call-level broker or deadline error
    */
-  describeClientQuotas(options: { components: Array<{ entityType: 'user' | 'client-id' | 'ip'; matchType: 'exact' | 'default' | 'any'; match?: string }>; strict?: boolean } & ApiTimeoutOption): Promise<Array<{
+  describeClientQuotas(options: { components: Array<{ entityType: 'user' | 'client-id' | 'ip' } & ({ matchType: 'exact'; match: string } | { matchType: 'default' | 'any'; match?: undefined })>; strict?: boolean } & ApiTimeoutOption): Promise<Array<{
     entity: Array<{ entityType: string; entityName: string | null }>; values: Record<string, number>
   }>>
   /** Security administration; apiTimeout inherits the original call budget.
@@ -1353,25 +1381,33 @@ export type MemberMetadataInput = {
   rackId?: string | null
 }
 
-/** What `AssignerProtocol.MemberMetadata.decode` returns. */
+/** What `AssignerProtocol.MemberMetadata.decode` returns. `userData` is `null` when the member sent none. */
 export type MemberMetadata = {
   version: number
   topics: string[]
-  userData: Buffer
+  userData: Buffer | null
   ownedPartitions?: Array<{ topic: string; partitions: number[] }>
   generationId?: number
   rackId?: string | null
 }
 
+/** What `AssignerProtocol.MemberAssignment.decode` returns. `userData` is `null` when the member sent none. */
 export type MemberAssignment = {
   version: number
   assignment: Assignment
-  userData: Buffer
+  userData: Buffer | null
+}
+
+/** What `AssignerProtocol.MemberAssignment.encode` accepts. Omitting `userData` writes an empty byte string; `null` writes the wire null. */
+export type MemberAssignmentInput = {
+  version: number
+  assignment: Assignment
+  userData?: Buffer | null
 }
 
 export const AssignerProtocol: {
   MemberMetadata: ISerializer<MemberMetadataInput, MemberMetadata>
-  MemberAssignment: ISerializer<MemberAssignment>
+  MemberAssignment: ISerializer<MemberAssignmentInput, MemberAssignment>
 }
 
 export enum logLevel {
@@ -1383,7 +1419,8 @@ export enum logLevel {
 }
 
 export interface LogEntry {
-  namespace: string
+  /** `undefined` for the root logger; a namespaced logger sets it. */
+  namespace: string | undefined
   level: logLevel
   label: string
   log: LoggerEntryContent
@@ -1602,9 +1639,9 @@ export type Broker = {
     allowReplicationFactorChange?: boolean
   }): Promise<any>
   listPartitionReassignments(request: {
-    topics?: TopicPartitions[]
+    topics?: TopicPartitions[] | null
     timeout?: number
-  }): Promise<ListPartitionReassignmentsResponse>
+  }): Promise<ListPartitionReassignmentsResponse & { throttleTime: number; clientSideThrottleTime: number; errorCode: number }>
   /** `includeDocumentation` is sent from DescribeConfigs v3 and ignored by older versions. */
   describeConfigs(request: {
     resources: ResourceConfigQuery[]
@@ -1759,7 +1796,8 @@ type Sender = {
    * Sends a produce request for one topic's messages. Rejects with a `KafkaJSProtocolError`
    * (`topic`, `partition`, `errorMessage` set) when the broker fails the whole batch; when it
    * rejected individual records (KIP-467), the error also carries
-   * `recordErrors: ProduceRecordError[]`.
+   * `recordErrors: readonly ProduceRecordError[]`. Sends that shared a batch each get an error of
+   * their own, unless the broker's answer is delivered as it is (see `ProduceRecordError`).
    */
   send(record: ProducerRecord): Promise<RecordMetadata[]>
   sendBatch(batch: ProducerBatch): Promise<RecordMetadata[]>
@@ -1773,6 +1811,7 @@ export type ProducerEvents = {
   REQUEST_TIMEOUT: 'producer.network.request_timeout'
   REQUEST_QUEUE_SIZE: 'producer.network.request_queue_size'
   AUTHENTICATION_FAILURE: 'producer.network.authentication_failure'
+  /** Not emitted by this release. */
   LOCK_TIMEOUT: 'producer.network.lock_timeout'
   TOPIC_RECREATED: 'producer.cluster.topic_recreated'
   REBOOTSTRAP: 'producer.cluster.rebootstrap'
@@ -1938,7 +1977,8 @@ export type GroupDescription = {
   /** Group-level error for this id; `0` when the description succeeded. */
   errorCode: number
   errorMessage?: string | null
-  groupType?: 'classic' | 'consumer' | 'share' | 'streams' | 'unknown'
+  /** `''` when a consumer-protocol group's description failed, so its type is unknown. */
+  groupType?: 'classic' | 'consumer' | 'share' | 'streams' | 'unknown' | ''
   /** Consumer groups only; `null` for a classic group. */
   groupEpoch?: number | null
   assignmentEpoch?: number | null
@@ -2078,6 +2118,7 @@ export type ConsumerEvents = {
   PARTITIONS_LOST: 'consumer.partitions_lost'
   POLL_INTERVAL_EXCEEDED: 'consumer.poll_interval_exceeded'
   RECEIVED_UNSUBSCRIBED_TOPICS: 'consumer.received_unsubscribed_topics'
+  TOPIC_METADATA_STATUS: 'consumer.topic_metadata_status'
   REQUEST: 'consumer.network.request'
   REQUEST_TIMEOUT: 'consumer.network.request_timeout'
   REQUEST_QUEUE_SIZE: 'consumer.network.request_queue_size'
@@ -2156,7 +2197,10 @@ export type ConsumerRebalancingEvent = InstrumentationEvent<{
   memberId: string | null
   /** Which membership protocol this round belongs to. */
   membershipProtocol: 'classic' | 'consumer'
-  /** Why the rebalance started. Absent on the first join of a run, which reports no reason. */
+  /**
+   * Why the rebalance started. Absent when no reason was recorded. The text passed to
+   * `enforceRebalance` is reported as given, so any string can occur.
+   */
   reason?:
     | 'rebalance-in-progress'
     | 'lost'
@@ -2166,6 +2210,9 @@ export type ConsumerRebalancingEvent = InstrumentationEvent<{
     | 'coordinator-changed'
     | 'assignment-changed'
     | 'fenced'
+    | 'subscription-changed'
+    | 'enforced-rebalance'
+    | (string & {})
 }>
 /** Payload of `PARTITIONS_ASSIGNED`, `PARTITIONS_REVOKED` and `PARTITIONS_LOST`. */
 export type ConsumerPartitionsEvent = InstrumentationEvent<{
@@ -2181,7 +2228,8 @@ export type ConsumerPartitionsRevokedEvent = ConsumerPartitionsEvent
 export type ConsumerPartitionsLostEvent = ConsumerPartitionsEvent
 export interface ConsumerPartitionHaltedBase {
   groupId: string | null
-  memberId: string
+  /** `null` while this member has no id, as on the partition events. */
+  memberId: string | null
   topic: string
   partition: number
 }
@@ -2201,7 +2249,7 @@ export type ConsumerPartitionHaltedEventPayload = ConsumerPartitionHaltedBase &
         nextOffset?: string
         /** The codec of a compressed batch, when present on the error. */
         codec?: 'gzip' | 'snappy' | 'lz4' | 'zstd'
-        /** The bound in force: bytes, or records for a `count` over the record ceiling. */
+        /** The bound in force: bytes; for a `count`, records over the record ceiling or headers over the header ceiling. */
         limit?: number
       }
     | { reason: 'no-offset'; offset: null; error: KafkaJSNoOffsetError }
@@ -2231,6 +2279,22 @@ export type ConsumerReceivedUnsubcribedTopicsEvent = InstrumentationEvent<{
   topicsSubscribed: string[]
   topicsNotSubscribed: string[]
 }>
+/**
+ * A subscribed topic's metadata changed between unavailable (a refresh answered
+ * UNKNOWN_TOPIC_OR_PARTITION; the other topics keep consuming and the topic stays subscribed) and
+ * available again. Emitted on change only. `available` means the metadata is back, not that
+ * records or an assignment arrived.
+ */
+export type ConsumerTopicMetadataStatusEvent = InstrumentationEvent<
+  | {
+      groupId: string | null
+      topic: string
+      status: 'unavailable'
+      type: 'UNKNOWN_TOPIC_OR_PARTITION'
+      code: 3
+    }
+  | { groupId: string | null; topic: string; status: 'available'; type: null; code: 0 }
+>
 
 export interface OffsetsByTopicPartition {
   topics: Array<{
@@ -2486,6 +2550,10 @@ export type Consumer = ClientTelemetry & {
     listener: (event: ConsumerReceivedUnsubcribedTopicsEvent) => void
   ): RemoveInstrumentationEventListener<typeof eventName>
   on(
+    eventName: ConsumerEvents['TOPIC_METADATA_STATUS'],
+    listener: (event: ConsumerTopicMetadataStatusEvent) => void
+  ): RemoveInstrumentationEventListener<typeof eventName>
+  on(
     eventName: ConsumerEvents['REQUEST'],
     listener: (event: RequestEvent) => void
   ): RemoveInstrumentationEventListener<typeof eventName>
@@ -2606,10 +2674,7 @@ export type EachShareMessageHandler = (payload: EachShareMessagePayload) => Prom
 export type EachShareBatchHandler = (payload: EachShareBatchPayload) => Promise<void>
 
 /** Exactly one of the two handlers. */
-export type ShareConsumerRunConfig = {
-  eachMessage?: EachShareMessageHandler
-  eachBatch?: EachShareBatchHandler
-}
+export type ShareConsumerRunConfig = XOR<{ eachMessage: EachShareMessageHandler }, { eachBatch: EachShareBatchHandler }>
 
 export type ShareSubscribeTopics = {
   topics: string[]
@@ -2718,7 +2783,7 @@ export type ShareConsumer = ClientTelemetry & {
   assignment(): TopicPartitions[]
   run(config: ShareConsumerRunConfig): Promise<void>
   stop(): Promise<void>
-  /** The lock duration of the latest fetch, in ms; `null` before the first one. */
+  /** Latest broker lock duration from a fetch or a successful renew, in ms; `null` until one arrives. */
   acquisitionLockTimeoutMs(): number | null
   on(
     eventName: ShareConsumerEvents['HEARTBEAT'],
@@ -2833,14 +2898,14 @@ export class KafkaJSError extends Error {
   readonly cause?: Error
   /** Protocol error type, carried through when the wrapped error had one */
   readonly type?: string
-  /** Protocol error code, carried through when the wrapped error had one */
-  readonly code?: number
+  /** A Kafka error code, or the code of a Node.js error it wraps, such as `'ECONNREFUSED'` */
+  readonly code?: number | string
 
   constructor(e: Error | string, metadata?: KafkaJSErrorMetadata)
 }
 
 export class KafkaJSNonRetriableError extends KafkaJSError {
-  constructor(e: Error | string)
+  constructor(e: Error | string, options?: { cause?: Error })
 }
 
 /** A partition with the none policy needs an explicit starting position. */
@@ -2858,6 +2923,16 @@ export class KafkaJSNoOffsetError extends KafkaJSNonRetriableError {
   )
 }
 
+/** What a protocol error is built from: a row of the protocol error table, or a caught protocol error. */
+export type KafkaJSProtocolErrorSource = {
+  type: string
+  code: number
+  message: string
+  retriable?: boolean
+  helpUrl?: string
+  category?: KafkaJSErrorCategory
+}
+
 export class KafkaJSProtocolError extends KafkaJSError {
   readonly code: number
   readonly type: string
@@ -2868,7 +2943,7 @@ export class KafkaJSProtocolError extends KafkaJSError {
   /** The broker's own message for this error, when it sent one */
   readonly errorMessage?: string | null
   /** The records the broker rejected individually out of a failed produce batch (KIP-467) */
-  readonly recordErrors?: ProduceRecordError[]
+  readonly recordErrors?: readonly ProduceRecordError[]
   /**
    * Set on what `admin.deleteTopics` and `admin.createPartitions` throw: every topic the broker
    * failed, where the error itself names the first one's code.
@@ -2879,19 +2954,36 @@ export class KafkaJSProtocolError extends KafkaJSError {
     errorMessage?: string | null
     topicId?: string | null
   }>
-  constructor(e: Error | string)
+  constructor(e: KafkaJSProtocolErrorSource, options?: { retriable?: boolean })
 }
 
 /**
- * A single record the broker rejected out of an otherwise-failed produce batch (KIP-467).
- * `batchIndex` is the record's position as sent to that partition; `record` is the corresponding
- * entry from the `messages` array passed to `Producer#send`/`sendBatch`, when the client could
- * resolve it.
+ * A single record the broker rejected out of a failed Produce batch (KIP-467).
+ * For an eligible matched answer, each send gets a fresh native protocol error with the original
+ * public fields and category. An eligible idempotent delivery timeout has a fresh protocol
+ * cause for that send. Stacks are lazily formatted diagnostic text with unspecified frames.
+ * The protocol error's own array is created on first read in broker order. Only entries the
+ * send owns carry detached record bytes. Other entries are frozen and shared. Ineligible
+ * failures keep their original error or existing retry or delivery-timeout wrapper, with raw
+ * entries. See the migration guide for eligibility and failure handling.
  */
 export type ProduceRecordError = {
-  batchIndex: number
-  record?: Message
-  errorMessage: string | null
+  /** Position of the record inside the rejected batch, not an index into your `messages`. */
+  readonly batchIndex: number
+  /**
+   * A copy of the record as the producer wrote it, in a store of its own: `key`, `value` and the
+   * header values as `Buffer`s (strings UTF-8 encoded). A truthy supported snapshot timestamp is
+   * reported as a decimal string. Dates and objects with a bigint `value` are normalized to
+   * strings in the snapshot, including `'0'`. Numeric zero, `0n`, `null`, omission and other
+   * timestamp objects omit `timestamp`. An empty string is refused when the record is sent.
+   */
+  readonly record?: {
+    readonly key: Buffer | null
+    readonly value: Buffer | null
+    readonly headers: { readonly [key: string]: Buffer | readonly Buffer[] }
+    readonly timestamp?: string
+  }
+  readonly errorMessage: string | null
 }
 
 export class KafkaJSAggregateError extends Error {
@@ -2902,7 +2994,7 @@ export class KafkaJSAggregateError extends Error {
   constructor(message: Error | string, errors: (Error | string)[])
 }
 
-/** Raised inside the consumer's fetch loop when the group rebalances; its `name` is `'Error'`. */
+/** Kept for compatibility; no longer thrown. Its `name` is `'Error'`. */
 export class KafkaJSFetcherRebalanceError extends Error {
   readonly category: KafkaJSErrorCategory
 }
@@ -2987,7 +3079,7 @@ export class KafkaJSCorruptRecordError extends KafkaJSNonRetriableError {
   readonly nextOffset?: string
   /** The codec of a compressed batch. */
   readonly codec?: 'gzip' | 'snappy' | 'lz4' | 'zstd'
-  /** The bound in force: bytes for `decompressed-size` and `decompression`, records for a `count` over the record ceiling. */
+  /** The bound in force: bytes for `decompressed-size` and `decompression`; for a `count`, records over the record ceiling or headers over the header ceiling. */
   readonly limit?: number
   constructor(
     e: Error | string,
@@ -3002,13 +3094,6 @@ export class KafkaJSCorruptRecordError extends KafkaJSNonRetriableError {
   )
 }
 
-/**
- * An offset commit was refused because the consumer lost its group membership, or a handler or
- * retry outlived a rejoin. For a loss the broker reported, `type`, `code` and `helpUrl` are those
- * of the loss; a synthetic loss carries no `code`, and a stale handler has the `type`
- * `STALE_ASSIGNMENT` and no `code`. Test `instanceof KafkaJSCommitFailedError` and `reason`.
- * `cause` is the loss.
- */
 /**
  * A record or a send cannot ever fit: its size is above `maxRequestSize` (checked on the encoded
  * frame where compression applies) or `bufferMemory`. Non-retriable. Carries the type and code of
@@ -3058,6 +3143,37 @@ export class KafkaJSRebalanceListenerError extends KafkaJSNonRetriableError {
   )
 }
 
+/**
+ * A classic-protocol rebalance chain with a cooperative assignor completed 20 rounds and another was
+ * still required. Retriable: the default `restartOnFailure` policy restarts the consumer, and a
+ * custom one receives this error itself. Classic eager chains and consumer-protocol (KIP-848)
+ * groups have no round limit and never raise it.
+ */
+export class KafkaJSRebalanceNotConvergedError extends KafkaJSError {
+  constructor(e: Error | string, options?: { cause?: Error })
+}
+
+/**
+ * A topic the consumer holds positions of came back under a new topic id (deleted and recreated).
+ * The run stops with it and `CRASH` reports `restart: false`, whatever `restartOnFailure` returns.
+ */
+export class KafkaJSTopicRecreatedError extends KafkaJSNonRetriableError {
+  readonly topic: string
+  readonly previousTopicId: string
+  readonly topicId: string
+  readonly groupId: string | null
+  constructor(
+    e: Error | string,
+    options: {
+      topic: string
+      previousTopicId: string
+      topicId: string
+      groupId?: string | null
+      cause?: Error
+    }
+  )
+}
+
 /** No buffer memory became available within `maxBlockMs`, or too many sends were already waiting. Retriable. */
 export class KafkaJSBufferExhaustedError extends KafkaJSError {
   readonly reason: 'timeout' | 'queue-full'
@@ -3078,16 +3194,28 @@ export class KafkaJSBufferExhaustedError extends KafkaJSError {
   )
 }
 
+/**
+ * An offset commit was refused because the consumer lost its group membership, or a handler or
+ * retry outlived a rejoin. For a loss the broker reported, `type`, `code` and `helpUrl` are those
+ * of the loss; a synthetic loss carries no `code`, and a stale handler has the `type`
+ * `STALE_ASSIGNMENT` and no `code`. Test `instanceof KafkaJSCommitFailedError` and `reason`.
+ * `cause` is the loss; it is absent for a stale handler and for a seek. Reason `stale-assignment`
+ * also covers a handler commit of offsets for a batch fetched before a `consumer.seek()` of its
+ * partition, with no rejoin: it does not by itself mean the group rebalanced. Under
+ * `groupProtocol: 'consumer'` it also covers a commit built under a member epoch of 0 or below (a
+ * member joining, or one that left the group). It is also the `cause` of the
+ * `KafkaJSTransactionAbortableError` that refuses a transaction carrying offsets of such a batch.
+ */
 export class KafkaJSCommitFailedError extends KafkaJSNonRetriableError {
   readonly reason: 'membership-lost' | 'poll-interval-exceeded' | 'stale-assignment'
-  readonly cause: Error
-  constructor(e: Error | string, options: { reason: KafkaJSCommitFailedError['reason']; cause: Error })
+  readonly cause?: Error
+  constructor(e: Error | string, options: { reason: KafkaJSCommitFailedError['reason']; cause?: Error })
 }
 
 export class KafkaJSOffsetOutOfRange extends KafkaJSProtocolError {
   readonly topic: string
   readonly partition: number
-  constructor(e: Error | string, metadata?: KafkaJSOffsetOutOfRangeMetadata)
+  constructor(e: KafkaJSProtocolErrorSource, metadata: KafkaJSOffsetOutOfRangeMetadata)
 }
 
 /**
@@ -3119,7 +3247,7 @@ export class KafkaJSNumberOfRetriesExceeded extends KafkaJSNonRetriableError {
   readonly stack: string
   readonly retryCount: number
   readonly retryTime: number
-  constructor(e: Error | string, metadata?: KafkaJSNumberOfRetriesExceededMetadata)
+  constructor(e: Error | string, metadata: KafkaJSNumberOfRetriesExceededMetadata)
 }
 
 /**
@@ -3147,7 +3275,9 @@ export class KafkaJSInvalidLongError extends KafkaJSNonRetriableError {
 }
 
 export class KafkaJSConnectionError extends KafkaJSError {
-  readonly broker: string
+  readonly broker?: string
+  /** The code of the Node.js error behind the failure, such as `'ECONNREFUSED'` */
+  readonly code?: string
   constructor(e: Error | string, metadata?: KafkaJSConnectionErrorMetadata)
 }
 
@@ -3157,6 +3287,7 @@ export class KafkaJSConnectionError extends KafkaJSError {
  * `broker` is `host:port`.
  */
 export class KafkaJSConnectionClosedError extends KafkaJSConnectionError {
+  readonly broker: string
   readonly host?: string
   readonly port?: number
   constructor(e: Error | string, options?: { host?: string; port?: number })
@@ -3172,7 +3303,7 @@ export class KafkaJSRequestTimeoutError extends KafkaJSError {
 }
 
 export class KafkaJSMetadataNotLoaded extends KafkaJSError {
-  constructor()
+  constructor(e: Error | string, metadata?: KafkaJSErrorMetadata)
 }
 
 export class KafkaJSTopicMetadataNotLoaded extends KafkaJSMetadataNotLoaded {
@@ -3181,8 +3312,10 @@ export class KafkaJSTopicMetadataNotLoaded extends KafkaJSMetadataNotLoaded {
 }
 
 export class KafkaJSStaleTopicMetadataAssignment extends KafkaJSError {
-  readonly topic: string
-  readonly unknownPartitions: number
+  /** Absent when the error was built without metadata; the client's own errors carry it */
+  readonly topic?: string
+  /** Absent when the error was built without metadata; the client's own errors carry it */
+  readonly unknownPartitions?: number[]
   constructor(e: Error | string, metadata?: KafkaJSStaleTopicMetadataAssignmentMetadata)
 }
 
@@ -3243,7 +3376,7 @@ export class KafkaJSShareAcknowledgementError extends KafkaJSError {
 }
 
 export class KafkaJSBrokerNotFound extends KafkaJSError {
-  constructor()
+  constructor(e: Error | string, metadata?: KafkaJSErrorMetadata)
 }
 
 /** The consumer's fetch manager found no broker to fetch from. Retriable. */
@@ -3252,7 +3385,7 @@ export class KafkaJSNoBrokerAvailableError extends KafkaJSError {
 }
 
 export class KafkaJSPartialMessageError extends KafkaJSNonRetriableError {
-  constructor()
+  constructor(e: Error | string, options?: { cause?: Error })
   /**
    * @deprecated The Fetch decoder no longer sets it: a record-batch CRC32C mismatch (see
    * `checkCrcs`) is a `KafkaJSCorruptRecordError` with reason `checksum`.
@@ -3261,27 +3394,53 @@ export class KafkaJSPartialMessageError extends KafkaJSNonRetriableError {
 }
 
 export class KafkaJSSASLAuthenticationError extends KafkaJSNonRetriableError {
-  constructor()
+  constructor(e: Error | string, options?: { cause?: Error })
 }
 
 export class KafkaJSGroupCoordinatorNotFound extends KafkaJSNonRetriableError {
-  constructor()
+  /** The last failure a broker's FindCoordinator request ended with, when there was one. */
+  lastError?: Error
+  constructor(e: Error | string, options?: { cause?: Error })
 }
 
 export class KafkaJSNotImplemented extends KafkaJSNonRetriableError {
-  constructor()
+  constructor(e: Error | string, options?: { cause?: Error })
 }
 
 export class KafkaJSTimeout extends KafkaJSNonRetriableError {
-  constructor()
+  constructor(e: Error | string, options?: { cause?: Error })
+}
+
+/** One written request that changes broker state and got no answer, and the items it carried. */
+export interface UnknownOutcomeRequest {
+  /** The API name, such as `'DeleteRecords'`. */
+  readonly api: string
+  readonly apiVersion: number
+  /** Null when the request went to a bootstrap broker whose id is unknown. */
+  readonly nodeId: number | null
+  /** The named items, or null for a single-frame API or when the items could not be named. */
+  readonly items: unknown[] | null
+}
+
+/**
+ * An admin request that changes broker state was written and no answer arrived, so it may have
+ * been applied. The client does not send it again. Never retried: check the state of the items in
+ * `requests` before repeating the call.
+ */
+export class KafkaJSUnknownOutcomeError extends KafkaJSNonRetriableError {
+  readonly outcome: 'unknown'
+  readonly requests: UnknownOutcomeRequest[]
+  /** The error that ended the first of those requests. */
+  readonly cause?: Error
+  constructor(e: Error | string, options?: { requests?: UnknownOutcomeRequest[]; cause?: Error })
 }
 
 export class KafkaJSLockTimeout extends KafkaJSTimeout {
-  constructor()
+  constructor(e: Error | string, options?: { cause?: Error })
 }
 
 export class KafkaJSUnsupportedMagicByteInMessageSet extends KafkaJSNonRetriableError {
-  constructor()
+  constructor(e: Error | string, options?: { cause?: Error })
 }
 
 export class KafkaJSDeleteGroupsError extends KafkaJSError {
@@ -3290,28 +3449,33 @@ export class KafkaJSDeleteGroupsError extends KafkaJSError {
 }
 
 export class KafkaJSDeleteTopicRecordsError extends KafkaJSError {
+  readonly partitions: KafkaJSDeleteTopicRecordsErrorPartition[]
   constructor(metadata: KafkaJSDeleteTopicRecordsErrorTopic)
 }
 
 export interface KafkaJSDeleteGroupsErrorGroups {
   groupId: string
   errorCode: number
+  errorMessage?: string | null
   error: KafkaJSError
 }
 
 export interface KafkaJSDeleteTopicRecordsErrorTopic {
-  topic: string
+  topic?: string
   partitions: KafkaJSDeleteTopicRecordsErrorPartition[]
 }
 
 export interface KafkaJSDeleteTopicRecordsErrorPartition {
   partition: number
-  offset: string
-  error: KafkaJSError
+  /** The requested offset; undefined when the response row matched no requested partition */
+  offset: string | undefined
+  /** Rows are kept as passed, so a row can carry no error, or an explicit undefined */
+  error?: KafkaJSError | null | undefined
 }
 
 export interface KafkaJSErrorMetadata {
   retriable?: boolean
+  cause?: Error
   topic?: string
   partitionId?: number
   metadata?: PartitionMetadata
@@ -3349,12 +3513,14 @@ export interface KafkaJSTopicMetadataNotLoadedMetadata {
 
 export interface KafkaJSStaleTopicMetadataAssignmentMetadata {
   topic: string
-  unknownPartitions: PartitionMetadata[]
+  unknownPartitions: number[]
 }
 
 export interface KafkaJSServerDoesNotSupportApiKeyMetadata {
   apiKey: number
   apiName: string
+  /** The broker's error, when the broker refused the request. */
+  cause?: Error
 }
 
 export interface ClientTelemetryConfig {

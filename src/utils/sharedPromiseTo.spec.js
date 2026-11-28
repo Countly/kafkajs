@@ -45,6 +45,25 @@ describe('Utils > sharedPromiseTo', () => {
     expect(asyncFunction).toHaveBeenCalledTimes(2)
   })
 
+  it('Reports an invocation running from the call until its settlement has been observed', async () => {
+    expect(sharedPromise1.isRunning()).toBe(false)
+    const p1 = sharedPromise1()
+    expect(sharedPromise1.isRunning()).toBe(true)
+    resolvePromise1('done')
+
+    await p1
+    expect(sharedPromise1.isRunning()).toBe(false)
+    expect(asyncFunction).toHaveBeenCalledTimes(1)
+  })
+
+  it('Reports a rejected invocation not running once its rejection has been observed', async () => {
+    const p1 = sharedPromise1()
+    rejectPromise1(new Error('Rejected promise #1'))
+
+    await expect(p1).rejects.toThrow('Rejected promise #1')
+    expect(sharedPromise1.isRunning()).toBe(false)
+  })
+
   it('Passes through arguments passed at invocation time', async () => {
     const args = ['arg1', 'arg2']
     const p1 = sharedPromise1(...args)

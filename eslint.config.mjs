@@ -30,7 +30,7 @@ export default [
       // --- ported from eslint-config-standard@17.1.0 -------------------------------------
       // The 52 core rules `standard` sets that @eslint/js `recommended` does not (minus the 47
       // eslint-config-prettier disables). 50 are listed here; `camelcase` is in the options
-      // block below (merged with this repo's ^testIfKafka_ allowance), and `no-new-symbol` is
+      // block below (merged with this repo's ^UNSAFE_ allowance), and `no-new-symbol` is
       // deliberately dropped: it is deprecated in ESLint 9 and superseded by
       // `no-new-native-nonconstructor`, which `js.configs.recommended` already sets to 'error'.
       // See the task header for the measurement.
@@ -114,17 +114,8 @@ export default [
       'no-self-assign': ['error', { props: true }],
       'use-isnan': ['error', { enforceForSwitchCase: true, enforceForIndexOf: true }],
       'valid-typeof': ['error', { requireStringLiterals: true }],
-      // standard's options plus this repo's testHelpers allowance (was in .eslintrc).
-      // Deviates from the brief's literal `^testIfKafka_` (requires an underscore right after
-      // the prefix): the actual identifiers are `testIfKafkaAtMost_0_10`,
-      // `testIfKafkaAtLeast_0_11`, `testIfKafkaAtLeast_1_1_0` (testHelpers/index.js:402-404) —
-      // no underscore directly follows "testIfKafka". `^testIfKafka` restores the old
-      // `.eslintrc` behavior (`^testIfKafka_*`, which — with no `$` anchor and `_*` meaning
-      // "zero or more underscores" — matched any identifier merely prefixed "testIfKafka").
-      camelcase: [
-        'error',
-        { allow: ['^UNSAFE_', '^testIfKafka'], properties: 'never', ignoreGlobals: true },
-      ],
+      // standard's options plus this repo's UNSAFE_ allowance (was in .eslintrc).
+      camelcase: ['error', { allow: ['^UNSAFE_'], properties: 'never', ignoreGlobals: true }],
 
       // --- carried over from .eslintrc (Phase 1 baseline) ---------------------------------
       'no-unexpected-multiline': 'off',
@@ -169,6 +160,23 @@ export default [
       'n/no-missing-import': 'off',
       'n/no-extraneous-import': 'off',
       'n/no-unpublished-import': 'off',
+    },
+  },
+  {
+    // The client reads the global `performance` only: fake timers replace the global, not the
+    // `perf_hooks` export, so mixing the two compares deadlines across different clocks.
+    files: ['src/**/*.js'],
+    ignores: ['src/**/__tests__/**', 'src/**/*.spec.js'],
+    rules: {
+      'n/no-restricted-require': [
+        'error',
+        [
+          {
+            name: ['perf_hooks', 'node:perf_hooks'],
+            message: 'Use the global `performance` so the client reads one monotonic clock.',
+          },
+        ],
+      ],
     },
   },
   {

@@ -1,0 +1,11 @@
+--- a/src/consumer/offsetManager/index.js
++++ b/src/consumer/offsetManager/index.js
+@@ -1156,7 +1156,7 @@
+    * @returns {boolean}
+    */
+   isConfirmedIncarnation(topic, requestedId) {
+-    return requestedId !== undefined && requestedId === this.cluster.topicId(topic)
++    return requestedId === this.cluster.topicId(topic)
+   }
+ 
+   /**

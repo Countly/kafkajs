@@ -1,0 +1,11 @@
+--- a/src/protocol/requests/offsetFetch/v8/response.js
++++ b/src/protocol/requests/offsetFetch/v8/response.js
+@@ -49,7 +49,7 @@
+   return {
+     throttleTime: 0,
+     clientSideThrottleTime: throttleTime,
+-    groupId: group.groupId,
++    groupId: undefined,
+     errorCode: group.errorCode,
+     responses: group.topics,
+   }

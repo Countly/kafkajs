@@ -1261,6 +1261,26 @@ const interruptsAcquisition = (kind, event, entry) =>
     })
   )
 
+/**
+ * Optional work meter for the cooperative audits, set by tests: every bounded audit loop counts
+ * each record, row or member it visits here, so a test can bound the visits between two yields
+ * and their growth with the run without reading real time. Work done inside one visit is not
+ * counted and stays one step: encoding or decoding one archive row (its size follows the row),
+ * `historyAccounting` for one cut and `epochAdvance` for one replay.
+ * @type {{ visits: number } | null}
+ */
+let auditMeter = null
+
+/**
+ * Counts one audit visit and tells its loop when to yield.
+ * @param {number} visited Visits this loop made before this one.
+ * @returns {boolean} Whether to yield first: before every 100th visit.
+ */
+const auditVisit = (visited) => {
+  if (auditMeter) auditMeter.visits++
+  return visited % 100 === 0
+}
+
 /** @param {Map} index Join index. @param {*} key Key. @param {*} value Member. @returns {void} */
 const indexMember = (index, key, value) => {
   if (!index.has(key)) index.set(key, [])
@@ -1272,7 +1292,7 @@ const mappedAuditWork = function* (values, project) {
   const rows = []
   let visited = 0
   for (const value of values) {
-    if (visited++ % 100 === 0) yield
+    if (auditVisit(visited++)) yield
     rows.push(project(value))
   }
   return rows
@@ -1290,7 +1310,7 @@ const sortedAuditWork = function* (values, compare) {
       const middle = right
       const end = Math.min(base + 2 * width, source.length)
       for (let at = base; at < end; at++) {
-        if (comparisons++ % 100 === 0) yield
+        if (auditVisit(comparisons++)) yield
         target[at] =
           left < middle && (right >= end || compare(source[left], source[right]) <= 0)
             ? source[left++]
@@ -1371,7 +1391,7 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
   evidence.outcomesByCohort = new Map()
   let visited = 0
   for (const [cohort, outcomes] of cohortOutcomes) {
-    if (visited++ % 100 === 0) yield
+    if (auditVisit(visited++)) yield
     evidence.outcomesByCohort.set(cohort, outcomes)
   }
   entries = yield* mappedAuditWork(originalEntries, (entry) => ({
@@ -1394,14 +1414,14 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
     evidence.auditIndex.obligations.set(bounce, effectiveObligations(bounce))
   }
   for (const exchange of evidence.exchanges) {
-    if (visited++ % 100 === 0) yield
+    if (auditVisit(visited++)) yield
     const cohorts = new Set(exchange.tickets.map(({ cohort }) => cohort))
     for (const cohort of cohorts) indexMember(evidence.exchangesByCohort, cohort, exchange)
   }
   // Preserve cohort membership even for scripted empty-ticket acquisitions.
   for (const [cohort, exchanges] of cohortExchanges)
     for (const exchange of exchanges) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       if (!originalExchanges.has(exchange)) continue
       const copied = exchangeCopy(exchange)
       if (!(evidence.exchangesByCohort.get(cohort) ?? []).includes(copied))
@@ -1416,11 +1436,11 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
   }))
   const seenAcquisitions = new Set()
   for (const { acquisition } of originals) {
-    if (visited++ % 100 === 0) yield
+    if (auditVisit(visited++)) yield
     seenAcquisitions.add(acquisition)
   }
   for (const entry of entries) {
-    if (visited++ % 100 === 0) yield
+    if (auditVisit(visited++)) yield
     if (!seenAcquisitions.has(entry.acquisition)) {
       seenAcquisitions.add(entry.acquisition)
       originals.push(entry)
@@ -1428,7 +1448,7 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
   }
   const authorities = new Map()
   for (const entry of originals) {
-    if (visited++ % 100 === 0) yield
+    if (auditVisit(visited++)) yield
     if (!entry.acquisition?.source?.frames[0]) continue
     const scope = authority(entry)
     const key = JSON.stringify(scope)
@@ -1446,7 +1466,7 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
   }
   const journal = interruptionJournal(evidence)
   for (const item of journal) {
-    if (visited++ % 100 === 0) yield
+    if (auditVisit(visited++)) yield
     const key =
       item.kind === 'socket'
         ? `socket:${item.event.socket}`
@@ -1464,7 +1484,7 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
     }
   )
   for (const { kind, event } of primitives) {
-    if (visited++ % 100 === 0) yield
+    if (auditVisit(visited++)) yield
     const cut = interruptionEvent(kind, event)
     if (kind === 'command') {
       episodes.push({
@@ -1491,7 +1511,7 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
   }
   const timeline = []
   for (const entry of entries) {
-    if (visited++ % 100 === 0) yield
+    if (auditVisit(visited++)) yield
     indexMember(evidence.auditIndex.deliveries, entry.identity, entry)
     timeline.push({ kind: 'handler', event: entry })
     const outcomes = entry.acquisition ? evidence.successfulReceipts(entry) : []
@@ -1513,7 +1533,7 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
     const successes = []
     const cuts = []
     while (position < orderedTimeline.length && orderedTimeline[position].event.at === at) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       const item = orderedTimeline[position++]
       if (item.kind === 'handler') indexMember(active, item.event.identity, item.event)
       else if (item.kind === 'success') successes.push(item)
@@ -1525,7 +1545,7 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
       if (evidence.auditIndex.history.has(key)) continue
       const lastSuccess = new Map()
       for (const { entry, event } of successes) {
-        if (visited++ % 100 === 0) yield
+        if (auditVisit(visited++)) yield
         if (!precedes(entry, cut) || !precedes(event, cut)) continue
         const prior = lastSuccess.get(entry.identity)
         if (!prior || entryPosition.get(prior) < entryPosition.get(entry))
@@ -1535,7 +1555,7 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
       for (const [identity, group] of active) {
         const success = lastSuccess.get(identity)
         for (const entry of group) {
-          if (visited++ % 100 === 0) yield
+          if (auditVisit(visited++)) yield
           if (precedes(entry, cut) && (!success || precedes(success, entry))) history.push(entry)
         }
       }
@@ -1546,7 +1566,7 @@ const indexedEvidenceWork = function* (entries, original, bounces) {
     }
     // Every later clock strictly follows these receipts, even when their sequence is unavailable.
     for (const { entry } of successes) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       const remaining = (active.get(entry.identity) ?? []).filter((later) => precedes(entry, later))
       if (remaining.length) active.set(entry.identity, remaining)
       else active.delete(entry.identity)
@@ -1956,14 +1976,14 @@ const reconstructFreezes = function* (entries, bounces, evidence) {
   )
   let primitiveCount = 0
   for (const { kind, event } of journal) {
-    if (primitiveCount++ % 100 === 0) yield
+    if (auditVisit(primitiveCount++)) yield
     const cut = interruptionEvent(kind, event)
     if (kind === 'command') {
       origins = new Map()
       for (const prior of reconstructed)
         if (prior.index < event.index)
           for (const held of newObligations(prior)) {
-            if (primitiveCount++ % 100 === 0) yield
+            if (auditVisit(primitiveCount++)) yield
             if (!origins.has(held.entry)) origins.set(held.entry, prior.index)
           }
       const history = unresolvedAt(entries, evidence, cut)
@@ -2133,7 +2153,7 @@ const epochSampleIndexWork = function* (samples) {
     cached = { length: samples.length, rows: new Map() }
     let visited = 0
     for (const sample of samples) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       if (sample.frames.length !== 1) continue
       const frame = sample.frames[0]
       if (frame.apiKey !== 3 || frame.apiVersion < 7) continue
@@ -2720,7 +2740,7 @@ const auditReplayWork = function* (entries, bounces, corpus, evidence) {
   const problems = [...uncertainty.problems]
   const extras = []
   for (const [index, entry] of entries.entries()) {
-    if (index % 100 === 0) yield
+    if (auditVisit(index)) yield
     const old = previous.get(entry.identity)
     const key = `${entry.acquisition?.source?.frames[0]?.id}:${entry.topicId}:${entry.partition}:${entry.offset}`
     if (!corpus.has(entry.identity)) problems.push(`${entry.identity} is outside the corpus`)
@@ -2810,7 +2830,7 @@ const settlementCandidatesWork = function* (entries, corpus, bounces, evidence, 
   const successful = new Set()
   const last = new Map()
   for (const [index, entry] of entries.entries()) {
-    if (index % 100 === 0) yield
+    if (auditVisit(index)) yield
     last.set(entry.identity, entry)
     if (
       entry.acquisition &&
@@ -2820,7 +2840,7 @@ const settlementCandidatesWork = function* (entries, corpus, bounces, evidence, 
   }
   let checked = 0
   for (const entry of last.values()) {
-    if (checked++ % 100 === 0) yield
+    if (auditVisit(checked++)) yield
     if (corpus.has(entry.identity) && validAcquisition(entry) && evidence.successful(entry))
       successful.add(entry.identity)
   }
@@ -2829,7 +2849,7 @@ const settlementCandidatesWork = function* (entries, corpus, bounces, evidence, 
   const unresolved = []
   let visited = 0
   for (const identity of corpus) {
-    if (visited++ % 100 === 0) yield
+    if (auditVisit(visited++)) yield
     if (successful.has(identity)) continue
     const entry = last.get(identity)
     let candidate = null
@@ -2977,7 +2997,7 @@ const archivalProblemsWork = function* (entries, exchanges, limits) {
   }
   let visited = 0
   for (const [occurrence, exchange] of exchanges.entries()) {
-    if (visited++ % 100 === 0) yield
+    if (auditVisit(visited++)) yield
     for (const frame of exchange.frames) {
       if (
         frame.request?.topics.some(({ partitions }) =>
@@ -3007,7 +3027,7 @@ const archivalProblemsWork = function* (entries, exchanges, limits) {
         const state = requested.has(key) && partitions.get(key)
         if (!state) continue
         for (const range of partition.acquiredRecords ?? []) {
-          if (visited++ % 100 === 0) yield
+          if (auditVisit(visited++)) yield
           const bad =
             !Number.isInteger(range.deliveryCount) ||
             range.deliveryCount < 1 ||
@@ -3032,7 +3052,7 @@ const archivalProblemsWork = function* (entries, exchanges, limits) {
     let position = 0
     for (const { at, entry } of identities) {
       while (position < events.length && events[position].at <= at) {
-        if (visited++ % 100 === 0) yield
+        if (auditVisit(visited++)) yield
         const event = events[position++]
         const count = (active.get(event.occurrence) ?? 0) + event.delta
         if (count) active.set(event.occurrence, count)
@@ -3514,6 +3534,7 @@ const boundedEvidence = (value, limit) => {
 /**
  * Compresses complete JSON losslessly; chunks split encoded bytes, never nested membership.
  * Manifest counts and the digest let readers reject missing, reordered or changed chunks.
+ * Synchronous: one call is one audit step, so the step's work grows with the row's size.
  * @param {string} event Original row kind.
  * @param {string} id Stable object ID.
  * @param {object} fields Complete original facts.
@@ -3548,6 +3569,7 @@ const evidenceRows = (event, id, fields) => {
 
 /**
  * Reconstructs a chunked object, rejecting missing, reordered or damaged members.
+ * Synchronous, like `evidenceRows`: one row's decode is one audit step.
  * @param {object[]} rows Manifest followed by original chunks.
  * @returns {object} Complete original object.
  * @throws {Error} The specific incomplete evidence component.
@@ -4054,10 +4076,7 @@ class ShareBounceCase {
       )
       return false
     }
-    if (
-      event === 'case-complete' &&
-      performance.now() >= Math.min(this.deadline, this.finalDeadline ?? Infinity)
-    ) {
+    if (event === 'case-complete' && this.deadlinePassed()) {
       storage.truncate(before)
       throw new Error('deadline: finalization overrun')
     }
@@ -4090,6 +4109,23 @@ class ShareBounceCase {
       captureProblems: this.captureProblems,
       bounces: this.snapshots.map(({ held, ...rest }) => ({ ...rest, held: held.size })),
     }
+  }
+
+  /**
+   * The case's deadline owns every real-time bound of completion. A case without one
+   * (`deadline: Infinity`, as the broker-free fixtures set) has no real-time bound at all.
+   * @returns {boolean} whether the selection deadline or the final window has passed
+   */
+  deadlinePassed() {
+    return performance.now() >= Math.min(this.deadline, this.finalDeadline ?? Infinity)
+  }
+
+  /**
+   * @param {number} ms a completion step's bound in a case with a deadline
+   * @returns {number} `ms`, or `Infinity` for a case without a deadline
+   */
+  stepBound(ms) {
+    return this.deadline === Infinity ? Infinity : ms
   }
 
   /**
@@ -5757,7 +5793,7 @@ class ShareBounceCase {
     const bulkFrames = []
     let planned = 0
     for (const frame of this.tap.allFrames) {
-      if (planned++ % 100 === 0) yield
+      if (auditVisit(planned++)) yield
       const producerFrame = [0, 22].includes(frame.apiKey)
       if (failed && !producerFrame && !frameIds.has(frame.id)) continue
       const { bytes, responseBytes, ...fact } = frame
@@ -5887,7 +5923,7 @@ class ShareBounceCase {
     // Use the existing lossless history schema to avoid thousands of duplicate row envelopes.
     const counts = new Map()
     for (const row of rows) {
-      if (planned++ % 100 === 0) yield
+      if (auditVisit(planned++)) yield
       indexMember(counts, `${row.event}:${priority(row)}`, row)
     }
     const packed = []
@@ -5917,7 +5953,7 @@ class ShareBounceCase {
     }
     const manifest = []
     for (const [index, fact] of orderedRows.entries()) {
-      if (index % 100 === 0) yield
+      if (auditVisit(index)) yield
       manifest.push({
         index,
         event: fact.event,
@@ -5972,11 +6008,11 @@ class ShareBounceCase {
     const byEvent = new Map()
     let visited = 0
     for (const { event, fields } of rows) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       const history = ARCHIVE_HISTORY_MEMBERS.get(event)
       if (history) {
         for (const member of fields[history.key]) {
-          if (visited++ % 100 === 0) yield
+          if (auditVisit(visited++)) yield
           indexMember(byEvent, history.event, member)
         }
       } else indexMember(byEvent, event, fields)
@@ -5989,7 +6025,7 @@ class ShareBounceCase {
         ...(byEvent.get(bulk) ?? []).map((row) => row[key]),
       ])
         for (const row of group) {
-          if (visited++ % 100 === 0) yield
+          if (auditVisit(visited++)) yield
           index.set(row.id, row)
         }
       return index
@@ -6003,7 +6039,7 @@ class ShareBounceCase {
       ...(byEvent.get('exchange-history') ?? []).flatMap(({ exchanges }) => exchanges),
     ]
     for (const row of referenced) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       for (const id of row.frames ?? []) frameIds.add(id)
     }
     problems.push(...this.archiveLifecycleProblems(byEvent))
@@ -6011,7 +6047,7 @@ class ShareBounceCase {
       (byEvent.get('bounce-control') ?? []).map((control) => [control.id, control])
     )
     for (const extra of byEvent.get('replay-entry') ?? []) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       const witness = extra.incarnationWitness
       if (!witness) continue
       for (const key of [
@@ -6036,11 +6072,11 @@ class ShareBounceCase {
       ...this.evidence.epochs,
       ...this.evidence.brokerStates,
     ]) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       if (source.response) for (const { id } of source.frames) completed.add(id)
     }
     for (const id of frameIds) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       const frame = frames.get(id)
       if (!frame) problems.push(`frame: missing required original ${id}`)
       else {
@@ -6053,14 +6089,14 @@ class ShareBounceCase {
     const acquisitions = yield* originals('acquisition', 'acquisition-history', 'acquisitions')
     const exchanges = yield* originals('share-exchange', 'exchange-history', 'exchanges')
     for (const entry of entries.values()) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       const acquisition = acquisitions.get(entry.acquisition)
       if (!acquisition || !exchanges.has(acquisition.exchange))
         problems.push(`acquisition-reference: missing original for ${entry.id}`)
     }
     for (const bounce of byEvent.get('frozen-bounce') ?? []) {
       for (const held of [...bounce.obligations, ...bounce.carried]) {
-        if (visited++ % 100 === 0) yield
+        if (auditVisit(visited++)) yield
         if (!entries.has(held.entry))
           problems.push(`interruption-member: missing original ${held.entry}`)
       }
@@ -6071,7 +6107,7 @@ class ShareBounceCase {
           ...cut.obligations.map(({ entry }) => entry),
           ...cut.carried.map(({ entry }) => entry),
         ]) {
-          if (visited++ % 100 === 0) yield
+          if (auditVisit(visited++)) yield
           if (!entries.has(id)) problems.push(`interruption-member: missing original ${id}`)
         }
         const event =
@@ -6227,7 +6263,7 @@ class ShareBounceCase {
     const groups = new Map()
     let visited = 0
     for (const original of typeof stored === 'string' ? stored.split('\n') : stored) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       if (!original) continue
       const row = typeof original === 'string' ? JSON.parse(original) : original
       rows.push(row)
@@ -6273,7 +6309,8 @@ class ShareBounceCase {
   }
 
   /**
-   * Retains original acquisition/receipt provenance only for involved identities, with raw frame links.
+   * Retains original acquisition/receipt provenance only for involved identities, with raw frame links,
+   * and archives individually every event an interruption cut references.
    * @param {Set<string>} identities Failure identities and their matching public receipts.
    * @param {Set<number>} frameIds Relevant frames, extended with acquisition/receipt/epoch sources.
    * @param {Function} emit Collects rows for closure ordering.
@@ -6285,7 +6322,7 @@ class ShareBounceCase {
     const cohorts = new Set()
     const exchanges = new Set()
     for (const { acquisition, ...entry } of this.entries) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       if (!identities.has(entry.identity)) continue
       cohorts.add(acquisition?.id)
       exchanges.add(acquisition?.exchange)
@@ -6297,8 +6334,14 @@ class ShareBounceCase {
         emit('acquisition', acquisition)
         for (const frame of source.frames) frameIds.add(frame.id)
       }
+    // Every cut's referenced event is archived individually: retirements always are; failures and
+    // sockets are selected here even when the cut holds no unresolved work.
+    const cutSockets = new Set()
     for (const bounce of this.snapshots)
-      for (const cut of bounce.interruptions) if (cut.kind === 'failure') exchanges.add(cut.event)
+      for (const cut of bounce.interruptions) {
+        if (cut.kind === 'failure') exchanges.add(cut.event)
+        if (cut.kind === 'socket') cutSockets.add(cut.scope.socket)
+      }
     for (const extra of this.replay?.extras ?? []) {
       const witness = extra.incarnationWitness
       if (witness?.kind !== 'partition-transition') continue
@@ -6310,7 +6353,7 @@ class ShareBounceCase {
       }
     }
     for (const { frames, response, ...exchange } of this.evidence.exchanges) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       if (
         !exchange.tickets.some(({ cohort }) => cohorts.has(cohort)) &&
         !exchanges.has(exchange.id)
@@ -6366,7 +6409,7 @@ class ShareBounceCase {
         ])
     )
     for (const entry of involvedSources.values()) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       const frame = entry.acquisition?.source?.frames[0]
       if (!frame) continue
       const samples = sourceEpochSamples(entry, this.evidence.epochs, false)
@@ -6391,7 +6434,7 @@ class ShareBounceCase {
           chosen.add(sample.frame.id)
     }
     for (const { frames, ...source } of this.evidence.epochs) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       if (!frames.some(({ id }) => chosen.has(id))) continue
       for (const { id } of frames) frameIds.add(id)
       emit('epoch-source', { ...source, frames: frames.map(({ id }) => id) })
@@ -6401,10 +6444,11 @@ class ShareBounceCase {
         .filter(({ identity }) => identities.has(identity))
         .map((entry) => entry.acquisition?.source?.frames[0]?.socket)
     )
+    for (const socket of cutSockets) sockets.add(socket)
     for (const frame of this.tap.allFrames) if (frameIds.has(frame.id)) sockets.add(frame.socket)
     const omittedEvents = []
     for (const event of this.tap.socketEvents) {
-      if (visited++ % 100 === 0) yield
+      if (auditVisit(visited++)) yield
       if (!sockets.has(event.socket)) {
         omittedEvents.push(event)
         continue
@@ -6581,23 +6625,21 @@ class ShareBounceCase {
     if (!this.cleanupProof?.completed) throw new Error('cleanup: missing completed evidence')
     if (this.cleanupProof.tainted !== false)
       throw new Error('taint: missing or failed cleanup evidence')
-    if (performance.now() >= Math.min(this.deadline, this.finalDeadline ?? Infinity))
-      throw new Error('deadline: selection deadline passed')
+    if (this.deadlinePassed()) throw new Error('deadline: selection deadline passed')
     expect(this.terminalVerified).toBe(true)
     expect([...this.tap.problems, ...this.producerEvidence.problems]).toEqual([])
     await pollUntil(
       scope,
-      5000,
+      this.stepBound(5000),
       async () => (await this.probe.snapshot()).sockets.open === this.beforeAdmin.sockets.open,
       { delayMs: 50, label: 'The admin sockets closing' }
     )
-    const final = await bounded(scope, 10000, () => this.probe.snapshot())
+    const final = await bounded(scope, this.stepBound(10000), () => this.probe.snapshot())
     if (!this.row('cleanup', { snapshot: final, ...this.cleanupProof }))
       throw new Error('cleanup: evidence omitted')
     const { extras, perBounce } = this.replay
     scope.throwIfAborted()
-    if (performance.now() >= Math.min(this.deadline, this.finalDeadline ?? Infinity))
-      throw new Error('deadline: selection deadline passed')
+    if (this.deadlinePassed()) throw new Error('deadline: selection deadline passed')
     if (
       !this.row('case-complete', {
         status: 'passed',
@@ -7310,9 +7352,11 @@ const budgetFixture = (count, perEpisode, unknown) => {
 
 /**
  * Scripts six unknown pools and the remaining real Accepts against a fixed three-partition corpus.
- * @returns {object} Full terminal proof with 1800 unknown and 28200 successful identities.
+ * @param {number} [records] Corpus size: a multiple of 300 above the 1800 unknown identities.
+ * @returns {object} Full terminal proof with 1800 unknown and `records - 1800` successful identities.
  */
-const terminalBudgetFixture = () => {
+const terminalBudgetFixture = (records = RECORDS) => {
+  const perPartition = records / PARTITIONS
   const fixture = budgetFixture(MAX_REPLAY, MAX_HELD, true)
   const { evidence } = fixture
   evidence.acquisitions = fixture.entries.map(({ acquisition }) => acquisition)
@@ -7351,8 +7395,8 @@ const terminalBudgetFixture = () => {
       value: Buffer.from('v'),
     })
   }
-  const batchesPerPartition = (RECORDS - MAX_REPLAY) / PARTITIONS / BURST_SIZE
-  for (let batch = 0; batch < (RECORDS - MAX_REPLAY) / BURST_SIZE; batch++) {
+  const batchesPerPartition = (records - MAX_REPLAY) / PARTITIONS / BURST_SIZE
+  for (let batch = 0; batch < (records - MAX_REPLAY) / BURST_SIZE; batch++) {
     const partition = Math.floor(batch / batchesPerPartition)
     const first = MAX_REPLAY / PARTITIONS + (batch % batchesPerPartition) * BURST_SIZE
     const last = first + BURST_SIZE - 1
@@ -7403,11 +7447,11 @@ const terminalBudgetFixture = () => {
   }
   captureFreezes(fixture)
   const { topic, topicId, groupId } = fixture.entries[0]
-  const corpus = Array.from({ length: RECORDS }, (_value, index) =>
+  const corpus = Array.from({ length: records }, (_value, index) =>
     shareRecordIdentity({
       topic,
-      partition: Math.floor(index / 10000),
-      offset: String(index % 10000),
+      partition: Math.floor(index / perPartition),
+      offset: String(index % perPartition),
       key: Buffer.from('k'),
       value: Buffer.from('v'),
     })
@@ -7415,7 +7459,7 @@ const terminalBudgetFixture = () => {
   const partitions = Array.from({ length: PARTITIONS }, (_value, partition) => ({
     partition,
     floor: '0',
-    end: '10000',
+    end: String(perPartition),
   }))
   const rows = [
     {
@@ -7435,7 +7479,7 @@ const terminalBudgetFixture = () => {
     topicId,
     named: rows,
     all: JSON.parse(JSON.stringify(rows)),
-    ends: partitions.map(({ partition }) => ({ partition, high: '10000' })),
+    ends: partitions.map(({ partition }) => ({ partition, high: String(perPartition) })),
   }
   return {
     ...fixture,
@@ -8186,7 +8230,7 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     }
     Object.assign(instance, {
       cleanupProof: { completed: true, tainted: false },
-      deadline: performance.now() + FINAL_MS,
+      deadline: Infinity,
       terminalVerified: true,
       bounceFacts: [],
       beforeAdmin: snapshot,
@@ -8206,6 +8250,41 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     instance.archive()
     await instance.complete(NEVER)
     expect(rows.filter(({ event }) => event === 'case-complete')).toHaveLength(1)
+  })
+
+  it('completes a case without a deadline however long its socket and snapshot reads take', async () => {
+    const { instance, rows } = archiveFixture()
+    readyCompletion(instance)
+    instance.archive()
+    const { snapshot } = instance.probe
+    let reached
+    let release
+    const waiting = new Promise((resolve) => {
+      reached = resolve
+    })
+    const held = new Promise((resolve) => {
+      release = resolve
+    })
+    instance.probe = {
+      snapshot: async () => {
+        reached()
+        await held
+        return snapshot()
+      },
+    }
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] })
+    try {
+      const completion = instance.complete(NEVER)
+      await waiting
+      jest.advanceTimersByTime(60000)
+      release()
+      await completion
+      expect(rows.filter(({ event }) => event === 'case-complete')).toHaveLength(1)
+      expect(liveRun.tainted).toBe(false)
+    } finally {
+      jest.useRealTimers()
+      liveRun.reset()
+    }
   })
 
   it('stops completion when the final scope aborts between persisted validation steps', async () => {
@@ -8290,6 +8369,48 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     expect(instance.archiveClosure.problems).toEqual([])
     await expect(instance.requireArchive(NEVER)).resolves.toBeUndefined()
     expect(rows.find(({ event }) => event === 'witness-closure-end').complete).toBe(true)
+  })
+
+  it('archives the socket event of a socket cut whose partition holds no unresolved work', async () => {
+    const { fixture, instance, rows } = archiveFixture()
+    const prior = fixture.bounces[0].interruptions[0]
+    const base = fixture.old.acquisition
+    const frame = { ...base.source.frames[0], id: 70, socket: 7, correlationId: 70 }
+    fixture.evidence.acquisitions.push({
+      ...base,
+      id: 'idle-partition-1',
+      partition: 1,
+      source: { ...base.source, frames: [frame], open: 1 },
+    })
+    instance.tap.allFrames.push(frame)
+    instance.tap.socketEvents.push({
+      id: 0,
+      socket: 7,
+      event: 'end',
+      at: prior.at - 0.5,
+      order: prior.order - 1,
+      label: 'member',
+      endpoint: 'node-1',
+      outstanding: [],
+      error: null,
+    })
+    captureFreezes(fixture)
+    instance.replay = audit(fixture)
+    expect(fixture.bounces[0].interruptions).toContainEqual(
+      expect.objectContaining({
+        kind: 'socket',
+        event: 0,
+        scope: expect.objectContaining({ socket: 7, partition: 1 }),
+        obligations: [],
+        carried: [],
+      })
+    )
+    instance.archive()
+    await expect(instance.requireArchive(NEVER)).resolves.toBeUndefined()
+    expect(instance.archiveClosure.problems).toEqual([])
+    expect(
+      rows.filter(({ event }) => event === 'socket-event').map(({ id, socket }) => [id, socket])
+    ).toEqual([[0, 7]])
   })
 
   it.each([
@@ -9015,10 +9136,28 @@ describe('share bounce acquisition and settlement sensitivity', () => {
     expect(rows.at(-1).event).toBe('unresolved-settlement')
   })
 
-  it('audits 30000 records with Metadata and count resets through drain, terminal, archive and completion work', async () => {
-    // Coverage instrumentation slows the synthetic audit; the live finalization budget stays strict.
-    const AUDIT_MS = globalThis.__coverage__ ? 3 * FINAL_MS : FINAL_MS
-    const proof = terminalBudgetFixture()
+  /** Most metered visits one audit step may make: a 100-visit loop tail joined to the next loop's head. */
+  const STEP_VISITS = 200
+
+  /** Most growth in visits and steps when the records double: linear work plus fixed work. */
+  const LINEAR_GROWTH = 2
+
+  /**
+   * Least growth in visits when the records double. It proves the metered visits are mostly
+   * record-sized work, so the `LINEAR_GROWTH` bound would see a loop that grows faster.
+   */
+  const RECORD_GROWTH = 1.5
+
+  /**
+   * Runs the synthetic drain, terminal, archive and completion audit on one corpus size, metering
+   * the visits the cooperative audit loops count (`auditMeter`) and the steps between yields.
+   * No real-time bound decides the outcome: the case has no deadline and only work is asserted.
+   * @param {number} records Corpus size.
+   * @returns {Promise<{ visits: number, turns: number, maxVisits: number, archiveBytes: number }>}
+   *   Total visits and steps, the most visits in one step and the archive's size.
+   */
+  const meteredAudit = async (records) => {
+    const proof = terminalBudgetFixture(records)
     const replay = replayFixture({ sameLeader: true })
     replay.next.acquisition.acquiredRecords[0].lastOffset = '99'
     for (let offset = 0; offset < 100; offset++) {
@@ -9091,98 +9230,121 @@ describe('share bounce acquisition and settlement sensitivity', () => {
       })
     }
     captureFreezes(proof)
+    const meter = { visits: 0 }
     let turns = 0
-    let maxStepMs = 0
-    /** @param {Generator} work Actual audit. @returns {Generator} Identical steps with runtime observations. */
+    let maxVisits = 0
+    /** @param {Generator} work Actual audit. @returns {Generator} Identical steps with metered visits. */
     const measured = function* (work) {
       for (;;) {
-        const started = performance.now()
+        const before = meter.visits
         const step = work.next()
-        maxStepMs = Math.max(maxStepMs, performance.now() - started)
+        maxVisits = Math.max(maxVisits, meter.visits - before)
         if (step.done) return step.value
         turns++
         yield
       }
     }
-    const started = performance.now()
-    const candidates = await cooperativeAudit(
-      measured(
-        settlementCandidatesWork(
-          proof.entries,
-          new Set(proof.corpus),
-          proof.bounces,
-          proof.evidence
-        )
-      ),
-      NEVER
-    )
-    const terminal = await cooperativeAudit(measured(auditTerminalWork(proof)), NEVER)
-    expect(proof.corpus).toHaveLength(RECORDS)
-    expect(proof.evidence.epochs).toHaveLength(2000)
-    expect(candidates.problems).toEqual([])
-    expect(terminal.problems).toEqual([])
-    expect(terminal.replay.extras).toHaveLength(100)
-    expect(
-      terminal.replay.extras.every(
-        ({ incarnationWitness }) => incarnationWitness.kind === 'partition-transition'
+    auditMeter = meter
+    try {
+      const candidates = await cooperativeAudit(
+        measured(
+          settlementCandidatesWork(
+            proof.entries,
+            new Set(proof.corpus),
+            proof.bounces,
+            proof.evidence
+          )
+        ),
+        NEVER
       )
-    ).toBe(true)
-    expect(terminal.settlement.successful).toEqual(candidates.successful)
-    const { instance, rows } = archiveFixture()
-    readyCompletion(instance)
-    const socketEvents = proof.evidence.owner.tap.socketEvents
-    Object.assign(instance, {
-      entries: proof.entries,
-      snapshots: proof.bounces,
-      expected: proof.corpus,
-      evidence: proof.evidence,
-      replay: terminal.replay,
-      settlement: terminal.settlement,
-      lifecycle: proof.evidence.owner.lifecycle,
-      deadline: started + AUDIT_MS,
-      rawIdentities: proof.raw,
-      handled: tally(proof.entries.map(({ identity }) => identity)),
-      expectedHandled: tally([
-        ...proof.corpus,
-        ...terminal.replay.extras.map(({ identity }) => identity),
-      ]),
-      beforeTerminal: proof.before,
-      afterTerminal: proof.after,
-      quiet: proof.quiet,
-    })
-    instance.evidence.owner = instance
-    instance.tap.socketEvents = socketEvents
-    instance.tap.allFrames = [
-      ...new Map(
-        [...proof.evidence.exchanges, ...proof.evidence.epochs]
-          .flatMap(({ frames }) => frames)
-          .map((frame) => [frame.id, frame])
-      ).values(),
-    ]
-    for (const frame of instance.tap.allFrames) frame.bytes = 'original-request'
-    let validationRuns = 0
-    let validationTurns = 0
-    const read = instance.requireArchiveWork.bind(instance)
-    instance.requireArchiveWork = function* (...args) {
-      validationRuns++
-      const before = turns
-      const result = yield* measured(read(...args))
-      validationTurns += turns - before
-      return result
+      const terminal = await cooperativeAudit(measured(auditTerminalWork(proof)), NEVER)
+      expect(proof.corpus).toHaveLength(records)
+      expect(proof.evidence.epochs).toHaveLength(2000)
+      expect(candidates.problems).toEqual([])
+      expect(terminal.problems).toEqual([])
+      expect(terminal.replay.extras).toHaveLength(100)
+      expect(
+        terminal.replay.extras.every(
+          ({ incarnationWitness }) => incarnationWitness.kind === 'partition-transition'
+        )
+      ).toBe(true)
+      expect(terminal.settlement.successful).toEqual(candidates.successful)
+      const { instance, rows } = archiveFixture()
+      readyCompletion(instance)
+      const socketEvents = proof.evidence.owner.tap.socketEvents
+      Object.assign(instance, {
+        entries: proof.entries,
+        snapshots: proof.bounces,
+        expected: proof.corpus,
+        evidence: proof.evidence,
+        replay: terminal.replay,
+        settlement: terminal.settlement,
+        lifecycle: proof.evidence.owner.lifecycle,
+        rawIdentities: proof.raw,
+        handled: tally(proof.entries.map(({ identity }) => identity)),
+        expectedHandled: tally([
+          ...proof.corpus,
+          ...terminal.replay.extras.map(({ identity }) => identity),
+        ]),
+        beforeTerminal: proof.before,
+        afterTerminal: proof.after,
+        quiet: proof.quiet,
+      })
+      instance.evidence.owner = instance
+      instance.tap.socketEvents = socketEvents
+      instance.tap.allFrames = [
+        ...new Map(
+          [...proof.evidence.exchanges, ...proof.evidence.epochs]
+            .flatMap(({ frames }) => frames)
+            .map((frame) => [frame.id, frame])
+        ).values(),
+      ]
+      for (const frame of instance.tap.allFrames) frame.bytes = 'original-request'
+      let validationRuns = 0
+      let validationTurns = 0
+      const read = instance.requireArchiveWork.bind(instance)
+      instance.requireArchiveWork = function* (...args) {
+        validationRuns++
+        const before = turns
+        const result = yield* measured(read(...args))
+        validationTurns += turns - before
+        return result
+      }
+      await cooperativeAudit(measured(instance.archiveWork()), NEVER)
+      expect(instance.archiveClosure.problems).toEqual([])
+      expect(instance.captureProblems).toEqual([])
+      expect(instance.archiveIncomplete).not.toBe(true)
+      await instance.complete(NEVER)
+      expect(validationRuns).toBe(1)
+      expect(validationTurns).toBeGreaterThan(records / 100)
+      expect(rows.filter(({ event }) => event === 'case-complete')).toHaveLength(1)
+      expect(rows.some(({ event }) => event === 'witness-closure-end')).toBe(true)
+      expect(turns).toBeGreaterThan(records / 100)
+      return {
+        visits: meter.visits,
+        turns,
+        maxVisits,
+        archiveBytes: instance.archiveStorage.size(),
+      }
+    } finally {
+      auditMeter = null
     }
-    await cooperativeAudit(measured(instance.archiveWork()), NEVER)
-    expect(instance.archiveClosure.problems).toEqual([])
-    expect(instance.captureProblems).toEqual([])
-    expect(instance.archiveIncomplete).not.toBe(true)
-    await instance.complete(NEVER)
-    expect(validationRuns).toBe(1)
-    expect(validationTurns).toBeGreaterThan(RECORDS / 100)
-    expect(rows.filter(({ event }) => event === 'case-complete')).toHaveLength(1)
-    expect(rows.some(({ event }) => event === 'witness-closure-end')).toBe(true)
-    expect(turns).toBeGreaterThan(RECORDS / 100)
-    expect(maxStepMs).toBeLessThan(1000)
-    expect(performance.now() - started).toBeLessThan(AUDIT_MS)
-  })
+  }
+
+  it('audits 30000 records with Metadata and count resets through drain, terminal, archive and completion work', async () => {
+    const half = await meteredAudit(RECORDS / 2)
+    const full = await meteredAudit(RECORDS)
+    for (const run of [half, full]) {
+      expect(run.visits).toBeGreaterThan(run.turns)
+      expect(run.maxVisits).toBeGreaterThan(0)
+      expect(run.maxVisits).toBeLessThanOrEqual(STEP_VISITS)
+    }
+    expect(full.visits).toBeLessThanOrEqual(LINEAR_GROWTH * half.visits)
+    expect(full.turns).toBeLessThanOrEqual(LINEAR_GROWTH * half.turns)
+    expect(full.visits).toBeGreaterThan(RECORD_GROWTH * half.visits)
+    // The 1 MiB margin covers the run stamps evidence lines add beyond these envelope rows.
+    expect(full.archiveBytes).toBeLessThanOrEqual(ARCHIVE_BYTES - 1024 * 1024)
+  }, 300000)
 
   it.each([
     ['receipt before cut', 9, 10, false],

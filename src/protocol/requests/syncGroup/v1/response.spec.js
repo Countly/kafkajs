@@ -1,3 +1,4 @@
+const Encoder = require('../../../encoder')
 const { decode, parse } = require('./response')
 
 describe('Protocol > Requests > SyncGroup > v1', () => {
@@ -10,5 +11,11 @@ describe('Protocol > Requests > SyncGroup > v1', () => {
     })
 
     await expect(parse(data)).resolves.toBeTruthy()
+  })
+
+  test('rejects UNSUPPORTED_VERSION before reading the absent assignment bytes', async () => {
+    const buffer = new Encoder().writeInt32(0).writeInt16(35).buffer
+
+    await expect(decode(buffer)).rejects.toMatchObject({ type: 'UNSUPPORTED_VERSION', code: 35 })
   })
 })

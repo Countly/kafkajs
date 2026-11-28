@@ -1,0 +1,11 @@
+--- a/src/consumer/runner.js
++++ b/src/consumer/runner.js
+@@ -1796,7 +1796,7 @@
+    */
+   autoCommitOffsets(batch = handlerContext.current() ?? null, round = null) {
+     const refusal = () => round?.guard() || this.commitRefusal(undefined, batch)
+-    if (this.autoCommit && !refusal()) {
++    if (this.autoCommit && this.consumerGroup.offsetManager?.autoCommitInterval == null && !refusal()) {
+       return this.consumerGroup.commitOffsets({}, { auto: true, guard: refusal })
+     }
+   }

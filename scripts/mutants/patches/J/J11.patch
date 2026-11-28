@@ -1,0 +1,11 @@
+--- a/src/consumer/__tests__/fixtures/fetchHarness.js
++++ b/src/consumer/__tests__/fixtures/fetchHarness.js
+@@ -405,7 +405,7 @@
+     while (answered < state.writes.length) {
+       const header = readRequestHeader(state.writes[answered])
+       answered += 1
+-      const responseState = chunks
++      const responseState = false
+         ? {
+             socket: {
+               emit: (_event, frame) => {

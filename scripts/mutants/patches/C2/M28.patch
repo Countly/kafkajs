@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -1999,7 +1999,7 @@
+         return
+       } catch (e) {
+         if (!current()) return
+-        if (!(await this.awaitFreshEpochFor(e, deadline, scope))) {
++        if (!(await this.awaitFreshEpochFor(e, deadline, undefined))) {
+           if (!current()) return
+           this.logger.warn(
+             'Commit before releasing partitions failed; proceeding with the rebalance',

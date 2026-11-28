@@ -31,8 +31,10 @@ class ShareSession {
    * @param {(oldToken: symbol, reason: string, cause?: Error) => void} [options.onReset]
    *   Synchronous: called once per reset, after the old open is invalid and before any
    *   replacement work can use the new one.
+   * @param {Map<object, object>} [options.openBindings] The run's map from each data connection to
+   *   the binding of the last opening fetch written on it, shared by all its node records.
    */
-  constructor({ operation, onReset = () => {} }) {
+  constructor({ operation, onReset = () => {}, openBindings = new Map() }) {
     this.operation = operation
     this.onReset = onReset
     this.epoch = 0
@@ -43,11 +45,23 @@ class ShareSession {
     this.closed = false
     this.resetStreak = 0
     this.binding = null
+    this.openBindings = openBindings
+    this.idlers = []
   }
 
   /** @returns {boolean} Whether a request runs or waits; a captured close skips a busy node. */
   get busy() {
     return this.active || this.queue.length > 0
+  }
+
+  /**
+   * @returns {Promise<void>} Resolves once no request runs or waits; at once when none does. A
+   *   request still running when the session retires settles through its operation, so this
+   *   resolves then as well.
+   */
+  whenIdle() {
+    if (!this.busy) return Promise.resolve()
+    return new Promise((resolve) => this.idlers.push(resolve))
   }
 
   /**
@@ -76,7 +90,10 @@ class ShareSession {
   drain() {
     if (this.active) return
     const entry = this.queue.shift()
-    if (!entry) return
+    if (!entry) {
+      for (const resolve of this.idlers.splice(0)) resolve()
+      return
+    }
     if (this.closed || entry.token !== this.token) {
       entry.reject(new KafkaJSNonRetriableError('Share session is no longer current'))
       this.drain()
@@ -155,6 +172,19 @@ class ShareSession {
   }
 
   /**
+   * Records a written opening fetch, before its reply, as the owner of its data connection,
+   * replacing any earlier open there: the broker keeps at most the last session opened on a
+   * connection. Entries whose socket is gone are dropped here.
+   * @param {object} binding The opening fetch's exact data binding.
+   * @returns {void}
+   */
+  trackOpen(binding) {
+    for (const [connection, open] of this.openBindings)
+      if (ShareSession.bindingLost(open)) this.openBindings.delete(connection)
+    this.openBindings.set(binding.connection, binding)
+  }
+
+  /**
    * Applies a current top-level answer exactly once: advances or wraps the epoch, updates the
    * model, or resets on a session error. Acknowledgements and records are the caller's job.
    * A final (epoch -1) answer is terminal and checked before any reset policy, so it never reopens.
@@ -202,6 +232,9 @@ class ShareSession {
    */
   applyFinal(request, response) {
     const policy = sessionAction(request.apiKey, response.errorCode)
+    const { binding } = this
+    if (policy.error === null && binding && this.openBindings.get(binding.connection) === binding)
+      this.openBindings.delete(binding.connection)
     this.model.clear()
     this.binding = null
     this.closed = true

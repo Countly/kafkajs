@@ -1,0 +1,11 @@
+--- a/scripts/protocol/javaVectors/GenerateAssignorVectors.java
++++ b/scripts/protocol/javaVectors/GenerateAssignorVectors.java
+@@ -865,7 +865,7 @@
+     List<PartitionInfo> partitions = new ArrayList<>();
+     for (String topic : spec.topics.keySet()) {
+       for (int partition = 0; partition < 4; partition++) {
+-        int rack = partition < 2 ? 1 : 0;
++        int rack = partition < 2 ? 0 : 1;
+         if (spec.caseId.equals("rack_balance")) rack = partition == 3 ? 0 : 1;
+         Node[] replicas = spec.caseId.equals("rack_all_replicas") ? nodes.toArray(new Node[0])
+             : new Node[] {nodes.get(rack), nodes.get(2)};

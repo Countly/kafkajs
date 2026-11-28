@@ -8,7 +8,8 @@ its documented entry points can be imported, and `import` resolves its own ESM e
 lists every behavior change a caller might actually notice, grouped by the part of your application
 it touches; each item says what changed and what, if anything, to do. The goal is that a change not
 listed here did not change observable behavior. Start with **Install and runtime**, then read the
-areas you use.
+areas you use. If you come from the Java or Go client instead, also read
+[Coming from the Java or Go client](#coming-from-the-java-or-go-client).
 
 ### Install and runtime
 
@@ -53,7 +54,7 @@ What to change to install the package and run it on a Kafka 4.x cluster.
   package's version. Operators watching a broker's `clientSoftwareName`/`clientSoftwareVersion`
   metrics or request logs will see this name where kafkajs 2.2.4 previously showed `unknown`.
 - **A closed connection's socket is destroyed, not ended.** A connection that closes (a timeout, a replaced or retired broker, `disconnect()`) now calls `socket.destroy()` where 2.2.4 called `socket.end()`. The default socket factory is unaffected. *What to do:* if you pass a custom `socketFactory` that returns a partial `net.Socket`, give it a `destroy()` method.
-- **Write IPv6 bootstrap hosts in brackets.** `brokers: ['[::1]:9092']` now works; `'::1:9092'` and an address without a valid port (1 to 65535) fail the first connect with `KafkaJSNonRetriableError` naming the address. *What to do:* bracket IPv6 literals and check the port of every entry of `brokers`, because every entry is now checked, not only the one in use.
+- **Write IPv6 bootstrap hosts in brackets.** `brokers: ['[::1]:9092']` now works; `'::1:9092'` and an address without a valid port (1 to 65535) fail the first connect with `KafkaJSNonRetriableError` naming the entry's position in the list, not the address text. A host may use only letters, digits, `.`, `_`, `-` and `%` (and `:` inside the brackets of an IPv6 literal), so a URL or an address with user info (`user@host:9092`) is refused before any connection is made. Write an internationalized host name in its ASCII (punycode) form. *What to do:* bracket IPv6 literals and check the host and port of every entry of `brokers`, because every entry is now checked, not only the one in use.
 
 - **Connection readiness timeout.** An omitted `connectionTimeout` now starts at 10000 ms and grows after consecutive physical setup failures at that address, with ±20% jitter, to `connectionTimeoutMax` (30000 ms). A successful ready resets it. A blackholed node therefore takes about 10, 20, 30, 30 and 30 seconds across five attempts, plus reconnect waits, about two minutes in total. A refused or reset connection still fails immediately. *What to do:* set `connectionTimeout: 1000` to restore exactly the old flat timeout value, or set an explicit base alone to another flat value. Setting `connectionTimeoutMax` opts into growth. The wider readiness boundary still applies.
 - **The readiness boundary.** The setup timeout covers TCP, TLS, ApiVersions and SASL. A stalled ApiVersions or SASL phase can now fail before `requestTimeout`, and the retriable connection error identifies the phase and node timeout. A directly opened Fetch socket's setup budget ends at TCP/TLS; its authentication uses the SASL cap. *What to do:* raise `connectionTimeout` or `connectionTimeoutMax` when successful readiness legitimately needs more time.
@@ -73,12 +74,17 @@ To use GSSAPI, install `kerberos@7.0.0` yourself. The client loads this optional
 
 - Remove the `kafkajs-snappy` registration to use the built-in codec, or keep it: yours wins. The built-in codec runs on the main thread (no native module), in short slices that yield to the event loop: about 100 MiB/s to decode, 40 MiB/s to encode
 - **Delivery deadlines also settle requests that are already on the wire.** `send()` and `sendBatch()` reject at the deadline instead of waiting for a late broker answer. Later work is fenced, and a late answer cannot resolve that send. There is no configuration escape. If the error says `outcome: 'unknown'`, the broker may already have the records and an application resend may duplicate them; `outcome: 'unsent'` is the positive evidence that no attempt carrying those records could have been written. With `enforceRequestTimeout: false`, an outstanding request can still retain its records until its answer or connection failure after the send has rejected.
-- If you relied on a send failing soon after a broker problem (the five default attempts nominally accumulate about 9 seconds of backoff, request time on top), set `deliveryTimeout` (at least `linger + requestTimeout`) or `retry: { retries: n }`. Code that matched `KafkaJSNumberOfRetriesExceeded` on a send now also sees `KafkaJSDeliveryTimeout`: match `e.type` or `e.cause`. Admin and consumer retries, and the retries of a transaction's own requests (`commit`, `abort`, `initTransactions`), are unchanged
+- If you relied on a send failing soon after a broker problem (the five default attempts nominally accumulate about 9 seconds of backoff, request time on top), set `deliveryTimeout` (at least `linger + requestTimeout`) or `retry: { retries: n }`. Code that matched `KafkaJSNumberOfRetriesExceeded` on a send now also sees `KafkaJSDeliveryTimeout`: match `e.type` or `e.cause`. Admin and consumer retries, and the retries of a transaction's own requests (`commit`, `abort`, and InitProducerId at connect and at a transaction's start), are unchanged
 - A producer that sends faster than the cluster accepts used to grow without bound; it now rejects with a retriable error you can back off on. Raise `bufferMemory` (up to `Number.MAX_SAFE_INTEGER`) or `maxBlockMs` if your bursts are larger. A single `send()` holding more than `bufferMemory` is rejected: split it. Admitted sends are charged at most `bufferMemory`, waiting sends (which keep their records) at most the same again, and each live batch a further 1 024 bytes on top (about 13.6× in the worst case of one empty record per batch, about 3× for records of 1 KiB or more); the bound is a charge, not RSS. **In a transaction, a refused `send()` means the transaction can no longer commit: catch it, `abort()`, and start a new transaction**
-- Do not rely on mutating a record you already passed to `send()`. Mutating the bytes of an uncopied `Buffer` still affects what is sent, as in 2.2.4. A view over a backing store larger than 16 KiB and more than 16 times the view's length is copied at the call. Treat records and Buffer bytes as immutable after passing them; pass a separate Buffer containing the same bytes if you need to change your original Buffer.
+- Do not rely on mutating a record you already passed to `send()`. Mutating the bytes of an uncopied `Buffer` still affects what is sent, as in 2.2.4. A view over a backing store larger than 16 KiB and more than 16 times the view's length is copied during the call, once every record of the send has been read; all such views of one send share one copy. Treat records and Buffer bytes as immutable after passing them; pass a separate Buffer containing the same bytes if you need to change your original Buffer.
 - A `send()` over about 1 MiB used to travel as one request and fail at the broker or close the connection; it is now split. A rejected split send may have written some of its records: resending it whole can duplicate those. Raise `maxRequestSize` to match the broker's `message.max.bytes` if you raised that. **Inside a transaction a size rejection now makes the transaction abort-only** (as Java's producer does for an `ApiException` from `send`): abort and begin a new one
-- Keyless records now stay on one partition until about `batchSize` bytes have gone to it, then move on, so batches are larger and fewer; the per-partition spread is even over time, not per record. To keep the previous placement use `createPartitioner: Partitioners.DefaultPartitioner`
+- `kafka.producer({ maxRequestSize: null })` now throws `KafkaJSInvalidConfigurationError`, like any other `maxRequestSize` that is not an integer in range. kafkajs 2.2.4 had no `maxRequestSize` option and ignored what was passed, `null` included: omit the option (or pass `undefined`) to take the default
+- Keyless records now stay on one partition until about `batchSize` bytes have gone to it, then move on, so batches are larger and fewer. With `adaptive: false` (or equal queues) the per-partition spread is even over time, not per record; the default weighs queues (next item) and may favor faster partitions. To keep the previous placement use `createPartitioner: Partitioners.DefaultPartitioner`
+- **The default partitioner weighs each partition's queue (adaptive partitioning, KIP-794).** When it picks the next partition for keyless records, a partition with more batches waiting is less likely, so a slow broker's partitions get fewer records, which reduces pressure on the buffer; a full buffer still refuses sends as described above. Keyed records and records with an explicit `partition` are placed as before. *What to do:* nothing; for the previous non-adaptive sticky behavior, pass `createPartitioner: Partitioners.UniformStickyPartitioner({ stickyBytes: 16384, adaptive: false })` with your `batchSize` as `stickyBytes` (16384 is the default `batchSize`)
 - **A producer forgets the metadata of topics it has not produced to, and has no work for, for `metadataMaxIdle` (300 000 ms).** Nothing to change; the first send to a forgotten topic loads its metadata again.
+- **Sends no longer wait at the `metadataMaxAge` mark.** When the cached metadata names every topic the producer targets (each topic it has sent to and not yet forgotten after `metadataMaxIdle`), metadata older than `metadataMaxAge` is refreshed in the background while the send uses the known leaders. New partitions of a known topic are picked up after that background refresh, not by the send that noticed the age. Nothing to change; a send to an unknown topic still waits for its metadata.
+- **The error for a record without a `value` names the topic and the record's zero-based index.** It reads `Invalid message without value for topic "t" at index 1` and no longer prints the record. It is still a `KafkaJSNonRetriableError`. If you match the full error message, update your match to this format.
+- **A send to a deleted topic may end with a missing-metadata error.** After a producer reconnect or a metadata rebootstrap, a fresh send to an earlier target that the broker has deleted can reject with `KafkaJSNumberOfRetriesExceeded` caused by `KafkaJSMetadataNotLoaded`, where kafkajs 2.2.4 reported `UNKNOWN_TOPIC_OR_PARTITION`. Sends to other topics proceed. Once no send owns the refused target it is dropped, and a later send adds it again and receives its own metadata refusal. Do not rely on every failed send to a deleted topic carrying the broker's topic error.
 
 
 Producers are idempotent by default and gather sends into batches; each item says what you may
@@ -91,14 +97,33 @@ notice and what, if anything, to do.
   *What to do:* nothing, unless you relied on unbounded pipelining; `maxInFlightRequests: null`
   restores it (and turns idempotence off for a producer — see the producer items).
 
-- **Produce errors carry per-record detail.** The error thrown by a failed `send()`/`sendBatch()`
-  now carries `topic`, `partition`, the broker's own `errorMessage`, and, when the broker rejected
-  individual records rather than the whole partition, `recordErrors`: an array of
-  `{ batchIndex, record, errorMessage }`, where `record` is the message object you passed in, not a
-  copy or an index into a flattened list. `type`, `code` and `retriable` are unchanged. Which
-  failure is reported is also unchanged — the first failing partition in the response, exactly as
-  before — and there is still no automatic re-batching: a batch containing one rejected record
-  fails as a whole, as it always did.
+- **Produce errors carry per-record detail.** When a matched broker answer identifies at least
+  one record of a failed batch, each participating `send()` or `sendBatch()` gets a fresh native
+  `KafkaJSProtocolError`. An idempotent delivery timeout around that answer gives each send a
+  fresh `KafkaJSDeliveryTimeout` with its own protocol error as the cause. The errors preserve
+  `name`, `message`, `type`, `code`, `retriable`, and `category`. The protocol error also
+  preserves `topic`, `partition` and the broker's `errorMessage`, including null versus absent.
+  The timeout preserves its delivery `outcome`. A cause wrap with matching retriability preserves
+  the category. Routing hints stay on the producer's internal error.
+
+  The protocol error has its own `recordErrors` array, created and cached on first read.
+  `batchIndex` identifies a position in the batch sent to Kafka. The array follows broker order,
+  including duplicate and unresolved indices. Only entries for records owned by this send gain
+  `record`, with detached key, value and header bytes as `Buffer`s. The other entries are shared
+  and frozen. `record.timestamp` is the decimal string of a truthy supported snapshot timestamp.
+  The snapshot normalizes a `Date` or an object with a bigint `value` to a string, so epoch zero
+  in either form is `'0'`. Numeric zero, `0n`, a `null` or omitted timestamp and other timestamp
+  objects omit `record.timestamp`. An empty string is not a timestamp: `send` refuses it with a
+  `KafkaJSInvalidConfigurationError` before the record joins a batch, so no record carries one.
+
+  Whole-request failures, exhausted retries, plain-producer delivery timeouts, ambiguous answers
+  and other failures that cannot be attributed keep the existing error or retry/deadline wrapper
+  and raw entries. The transaction's armed error also keeps its identity. Failure selection and
+  the scope of the failed batch stay the same.
+
+  *What to do:* Treat `stack` as lazily formatted diagnostic text with unspecified frames.
+  If you match stack text, switch to the error class, `type`, `code` or `category`. Each fresh
+  error has its own construction stack.
 
 - **The producer follows leader hints.** When a produce request fails with a leadership error, a
   Kafka 4.x broker also names the node that now leads the partition and, where the client may not
@@ -122,7 +147,14 @@ notice and what, if anything, to do.
   id and the sequence numbers; it does not restore 2.2.4's send path, which every producer shares
   (the accumulator and per-partition retry items below). If you check `producer.isIdempotent()`,
   read it after `connect()`.
-  At `linger: 0`, an awaited single `send()` of an idempotent producer takes about 2 % longer
+  An idempotent producer keeps one batch of each partition in flight at a time. 2.2.4's default,
+  non-idempotent producer sent every `send()` as its own request, so concurrent sends to one
+  partition could all be in flight together; now one busy partition carries at most one batch,
+  up to `batchSize` (16384 bytes by default), per round trip, and a backlog above that fills
+  `bufferMemory` until sends reject with `KafkaJSBufferExhaustedError`. If one hot partition
+  needs more, raise `batchSize` (and `bufferMemory`), pass arrays of messages per `send()`, or
+  spread the records over more partitions: see "Running at high throughput" in the producing guide.
+  At the default `linger` of 0, an awaited single `send()` of an idempotent producer takes about 2 % longer
   (about 30 µs on a 1.5 ms send) than with `idempotent: false`, which removes that cost and gives
   up the protection against duplicates and reordering on retry.
 
@@ -218,20 +250,20 @@ notice and what, if anything, to do.
   *What to do:* match results by `topicName`/`partition` rather than by array index. A
   single-partition send is unaffected; so is any caller that already reads the fields.
 
-- **Every producer gathers sends into batches, so a `send()` may wait up to 5 ms before its
-  request leaves.** The accumulator is on for every producer, idempotent or not, with the Java
-  client's defaults: `linger` 5 ms (Java's `linger.ms` moved from 0 to 5 in Kafka 4.0) and
+- **Sends made in the same turn of the event loop are merged into one request.** The accumulator
+  is on for every producer, idempotent or not, with `linger` 0 (the Java client's is 5 ms) and
   `batchSize` 16384 bytes of keys and values. In 2.2.4 every `send()` and `sendBatch()` was its own
-  request; now the records of sends made within `linger` of each other to one topic-partition
-  share a batch, a batch goes out once it reaches `batchSize`, and one `send()` or `sendBatch()`
-  usually makes one Produce request per broker: its records that join a batch an earlier send
-  began leave with that batch, so one call can reach a broker in two requests. On an idempotent
-  producer a partition's next batch also keeps gathering sends while the batch before it waits for
-  its answer.
-  *What to do:* nothing for code that sends without awaiting each send. Code that awaits every
-  `send()` before the next one waits up to `linger` each time: pass `linger: 0`, which sends at
-  once, with no timer, and on an idempotent producer still merges the sends that queue behind a
-  partition's batch in flight.
+  request; now a lone `send()` leaves at once, with no timer, but the records of sends made in the
+  same turn to one topic-partition share a batch, a batch goes out once it reaches `batchSize`, and
+  one `send()` or `sendBatch()` usually makes one Produce request per broker: its records that
+  join a batch an earlier send began leave with that batch, so one call can reach a broker in two
+  requests. On an idempotent producer a partition's next batch also keeps gathering sends while
+  the batch before it waits for its answer.
+  *What to do:* nothing for most code; an awaited `send()` takes one round trip, as in 2.2.4. To
+  batch more under many independent callers that send to the same partitions, pass a `linger`
+  above 0 (for example `linger: 5`): a batch then waits up to that long for more records, so a lone
+  send takes up to `linger` ms longer, and an explicit `deliveryTimeout` must be at least
+  `linger + requestTimeout`.
   No setting restores one request per `send()`; the Java client has none either.
 
 - **Sends to one topic-partition can share a batch, and then succeed or fail together.** A batch
@@ -252,12 +284,15 @@ notice and what, if anything, to do.
   `KafkaJSInvalidConfigurationError` instead, and fixes the record.
 
 - **`producer.disconnect({ timeout })` delivers earlier sends and aborts an open transaction.**
+
+- **A producer `connect()` that waits for a `disconnect()` in progress rejects with `KafkaJSNonRetriableError` if another `disconnect()` is called before it starts.** Such a call waits until the close in progress finishes. If another valid `disconnect()` is called while it waits, whether it joins that close or is called after that close has finished, the waiting `connect()` is cancelled: it rejects with `KafkaJSNonRetriableError` (`retriable: false`), emits no `CONNECT`, opens no connection and sends no `InitProducerId`; the producer stays disconnected. An invalid `disconnect()` (a bad `timeout`) rejects on its own and does not cancel the waiting call. In 2.2.4 `connect()` did not wait for a close and a later `disconnect()` never made it reject. *What to do:* catch `KafkaJSNonRetriableError` from a `connect()` made during shutdown and treat it as cancelled by that shutdown. To reconnect on purpose, await every `disconnect()` first, then call `connect()` again.
   Call `commit()` first if you intend to commit. Without `timeout`, shutdown waits naturally for
   delivery, transaction cleanup and connection draining; a blackholed request can leave it
   unbounded when `enforceRequestTimeout` is false. For a hard shutdown limit, use
   `await producer.disconnect({ timeout: 10000 })`. At the deadline, never-written sends reject
   with `KafkaJSProducerClosedError` and `outcome: 'unsent'`; sends written at least once have
-  `outcome: 'unknown'`. An unknown commit stays pending and is never aborted by forced close.
+  `outcome: 'unknown'`, and so does a send only some of whose records were written before the
+  close. An unknown commit stays pending and is never aborted by forced close.
   Concurrent disconnects share the first call's timeout. A second call after close completed
   does nothing until an explicit `connect()`: it no longer sends an unknown commit again.
   After reconnect, resolve that commit explicitly with `commit()`, or replace the producer.
@@ -265,15 +300,14 @@ notice and what, if anything, to do.
 - **`deliveryTimeout` counts the wait for `linger` and for the producer id.** A send's deadline
   starts when the send is made, as the Java client's does, so the `linger` wait - and on an
   idempotent producer the `InitProducerId` wait - count against it. An explicit
-  `deliveryTimeout` must be at least `linger + requestTimeout`: 30005 ms with both defaults.
+  `deliveryTimeout` must be at least `linger + requestTimeout`: 30000 ms with both defaults.
   When `deliveryTimeout` is unset, an explicit `retry.maxTotalTime` may be below that sum.
   *What to do:* nothing unless you set `deliveryTimeout`, new in 3.0.0: give it at least
   `linger + requestTimeout`.
 
-- **Two opt-ins, neither on by default**: `Partitioners.UniformStickyPartitioner`;
-  and `leaderEpoch` on the partitions given to `sendOffsets`.
-  *What to do:* nothing; leaving them unset changes nothing beyond what the other items describe.
-- **A broker's waiting batches leave together.** When one batch's `linger` runs out, the other
+- **One opt-in, off by default**: `leaderEpoch` on the partitions given to `sendOffsets`.
+  *What to do:* nothing; leaving it unset changes nothing beyond what the other items describe.
+- **A broker's waiting batches leave together (with a `linger` above 0).** When one batch's `linger` runs out, the other
   waiting batches for the same broker (same `acks`, `timeout` and `compression`) leave with it,
   possibly before their own `linger`, so sends made a few milliseconds apart to partitions of one
   broker are one request. Pulling a batch forward adds no batching delay, but `linger` sets when a
@@ -283,10 +317,32 @@ notice and what, if anything, to do.
   `0`/absent for the send time (numeric `0`, `0n` and absent still mean the send time; the string
   `'0'` and `new Date(0)` are the literal epoch).
 
+- **A custom partitioner that returns an invalid partition now rejects the send.** 2.2.4
+  resolved such a send and dropped the records whose partition was not a partition of the topic.
+  3.0.0 rejects it with `KafkaJSInvalidConfigurationError` before anything is queued. The value
+  must be an integer from 0 to 2147483647, as a number or a canonical decimal string. The built-in
+  partitioners return an explicit `message.partition` as it is, so a message with an invalid
+  `message.partition` is rejected the same way. *What to do:* make the partitioner return a
+  partition id, and give messages only valid `partition` values.
+
 ### Transactions
 
 Transactions move to the transaction protocol Kafka 4.x brokers speak, and a failed send now ends a
 transaction in a way its error decides.
+
+- **A seek can now make a transaction abort-only.** `transaction.sendOffsets()` called from a
+  consumer handler, or from work it started, with that handler's group and partition among the
+  offsets (with `consumerGroupMetadata` or `consumerGroupId`) ties the transaction to that batch.
+  If a seek of the partition, a topic recreation or the end of the batch's assignment supersedes
+  the batch before the commit `EndTxn` is written, `sendOffsets()` or `commit()` rejects with
+  `KafkaJSTransactionAbortableError` (cause: `KafkaJSCommitFailedError`, `reason:
+  'stale-assignment'`). The whole offset set is refused, never a filtered subset, and a fresh
+  `sendOffsets()` cannot repair the transaction. *What to do:* a handler that seeks its own
+  partition must commit or abort its transaction first, then seek; after such a refusal, `abort()`
+  and process the records again in a new transaction, from a handler of a batch fetched after the
+  seek. Offsets sent outside any handler, for another partition or another group are not fenced.
+  A commit `EndTxn` already written is never turned into an abort by a later seek: retry an
+  unknown commit outcome as before.
 
 - **A consumer resolving its position waits for open transactions** (KIP-447). Every `OffsetFetch`
   a consumer sends to find its committed offsets now asks for stable offsets (`RequireStable`),
@@ -309,6 +365,12 @@ transaction in a way its error decides.
   stays ready and the next `transaction()` tries again. *What to do:* nothing if you already
   handle a rejected `transaction()` — it could reject in 2.2.4 too, for example on its first
   InitProducerId.
+
+- **A transaction coordinator that cannot be found no longer ends the producer.** `commit()`
+  rejects with a retriable error (its `cause` is the discovery error) and can be called again;
+  `abort()` resolves; offset or partition registration makes the transaction abort-only.
+  Transactional-id authorization and producer fencing errors stay fatal; group authorization failures remain
+  abortable.
 
 - **Transactions use the transaction protocol version 2 on Kafka 4.x clusters** (KIP-890). The
   producer reads the cluster's `transaction.version` feature from the transaction coordinator at
@@ -349,8 +411,9 @@ transaction in a way its error decides.
   (KIP-360) when the transaction was abort-only, as the Java client does, or when it cancelled a
   batch that had already been sent once; under either version it does so when its own `EndTxn`
   failed. A send refused before any record was queued — for its own arguments (an empty topic, a
-  message without a value, a record that cannot be encoded) or by a custom partitioner that threw —
-  leaves the transaction as it was.
+  message without a value, a record that cannot be encoded) or by a custom partitioner that threw
+  (whatever it threw, a KafkaJS error class included, also when the send ran out of retries or of
+  its delivery deadline while the partitioner kept failing) — leaves the transaction as it was.
   *What to do:* wrap the transaction in `try` and, on any error but a retriable one from `commit()`
   (see the item on a commit whose outcome is unknown), `abort()` first. A send rejects
   with its own error — the broker's, such as a `KafkaJSProtocolError` with code 90 when another
@@ -456,9 +519,15 @@ The following limits belong to the share consumer. There is no callable synchron
 
 - **Unsubscribed-topic instrumentation is classic-only.** With `groupProtocol: 'consumer'`, assignments outside the round subscription are still filtered, but no longer emit `RECEIVED_UNSUBSCRIBED_TOPICS` or its warning. *What to do:* update event-count assertions and monitoring that expect this signal under the consumer protocol; debug logs record the filtered names. Classic consumers keep the event and warning.
 
+- **An offset answer that does not match the request is refused.** An OffsetFetch answer for named topics that misses a requested partition, names one that was not requested, names one twice or spreads a topic over more entries than the request had is refused with a retriable `KafkaJSError`; a ListOffsets answer is held to the same partition rules and may not carry an offset below -1, but it is not limited in how many entries it fills for one topic: only the OffsetFetch topic selection refuses a topic split over more entries than the request had. kafkajs 2.2.4 used such answers as they came: `admin.fetchOffsets()` returned the rows as given, and the consumer left a missing partition unresolved or read a foreign topic into its offset reset. The consumer reads again, as for any retriable error. `admin.fetchOffsets()`, `admin.fetchTopicOffsets()` and `admin.fetchTopicOffsetsByTimestamp()` reject at once. `consumer.committed()` (new in 3.0.0, not in 2.2.4) reads again within `retry`; when every attempt gets such an answer it rejects with `KafkaJSNumberOfRetriesExceeded`, which is not retriable and has the retriable `KafkaJSError` as its `cause`; the error names the topic, and the partition when the failure concerns one. A spent `retry.maxTotalTime` or call deadline ends the call with its own error instead. *What to do:* handle `KafkaJSNumberOfRetriesExceeded` from `committed()` and read `error.cause` for the topic and partition.
+
 - **An uncommitted offset has null metadata.** `consumer.committed()` now returns `metadata: null` whenever `offset` is null; committed offsets still preserve stored metadata, including the empty string. *What to do:* use `offset === null` to detect the absence of a commit and update assertions that expected empty or synthetic metadata there.
 
-- **A handler's explicit commit that is still waiting when you call `stop()` or `disconnect()` can reject with `CONSUMER_STOPPING`.** In 2.2.4, `stop()` waited for the batch, and a `commitOffsets()` the handler had already started could still finish. Here, stop ends the handler's API authority at once. A handler's explicit `commitOffsets()` that is still waiting for the group coordinator at that point (for example while a heartbeat's coordinator lookup is pending) may reject with `CONSUMER_STOPPING`, with no promise that it completes. If the handler does not catch the rejection it becomes the handler's error, and the batch can be redelivered. Offsets committed before the stop began stay committed. Calls from outside the handlers, and the commit that a close hook makes, may still complete. *What to do:* if a commit must finish, drain your handlers and await the commit before you call `stop()` or `disconnect()`; or catch `CONSUMER_STOPPING` in the handler and treat that batch as unconfirmed, because it is replayed after the next start.
+- **A handler's explicit commit that is still waiting when you call `stop()` or `disconnect()` can reject with `CONSUMER_STOPPING`.** In 2.2.4, `stop()` waited for the batch, and a `commitOffsets()` the handler had already started could still finish. Here, stop ends the handler's API authority at once. A handler's explicit `commitOffsets()` that is still waiting for the group coordinator at that point (for example while a heartbeat's coordinator lookup is pending) may reject with `CONSUMER_STOPPING`, with no promise that it completes. If the handler does not catch the rejection it becomes the handler's error, and the batch can be redelivered. Offsets committed before the stop began stay committed. The commit that a close hook makes may still complete. A `commitOffsets()` called from outside the handlers while the consumer was running may still complete too; if it fails after the stop began, or after the run crashed, it now rejects with `CONSUMER_STOPPING`, with the failure as `cause` when one was raised and no `cause` after a forced close, an expired close deadline or an expired `retry.maxTotalTime`; with or without a `cause` the commit may already have reached the broker (a lost membership still rejects with its own `KafkaJSCommitFailedError`). In 2.2.4 such a call resolved although nothing was committed. A `commitOffsets()` that starts after the stop began sends nothing and rejects (next item). *What to do:* if a commit must finish, drain your handlers and await the commit before you call `stop()` or `disconnect()`; or catch `CONSUMER_STOPPING` and treat those offsets as unconfirmed, because they are replayed after the next start.
+
+- **`commitOffsets()` no longer resolves when it sent nothing.** In 2.2.4, a `commitOffsets()` called while `stop()` or `disconnect()` was in progress, while a crashed run was being cleaned up, or before `run()` had finished starting resolved although nothing was committed. It now rejects: with `CONSUMER_STOPPING` during a stop or a crash cleanup, and with `KafkaJSNonRetriableError` while the consumer is still starting. After an awaited `stop()` it rejects with "Consumer group was not initialized", as before. An empty offsets list commits nothing and still resolves. This also reaches handler code: a `commitOffsets()` that a handler (for example an `eachMessage` with `autoCommit: false` that commits per message) starts after `stop()` or `disconnect()` began now rejects with `CONSUMER_STOPPING`, where 2.2.4 resolved without sending. If the handler does not catch it, it becomes the handler's error; the consumer treats it as part of the stop, not as a crash. The batch is replayed after the next start either way, because its offsets were not committed. *What to do:* await the commit before you call `stop()`, await `run()` before the first commit, and add a `.catch` to any `commitOffsets()` you do not await. In a handler that must not throw, catch `CONSUMER_STOPPING` from `commitOffsets()` (the offsets stay uncommitted), or stop committing once your own code has begun the stop.
+
+- **A `connect()`, `run()` or `assign()` that waits for a `disconnect()` in progress rejects with `CONSUMER_STOPPING` if another `disconnect()` is called before it starts.** Such a call waits until the close in progress finishes. If another valid `disconnect()` is called while it waits, whether it joins that close or starts a new one, the waiting call is cancelled: it rejects with `CONSUMER_STOPPING` and joins no group and opens no connection. An invalid `disconnect()` (a bad `timeout` or `leaveGroup`) rejects on its own and does not cancel the waiting call. In 2.2.4 these calls did not wait for a close and a later `disconnect()` never made them reject. *What to do:* catch `CONSUMER_STOPPING` from a `connect()`, `run()` or `assign()` made during shutdown and treat it as cancelled by that shutdown. To reconnect on purpose, await every `disconnect()` first, then call `connect()` or `run()` again.
 
 Rebalancing, fetching, committing and group membership, for the classic protocol and, where an item
 says so, `groupProtocol: 'consumer'`.
@@ -471,13 +540,15 @@ says so, `groupProtocol: 'consumer'`.
   invoked only for errors KafkaJS considered retriable, so a callback that returned `true` or
   `false` for a non-retriable error was silently ignored. If you never set it, nothing changes: the
   default is still "restart on retriable errors, stop on non-retriable ones". If the consumer is
-  stopped or disconnected while the callback is still deciding, no restart is scheduled. A fenced
+  stopped or disconnected after the run failed, whether before the crash is reported, during its
+  cleanup or while the callback is still deciding, no restart is scheduled. A fenced
   static member (`FENCED_INSTANCE_ID`, 82) and, under `groupProtocol: 'consumer'`, a fatal
   membership error never restart, whatever the callback returns (see "A fatal membership error
   never restarts under `groupProtocol: 'consumer'`"). *What to do:* check that a
   `restartOnFailure` you already pass returns what you want for non-retriable errors too.
-  A public disconnect that completes during crash cleanup also cancels the pending restart. The crash event reports `restart: false`; a later explicit connect/run can reuse the consumer.
-  A `consumer.disconnect()` that a `CRASH` listener makes does not cancel the restart, as in 2.2.4: the event has already reported `restart: true`, and the restart waits for that close to finish before the new run starts. That differs from the disconnect above, which finishes before `CRASH` is emitted, so the event reports `restart: false`. A forced close (`disconnect({ timeout: 0 })`), a close whose `timeout` expires, and any `stop()` or `disconnect()` asked after the restart is armed still cancel it, as does an explicit `run()`, which supersedes a pending automatic restart.
+  When a stop or disconnect cancels the restart this way, the `CRASH` event reports `restart: false`; a later explicit connect/run can reuse the consumer.
+  A `consumer.disconnect()` that a `CRASH` listener makes does not cancel the restart, as in 2.2.4: the event has already reported `restart: true`, and the restart waits for that close to finish before the new run starts. That differs from the disconnect above, which is asked before `CRASH` is emitted, so the event reports `restart: false`. A forced close (`disconnect({ timeout: 0 })`), a close whose `timeout` expires, and any `stop()`, `unsubscribe()` or `disconnect()` asked after the restart is armed, including one made from the `Restarting the consumer in …` log line, still cancel it (2.2.4 restarted after a `stop()` or `disconnect()` made from that line), as does an explicit `run()` once it is admitted, which supersedes a pending automatic restart; an admitted `run()` made before `CRASH` is emitted makes it report `restart: false`, and a `run()` refused because the consumer is still running, or rejected for an invalid `partitionsConsumedConcurrently`, changes nothing.
+- **A `run()` made while a crashed run is still being cleaned up now starts a run.** In 2.2.4 it returned at once with the warning `consumer#run was called, but the consumer is already running` and started nothing. It now waits for that cleanup and then starts the run, also when `CRASH` reported `restart: false`, and supersedes the automatic restart. A `connect()` made then waits too, instead of connecting and being disconnected by the cleanup. The wait has no deadline of its own: it ends when the crashed run's stop ends, which waits for a handler still running. *What to do:* if a supervisor calls `run()` on a timer or a health check, check `CRASH`'s `restart` before calling it when a non-restartable crash must leave the consumer stopped.
 
 - **`groupInstanceId` makes a static member that does not leave the group on
   `consumer.disconnect()`.**
@@ -613,7 +684,12 @@ says so, `groupProtocol: 'consumer'`.
   backoff — and is not governed by your `retry` options; if it has not resolved by then, the round
   fetches that partition unvalidated rather than stalling. Partitions whose epoch did not change are
   fetched throughout. In practice this is a latency change measured in milliseconds, visible only
-  around leader elections and at the first fetch of a new assignment, and never a stall.
+  around leader elections and at the first fetch of a new assignment. Each of its requests waits
+  for an answer up to `requestTimeout`, like any other request, and without a limit when
+  `enforceRequestTimeout` is false.
+
+- **`maxPollInterval` must be an integer from 1 to 2147483647; other values throw when the consumer
+  is created.**
 
 - **The rebalance timeout default changes from 60 s to 5 minutes.** The rebalance timeout sent to
   the coordinator is now the new `maxPollInterval` option, which defaults to 300000 ms and matches
@@ -622,13 +698,24 @@ says so, `groupProtocol: 'consumer'`.
   old 60 s rebalance timing, set `rebalanceTimeout: 60000`** — the legacy option still goes on the
   wire unchanged, and it never becomes a handler deadline below 5 minutes (see "`rebalanceTimeout`
   is deprecated, and it does not become your eviction deadline."). Setting `maxPollInterval: 60000`
-  instead would also shorten your handler deadline to 60 s, which is usually not what you want. One
-  related timing does change if you had raised the rebalance timeout above 60 s: the client-side
-  timeout on the SyncGroup request is now capped at 65 s, where it used to follow the rebalance
-  timeout, so a `rebalanceTimeout: 120000` waits 65 s for the assignment instead of 125 s. That is
-  what the Java client sends. If your group leader genuinely needs longer to compute an assignment,
-  raise the client-wide `requestTimeout`, which still raises this one with it. At the default
-  nothing changes: it was 65 s and it stays 65 s. The JoinGroup request goes the other way: its
+  instead would also shorten your handler deadline to 60 s, which is usually not what you want. SyncGroup's
+  per-request allowance follows this member's rebalance timeout plus 5 s; the rebalance round
+  deadline that started at round entry can end the operation sooner. The coordinator holds a
+  follower's SyncGroup until the leader has computed and sent the assignment, so with
+  `t = rebalanceTimeout || sessionTimeout` the allowance is
+  `max(requestTimeout, Number.isSafeInteger(t + 5000) ? t + 5000 : t)`. That is 305 s at the
+  defaults and 125 s with `rebalanceTimeout: 120000`; kafkajs 2.2.4 used the plain
+  `requestTimeout` (30 s by default); the Java client also uses `request.timeout.ms`. The allowance does not extend the rebalance: the round that
+  started before the JoinGroup keeps its original deadline (`maxPollInterval`, or the legacy
+  `rebalanceTimeout`) and ends a SyncGroup that outlives it, and a peer's larger rebalance budget
+  is neither learned nor covered. The cost is that a coordinator which accepts a SyncGroup and
+  then goes silent can remain undetected until the round ends (about five minutes at the
+  defaults rather than about one), although another request on the same connection can fail
+  sooner. `consumer.crash` is reported after the consumer's cleanup, which may wait for the
+  transport to drain, so treat the 305 s figure as an allowance, not as a deadline for the crash
+  event. A closed or reset connection still fails at once, and `disconnect({ timeout })` still
+  bounds a close while a SyncGroup is parked. To detect a silent coordinator sooner, lower
+  `maxPollInterval`. The JoinGroup request is sized the same way: its
   client-side timeout is `maxPollInterval + 5000`, so 305 s at the default where 2.2.4 gave 65 s. A
   JoinGroup is held open by the coordinator until every member has rejoined, so the client has to be
   willing to wait out the whole rebalance timeout — the Java client sizes it the same way — but a
@@ -813,7 +900,14 @@ says so, `groupProtocol: 'consumer'`.
   - **`consumer.commitOffsets(offsets)`**, and `commitOffsetsIfNecessary(offsets)` with your own
     payload, still fail: they reject with a non-retriable error whose message begins `OffsetCommit
     failed with stale member epoch.` and whose `type` is `STALE_MEMBER_EPOCH`. Handle it as you would
-    any other commit failure — retrying it yourself under the same epoch cannot succeed.
+    any other commit failure. Each new attempt is built with the latest positive epoch the
+    heartbeats have installed, and can still draw 113 if the coordinator moves the epoch again.
+
+  A commit is never sent under a member epoch of 0 or below (a member that is joining, or one that
+  has left): it is refused before it is written, an automatic commit is skipped, and
+  `consumer.commitOffsets()` rejects with `KafkaJSCommitFailedError` (reason `stale-assignment`).
+  This keeps a commit that is still retrying when the consumer leaves from overwriting the offsets
+  of the final commit.
 
   An `OffsetFetch` rejected the same way is re-sent under whatever epoch the heartbeats have
   installed by then, for up to the rebalance timeout, so a first fetch of committed offsets around a
@@ -836,6 +930,8 @@ says so, `groupProtocol: 'consumer'`.
   sends epoch −1 instead, which removes the member (see "`consumer.disconnect({ leaveGroup })`
   overrides how a member leaves its group").
 
+With consumer group protocol, after a fatal heartbeat the consumer waits for in-flight handlers for up to the resolved maxPollInterval from receipt, or a shorter explicit disconnect deadline. Cleanup and crash reporting can proceed while an old handler promise is still pending. After retirement its commit and heartbeat calls fail locally with CONSUMER_STOPPING. The loss is delivered once to onPartitionsLost (or onPartitionsRevoked when lost is absent) at that deadline, without waiting for the handler. The crash cleanup, `CRASH` and a `disconnect()` joining it wait for that callback to settle, or for the rebalance timeout or an earlier deadline of the first `disconnect({ timeout })` to retire it; the consumer can then run again, and the retired callback's later client calls are refused. A run started after that crash does not wait for the old handler, which can still be running: wait for it yourself if two handlers must not process one partition at once.
+
 - **A fatal membership error never restarts under `groupProtocol: 'consumer'`.** These conditions
   will be answered the same way by every rejoin, so the consumer stops instead of looping: the group
   is at its configured size limit (`GROUP_MAX_SIZE_REACHED`, 81), the static instance id is still
@@ -843,7 +939,7 @@ says so, `groupProtocol: 'consumer'`.
   exist (`UNSUPPORTED_ASSIGNOR`, 112), the subscription regex is one the broker will not accept
   (`INVALID_REGULAR_EXPRESSION`, 128), the caller is not authorized for the group
   (`GROUP_AUTHORIZATION_FAILED`, 30), the coordinator rejected the request as malformed
-  (`INVALID_REQUEST`, 42), a duplicate `groupInstanceId` fenced this member (`FENCED_INSTANCE_ID`,
+  (`INVALID_REQUEST`, 42), a current heartbeat answered `GROUP_ID_NOT_FOUND` (69) while the member is still in the group or answered with any other error code the heartbeat does not handle (an unrecognized broker error included), a duplicate `groupInstanceId` fenced this member (`FENCED_INSTANCE_ID`,
   82), or the cluster does not implement the consumer protocol at all. Each emits `CRASH` with
   `restart: false` **regardless of `retry.restartOnFailure`** — a callback returning `true` does not
   bring the consumer back. What to do: fix the ACL, the configuration, the assignor name, the
@@ -953,14 +1049,18 @@ says so, `groupProtocol: 'consumer'`.
   configuration change. A value of `2` or more is rejected at construction rather than clamped.
   See [Prefetching](Consuming.md#prefetching).
 - **A seek or commit made while the consumer is still resolving its initial offsets now wins.** It is no longer overwritten by the older answer. Nothing to change in code; the documented guarantees of `docs/Consuming.md` now hold. If you relied on the older answer overwriting your seek or commit, do the seek or commit again.
-- **Sentinel seeks select an explicit boundary.** `consumer.seek({ topic, partition, offset: '-2' })` selects earliest and `offset: '-1'` selects latest on the next resolution, regardless of the subscription's `fromBeginning` setting or `autoCommit`. The following fetch uses the concrete offset returned by ListOffsets. Sentinel seeks change the local position and do not commit a negative sentinel. Concrete-offset seeks retain their existing commit behavior. *What to do:* choose the sentinel for the boundary you intend; do not rely on the subscription default to reinterpret it. If you need a durable group offset change, commit the intended concrete offset explicitly. `admin.setOffsets()` and `admin.resetOffsets()` are not affected: they still store `-1` and `-2` as the group offset. A sentinel commit the coordinator rejects now rejects the `setOffsets` or `resetOffsets` call with that error, after the admin's internal consumer has stopped; 2.2.4 resolved the call without storing the offset.
+- **A seek fences the batches fetched before it.** After `consumer.seek()`, a handler still working on an older batch of that partition, and any work it started, can no longer resolve or commit its offsets, also when the seek fails. Explicit commits from it (`commitOffsetsIfNecessary(offsets)`, `consumer.commitOffsets()`) reject with `KafkaJSCommitFailedError` with `reason: 'stale-assignment'`; treat that as "this batch's offsets are obsolete", not as a rebalance, and do not retry it from the same handler. A seek does not stop a handler that is already running; a seek made from a `consumer.start_batch_process` listener keeps that batch from the handler. `isStale()` now stays true for a batch fetched before a seek of its partition (2.2.4: only while the seek was queued); a rebalance alone does not make it true. As in kafkajs 2.2.4, a seek whose commit fails is not applied and not retried; in version 3 the partition then stays exactly where it was (position, committed offset, halt), the failure rejects `position()` and the fetch loop logs one warning or handles it as any fetch error. *What to do:* await `position()` after `seek()` when the seek must take effect, and call `seek()` again if it rejects. Two seeks of one partition are applied one after the other: the second waits until the first one's commit has been answered, timed out or closed with its connection. If you deliberately committed an older batch's offsets after seeking, commit them from code outside the handler instead. A commit already sent before the seek can still land on the broker, so drain or cancel outstanding work before seeking if that matters.
+- **Batch events for a record batch emptied by compaction, and a new optional field in the low-level Fetch result.** When every record of the batches a Fetch returned is gone or below the fetch offset, but the last complete record batch ends beyond it, the consumer now resolves to that record batch's last offset instead of staying put (or moving one offset per fetch). `consumer.start_batch_process` and `consumer.end_batch_process` therefore fire for some batches that were silent in 2.2.4, with `batchSize` 0 and the record batch's last offset as `lastOffset` (and a different `offsetLag`); such a batch is never passed to `eachBatch`. A listener that counts these events or reads `lastOffset` should expect the extra events. A direct `broker.fetch()` caller, or a custom partition assigner that does, sees the optional partition properties `nextBatchOffset` and `nextBatchLeaderEpoch` on a decoded partition that ends in a complete record batch; a partition without a complete record batch does not have them.
+- **`consumer.commit_offsets` listeners get a copy.** The event payload is the request as sent and the listener's own copy down to each offset cell. kafkajs 2.2.4 handed out the cells it then cached, so a listener that changed an offset in place changed where the consumer read next. Do not rely on changing the payload.
+- **Pass an integer partition id to `consumer.seek()` and `admin.setOffsets()`.** kafkajs 2.2.4 silently ignored a seek with a partition such as the string `'0'`, `-1` or `1.5`; version 3 throws `KafkaJSNonRetriableError` before changing any consumer state (`admin.setOffsets` rejects before it sends any request).
+- **Sentinel seeks select an explicit boundary.** `consumer.seek({ topic, partition, offset: '-2' })` selects earliest and `offset: '-1'` selects latest on the next resolution, regardless of the subscription's `fromBeginning` setting or `autoCommit`. The following fetch uses the concrete offset returned by ListOffsets. Sentinel seeks change the local position and do not commit a negative sentinel. Concrete-offset seeks retain their existing commit behavior. *What to do:* choose the sentinel for the boundary you intend; do not rely on the subscription default to reinterpret it. If you need a durable group offset change, commit the intended concrete offset explicitly. `admin.setOffsets()` and `admin.resetOffsets()` are not affected: they still store `-1` and `-2` as the group offset. A sentinel commit the coordinator rejects now rejects the `setOffsets` or `resetOffsets` call with that error; 2.2.4 resolved the call without storing the offset.
 
 - **A `read_committed` consumer no longer receives records of an aborted transaction whose producer
   also wrote a data record keyed with four zero bytes.** A corrupt batch is a typed
   `KafkaJSCorruptRecordError` inside the decoder.
 - **A partition stops at a corrupt record batch instead of stalling silently.** The consumer delivers the records before the batch, reports `consumer.partition_halted` once (`offset` is the batch's first offset) and keeps the other partitions running; it never commits past the batch on its own. *What to do:* to skip the batch, `consumer.seek` the partition to a later offset (a seek from the `consumer.partition_halted` listener works, but the event fires before the records ahead of the batch are processed, and the seek also drops them); a rebalance that revokes the partition, a recreation of its topic or a restart also clears the halt, and a recreated topic does not inherit it. A CRC mismatch halts its partition with reason `checksum` and no `nextOffset`; the other partitions keep delivering.
 - **Topics named after `Object.prototype` members work.** If you renamed topics to avoid `__proto__`, `constructor`, `toString`, `hasOwnProperty` or `valueOf`, you can stop: they work with every built-in partition assigner, and nothing else changes. A custom assigner that decodes a `MemberAssignment` gets every topic as an own entry of `assignment`.
-- **A short broker outage no longer crashes a classic consumer.** With the default `groupProtocol: 'classic'`, a lost connection, a request timeout or a moved coordinator on the consumer's own requests (the join, Fetch, heartbeat, automatic commit) is retried without `consumer.crash`, without a `restartOnFailure` call and without a rejoin, until that kind of request has failed for `sessionTimeout` since its first failure with no success. The consumer logs a warning, "Lost a connection while fetching, trying again" or "Lost the group coordinator while joining, trying again". A longer outage crashes as before, with the same error; while some leader still answers, a lost connection to another leader is retried until its partitions move, as the Java client does. Errors your handler throws, a lost connection of its own included, count against `retry.retries` as before, except that a classic member retries an OffsetCommit `COORDINATOR_LOAD_IN_PROGRESS` (14) propagated from `eachBatch`'s `commitOffsetsIfNecessary` as a commit outage until `sessionTimeout`, and rides out a `NOT_COORDINATOR` (16) that a handler propagates from its `heartbeat()` or `commitOffsetsIfNecessary()` callback like the request that raised it, until `sessionTimeout`, without spending `retry.retries`. A consumer with `groupProtocol: 'consumer'` keeps its counted retries. *What to do:* if you used `consumer.crash` to learn of broker bounces, read those warnings instead, or lower `sessionTimeout` to bound the ride. `restartOnFailure` still decides every crash.
+- **A short broker outage no longer crashes a classic consumer.** With the default `groupProtocol: 'classic'`, a lost connection, a request timeout or a moved coordinator on the consumer's own requests (the join, Fetch, heartbeat, automatic commit) is retried without `consumer.crash`, without a `restartOnFailure` call and without a rejoin, until that kind of request has failed for `sessionTimeout` since its first failure with no success. The consumer logs a warning, "Lost a connection while fetching, trying again" or "Lost the group coordinator while joining, trying again". A longer outage crashes as before, with the same error; while some leader still answers, a lost connection to another leader is retried until its partitions move, as the Java client does. Errors your handler throws, a lost connection of its own included, count against `retry.retries` as before, except that a classic member retries an OffsetCommit `COORDINATOR_LOAD_IN_PROGRESS` (14) propagated from `eachBatch`'s `commitOffsetsIfNecessary` as a commit outage until `sessionTimeout`, and rides out a `NOT_COORDINATOR` (16) that a handler propagates from its `heartbeat()` or `commitOffsetsIfNecessary()` callback like the request that raised it, until `sessionTimeout`, without spending `retry.retries`. A consumer with `groupProtocol: 'consumer'` keeps its counted retries for its join. A lost connection, a request timeout or a moved, unavailable or loading coordinator on the requests of its running fetch loop is retried without spending `retry.retries` and without a time limit, until the requests succeed again, the coordinator reports the membership lost, a handler overruns `maxPollInterval` or you stop the consumer. *What to do:* if you used `consumer.crash` to learn of broker bounces, read those warnings instead, or lower `sessionTimeout` to bound the ride. `restartOnFailure` still decides every crash.
 - **`NOT_COORDINATOR` no longer makes a classic member rejoin.** The member looks the coordinator up again and keeps its partitions, so a coordinator move (a broker restart, a preferred-leader election) no longer rebalances the group. A cooperative member's `heartbeat()` callback still resolves on it until its heartbeats have failed for `sessionTimeout`. *What to do:* if you counted `REBALANCING` events with reason `coordinator-changed`, they no longer come for a coordinator move, `COORDINATOR_LOAD_IN_PROGRESS` included.
 - **Heartbeat retry backoff is capped, and a lost member stops further delivery.** With `groupProtocol: 'consumer'`, heartbeat retry backoff is capped at 1 000 ms, even when `retry.maxRetryTime` is larger. If you relied on `retry.maxRetryTime` to slow those heartbeat retries, they are now capped at 1 s. Coordinator lookup and request duration can still take longer. Under either protocol, once the consumer learns its membership is lost, `eachMessage` stops before the next message and batches not yet handed to a handler are dropped. An `eachBatch` handler already running keeps its batch, but commits under the lost membership are refused. Records not committed are delivered again from the last commit to whoever owns the partition next, this member included after its rejoin. No application change is required.
 - To skip a halted batch, `consumer.seek` the partition to the event's `nextOffset` (or later) when it has one; a rebalance that revokes the partition or a restart clears the halt. Offsets the client derives itself never cross the bad batch; a commit you make yourself keeps its ordinary meaning. Raise `maxDecompressedBatchBytes` if you legitimately produce larger batches. The bound is per batch and counts decompressed bytes; the same value also sets a **derived ceiling of `max(1, floor(value / 512))` records per batch**, so a batch can pass the byte limit and still halt the partition for its record count, and raising the option raises both. Size it against `maxBytes`, the number of brokers and the heap (decoded records cost 208 to 321 bytes each)
@@ -970,9 +1070,11 @@ says so, `groupProtocol: 'consumer'`.
 
 Nothing to do; code that slept after `resume()` to ride out the wait can stop.
 
-- **A broker joining or leaving no longer pauses the other fetchers.** 2.2.4 stopped every fetcher, waited for all in-flight long polls and recreated them. 3.0.0 keeps the fetchers of surviving brokers running, starts a new broker's fetcher at once, and stops only a departed broker's fetcher. Nothing to do; there is at most one fetcher, and one Fetch in flight, per broker.
+- **A broker joining or leaving no longer pauses the other fetchers.** 2.2.4 stopped every fetcher, waited for all in-flight long polls and recreated them. 3.0.0 keeps the fetchers of surviving brokers running, starts a new broker's fetcher at once, and stops only a departed broker's fetcher. Nothing to do; there is at most one fetcher, and one Fetch in flight, per broker. This applies to subscribe/group consumers; a manual (`assign`) consumer behaves as described in [Consuming](Consuming.md#manual-assignment).
 
-- **An unreachable broker no longer stalls the other fetchers.** 2.2.4 stopped and restarted every fetcher each time a fetch lost its connection. 3.0.0 backs off and retries only that broker's fetcher while the others keep fetching. Outage limits, warnings and events are unchanged. Nothing to do.
+- **An unreachable broker no longer stalls the other fetchers.** 2.2.4 stopped and restarted every fetcher each time a fetch lost its connection. 3.0.0 backs off and retries only that broker's fetcher while the others keep fetching. Outage limits, warnings and events are unchanged. Nothing to do. This applies to subscribe/group consumers; a manual (`assign`) consumer behaves as described in [Consuming](Consuming.md#manual-assignment).
+
+Pausing some partitions of a topic that is paused as a whole, including from a handler's `pause()`, keeps the rest of the topic paused. 2.2.4 resumed the rest of the topic. Call `resume` for the topic to clear a topic-wide pause.
 
 If you paused a topic and an operator recreated it, pause it again after you see `consumer.cluster.topic_recreated`. Pausing a topic before it is assigned still works and lasts until the subscription changes.
 
@@ -999,6 +1101,7 @@ Connection or coordinator failures in the consumer protocol no longer spend the 
 - Pass a `groupId` for any consumer that subscribes. A consumer that only `assign`s partitions may omit it and reads without a group; null/empty/non-string groupId reject, groupMetadata also needs a group.
 - Treat a mismatching-group OffsetFetch refusal as an invalid broker response; do not use offsets from another group.
 - **Awaited rebalance callbacks are opt-in.** Pass `rebalanceListener` to `consumer.run` to load offsets before delivery or save final positions before ownership is released. An ordinary callback failure finishes only the still-live round and then crashes the run with `KafkaJSRebalanceListenerError`; the callback is not retried. Expiry fences and cleans the failed round. The lost callback defaults to revoked, but lost partitions cannot commit. Client calls from a settled, expired or retired invocation are refused, even after a new run starts. A valid callback may request stop/disconnect/unsubscribe without awaiting its own round; the request settles on the next microtask, before cleanup completes. Manual consumers reject listeners. A run without a listener keeps its existing behavior.
+- **A non-converging rebalance chain.** kafkajs 2.2.4 had no cooperative rebalancing and no round limit: each rebalance was one rejoin, repeated as often as the group asked. In 3.0.0 a classic-protocol consumer with a cooperative assignor allows 20 consecutive rounds in one rebalance chain; when a 21st round is required it raises `KafkaJSRebalanceNotConvergedError` (message `cooperative rebalance did not converge in 20 rounds`, `retriable: true`, extends `KafkaJSError`). The error reaches the crash policy itself, never wrapped, wherever the chain ran. Under the normal return contract of `retry.restartOnFailure`: without one, the consumer restarts after `retry.initialRetryTime`; with one, it receives this error (match it with `instanceof KafkaJSRebalanceNotConvergedError` or its `name`) and true restarts, false leaves the consumer stopped. A callback that throws defaults to a restart, and a stop or disconnect during the decision or the retry delay cancels the restart even after true. The restarted consumer resumes from the committed offsets (offset reset rules apply where none is committed), so records processed since the last commit can be delivered again. A classic consumer with an eager assignor (the default) needs no action: like kafkajs 2.2.4 it has no round limit and keeps rejoining while another round is owed, logging `Rebalance is still running` at WARN after every 20 completed rounds when another is due. Consumers with `groupProtocol: 'consumer'` (KIP-848) never raise it and do not stop on a round count: they wait the heartbeat interval clamped to 100 ms–5 s between rounds and log `Reconciliation is still running` at WARN after every 20 completed rounds when another is due; see "Consumer group protocols → Limitations" in docs/Consuming.md for what this means at startup.
 
 With autoCommitInterval or autoCommitThreshold set, batch-end commits occur only when either condition is eligible at a processing/check opportunity. There is no background commit timer: a short batch followed by idle time waits for another opportunity. Fewer commits can increase replay after a crash beyond the last broker-confirmed offset. Remove both knobs for per-batch commits. Classic graceful stop, disconnect and unsubscribe now attempt a final automatic commit when eligible; use autoCommit:false and explicit commits if you need to control that attempt. A successful graceful final commit can make broker offsets equal eligible processed positions; timeout, lost ownership or a failed attempt can leave them behind.
 
@@ -1009,6 +1112,8 @@ retry.maxTotalTime adds a public-entry deadline only to consumer commitOffsets, 
 - **Follower fetching:** No option change; rack-aware follower fetching avoids a replica known offline.
 - Fetch sessions are opt-in. Set `fetchSessions: true` to enable them. The default remains `false`, so existing consumers keep full Fetch requests.
 
+- **A deleted subscribed topic no longer stops the consumer.** When a metadata refresh answers `UNKNOWN_TOPIC_OR_PARTITION` for a topic the consumer already subscribed to or assigned, the other topics keep consuming and the missing topic stays subscribed; it is asked for again within a second and read again once it is recreated, with the usual [topic recreation](Consuming.md#topic-recreation) reset. kafkajs 2.2.4 crashed and restarted the consumer (`CRASH` with `restart: true`) until the topic came back. If you relied on that crash to notice a missing input on a literal subscription or a manual assignment, listen for `consumer.events.TOPIC_METADATA_STATUS` (or the `kafkajs.consumer.topic_metadata_status` diagnostics channel): `status: 'unavailable'` when the topic goes missing, `status: 'available'` when its metadata is back, once per change, with a warning log for the first. `available` describes metadata only. A broker can answer this code for a topic you may not describe, so treat a topic that stays unavailable as missing input. Under a broker-side `regex` the coordinator can stop assigning a deleted match before or without a status event; a match that was never acquired emits no revocation. The recreated topic is read from the position your reset policy gives (`fromBeginning`), as for any [topic recreation](Consuming.md#topic-recreation).
+
 
 ### Admin
 
@@ -1016,11 +1121,14 @@ Share administration is additive. Each new method accepts `apiTimeout` under the
 
 For share membership use admin.describeShareGroups. Existing admin.describeGroups outcomes on share ids are captured and pinned per supported broker line; see the Admin guide and describeGroupsShareGroup fixture. Generic admin.deleteGroups is the share-group deletion equivalent, proved against a live Kafka 4.3.1 and 4.4.0: it deleted an empty share group (errorCode 0) and refused a share group that still had a member with NON_EMPTY_GROUP (68), leaving the group and its member in place.
 
+- **`setOffsets` and `resetOffsets` report a failed commit.** In 2.2.4 a reset whose offset commit timed out or was refused with a retriable or member error resolved as if it had worked, and the group kept its old offsets. Version 3 writes the offsets with one OffsetCommit that carries no member, as the Java admin does, and rejects unless every partition was accepted: a `KafkaJSAggregateError` lists each partition that was not committed (`error.errors[i].partition`, `.type`, or `.cause` for a partition whose commit got no answer), or the request's own error if the coordinator never answered. Partitions an aggregate does not list are committed; after any other rejection, assume nothing about which partitions were written. The call no longer joins the group as a temporary member, so it causes no rebalance and no longer converts an empty consumer-protocol group to a classic one. A group that does not exist is still created, now with an empty protocol type, so tooling that filters groups on protocol type `consumer` can see it differently; a classic group that is already empty keeps its earlier empty-since time for offset expiry, which the temporary member's join and leave used to refresh, so offsets set on a group that has been empty for a while expire `offsets.retention.minutes` after the group became empty, not after the reset: start its consumers before then. A partition the topic does not have is now sent and its `UNKNOWN_TOPIC_OR_PARTITION` refusal rejects the call (2.2.4 dropped it and resolved, also when every named partition was out of range). An offset that is not a decimal integer string or a safe integer number, such as `'NaN'`, `'Infinity'`, `'   '`, `'0x1F'`, `true` or `[]`, is now refused before any request; 2.2.4 committed it as `0` (or `1` for `true`). *What to do:* await the call and treat a rejection as "not confirmed": a commit that timed out may still have been applied. Retry the partitions in `error.errors`, or the whole call; sending it again writes the offsets again, over any offset committed in between, even when the value is the same.
 - **Admin lifecycle.** Admin operations after disconnect reject without dialing until an explicit connect opens a new lifecycle. Call `await admin.connect()` to resume; legacy implicit reconnection after close is no longer supported. Concurrent closes share cleanup and cannot affect the replacement lifecycle. `disconnect({ timeout })` accepts an integer from 0 through 2147483647 milliseconds; omitted timeout drains naturally, zero forces close immediately, and invalid object options reject before mutation. Non-object signal-handler arguments remain ignored. A forced close cannot undo a mutation already transmitted; inspect broker state before repeating it.
+
+- **An admin `connect()` that waits for a `disconnect()` in progress rejects with `KafkaJSNonRetriableError` if another `disconnect()` is called before it starts.** Such a call waits until the close in progress finishes. If another valid `disconnect()` is called while it waits, whether it joins that close or is called after that close has finished, the waiting `connect()` is cancelled: it rejects with `KafkaJSNonRetriableError`, emits no `CONNECT` and opens no connection; the admin stays disconnected and its operations keep rejecting until an explicit `connect()`. An invalid `disconnect()` (a bad `timeout`) rejects on its own and does not cancel the waiting call. In 2.2.4 `connect()` did not wait for a close and a later `disconnect()` never made it reject. *What to do:* catch `KafkaJSNonRetriableError` from a `connect()` made during shutdown and treat it as cancelled by that shutdown. To reconnect on purpose, await every `disconnect()` first, then call `await admin.connect()` again.
 
 - **Token-admin diagnostics.** Token-admin response data and failure payloads are filtered before logging, including when buffer diagnostics are enabled. Use the stable error class, type/code and broker fields for diagnosis. The authorized caller still receives the token HMAC as a Buffer; do not depend on raw diagnostic payloads.
 
-deleteOffsets returns partition errorCode/error results; group-level refusals reject. fetchOffsetsForGroups returns each group's own result and batches by coordinator, falling back to single-group requests below OffsetFetch v8. requireStable defaults to false; an explicit stable read requires v7 or later. A call deadline does not recall a deletion already transmitted.
+deleteOffsets resolves with one row per requested partition and never throws for a row's own error, so check every row's errorCode (or error) before treating the offsets as deleted. Only the group-level refusals GROUP_AUTHORIZATION_FAILED (30), GROUP_ID_NOT_FOUND (69), INVALID_GROUP_ID (24) and NON_EMPTY_GROUP (68) reject. Any other whole-response error is copied onto every requested partition: COORDINATOR_LOAD_IN_PROGRESS (14) is first sent again to the same coordinator within the retry budget and the call's deadline: if the retry budget is spent first, the rows carry 14, and if the call's deadline passes first, the call rejects with KafkaJSTimeout; COORDINATOR_NOT_AVAILABLE (15) and NOT_COORDINATOR (16) are returned at once on every partition, with no new coordinator lookup, where earlier 3.0.0 prereleases looked the coordinator up again and retried. A resolved call is therefore not proof of deletion. fetchOffsetsForGroups returns each group's own result and batches by coordinator, falling back to single-group requests below OffsetFetch v8. requireStable defaults to false; an explicit stable read requires v7 or later. A call deadline does not recall a deletion already transmitted.
 
 Group visibility and the admin client.
 
@@ -1070,13 +1178,23 @@ Group visibility and the admin client.
   resource whose name is the empty string. That name now stands for the cluster-wide default broker
   config, and all three config methods send it to the controller. Every other resource type still
   needs a non-empty name. *What to do:* nothing.
-- **`createTopics`, `deleteTopics` and `createPartitions` retry a quota refusal.** On a cluster with
-  controller-mutation quotas (KIP-599) a broker now refuses with `THROTTLING_QUOTA_EXCEEDED` a
-  request it used to slow down, because the client negotiates newer versions of these APIs. The
-  client waits the throttle time the broker reports and sends only the refused topics again within
-  the `retry` budget, so a call that succeeded under 2.2.4 still succeeds, a little later; one that
-  outlives the budget rejects with `KafkaJSNumberOfRetriesExceeded`, whose `cause` is the quota
-  error. *What to do:* nothing.
+- **`createTopics`, `deleteTopics` and `createPartitions` retry a quota refusal.** On a cluster
+  with controller-mutation quotas (KIP-599) a broker now refuses with `THROTTLING_QUOTA_EXCEEDED` a
+  request it used to slow down, because the client negotiates CreateTopics v7, DeleteTopics v6 and
+  CreatePartitions v3, where 2.2.4 sent v3, v1 and v1, which the broker throttled but did not
+  refuse. The broker checks the quota before it records anything for a topic, so the client sends
+  only the refused topics again within the `retry` budget and the call's deadline; a topic the
+  broker accepted is never sent again. The connection that received the refusal holds its next
+  request for the throttle time the broker reports; a retry that goes to another broker's
+  connection is not held by it. A call that succeeded under 2.2.4 still succeeds, a little later;
+  one that outlives the budget rejects with `KafkaJSNumberOfRetriesExceeded`, whose `cause` is the
+  quota error (`KafkaJSDeliveryTimeout` when a configured `retry.maxTotalTime` would end before the
+  next attempt). `deleteTopics` and
+  `createPartitions` retry only when every topic that failed in the answer was refused by the
+  quota. `deleteTopics` sends a refused topic again by the topic ID the answer gave for it, also
+  when the call named it, so a topic deleted and recreated under that name during the wait is not
+  deleted; a refusal without an ID (DeleteTopics v5 and older, or a null ID) is final. Errors
+  still name the topics you passed. *What to do:* nothing.
 - **Admin and broker results gain keys.** Nothing was renamed or removed; code that compares whole
   objects sees more keys. `admin.fetchTopicMetadata()` topics gain `topicId` (`null` when the broker
   sends none) and `isInternal`, on the Metadata path and on the new `useDescribeTopicPartitions`
@@ -1102,14 +1220,45 @@ Group visibility and the admin client.
   `fetchTopicMetadata()` with no topics now returns such a partition with its `partitionErrorCode`
   and `leader: -1` instead of waiting. *What to do:* code that used `fetchTopicMetadata()` to wait
   for leaders should name the topics: a named request still waits.
-- **`deleteTopicRecords` retries connection errors.** A retriable error without per-partition
-  detail, such as `KafkaJSConnectionError`, used to hit a `TypeError` in the method's own error
-  handling, which the retrier reported at once as `KafkaJSNonRetriableError`; it is now retried, and
-  the call ends in success or in `KafkaJSNumberOfRetriesExceeded` whose `cause` is the connection
-  error. It also works as an admin's first call now, where 2.2.4 failed with
-  `KafkaJSTopicMetadataNotLoaded`. *What to do:* a transient connection failure no longer aborts
-  `deleteTopicRecords`; if you caught `KafkaJSNonRetriableError` from it, expect
-  `KafkaJSNumberOfRetriesExceeded` after the retry budget instead.
+- **A written admin mutation with no usable answer is never sent again.** If the broker's answer is missing
+  or cannot be decoded, the call rejects with `KafkaJSUnknownOutcomeError` (`retriable: false`).
+  Its `requests` lists the unresolved requests and their items where available. The mutation
+  may already have applied. The call's own deadline (`KafkaJSTimeout`) and close errors take
+  precedence. An unknown outcome takes precedence over ordinary result rows.
+- A broker error after sending is final, including moved-controller, coordinator, leader and
+  request-timeout errors, with two exceptions where the broker refuses before it applies anything:
+  `deleteTopics` sends again, by topic ID, only the topics a controller-mutation quota refused
+  (`THROTTLING_QUOTA_EXCEEDED`, when every topic that failed was refused that way and the answer
+  gives each one's ID), and
+  `deleteOffsets` and `removeMembersFromConsumerGroup` send again a request the group coordinator
+  answered with a top-level `COORDINATOR_LOAD_IN_PROGRESS`. Both stay within the `retry` budget and the call's
+  deadline. `NOT_COORDINATOR` and `COORDINATOR_NOT_AVAILABLE` stay final for these calls, and a
+  loading coordinator stays final for `deleteGroups`, `alterShareGroupOffsets` and
+  `deleteShareGroupOffsets`, whose broker can report it after part of the change ran. Pre-write
+  failures keep their existing retry policy; for `deleteTopics` that covers the metadata refresh
+  and controller lookup before an ID resend too, where `NOT_CONTROLLER` and
+  `UNKNOWN_TOPIC_OR_PARTITION` are retried.
+- In kafkajs 2.2.4, `deleteTopics`, `deleteTopicRecords`, `alterConfigs`, `createAcls`,
+  `deleteAcls` and `alterPartitionReassignments` retried some such errors (`NOT_CONTROLLER`,
+  `UNKNOWN_TOPIC_OR_PARTITION` from `deleteTopics`, retriable partition errors from
+  `deleteTopicRecords`); they no longer retry them. These methods and `deleteGroups` now report
+  lost replies as `KafkaJSUnknownOutcomeError`. In 2.2.4, `deleteTopicRecords` could instead
+  surface a `TypeError` after a lost reply.
+- **`deleteTopicRecords` retries connection errors before sending.** In 2.2.4 a connection error
+  hit a `TypeError` in the method's own error handling and ended the call at once as
+  `KafkaJSNonRetriableError`. A failure before a leader's request is written is now retried for
+  that leader only, ending in `KafkaJSNumberOfRetriesExceeded` when the budget runs out. A
+  partition error from a broker still rejects as `KafkaJSNonRetriableError` with the
+  `KafkaJSDeleteTopicRecordsError` as its `cause`, listing the refused partitions of every leader.
+- **Calls that keep their retries** include `setOffsets`, `resetOffsets`,
+  `fetchOffsets({ resolveOffsets: true })`, `createTopics`, `createPartitions` and calls
+  whose request carries `validateOnly: true`. Repeating an offset write can overwrite another
+  admin's later write to the same idle group. A creation retry can recreate or grow a topic
+  deleted meanwhile. An already-exists or invalid-partition-count error does not identify which
+  call made the change.
+- Before repeating a call, check the current state of the affected items with the relevant
+  metadata, offsets, group or transaction read. A broker error can follow an applied change.
+- Use `deleteTopics({ topicIds })` to target a specific topic incarnation.
 - **`admin.listGroups` takes filters, and `admin.describeGroups` reports errors per group id.**
   `admin.listGroups({ states, types })` filters server-side with lower-case values, and every row
   now carries `groupState` and `groupType`. `admin.describeGroups` describes classic and consumer
@@ -1145,36 +1294,49 @@ Group visibility and the admin client.
   the `retry` budget; `useDescribeTopicPartitions` has no such cap. *What to do:* replace a
   `TypeError` catch with a check of the error's class or `type`. Read `KafkaJSTimeout` from
   `fetchTopicMetadata()` as "no usable Metadata answer within 10 s", not only as "no leader yet".
-- **`createTopics` and `alterPartitionReassignments` retry only what can still succeed.**
-  KafkaJS 2.2.4 retried these calls only on a top-level `NOT_CONTROLLER`; an answer that named any
-  failed topic or partition ended the call at once, so a retriable failure such as
-  `REQUEST_TIMED_OUT` on one topic failed the call and the topics that had been created were not
-  reported (`createTopics` resolved `false` when every failed topic already existed). Now each
-  retry sends only the items the broker marked retriable, never an item it confirmed, and the call
-  ends with one result over the whole request: it resolves (`createTopics` resolves `false` only
-  when every topic that did not go through already exists), or rejects with a
-  `KafkaJSAggregateError` of the items refused for good (followed by the failures that ended the
-  retries), or, when nothing was refused for good, with what ended the retries, unchanged. For example, reassigning a partition of a topic that
-  does not exist (`UNKNOWN_TOPIC_OR_PARTITION`, which Kafka marks retriable) is now retried until
-  the budget is spent and rejects with `KafkaJSNumberOfRetriesExceeded`, whose `cause.errors` lists
-  it; 2.2.4 rejected at once with the aggregate.
-  `waitForLeaders` waits once, after the last attempt, for the topics the call created; a call
-  whose attempts fail does not enter that wait, and a metadata error or timeout from the wait
-  itself rejects the call directly, not as an aggregate.
-  `alterPartitionReassignments` no longer sends a topic whose `partitionAssignment` is empty.
-  *What to do:* a retrier of your own around these calls that only existed to repeat a retriable
-  topic can go; code that reads `error.errors` finds the items refused for good first (when
-  nothing was refused for good and the retries ran out on failed items, `error.cause.errors` lists
-  them); `retry: { retries: 0 }` makes a single attempt.
-- **A DescribeTopicPartitions read has one 60 s deadline.** `fetchTopicMetadata({ topics, useDescribeTopicPartitions: true })` rejects with `KafkaJSTimeout` when the read, every page and retry included, is not done within 60 s, and a topic recreated between two pages is read again from the start. *What to do:* nothing, unless your cluster pages that slowly; then use the default Metadata path (`useDescribeTopicPartitions: false`).
+- **`createTopics` retries only topics that can still succeed.** KafkaJS 2.2.4 retried
+  only a top-level `NOT_CONTROLLER`. This version also retries individual topics the broker
+  marks retriable, without resending confirmed topics. The result covers the whole request.
+  It resolves `false` when every failed topic already existed, or rejects with
+  `KafkaJSAggregateError` for terminal item failures, followed by any failures that ended
+  the retries. If no item was refused for good, the retry failure is returned unchanged.
+  `waitForLeaders` waits once for the topics created by the call. A failure during that wait
+  rejects directly.
+  `alterPartitionReassignments` skips topics with empty assignments and reports decoded
+  partition failures in the broker's aggregate after one send.
+- **`deleteTopicRecords` and `alterPartitionReassignments` check all of their input first.**
+  Both read and copy their input when they are called, before they return, and refuse the whole
+  call with `KafkaJSNonRetriableError` before any request when one entry is invalid. Some input
+  that 2.2.4 sent, and that Kafka could accept, is now refused:
+  - a partition listed twice in `deleteTopicRecords`: 2.2.4 sent both entries and Kafka applied
+    the last one;
+  - a partition listed twice for a topic in `alterPartitionReassignments`: 2.2.4 sent both;
+  - a replica id listed twice in one assignment: 2.2.4 sent it, and Kafka refused that partition
+    while the other partitions of the call could still be applied; now none is reassigned;
+  - a `deleteTopicRecords` offset that is not a decimal integer string (an optional sign, then
+    digits), a safe integer number, a bigint or this package's own `Long`: 2.2.4 also sent
+    strings with spaces around the digits, a string of spaces only (as `0`), hex, octal and binary
+    strings such as `'0x1F'`, integral numbers above 2^53 - 1, booleans, one-element arrays,
+    objects with a `valueOf` and Long-like objects with a bigint `value` (kafkajs 2.2.4's `Long`,
+    or a `Long` from another copy of this package), and sent `'NaN'`, `'Infinity'`,
+    `'+Infinity'`, `'-Infinity'` and `NaN` as `0`.
 
-Admin calls take an `apiTimeout` (default 60 000 ms) and reject with `KafkaJSTimeout` when it passes; a mutation may have been applied. Retries are unchanged, unlike Java's unbounded retries inside the deadline. Configure the default with `kafka.admin({ apiTimeout })`, or override one call. Values must be integers from 1 to 2147483647. A broker-side `timeout` remains independent and is not shortened on the wire.
+  Offsets outside the signed 64-bit range (2.2.4 sent `'18446744073709551615'` as `-1`, which
+  deletes everything up to the high watermark), offsets below `-1`, fractions, missing or `null`
+  entries, holes, and partition or replica ids that are not integers from 0 to 2^31 - 1 (2.2.4 sent
+  `NaN` as `0` and truncated fractions) are refused too. A change made to the input after the call
+  no longer reaches the request. *What to do:* list each partition and each replica once, and pass
+  offsets as decimal strings such as `'31'`, or `'-1'`; for a Long-like object, pass
+  `String(offset.value)`.
+- **A DescribeTopicPartitions read shares the call's `apiTimeout` (60000 ms by default).** Metadata discovery, every page, every retry and an unsupported-API Metadata fallback use that one budget. The fallback's shorter Metadata polling cap is nested inside it, never added. At the deadline the call rejects with `KafkaJSTimeout`. A topic recreated between two pages is read again from the start within the remaining budget. *What to do:* increase `apiTimeout` if your cluster needs longer to page.
+
+Admin calls take an `apiTimeout` (default 60 000 ms) and reject with `KafkaJSTimeout` when it passes; a mutation may have been applied. Retries of reads, of failures before a request is written and of the calls that keep their retries (above) are unchanged, unlike Java's unbounded retries inside the deadline; a sent mutation is not retried. Configure the default with `kafka.admin({ apiTimeout })`, or override one call. Values must be integers from 1 to 2147483647. A broker-side `timeout` remains independent and is not shortened on the wire.
 
 Describe calls can request the optional raw authorized-operations mask; an unsupported field returns null. The mask stays an optional `number | null`, with the signed INT32 value preserved. No mask-type migration is required.
 
 Topic-offset reads accept isolationLevel: 'read_committed' (the unchanged default) or 'read_uncommitted'. During an open transaction, the default high is the last stable offset; use read_uncommitted for high-watermark committed lag and a raw fetchOffsets read with resolveOffsets: false. Missing commits are distinct from zero. Broker errorMessage is separate from stable protocol messages. deleteTopicRecords still returns Promise<void>; inspect the existing error/cause chain for its failing partitions and read low watermarks with fetchTopicOffsets. listTopics remains string[]; fetchTopicMetadata() provides topicId and isInternal from the same fresh Metadata snapshot.
 
-Transaction diagnostics and recovery are available through `describeProducers`, `describeTransactions`, `listTransactions`, `abortTransaction` and `fenceProducers`. The Java `forceTerminateTransaction(id)` equivalent is `admin.fenceProducers({ transactionalIds: [id] })`; there is no separate method. Producer IDs and other 64-bit results are decimal strings. Diagnostic and fence calls return per-item errors, while `abortTransaction` resolves without a value or throws and `listTransactions` fails as a whole if a broker fails. All five calls use the admin `apiTimeout`; expiry cannot recall an abort or fence already sent. Existing producer transaction methods keep their behavior.
+Transaction diagnostics and recovery are available through `describeProducers`, `describeTransactions`, `listTransactions`, `abortTransaction` and `fenceProducers`. The Java `forceTerminateTransaction(id)` equivalent is `admin.fenceProducers({ transactionalIds: [id] })`; there is no separate method. Producer IDs and other 64-bit results are decimal strings. Diagnostic and fence calls return per-item errors. A lost fence reply rejects the whole call with `KafkaJSUnknownOutcomeError` instead of returning rows. `fenceProducers` returns code 51 for a broker that is aborting an ongoing transaction. Once the abort is complete, the caller can fence again. `abortTransaction` resolves without a value or throws and `listTransactions` fails as a whole if a broker fails. All five calls use the admin `apiTimeout`; expiry cannot recall an abort or fence already sent. Existing producer transaction methods keep their behavior.
 
 | Behavior | Configuration | Default | Migration | Area |
 | --- | --- | --- | --- | --- |
@@ -1302,12 +1464,20 @@ now logged.
 - **A request timeout now closes its connection.** Code that retries `KafkaJSRequestTimeoutError` also sees `KafkaJSConnectionClosedError` for requests that were healthy on the same connection; both are retriable. A mutation written before the close has an unknown outcome, exactly as after any timeout (an idempotent producer resends it in order, a transaction commit stays unknown). There is no setting that keeps a connection open after a timeout; `enforceRequestTimeout: false` removes the timeout and with it the close.
 - **Obsolete connections drain for at most `requestTimeout`.** Nothing to do. With `enforceRequestTimeout: false` a request that never answered used to stall recovery indefinitely. A JoinGroup or long-poll Fetch with a per-API allowance above `requestTimeout` fails at the bound on an obsolete connection and is retried. Public `disconnect()` remains reusable and now also waits at most `requestTimeout` for requests in flight (the rest fail with a retriable `KafkaJSConnectionClosedError`); a retired broker object cannot reconnect. A mutation already transmitted before the connection closes still has an unknown outcome.
 - **A producer delivery timeout can include transmission evidence.** `KafkaJSDeliveryTimeout.outcome` is optional and is `'unsent'` or `'unknown'`; its absence says nothing about delivery. Earlier written attempts keep the outcome unknown even if a later reply was retriable. The timeout copies the last cause's `type` and `code` when available, so existing protocol-type checks can inspect them. Other error classes do not acquire an outcome, and a `retry.maxTotalTime` timeout outside a producer still omits it.
+- **`retry.maxTotalTime` is measured on a monotonic clock, and a retry whose timer fires after the deadline is not made.** The option is new in 3.0.0; 2.2.4 has no total-time budget. The time is elapsed monotonic time in fractions of a millisecond, so a change of the system clock does not move the deadline, and it is checked when an attempt fails and again when the retry timer fires. A retry whose timer fires after the deadline is not made: the call rejects with `KafkaJSDeliveryTimeout`, with the same class, message form (`Gave up after N attempts: the next one would start after the X ms deadline`, N the attempts made), `cause` (the error of the last attempt made), `retriable: false` and fields as when the next wait would end past the deadline. The check cannot tell a frozen process from a timer that is a few milliseconds late, so near the deadline an ordinary call can lose its last attempt: one whose delay was planned to end before the deadline is not made when Node delivers its timer after the deadline. Node delivers a timer from 0 to a few milliseconds after its delay (more on a busy event loop), so only an attempt planned to start within that margin of the deadline is affected: an otherwise successful final retry can become a `KafkaJSDeliveryTimeout` when ordinary event-loop delay puts its start after the deadline, and the call rejects at the moment the expired retry would have started. The comparison has no whole-millisecond rounding, so fractional timing can move the retry scheduling boundary by less than 1 ms in either direction. Host suspension may be excluded, depending on the monotonic clock. Calls without `retry.maxTotalTime` do not read the clock. *What to do:* if you rely on a last attempt close to the deadline, leave more room (raise `maxTotalTime` or lower the delays).
 - `KafkaJSCorruptRecordError` has three new `reason` values, `checksum`, `decompressed-size` and `decompression`, and the optional `nextOffset` (where `consumer.seek` goes to skip the batch; present only for a validated batch boundary), `codec` and `limit`. `KafkaJSPartialMessageError#crcMismatch` is deprecated and no longer set: a checksum mismatch is a `KafkaJSCorruptRecordError`.
 - **A forced producer close reports `KafkaJSProducerClosedError` with transmission evidence.** `outcome` is `'unsent'` for work that was never written and `'unknown'` for anything written at least once, which may still have been applied by the broker. The error is non-retriable and its `category` is `abortable`. A class without an `outcome`, or the absence of an error, proves nothing about delivery.
 
 - Switches handling partition-halted reasons keep the two reset reasons added with offsetReset. No-group CRASH/halt groupId is null. Existing corrupt/decode offset stays decimal and decode metadata fields remain available. TypeScript ≥4.1 remains required for the duration template-literal type.
 
-- **SASL diagnostics.** A broker's SASL error message, its authentication bytes, a SCRAM server error and what a token endpoint answered no longer reach error messages, causes, log lines, the `AUTHENTICATION_FAILURE` event or the reconnect blackout. Error classes and prefixes such as `SASL PLAIN authentication failed:` are unchanged; the text after the prefix preserves fixed, library-authored SCRAM validation reasons, uses the canonical description for a protocol error code (for example `SASL Authentication failed`), and is `Error` for other broker or supplier failures, the protocol error keeps its `type` and `code`, and the event's `errorMessage` reads `SASL <MECHANISM> authentication failed: broker=<host:port> stage=exchange`. *What to do:* diagnose from the error class, the protocol error's `type` and `code`, and the event's `broker` and `mechanism`; read the broker's own log for its message. Nothing restores the broker text.
+- **SASL diagnostics.** A broker's SASL error message, its authentication bytes, a SCRAM server error and what a token endpoint answered no longer reach error messages, causes, log lines, the `AUTHENTICATION_FAILURE` event or the reconnect blackout. Error classes and prefixes such as `SASL PLAIN authentication failed:` are unchanged; the text after the prefix preserves fixed, library-authored SCRAM validation reasons and the OAUTHBEARER error-challenge reason, uses the canonical description for a protocol error code (for example `SASL Authentication failed`), and is `Error` for other broker or supplier failures, the protocol error keeps its `type` and `code`, and the event's `errorMessage` reads `SASL <MECHANISM> authentication failed: broker=<host:port> stage=exchange`. *What to do:* diagnose from the error class, the protocol error's `type` and `code`, and the event's `broker` and `mechanism`; read the broker's own log for its message. Nothing restores the broker text.
+- **A login the connection ended is reported as the connection's error.** When the connection is lost, a request timeout closes it, or the setup is cancelled while a built-in mechanism (PLAIN, SCRAM, OAUTHBEARER, AWS, GSSAPI's Kafka exchange stages) is exchanging SASL messages, the mechanism now rethrows that connection error or cancellation with its own `retriable` flag instead of a `KafkaJSSASLAuthenticationError`, and logs no authentication failure for it. With the stock socket factory the client already retried these outages, so recovery behaviour is unchanged; what changes is the error and log a mechanism produces at that boundary. Any other exchange failure, including an error a custom socket throws, is still a sanitized `KafkaJSSASLAuthenticationError`. *What to do:* nothing for ordinary use. Read `KafkaJSSASLAuthenticationError` as "the login failed for a reason other than the transport" and investigate it (broker rejection, credentials or token, SCRAM server signature, Kerberos context) rather than assuming a wrong password. Unlike the Java client, which retries some transient Kerberos errors, a GSSAPI native failure stays terminal here.
+- **A rejected OAUTHBEARER token fails the login.** When a broker refuses a SASL OAUTHBEARER token it answers with an error challenge (RFC 7628 section 3.2.3) in a response that carries no error code. kafkajs 2.2.4 ignored it, so `connect()` resolved and the next request failed with a `KafkaJSProtocolError` (`ILLEGAL_SASL_STATE`) or a closed connection; at re-authentication the refresh looked successful and in-flight work then failed. The client now answers the challenge with a single `0x01` byte, as the Java client and franz-go do, so `connect()` and re-authentication reject with a non-retriable `KafkaJSSASLAuthenticationError` and the authentication blackout applies. A valid token is unchanged and sends no extra request. *What to do:* if code detected a bad or expired token by catching the later protocol error, catch `KafkaJSSASLAuthenticationError` from connect instead, and make the `oauthBearerProvider` return a fresh token. Custom `authenticationProvider` mechanisms are not changed.
+- **A request is not written on an ended or re-authenticating SASL session.** A request still waiting in a connection's queue (behind `maxInFlightRequests` or a broker throttle) when its SASL session ends, or when a re-authentication of that connection starts, is refused at the moment it would be written with a retriable `KafkaJSError` (`The SASL session was not valid when the request was due to be written; it was not sent`). The frame was never written, so the broker did not see it; a retrier sends it again, and the next attempt re-authenticates first. kafkajs 2.2.4 wrote it, and the broker closed the connection, failing every request in flight on it. With no retries left the call fails with the retriable error wrapped in `KafkaJSNumberOfRetriesExceeded`; a producer delivery timeout reports `outcome: 'unsent'` only when no earlier attempt of the batch was written (otherwise `'unknown'`), and inside a transaction the exhausted batch makes the transaction abortable, as any exhausted retriable error does. *What to do:* nothing with retries enabled. With `retry.retries: 0`, expect this retriable error at a session boundary. The refused request itself was not sent, but a call that sends several requests (a producer `send()` to more than one broker, for example) may already have written others, so decide whether to repeat the call as for any other failed send: without the idempotent producer a repeated send can write records twice.
+
+- **`KafkaJSFetcherRebalanceError` is kept for compatibility and is no longer thrown.**
+
+- **New consumer event `TOPIC_METADATA_STATUS`.** Payload `{ groupId, topic, status, type, code }`; see [Instrumentation events](InstrumentationEvents.md#consumer). There are now 44 ordinary diagnostics channels.
 
 ### Protocol
 
@@ -1371,10 +1541,16 @@ Wire and connection behavior: negotiated versions, version floors, authenticatio
   or every broker the client knows about has become unreachable. "Continuously" is measured from
   the first failure that follows a success, and any success clears it — so an idle client that hits
   one transient metadata failure and then succeeds never rebootstraps, however long it has been
-  running. A rebootstrap waits for each connection's in-flight requests to drain and then closes
-  every connection, so requests still outstanding fail with `KafkaJSConnectionClosedError` and go
-  through the caller's normal retry path against the rebuilt cluster. On an idempotent
-  producer (the default) the retry carries the same producer id and sequence numbers, so the broker
+  running. A rebootstrap does not wait for the connections it replaces: they take no new request
+  and drain in the background for at most `requestTimeout`. A request already written to an old
+  connection can still complete, and can still succeed, during that drain; a request still
+  outstanding when its connection closes fails with `KafkaJSConnectionClosedError` and goes through
+  the caller's normal retry path against the rebuilt cluster. A `disconnect()` closes those
+  draining connections too: without a close timeout it can wait for what is left of their
+  `requestTimeout`, a shorter timeout closes them sooner, and a failure closing them can reject the
+  `disconnect()` as a failure on a current connection can (see
+  [Metadata recovery](Configuration.md#metadata-recovery)). On an idempotent producer (the default)
+  a retry against the same cluster carries the same producer id and sequence numbers, so the broker
   deduplicates it; **on a producer created with `idempotent: false`, or one whose configuration
   turned idempotence off, a produce request that the broker had already appended, but whose
   response was lost when the connection closed, is sent again on the retry and can duplicate those
@@ -1382,7 +1558,20 @@ Wire and connection behavior: negotiated versions, version floors, authenticatio
   failure is never a trigger — a rejected credential means the broker is reachable and healthy,
   which no rebootstrap can fix. Setting `metadataRecoveryStrategy: 'none'` disables all three
   triggers and restores the previous behavior exactly, with code 129 surfacing as the non-retriable
-  protocol error it already was.
+  protocol error it already was. A rebootstrap does not notice when the broker list now leads to a
+  different cluster: a consumer keeps its old positions and may fetch the new cluster at those
+  offsets before it rejoins its group or is reassigned, and with `assign()` for as long as it keeps
+  them (see [Metadata recovery](Configuration.md#metadata-recovery)).
+
+  *New during a rebootstrap:* a metadata refresh that a rebootstrap overtakes rejects with a
+  retriable `KafkaJSConnectionError`, unless the caller refused first (a lifecycle close or a
+  deadline, whose own error wins) or a `REBOOTSTRAP_REQUIRED` answer to the refresh's own requests
+  started the rebootstrap (that error is kept). This can reach `consumer.subscribe()` (it rejects; with a
+  pattern it keeps the previous subscription; call it again), `consumer.run()` startup (the run
+  crashes with this retriable error and restarts by the restart policy, also with
+  `retry: { retries: 0 }`), admin calls (many reject at once; call them again) and producer sends
+  (retried within their retry settings). kafkajs 2.2.4 never rebootstraps and never shows this
+  error; `metadataRecoveryStrategy: 'none'` removes it.
 
 - **Negotiated protocol versions moved up.** Against a Kafka 4.1 or 4.3 broker the client now
   negotiates: Metadata **v13** (was v6), Produce **v13** (was v7; **v11** when a topic's id is not
@@ -1479,6 +1668,11 @@ The runtime is unchanged by these; they can fail `tsc` on an existing codebase.
   `const leader: string = event.payload.leaderId` is now `TS2322` and `event.payload.leaderId
   .slice(0, 8)` is `TS18047`, for every user — including one who never sets `groupProtocol`. Guard
   the value (`event.payload.leaderId ?? ''`) or narrow it before use.
+- **`ConsumerCrashEvent.payload.groupId` is now `string | null`.** A consumer created without a
+  `groupId` (manual assignment) has no group id. Guard it under `strictNullChecks`.
+- **`ConsumerRebalancingEvent.payload.memberId` is now `string | null`.** A member that has no id,
+  because it has not joined yet or the coordinator rejected its id, reports `null`. Guard it under
+  `strictNullChecks`.
 - **`ConsumerGroupState` gained `'Assigning' | 'Reconciling' | 'NotReady'`**, the states
   `GroupState.java` adds for consumer groups. An exhaustive `switch` over the union without a
   `default` no longer compiles; add the three cases or a `default`.
@@ -1500,6 +1694,85 @@ The runtime is unchanged by these; they can fail `tsc` on an existing codebase.
   table, which are strings; the declaration said `number[]`. Under `strict` a comparison such as
   `ids[0] === 1` is `TS2367` and `ids.includes(1)` is `TS2345`. Compare with `String(id)` or
   convert the element with `Number(id)`. The runtime is unchanged.
+- **Nine error constructors need a message.** `KafkaJSTimeout`, `KafkaJSLockTimeout`,
+  `KafkaJSNotImplemented`, `KafkaJSMetadataNotLoaded`, `KafkaJSBrokerNotFound`,
+  `KafkaJSPartialMessageError`, `KafkaJSSASLAuthenticationError`, `KafkaJSGroupCoordinatorNotFound`
+  and `KafkaJSUnsupportedMagicByteInMessageSet` are declared with the message they need:
+  `new KafkaJSTimeout()` threw a `TypeError` in 2.2.4 and still does, and is now a compile error.
+  Pass a message.
+- **`KafkaJSOffsetOutOfRange` and `KafkaJSNumberOfRetriesExceeded` need their metadata.**
+  `new KafkaJSOffsetOutOfRange(e, { topic, partition })` and
+  `new KafkaJSNumberOfRetriesExceeded(e, { retryCount, retryTime })` need their second argument:
+  without it they threw `TypeError` in 2.2.4 and still do.
+- **`KafkaJSOffsetOutOfRange`'s first argument is a protocol error.** It was declared
+  `Error | string`; it is now the object `KafkaJSProtocolError` takes, with `type`, `code` and
+  `message`. Code that passed an `Error` and the metadata no longer compiles. Before:
+  `new KafkaJSOffsetOutOfRange(new Error('out of range'), { topic: 'orders', partition: 0 })`.
+  After: `new KafkaJSOffsetOutOfRange({ type: 'OFFSET_OUT_OF_RANGE', code: 1, message: 'out of range' }, { topic: 'orders', partition: 0 })`.
+  An `Error` that carries `type` and `code`, such as a caught protocol error, is accepted.
+- **`KafkaJSProtocolError` is built from a protocol error.** `new KafkaJSProtocolError(e)` takes an
+  object with `type`, `code` and `message` (for example a caught protocol error), and optionally
+  `retriable`, `helpUrl` and `category`; built from a string its `code` and `type` were
+  `undefined`. Before: `new KafkaJSProtocolError('boom')`. After:
+  `new KafkaJSProtocolError({ type: 'UNKNOWN', code: -1, message: 'boom' })`.
+- **`KafkaJSError.code` is `number | string`.** An error built from a Node.js system error carries
+  its string code (`'ECONNREFUSED'`), and `KafkaJSConnectionError.code` is the optional string from
+  its metadata. Narrow with `typeof` before arithmetic. `KafkaJSConnectionError.broker` can be
+  absent.
+- **`KafkaJSStaleTopicMetadataAssignment.unknownPartitions` is `number[] | undefined`, and `topic`
+  is `string | undefined`.** The client's own errors carry both, but an error built without
+  metadata has neither, so guard the reads under `strictNullChecks`. The same field of the
+  constructor's metadata is `number[]`: the partition ids it has always held (the metadata was
+  declared `PartitionMetadata[]`).
+- **`KafkaJSDeleteTopicRecordsError` declares `partitions`, and its rows are nullable.**
+  `offset` is `string | undefined` (undefined when a response row matched no requested partition)
+  and `error` is `KafkaJSError | null | undefined` (the constructor keeps rows as passed). Guard
+  both reads. The `topic` of its constructor's metadata is optional and the error does not keep
+  it. A structural mock of the error, or a function typed to return it, must now supply
+  `partitions`.
+- **`listPartitionReassignments()` rows carry the keys they have always had.** A topic has `name`
+  (not `topic`) and a partition has `partition` (not `partitionIndex`); `addingReplicas` and
+  `removingReplicas` are always present, so a mock must set them. The broker method's result also
+  declares `throttleTime`, `clientSideThrottleTime` and `errorCode`.
+- **Fields that were never set are typed `undefined`.** `throttleTime` on `describeConfigs()`,
+  `describeAcls()` and `deleteAcls()` results, and `errorCode` and `errorMessage` on
+  `describeAcls()`, were never set. Drop them from mocks.
+- **Config values, a resource's `errorMessage` and ACL error messages can be `null`.** A sensitive or
+  unset config has no value; guard them under `strictNullChecks`.
+- **`admin.createPartitions()` is typed `Promise<void>`.** It has always resolved without a value;
+  `const created: boolean = await admin.createPartitions(...)` no longer compiles.
+- **If you used an earlier 3.0.0 prerelease: a client quota component takes `match` only for the
+  `'exact'` match type.** The three accepted shapes are `matchType: 'exact'` with a `match`, and
+  `matchType: 'default'` or `'any'` without one. A wrapper that builds a component from a
+  `matchType` of the whole union and an independent optional `match` fails to compile; build the
+  three cases separately.
+- **If you used an earlier 3.0.0 prerelease: `GroupDescription.groupType` can be `''`.** A group
+  whose consumer-protocol description failed has an empty group type. A function typed to take only
+  the earlier group-type union can no longer be called with `group.groupType`; handle `''` (an
+  exhaustive `switch` needs a `default`).
+- **`AssignerProtocol` decodes `userData` as `Buffer | null`.** A member that sent none, such as a
+  Java consumer, decodes to `null`; guard it under `strictNullChecks`. `MemberAssignment.encode` no
+  longer needs `userData` (it writes an empty byte string) and takes `null`, which writes the wire
+  null; its argument type is the new `MemberAssignmentInput`.
+- **`Message.timestamp` accepts a string, a number, a `Date` or a `bigint`.** `send()` took the
+  first three in 2.2.4 and takes the `bigint` in this release. Call sites are unaffected; code that *reads* it, such as a custom partitioner
+  (`PartitionerArgs.message`), must handle every form. Before: `Number(message.timestamp)`. After:
+  `message.timestamp instanceof Date ? message.timestamp.getTime() : Number(message.timestamp)`.
+- **A custom `socketFactory` receives `ssl` as configured: `true`, an options object, or
+  `null`/`false`.** Use `typeof args.ssl === 'object' && args.ssl` before passing it to
+  `tls.connect`.
+- **`LogEntry.namespace` is `string | undefined`.** It is `undefined` for the root logger; guard it
+  under `strictNullChecks`.
+- **If you used an earlier 3.0.0 prerelease: `ConsumerRebalancingEvent.payload.reason` is open.**
+  `'subscription-changed'` and `'enforced-rebalance'` were already reported, and the text passed to
+  `enforceRebalance` is reported as given, so an exhaustive `switch` over the earlier union needs a
+  `default`.
+- **If you used an earlier 3.0.0 prerelease: the `memberId` of `consumer.partition_halted` can be
+  `null`.** A member that has no id yet, or lost it, halts a partition with `null`; guard it under
+  `strictNullChecks`.
+- **If you used an earlier 3.0.0 prerelease: `ShareConsumerRunConfig` is exactly one handler.**
+  `run({})` and `run({ eachMessage, eachBatch })` are compile errors, as `run()` rejects them at run
+  time, and an `interface` can no longer `extends` the type (use an intersection type).
 The declared bases of KafkaJSPartialMessageError, KafkaJSSASLAuthenticationError, KafkaJSGroupCoordinatorNotFound, KafkaJSNotImplemented, KafkaJSTimeout and KafkaJSUnsupportedMagicByteInMessageSet now match KafkaJSNonRetriableError. KafkaJSLockTimeout extends KafkaJSTimeout. Runtime inheritance is unchanged.
 
 ### Numeric telemetry snapshots
@@ -1554,3 +1827,69 @@ Broker client telemetry (KIP-714) is opt-in on every client. The table gives eac
 | “Each client exposes an asynchronous stable `clientInstanceId({ timeout })`; disabled/unsupported/closed/unavailable calls reject with `KafkaJSTelemetryError`.” | UUID is per returned client, stable through reconnect, not a group instance ID. Cached IDs are available without a new network request. Call after connect; timeout0 means cached-only. | Do not call getter or disable metrics; ordinary Kafka calls keep their old error/result identity. |
 | “Applications may register/unregister finite numeric Gauge and monotonic BigInt Sum snapshots for broker subscriptions.” | Re-register the same identity to update its value; there is no callback invocation or OTel SDK bridge. Unregister before resetting a Sum or changing immutable name type/unit. All four client kinds have this API. | Use existing instrumentation/optional OTel instead of registering; registered data only transmits when telemetry is enabled and selected. |
 | “Disconnect sends a best-effort terminating telemetry push on an active connected subscription, for at most 1000 ms within the existing close budget; timeout0 sends no final.” | Final failure cannot delay core close past its inherited deadline or change its result. No reconnect/Get occurs for a final. Internal crash recovery and stop alone are not terminal. Explicit reconnect retains UUID and stays provisional through Get until its first successful normal Push. Only a first-Push 42 in that captured post-final reopen permits one corrective telemetry-transport retirement, ordinary backoff, nonzero-ID Get and additional normal Push; Get cannot replenish the allowance. A second 42 or other fatal result stops only telemetry; close/expiry tears down under existing limits. No UUID rotation, final resend, foreground reconnect or exception for established streams. | `disconnect({ timeout: 0 })` where inherited, or disable metrics; no new close overload/default. |
+
+### Known issues
+
+These issues are known in 3.0.0. A fix for each is planned for a later release.
+
+- **An admin client keeps the topics it reads as long-lived targets.** As in kafkajs 2.2.4, every
+  topic named in `fetchTopicOffsets`, `fetchTopicOffsetsByTimestamp`, `fetchOffsets` with `topics`,
+  `fetchOffsetsForGroups` (a topic without a partition list), `resetOffsets`, `setOffsets`,
+  `deleteTopicRecords`, `describeProducers` without `brokerId` or `abortTransaction` stays in every
+  later metadata request of that admin client. Only the client's own `deleteTopics` of that topic
+  removes it. If another client deletes such a topic, every later call of this admin client that
+  refreshes its metadata fails with `UNKNOWN_TOPIC_OR_PARTITION`, also when the call is about other
+  topics: `createTopics`, `deleteTopics` (also of the deleted topic), `describeConfigs`, an offset
+  read of another topic, and so on. `listTopics` and `fetchTopicMetadata` are not affected.
+  `disconnect()` and `connect()` on the same admin client do not clear it. Who is affected: a
+  long-lived admin client that reads offsets of topics that other clients delete. *What to do:*
+  create a new admin client with `kafka.admin()` (and disconnect the old one), or use one admin
+  client per task, as short-lived jobs already do.
+- **Parallel offset reads of a topic read for the first time can fail with a `TypeError`.**
+  Inherited from kafkajs 2.2.4 (tulios/kafkajs#461). When `fetchTopicOffsets` calls run in parallel
+  on one admin client and one of them reads a topic this client has not read before, that call
+  can join an older metadata request that does not ask for its topic, and fail with
+  `TypeError: Cannot destructure property 'partitions' of 'high.pop(...)' as it is undefined`. It
+  depends on the order the metadata answers arrive in, so it is intermittent. Once every topic has
+  been read once by that client, later parallel reads of those topics are not affected. *What to
+  do:* read each topic once, awaited, before you read topics in parallel, or await the calls in
+  sequence.
+- **A metadata answer can arrive without its brokers.** This applies to every client. When the
+  seed broker is replaced by a connection failure while a metadata request is in flight, or while
+  an answer's new brokers are still being connected, the answer's topic metadata is installed and
+  routing listeners are told before those brokers are in the broker table. If a rebootstrap
+  happens while those brokers are being connected, the refresh stops and rejects, but the answer's
+  topic metadata events and dropped producer topics are not undone. A metadata answer that arrives
+  after a rebootstrap installs nothing and its refresh rejects with a retriable
+  `KafkaJSConnectionError`. The next request to a broker the answer listed but the client did not
+  already know, or knew at another address, fails with the transient `KafkaJSBrokerNotFound` error
+  `Broker N not found in the cached metadata`, and the client refreshes its metadata. A call with
+  retries left recovers on its next attempt; a call with no retries left fails with that error.
+
+- **Metadata answers other than a refresh are not fenced across a rebootstrap.** Coordinator
+  lookups, lookups by topic id, `assign()`, offset lookups and the leader hints carried in Produce
+  and Fetch answers can still act on an answer from before a rebootstrap until the next metadata
+  refresh replaces it. If the old cluster is still reachable, such an answer can send a later
+  request there, and a write or offset commit that succeeds there stays. A broker chosen just
+  before a rebootstrap can be handed to a caller; its request may fail with a retriable connection
+  error or may still succeed on the old cluster.
+
+### Coming from the Java or Go client
+
+Read this if you run the Apache Kafka Java client or franz-go today, or if you share consumer groups or a cluster with them. It lists the differences that change how you configure or operate this client. Each item links the page that explains it.
+
+Two limits apply to everything below. The comparison comes from the code and the documentation. It is not a live interoperability result, so test a mixed deployment on your own cluster before you rely on it. And a limit listed here stays a limit: if your deployment needs the missing feature, this client does not provide it.
+
+- **Members of one group need a shared assigner.** A consumer created without `partitionAssigners` offers only `RoundRobinAssigner`. The Java and Go clients do not use that name, so the coordinator rejects the join of any member that shares no assigner with the members already in the group (`INCONSISTENT_GROUP_PROTOCOL`), and that can be the Java or Go member. *What to do:* give every member the same `range`, `sticky` or `cooperativeSticky` assigner, or move the group to `groupProtocol: 'consumer'` so that the broker assigns. The client stops at JoinGroup v8 on purpose. See [Built-in partition assigners](Consuming.md#partition-assigners), [Cooperative rebalancing, and how to roll it out](Consuming.md#cooperative-rebalancing), [Consumer group protocols](Consuming.md#group-protocols) and [Kafka protocol compatibility](KafkaCompatibility.md).
+- **Rack awareness covers `range` only.** `rackAwareAssignment: true` changes only the `range` assigner, and it defaults to `false`. `sticky`, `cooperativeSticky` and `roundRobin` ignore racks. Fetching from the nearest replica through `rackId` is a separate feature. The client uses a preferred read replica for `metadataMaxAge` after the last Fetch response that named it, then asks the leader again. No separate option sets that interval. See [Follower fetching](Consuming.md#follower-fetching).
+- **Fetch sessions are off, and prefetch does nothing.** Incremental fetch sessions (KIP-227) stay off until you set `fetchSessions: true`. `maxPrefetchBatches` accepts `0` or `1` and has no effect: a fetcher sends its next Fetch only after your handlers finish with the previous response. There is one fetcher, and at most one Fetch in flight, for each broker. No option limits the number of records in one handler call or the number of concurrent fetches. *What to do:* size what a fetch returns with `maxBytes` and `maxBytesPerPartition`. See [Fetch sessions](Consuming.md#fetch-sessions) and [Prefetching](Consuming.md#prefetching).
+- **Automatic commits run at processing points, not on a timer.** `autoCommitInterval` and `autoCommitThreshold` are checked at processing points, such as the end of a batch. An idle consumer does not commit later because the interval passed. After a crash, the records resolved since the last commit are delivered again. See [autoCommit](Consuming.md#auto-commit).
+- **A broker outage ends differently under each group protocol.** With the default classic protocol, a lost connection or a moved coordinator on the consumer's own requests is retried for up to `sessionTimeout`. A longer outage crashes the consumer, and `restartOnFailure` decides. With `groupProtocol: 'consumer'`, the join keeps its counted retries, so an outage during the join fails once `retry.retries` runs out. The same failures, and a request timeout, on the requests of the running fetch loop are retried without spending `retry.retries` and without a time limit. The consumer logs the warning "Lost a connection while fetching, trying again" and does not crash. This lasts until the requests succeed again, the coordinator reports the membership lost, a handler overruns `maxPollInterval` or you stop the consumer. An error your handler throws counts against `retry.retries`, apart from the coordinator errors that a commit or heartbeat callback propagates (see [Membership errors during rebalance](Consuming.md#membership-errors)). *What to do:* decide how long an outage you accept, watch for that warning, and stop or restart the consumer yourself when the limit passes. See [Membership errors during rebalance](Consuming.md#membership-errors) and [Choosing a server-side assignor](Consuming.md#choosing-a-server-side-assignor).
+- **There is no universal consumer deadline.** Only some calls have one. `commitOffsets`, `committed`, `position` and `describeGroup` end at `retry.maxTotalTime` when you set it, and `disconnect({ timeout })` bounds a shutdown. The fetch loop has no deadline. `maxPollInterval` measures progress across all partitions: a batch handed to a handler on any partition, or an empty fetch round, refreshes it. A handler that hangs on one partition is not caught while the other partitions keep making progress (see [Options](Consuming.md#options)). A `disconnect()` with no timeout waits for running handlers, so a handler that never returns holds the shutdown. *What to do:* pass a timeout to `disconnect`, and bound the calls you start yourself, as [Queued requests and memory](Configuration.md#queued-requests-and-memory) describes. See [Default Retry](Configuration.md#default-retry) and [Leaving the group on disconnect](Consuming.md#leaving-the-group).
+- **Offset reset by duration falls back to the log end.** With `offsetReset: 'by_duration:…'`, the consumer looks for the first record at or after the computed time. If none exists, it uses the log end after one lookup. Java waits for a later record instead. See [fromBeginning](Consuming.md#from-beginning).
+- **Share consumers have no acknowledgement flush.** There is no `commitSync` or `commitAsync` equivalent. A handler's `acknowledge()` records a decision locally and does not confirm that the broker accepted it. Sending is automatic, and the `acknowledge` event reports each result: `error: null` on a terminal event confirms the broker result. There is no `unsubscribe()` and no subscription replacement while running; use stop, subscribe, then run. *What to do:* if your application needs a barrier, wait for the events of the offsets that matter. See [Java API equivalents and boundaries](ShareConsumer.md#java-api-equivalents-and-boundaries) and [Acknowledgement settlement](ShareConsumer.md#acknowledgement-settlement).
+- **Producer differences.** An idempotent producer, the default, keeps one batch of a partition in flight at a time, and the client readies a broker on fewer triggers than the Java client does. There is no equivalent of `partitioner.availability.timeout.ms`. The client does not use two-phase commit (KIP-939); see the [Protocol](#protocol) section of this guide. The producer has no manual-only flush mode, streaming compression, per-topic batch size function, record count limit, per-call cancellation or data-loss callback. See [Accumulator](Producing.md#accumulator) and [Uniform sticky partitioner](Producing.md#uniform-sticky-partitioner).
+- **Admin differences.** `fetchTopicMetadata` describes topics by name only. It has no `topicIds` option, and a lookup by name cannot find an earlier topic that had the same name. `listShareGroupOffsets` takes one group per call. The admin offset calls (`fetchOffsets`, `setOffsets`, `resetOffsets`, `fetchTopicOffsets`) take topic names; there are no offset helpers that take topic IDs. Quorum and voter administration, `unregisterBroker` and Streams group administration are not implemented. See [Topics are described by name only](Admin.md#topics-are-described-by-name-only) and [Java administration dispositions](Admin.md#java-administration-dispositions).
+- **Native and platform prerequisites.** LZ4 needs the optional native package `lz4-napi`, and no LZ4 compression level is accepted. GSSAPI needs the optional peer `kerberos@7.0.0`; tickets come from the environment, and renewing them is the deployment's job. The `ssl` option goes to Node's `tls.connect`, so it takes PEM or PFX material and does not read Java keystores. There is no JAAS configuration or login-class plugin; use an `authenticationProvider` or the OAuth helpers. *What to do:* check these in your image before you migrate. See [LZ4](Producing.md#compression-lz4), [GSSAPI (Kerberos)](Configuration.md#gssapi-kerberos), [SSL](Configuration.md#ssl) and [Custom Authentication Mechanisms](Configuration.md#custom-authentication-mechanisms).
+- **Metrics and telemetry.** Broker client telemetry (KIP-714) is off unless you set `enableMetricsPush: true`. Local observation uses the instrumentation events, which are also published on `node:diagnostics_channel`. There is no metrics map or interceptor class. See [Broker client telemetry](#broker-client-telemetry), [Instrumentation events](InstrumentationEvents.md) and [Errors and events](#errors-and-events).
+- **Network tuning.** An idle connection closes after 540000 ms by default (`connectionsMaxIdle`). There are no options for socket buffer sizes or for the DNS lookup mode: set socket options in a custom `socketFactory`, and resolve broker addresses with an async `brokers` function. `maxRequestSize` limits Produce requests only; no option caps the size of other requests. See [Connection Timeout](Configuration.md#connection-timeout), [Resolving broker addresses](Configuration.md#resolving-broker-addresses) and [Custom socket factory](Configuration.md#custom-socket-factory).

@@ -22,6 +22,7 @@ const {
   produceCorpus,
   ShareThroughput,
   CorpusFixture,
+  ownerFile,
 } = require('../shareThroughput')
 
 const message = (offset, key = 'k', value = 'v') => ({
@@ -565,10 +566,10 @@ describe('Share throughput acknowledgement matching', () => {
 describe('Share throughput driver', () => {
   afterEach(() => jest.restoreAllMocks())
 
-  const drive = (arm = 'ordinary') => {
+  const drive = (arm = 'ordinary', handler = 'eachBatch') => {
     const frames = new Frames(fakeSocket)
     const driver = new ShareThroughput(
-      { arm, acquireMode: 'record_limit', maxRecords: 500, messages: 6 },
+      { arm, handler, acquireMode: 'record_limit', maxRecords: 500, messages: 6 },
       { kafka: null, frames, resources: {}, trace: '' }
     )
     driver.log = new AcquisitionLog(frames, new Map([[0, 'a']]))
@@ -633,6 +634,75 @@ describe('Share throughput driver', () => {
       call.messages.map((entry) => identity({ topic: 't', partition: 0, message: entry }))
     )
     expect(() => driver.evaluate(expected)).toThrow(diagnostic)
+  })
+
+  test('an eachMessage share arm enters the handler once per record, all in the acquisition', async () => {
+    const { driver, frames } = drive('share', 'eachMessage')
+    driver.consumer = { acquisitionLockTimeoutMs: () => LIMITS.lock }
+    frames.rows.push({ endpoint: 'a', apiKey: 78, writeAt: 0, responseAt: 1 })
+    clock([2, 3, 4, 5])
+    for (const offset of [0, 1]) {
+      await driver.messageHandler({ topic: 't', partition: 0, message: message(offset) })
+    }
+    expect(driver.log.calls.map((call) => call.messages.map(({ offset }) => offset))).toEqual([
+      ['0'],
+      ['1'],
+    ])
+    expect(new Set(driver.log.calls.map((call) => call.group)).size).toBe(1)
+    expect(driver.log.calls.map((call) => [call.enteredAt, call.returnedAt])).toEqual([
+      [2, 3],
+      [4, 5],
+    ])
+    driver.fetchEvents.push({ numberOfRecords: 2 })
+    const expected = [0, 1].map((offset) =>
+      identity({ topic: 't', partition: 0, message: message(offset) })
+    )
+    expect(driver.evaluate(expected)).toEqual({
+      delivered: { batches: 2, messages: 2 },
+      metrics: { status: 'inconclusive', reason: 'Too few acquisitions on a node' },
+    })
+  })
+
+  test('an eachMessage call takes its lock from the public acquisition lock reading', async () => {
+    const { driver, frames } = drive('share', 'eachMessage')
+    driver.consumer = { acquisitionLockTimeoutMs: () => 20 }
+    frames.rows.push({ endpoint: 'a', apiKey: 78, writeAt: 0, responseAt: 1 })
+    clock([2, 3])
+    await driver.messageHandler({ topic: 't', partition: 0, message: message(0) })
+    expect(driver.log.calls[0].lock).toBe(20)
+    driver.fetchEvents.push({ numberOfRecords: 1 })
+    const expected = [identity({ topic: 't', partition: 0, message: message(0) })]
+    expect(() => driver.evaluate(expected)).toThrow('Unexpected acquisition lock duration')
+  })
+
+  test.each([
+    ['eachBatch', 'share', ['eachBatch']],
+    ['eachMessage', 'share', ['eachMessage']],
+    ['eachBatch', 'ordinary', ['autoCommit', 'eachBatch']],
+  ])('runs the %s handler alone on the %s arm', async (handler, arm, keys) => {
+    const { driver } = drive(arm, handler)
+    driver.log = new AcquisitionLog(driver.frames, new Map())
+    let options
+    const consumer = {
+      events: Object.fromEntries(
+        ['CRASH', 'FETCH', 'ACKNOWLEDGE', 'SESSION_RESET', 'HANDLER_ERROR', 'LOCK_EXPIRED'].map(
+          (name) => [name, name]
+        )
+      ),
+      on: () => () => {},
+      connect: async () => {},
+      subscribe: async () => {},
+      run: async (runOptions) => {
+        options = runOptions
+      },
+    }
+    driver.kafka = { shareConsumer: () => consumer, consumer: () => consumer }
+    driver.resources = { track: () => {} }
+    await driver.consume('t', 0, performance.now() + 10000)
+    expect(Object.keys(options).sort()).toEqual(keys)
+    expect(options[handler]).toBe(
+      handler === 'eachMessage' ? driver.messageHandler : driver.handler
+    )
   })
 
   test('waits for terminal accepted results of every share record and surfaces faults', () => {
@@ -1212,8 +1282,25 @@ describe('Share throughput corpus and arguments', () => {
       maxRecords: 500,
       control: 1,
       arm: 'share',
+      handler: 'eachBatch',
     })
     expect(parseArgs([...argv, '--arm', 'ordinary']).arm).toBe('ordinary')
+  })
+
+  test('accepts the eachMessage handler only on a full-acquisition share arm', () => {
+    expect(parseArgs([...argv, '--handler', 'eachMessage']).handler).toBe('eachMessage')
+    expect(parseArgs([...argv, '--handler', 'eachBatch']).handler).toBe('eachBatch')
+    expect(() => parseArgs([...argv, '--handler', 'eachMessage', '--arm', 'ordinary'])).toThrow(
+      'The eachMessage handler is a full-acquisition share run'
+    )
+    const frame = argv.map((value) => ({ 200000: '3000', 500: '1' })[value] ?? value)
+    expect(() => parseArgs([...frame, '--handler', 'eachMessage'])).toThrow(
+      'The eachMessage handler is a full-acquisition share run'
+    )
+    expect(() => parseArgs([...argv, '--handler', 'each'])).toThrow('Invalid handler')
+    expect(() =>
+      parseArgs([...argv, '--handler', 'eachMessage', '--handler', 'eachMessage'])
+    ).toThrow('Invalid argument')
   })
 
   test('accepts the separate frame control corpus only as a record_limit share run', () => {
@@ -1293,6 +1380,42 @@ describe('Share corpus topic cleanup', () => {
     expect(timeout).toHaveBeenCalledWith(999)
     expect(visited).toEqual(['a:9092', 'b:9092', 'c:9092'])
     expect(emitter.listenerCount('request')).toBe(0)
+  })
+
+  test('a corpus preparation records its topic before creating it, and cleanup removes the topic from that record', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'share-owner-'))
+    const file = path.join(dir, 'corpus.json')
+    const fixture = Object.create(CorpusFixture.prototype)
+    Object.assign(fixture, {
+      file,
+      deadline: performance.now() + 60000,
+      config: { messages: 200000, size: 100, partitions: 3 },
+    })
+    const seen = []
+    fixture.admin = {
+      connect: async () => {},
+      disconnect: async () => {},
+      createTopics: async ({ topics }) => {
+        seen.push(['create', topics[0].topic, fs.existsSync(ownerFile(file))])
+        throw new Error('The controller moved')
+      },
+    }
+    fixture.producer = { disconnect: async () => {} }
+    fixture.removeTopic = async (topic) => seen.push(['remove', topic])
+    jest.spyOn(process.stdout, 'write').mockImplementation(() => true)
+
+    await expect(fixture.run('prepare')).rejects.toThrow('The controller moved')
+    const { topic } = JSON.parse(fs.readFileSync(ownerFile(file), 'utf8'))
+    expect(topic).toMatch(/^share-bench-[a-f0-9-]+$/)
+    expect(seen).toEqual([
+      ['create', topic, true],
+      ['remove', topic],
+    ])
+    expect(fs.existsSync(file)).toBe(false)
+
+    await fixture.run('cleanup')
+    expect(seen.at(-1)).toEqual(['remove', topic])
+    fs.rmSync(dir, { recursive: true, force: true })
   })
 
   test('refuses to extend a submillisecond cleanup remainder', async () => {

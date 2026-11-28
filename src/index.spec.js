@@ -222,7 +222,7 @@ describe('Client', () => {
       ...options,
       cluster: Cluster.mock.instances[0],
       telemetry: expect.any(TelemetryFactory),
-      linger: 5,
+      linger: 0,
       batchSize: 16384,
       deliveryTimeout: 120000,
       rackId: '',

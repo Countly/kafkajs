@@ -77,6 +77,30 @@ describe('Protocol > Compression > ZSTD', () => {
         expect(isolatedIndex.lookupCodec(isolatedIndex.Types.GZIP)).toBeTruthy()
       })
     })
+
+    it('refuses to compress or decompress through the codec itself, with the same actionable error', async () => {
+      jest.doMock('zlib', () => {
+        const stub = { ...jest.requireActual('zlib') }
+        delete stub.zstdCompressSync
+        delete stub.zstdCompress
+        delete stub.zstdDecompress
+        return stub
+      })
+      let isolatedZstd, KafkaJSNotImplemented
+      jest.isolateModules(() => {
+        isolatedZstd = require('./zstd')
+        ;({ KafkaJSNotImplemented } = require('../../../errors'))
+      })
+
+      for (const call of [
+        () => isolatedZstd.compress({ buffer: Buffer.from('x') }),
+        () => isolatedZstd.decompress(Buffer.from('x')),
+      ]) {
+        const error = await call().catch((e) => e)
+        expect(error).toBeInstanceOf(KafkaJSNotImplemented)
+        expect(error.message).toBe(isolatedZstd.NOT_SUPPORTED_MESSAGE)
+      }
+    })
   })
 
   describeIfZstd('when node:zlib provides zstd', () => {
@@ -202,6 +226,9 @@ describe('Protocol > Compression > ZSTD', () => {
     it('still rejects what is not zstd', async () => {
       const codec = require('./zstd')
       await expect(codec.decompress(Buffer.from('not a zstd stream'))).rejects.toMatchObject({
+        code: 'ZSTD_error_prefix_unknown',
+      })
+      await expect(codec.decompress(Buffer.from('abcde'))).rejects.toMatchObject({
         code: 'ZSTD_error_prefix_unknown',
       })
       const reserved = Buffer.from([0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x00, 0x07, 0x00, 0x00])

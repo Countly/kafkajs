@@ -2,7 +2,15 @@ const fs = require('fs')
 const path = require('path')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { mulberry32 } = require('../../../testHelpers/fuzz')
-const { TOPIC, TOPIC_ID, apiVersionsBody, createFakeBroker } = require('./fixtures/fetchHarness')
+const {
+  TOPIC,
+  TOPIC_ID,
+  apiVersionsBody,
+  createFakeBroker,
+  trackFixtures,
+} = require('./fixtures/fetchHarness')
+
+trackFixtures()
 
 const directory = path.join(__dirname, '../../protocol/requests/fetch/fixtures')
 const sessionDirectory = path.join(directory, 'java')
@@ -153,9 +161,13 @@ const delivery = async ({ name, version, body }, how) => {
           topics: [
             {
               topic: TOPIC,
-              partitions: [
-                { partition: 0, fetchOffset: '0', maxBytes: 1048576, currentLeaderEpoch: -1 },
-              ],
+              // The broker captures answer partition 1, the other vectors partition 0.
+              partitions: [0, 1].map((partition) => ({
+                partition,
+                fetchOffset: '0',
+                maxBytes: 1048576,
+                currentLeaderEpoch: -1,
+              })),
             },
           ],
           topicIds: version >= 13 ? new Map([[TOPIC, TOPIC_ID]]) : undefined,

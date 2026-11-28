@@ -1,0 +1,11 @@
+--- a/src/consumer/subscription.js
++++ b/src/consumer/subscription.js
+@@ -141,7 +141,7 @@
+     for (const row of metadata.topicMetadata) {
+       if (row.isInternal || (row.topicErrorCode != null && row.topicErrorCode !== 0)) continue
+       for (const entry of this.patterns) {
+-        if (entry.pattern.test(row.topic) && entry.order > (selected.get(row.topic)?.order ?? -1)) {
++        if (entry.pattern.test(row.topic)) {
+           selected.set(row.topic, entry)
+         }
+       }

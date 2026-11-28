@@ -18,6 +18,7 @@ const RackPreference = require('./producer/partitioners/rackPreference')
 const { minimumRequestSize } = require('./producer/state/recordSize')
 const { MAX_DELAY } = require('./producer/deadline')
 const createConsumer = require('./consumer')
+const topicMetadataStatusReporter = require('./consumer/topicMetadataStatus')
 const {
   createShareConsumer,
   validateShareConsumerOptions,
@@ -366,14 +367,16 @@ const validateBuffer = ({ bufferMemory, maxBlockMs }) => {
 /**
  * Checks a producer's `maxRequestSize`: an integer from the smallest Produce request this
  * producer's identifiers allow (its framing, one batch header and one empty record) to 2147483647.
- * @param {number|undefined} maxRequestSize absent keeps the default
+ * @param {number|undefined} maxRequestSize absent keeps the default; `null` is refused like any
+ *   other value that is not an integer
  * @param {string|null|undefined} clientId
  * @param {string|null|undefined} transactionalId
  * @returns {void}
  * @throws {KafkaJSInvalidConfigurationError} naming the minimum
  */
 const validateMaxRequestSize = (maxRequestSize, clientId, transactionalId) => {
-  const value = maxRequestSize ?? createProducer.defaults.maxRequestSize
+  const value =
+    maxRequestSize === undefined ? createProducer.defaults.maxRequestSize : maxRequestSize
   const minimum = minimumRequestSize(clientId, transactionalId)
   if (!(Number.isInteger(value) && value >= minimum && value <= INT_32_MAX_VALUE)) {
     throw new KafkaJSInvalidConfigurationError(
@@ -534,6 +537,7 @@ module.exports = class Client {
       maxInFlightRequests = DEFAULT_MAX_IN_FLIGHT_REQUESTS,
       instrumentationEmitter = null,
       isolationLevel,
+      onTopicMetadataStatus,
     }) =>
       new Cluster({
         telemetryMetrics,
@@ -567,6 +571,7 @@ module.exports = class Client {
         metadataClusterCheck: validatedMetadataClusterCheck,
         metadataRecoveryRebootstrapTriggerMs: validatedMetadataRecoveryRebootstrapTriggerMs,
         bootstrapResolveTimeout: validatedBootstrapResolveTimeout,
+        onTopicMetadataStatus,
       })
   }
 
@@ -577,7 +582,7 @@ module.exports = class Client {
    * `idempotent: true` or a `transactionalId` asked for it.
    * @public
    * @param {object} [options]
-   * @param {number} [options.linger=5] ms a batch waits for more records; 0 sends it at once
+   * @param {number} [options.linger=0] ms a batch waits for more records; 0 sends it at once
    * @param {number} [options.batchSize=16384] bytes of keys and values at which a batch is sent
    * @param {number} [options.deliveryTimeout] ms bounding the waiting and the retries of one send,
    *   at least `linger + requestTimeout`. A request already sent settles on its answer or on
@@ -810,6 +815,11 @@ module.exports = class Client {
       maxInFlightRequests,
       isolationLevel,
       instrumentationEmitter,
+      onTopicMetadataStatus: topicMetadataStatusReporter({
+        groupId,
+        logger: this[PRIVATE.LOGGER].namespace('Consumer'),
+        instrumentationEmitter,
+      }),
     })
 
     telemetry.bind(cluster)

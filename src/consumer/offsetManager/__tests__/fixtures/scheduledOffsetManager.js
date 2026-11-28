@@ -83,6 +83,7 @@ const createScheduledOffsetManager = ({
 
   const cluster = {
     committedOffsets: () => cache,
+    offsetOperations: () => operations,
     topicId: () => state.topicId,
     fetchTopicsOffset: jest.fn((topics) =>
       schedule.run({ api: 'ListOffsets', topics }, () =>

@@ -4,7 +4,6 @@
 const fs = require('fs')
 const { execSync } = require('child_process')
 const { randomUUID } = require('crypto')
-const semver = require('semver')
 const crypto = require('crypto')
 const Cluster = require('../src/cluster')
 const Broker = require('../src/broker')
@@ -68,6 +67,18 @@ const unsecuredJwt = (claims) => {
     exp: now + 3600,
     ...claims,
   })}.`
+}
+
+/**
+ * Builds an unsecured JWT whose expiry lies in the past. The test broker answers it with an
+ * OAUTHBEARER error challenge.
+ *
+ * @param {object} [claims] Claims that replace or add to the defaults.
+ * @returns {string} The serialized token.
+ */
+const expiredUnsecuredJwt = (claims) => {
+  const now = Math.floor(Date.now() / 1000)
+  return unsecuredJwt({ iat: now - 7200, exp: now - 3600, ...claims })
 }
 
 const plainTextBrokers = (host = getHost()) => [`${host}:9092`, `${host}:9095`, `${host}:9098`]
@@ -443,25 +454,6 @@ const addPartitions = async ({ topic, partitions }) => {
   })
 }
 
-const testIfKafkaVersion = (version, versionComparator) => {
-  const scopedTest = (description, callback, testFn = test) => {
-    return versionComparator(semver.coerce(process.env.KAFKA_VERSION), semver.coerce(version))
-      ? testFn(description, callback)
-      : test.skip(description, callback)
-  }
-
-  scopedTest.only = (description, callback) => scopedTest(description, callback, test.only)
-
-  return scopedTest
-}
-
-const testIfKafkaVersionLTE = (version) => testIfKafkaVersion(version, semver.lte)
-const testIfKafkaVersionGTE = (version) => testIfKafkaVersion(version, semver.gte)
-
-const testIfKafkaAtMost_0_10 = testIfKafkaVersionLTE('0.10')
-const testIfKafkaAtLeast_0_11 = testIfKafkaVersionGTE('0.11')
-const testIfKafkaAtLeast_1_1_0 = testIfKafkaVersionGTE('1.1')
-
 const flakyTest = (description, callback, testFn = test) =>
   testFn(`[flaky] ${description}`, callback)
 flakyTest.skip = (description, callback) => flakyTest(description, callback, test.skip)
@@ -517,6 +509,7 @@ module.exports = {
   saslSCRAM256ConnectionOpts,
   saslSCRAM512ConnectionOpts,
   saslOAuthBearerConnectionOpts,
+  expiredUnsecuredJwt,
   saslEntries,
   createConnectionPool,
   createConnectionBuilder,
@@ -534,9 +527,6 @@ module.exports = {
   waitForMessages,
   waitForNextEvent,
   waitForConsumerToJoinGroup,
-  testIfKafkaAtMost_0_10,
-  testIfKafkaAtLeast_0_11,
-  testIfKafkaAtLeast_1_1_0,
   flakyTest,
   describeIfOauthbearerEnabled,
   describeIfOauthbearerDisabled,

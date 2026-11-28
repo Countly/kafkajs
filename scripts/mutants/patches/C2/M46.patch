@@ -1,0 +1,11 @@
+--- a/src/consumer/assigners/partitionMetadata.js
++++ b/src/consumer/assigners/partitionMetadata.js
+@@ -8,7 +8,7 @@
+ module.exports = (cluster, groupTopicMetadata, topic) =>
+   groupTopicMetadata === undefined
+     ? cluster.findTopicPartitionMetadata(topic)
+-    : (groupTopicMetadata.get(topic) ?? [])
++    : (groupTopicMetadata.get(topic) ?? cluster.findTopicPartitionMetadata(topic))
+ 
+ /**
+  * Copies partition rows with replica racks from the same Metadata answer. The internal rack

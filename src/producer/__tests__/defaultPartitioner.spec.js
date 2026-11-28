@@ -2,7 +2,8 @@ const { webcrypto } = require('crypto')
 const { Kafka, Partitioners } = require('../../../index')
 const { LEVELS } = require('../../loggers')
 const { mulberry32 } = require('../../../testHelpers/schedule')
-const { bufferedProducer } = require('./fixtures/bufferHarness')
+const { bufferedProducer, deferred, flushAll } = require('./fixtures/bufferHarness')
+const { createFakeCluster } = require('./fixtures/fakeCluster')
 
 const TOPIC = 'topic-a'
 
@@ -89,6 +90,49 @@ describe('Producer > the default partitioner', () => {
     }
 
     expect(differing).toEqual([])
+  })
+
+  test("the producer's default partitioner is adaptive", async () => {
+    const held = deferred()
+    let calls = 0
+    const cluster = createFakeCluster({
+      partitions: 2,
+      produce: async ({ topicData }) => {
+        if ((calls += 1) === 1) await held.promise
+        return {
+          topics: topicData.map(({ topic, partitions }) => ({
+            topicName: topic,
+            partitions: partitions.map(({ partition }) => ({
+              partition,
+              errorCode: 0,
+              baseOffset: '0',
+              logAppendTime: '-1',
+              logStartOffset: '0',
+            })),
+          })),
+        }
+      },
+    })
+    const { producer } = bufferedProducer({ cluster })
+    await producer.connect()
+
+    // partition 0's broker answers slowly: one batch waits for it, none for partition 1
+    const sends = [producer.send({ topic: TOPIC, messages: [{ value: 'a', partition: 0 }] })]
+    try {
+      await flushAll()
+      expect(written(cluster)).toEqual([0])
+
+      // weights 1 and 2, a draw of 0.4 * 3 picks partition 1; a uniform pick would take 0
+      jest.spyOn(Math, 'random').mockReturnValue(0.4)
+      sends.push(producer.send({ topic: TOPIC, messages: [{ value: 'b' }] }))
+      await flushAll()
+      expect(written(cluster)).toEqual([0, 1])
+    } finally {
+      held.resolve()
+      await Promise.allSettled(sends)
+      await producer.disconnect()
+    }
+    await expect(Promise.all(sends)).resolves.toHaveLength(2)
   })
 
   test('an explicit partition goes where it says under the new default', async () => {

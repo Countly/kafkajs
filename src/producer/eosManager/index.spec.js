@@ -6,8 +6,10 @@ const FencedRetry = require('../../retry/fenced')
 const ProducerStateManager = require('../state')
 const {
   KafkaJSApplicationRecoverableError,
+  KafkaJSBrokerNotFound,
   KafkaJSConnectionError,
   KafkaJSDeliveryTimeout,
+  KafkaJSError,
   KafkaJSGroupCoordinatorNotFound,
   KafkaJSInvalidConfigurationError,
   KafkaJSInvariantViolation,
@@ -76,6 +78,19 @@ describe('Producer > eosManager', () => {
     expect(eosManager.getProducerId()).toEqual(mockInitProducerIdResponse.producerId)
     expect(eosManager.getProducerEpoch()).toEqual(mockInitProducerIdResponse.producerEpoch)
     expect(eosManager.isInitialized()).toEqual(true)
+  })
+
+  test('InitProducerId carries 60000 ms when no transaction timeout is configured', async () => {
+    const eosManager = createEosManager({ logger: newLogger(), cluster })
+
+    await eosManager.initProducerId()
+
+    expect(broker.initProducerId).toHaveBeenCalledWith({
+      transactionalId: null,
+      transactionTimeout: 60000,
+      producerId: -1,
+      producerEpoch: -1,
+    })
   })
 
   test.each([
@@ -456,6 +471,7 @@ describe('Producer > eosManager', () => {
         memberId: '',
         groupInstanceId: null,
         transactionVersion: 1,
+        guard: expect.any(Function),
       })
     })
 
@@ -825,11 +841,11 @@ describe('Producer > eosManager', () => {
     })
 
     test.each([
-      ['TRANSACTIONAL_ID_AUTHORIZATION_FAILED', 53],
-      ['GROUP_AUTHORIZATION_FAILED', 30],
+      ['TRANSACTIONAL_ID_AUTHORIZATION_FAILED', 'none: the producer is fatal', 53, 0],
+      ['GROUP_AUTHORIZATION_FAILED', 'one, since the AddOffsetsToTxn was sent', 30, 1],
     ])(
-      'an AddOffsetsToTxn refused with %s leaves the transaction unstarted: abort() sends no EndTxn',
-      async (_, code) => {
+      'an AddOffsetsToTxn refused with %s leaves the transaction unconfirmed and sends no TxnOffsetCommit; the EndTxn abort() sends: %s',
+      async (_, __, code, endTxns) => {
         broker.negotiatedVersion = jest.fn(() => 5)
         broker.initProducerId.mockImplementation(
           async ({ producerId: id, producerEpoch: epoch }) =>
@@ -850,7 +866,7 @@ describe('Producer > eosManager', () => {
         await eosManager.abort().catch(() => {})
 
         expect(broker.txnOffsetCommit).not.toHaveBeenCalled()
-        expect(broker.endTxn).not.toHaveBeenCalled()
+        expect(broker.endTxn).toHaveBeenCalledTimes(endTxns)
       }
     )
 
@@ -1185,6 +1201,26 @@ describe('Epoch bump failure at transaction boundaries', () => {
     expect(manager.getProducerEpoch()).toBe(1)
     await manager.abort()
   })
+  test('a direct InitProducerId refusal with code 53 keeps the epoch bump owed', async () => {
+    const { manager, broker } = await fixture()
+    const refusal = createErrorFromCode(53)
+    broker.initProducerId.mockRejectedValueOnce(refusal).mockRejectedValueOnce(refusal)
+
+    await expect(manager.abort({ droppedSequences: true })).resolves.toBeUndefined()
+    await expect(manager.beginTransaction()).rejects.toMatchObject({
+      name: 'KafkaJSTransactionAbortableError',
+      cause: refusal,
+    })
+    expect(manager.stateManager.state()).toBe('READY')
+    expect(manager.getProducerEpoch()).toBe(0)
+    expect(broker.initProducerId).toHaveBeenCalledTimes(3)
+
+    await manager.beginTransaction()
+    expect(manager.getProducerEpoch()).toBe(1)
+    expect(broker.initProducerId).toHaveBeenCalledTimes(4)
+    await manager.abort()
+  })
+
   test.each(['abort', 'begin'])('a fatal bump failure rejects at %s', async (boundary) => {
     const { manager, broker } = await fixture()
     if (boundary === 'begin') {
@@ -1322,9 +1358,11 @@ describe('The transaction coordinator lookup of a begin and of InitProducerId', 
     })
 
     test.each([
-      ['TRANSACTIONAL_ID_AUTHORIZATION_FAILED', () => createErrorFromCode(53)],
+      ['CLUSTER_AUTHORIZATION_FAILED', () => createErrorFromCode(31)],
       ['a TypeError', () => new TypeError('boom')],
-      ['a coordinator that was not found', () => new KafkaJSGroupCoordinatorNotFound('none')],
+      ...(method === 'beginTransaction'
+        ? [['a coordinator that was not found', () => new KafkaJSGroupCoordinatorNotFound('none')]]
+        : []),
     ])('rejects at once, as before, on %s', async (_name, make) => {
       const { manager, cluster, broker } = await build(options)
       const error = make()
@@ -1338,7 +1376,7 @@ describe('The transaction coordinator lookup of a begin and of InitProducerId', 
 
     test('rejects at once, as it is, on an error that is not retriable after a reset', async () => {
       const { manager, cluster, broker } = await build(options)
-      const refused = createErrorFromCode(53)
+      const refused = createErrorFromCode(31)
       cluster.findGroupCoordinator.mockRejectedValueOnce(reset()).mockRejectedValueOnce(refused)
 
       await expect(manager[method]()).rejects.toBe(refused)
@@ -1346,6 +1384,25 @@ describe('The transaction coordinator lookup of a begin and of InitProducerId', 
       expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
       expect(broker.initProducerId).not.toHaveBeenCalled()
     })
+
+    test.each([0, 1])(
+      'arms FATAL_ERROR on TRANSACTIONAL_ID_AUTHORIZATION_FAILED after %i connection resets',
+      async (resets) => {
+        const { manager, cluster, broker } = await build(options)
+        const refused = createErrorFromCode(53)
+        failLookups(cluster, resets)
+        cluster.findGroupCoordinator.mockRejectedValueOnce(refused)
+
+        const error = await manager[method]().catch((e) => e)
+
+        expect(error).toBe(manager.stateManager.transaction.armedError())
+        expect(error.name).toBe('KafkaJSApplicationRecoverableError')
+        expect(error.cause).toBe(refused)
+        expect(manager.stateManager.state()).toBe('FATAL_ERROR')
+        expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(resets + 1)
+        expect(broker.initProducerId).not.toHaveBeenCalled()
+      }
+    )
 
     test('stops retrying when the producer lifecycle closes meanwhile, and writes nothing late', async () => {
       const generation = new Generation()
@@ -1372,6 +1429,25 @@ describe('The transaction coordinator lookup of a begin and of InitProducerId', 
       expect(broker.initProducerId).not.toHaveBeenCalled()
       expect(manager.stateManager.state()).toBe(options.begun ? 'READY' : 'UNINITIALIZED')
     })
+  })
+
+  test('a begin whose lifecycle closes before it handles a lookup refusal arms nothing', async () => {
+    const generation = new Generation()
+    const { manager, cluster, broker } = await build({
+      begun: true,
+      getGeneration: () => generation,
+    })
+    const closed = new KafkaJSProducerClosedError('The producer was closed', { outcome: 'unknown' })
+    cluster.findGroupCoordinator.mockRejectedValueOnce(createErrorFromCode(53))
+    // Close after the retry checks the open lifecycle, before begin handles its rejection.
+    jest.spyOn(generation, 'check').mockImplementationOnce(() => {
+      queueMicrotask(() => generation.close(closed))
+    })
+
+    await expect(manager.beginTransaction()).rejects.toBe(closed)
+
+    expect(manager.stateManager.state()).toBe('READY')
+    expect(broker.initProducerId).not.toHaveBeenCalled()
   })
 
   test('a begin does not outlive a producer made unusable while it retries', async () => {
@@ -1419,5 +1495,420 @@ describe('The transaction coordinator lookup of a begin and of InitProducerId', 
 
     expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(3)
     expect(manager.stateManager.state()).toBe('IN_TRANSACTION')
+  })
+})
+
+describe('Transaction coordinator discovery that runs out', () => {
+  const { createFakeCluster } = require('../__tests__/fixtures/fakeCluster')
+  const RETRY = { retries: 3, initialRetryTime: 1, maxRetryTime: 1, factor: 0 }
+  const PENDING =
+    'The transaction coordinator could not be found; the commit is pending, call commit() again'
+  const TOPICS = [{ topic: 'topic-a', partitions: [{ partition: 0, offset: '5' }] }]
+  const notFound = () => new KafkaJSGroupCoordinatorNotFound('Failed to find group coordinator')
+  const spent = () =>
+    new KafkaJSNumberOfRetriesExceeded(new KafkaJSBrokerNotFound('Broker 1 not found'), {
+      retryCount: 3,
+      retryTime: 1,
+    })
+
+  /**
+   * A transactional manager over the fake cluster at transaction version `level`, its producer id
+   * acquired and a transaction begun; call counts start from there.
+   * @param {{ level?: 1|2, begun?: boolean, generation?: Generation }} [options]
+   * @returns {Promise<{ manager: object, cluster: object, broker: object }>}
+   */
+  const build = async ({ level = 1, begun = true, generation } = {}) => {
+    const cluster = createFakeCluster()
+    const { broker } = cluster
+    Object.assign(broker, {
+      finalizedFeatures: { 'transaction.version': { minVersionLevel: 0, maxVersionLevel: level } },
+      finalizedFeaturesEpoch: 1,
+      negotiatedVersion: () => 5,
+      addOffsetsToTxn: jest.fn(async () => ({})),
+      txnOffsetCommit: jest.fn(async () => ({})),
+    })
+    broker.initProducerId.mockImplementation(async ({ producerEpoch }) => ({
+      producerId: '1000',
+      producerEpoch: producerEpoch + 1,
+    }))
+    broker.endTxn.mockImplementation(async ({ producerEpoch }) =>
+      level === 2 ? { producerId: '1000', producerEpoch: producerEpoch + 1 } : {}
+    )
+    const manager = createEosManager({
+      cluster,
+      logger: newLogger(),
+      transactional: true,
+      transactionalId: 'discovery',
+      retry: RETRY,
+      ...(generation ? { getGeneration: () => generation } : {}),
+    })
+    if (begun) {
+      await manager.initProducerId()
+      await manager.beginTransaction()
+    }
+    cluster.findGroupCoordinator.mockClear()
+    broker.initProducerId.mockClear()
+    return { manager, cluster, broker }
+  }
+
+  /** @param {object} cluster @param {number} type @returns {number} lookups of that type */
+  const lookupsOf = (cluster, type) =>
+    cluster.findGroupCoordinator.mock.calls.filter(
+      ([{ coordinatorType }]) => coordinatorType === type
+    ).length
+
+  /** @param {object} cluster @param {() => Error} make fails every lookup of the group coordinator */
+  const failGroupLookups = (cluster, make) =>
+    cluster.findGroupCoordinator.mockImplementation(async ({ coordinatorType }) => {
+      if (coordinatorType === COORDINATOR_TYPES.GROUP) throw make()
+      return cluster.broker
+    })
+
+  test('InitProducerId discovery exhaustion at connect is retriable and not fatal', async () => {
+    const { manager, cluster, broker } = await build({ begun: false })
+    const lost = notFound()
+    cluster.findGroupCoordinator.mockRejectedValueOnce(lost)
+
+    const error = await manager.initProducerId().catch((e) => e)
+
+    expect(error).toBeInstanceOf(KafkaJSError)
+    expect(error.retriable).toBe(true)
+    expect(error.cause).toBe(lost)
+    expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
+    expect(broker.initProducerId).not.toHaveBeenCalled()
+    expect(manager.stateManager.state()).toBe('UNINITIALIZED')
+
+    await manager.initProducerId()
+    expect(manager.stateManager.state()).toBe('READY')
+    expect(broker.initProducerId).toHaveBeenCalledTimes(1)
+  })
+
+  test('AddPartitionsToTxn discovery exhaustion arms ABORTABLE_ERROR (TV1)', async () => {
+    const { manager, cluster, broker } = await build()
+    const lost = notFound()
+    cluster.findGroupCoordinator.mockRejectedValueOnce(lost)
+
+    const error = await manager
+      .addPartitionsToTransaction([{ topic: 'topic-a', partitions: [{ partition: 0 }] }])
+      .catch((e) => e)
+
+    expect(error).toBeInstanceOf(KafkaJSTransactionAbortableError)
+    expect(error.cause).toBe(lost)
+    expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
+    expect(broker.addPartitionsToTxn).not.toHaveBeenCalled()
+    expect(manager.stateManager.state()).toBe('ABORTABLE_ERROR')
+    await manager.abort()
+    expect(manager.stateManager.state()).toBe('READY')
+  })
+
+  test('sendOffsets arms ABORTABLE_ERROR when the transaction coordinator cannot be found for AddOffsetsToTxn (TV1)', async () => {
+    const { manager, cluster, broker } = await build()
+    cluster.findGroupCoordinator.mockRejectedValueOnce(spent())
+
+    const error = await manager
+      .sendOffsets({ consumerGroupId: 'g', topics: TOPICS })
+      .catch((e) => e)
+
+    expect(error).toBeInstanceOf(KafkaJSTransactionAbortableError)
+    expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
+    expect(broker.addOffsetsToTxn).not.toHaveBeenCalled()
+    expect(manager.stateManager.state()).toBe('ABORTABLE_ERROR')
+  })
+
+  test.each([
+    ['sendOffsets arms ABORTABLE_ERROR when the group coordinator cannot be found (TV1)', 1],
+    ['sendOffsets arms ABORTABLE_ERROR when the group coordinator cannot be found (TV2)', 2],
+  ])('%s', async (_title, level) => {
+    const { manager, cluster, broker } = await build({ level })
+    failGroupLookups(cluster, notFound)
+
+    const error = await manager
+      .sendOffsets({ consumerGroupId: 'g', topics: TOPICS })
+      .catch((e) => e)
+
+    expect(error).toBeInstanceOf(KafkaJSTransactionAbortableError)
+    expect(error.cause).toBeInstanceOf(KafkaJSGroupCoordinatorNotFound)
+    expect(lookupsOf(cluster, COORDINATOR_TYPES.GROUP)).toBe(1)
+    expect(broker.addOffsetsToTxn).toHaveBeenCalledTimes(level === 1 ? 1 : 0)
+    expect(broker.txnOffsetCommit).not.toHaveBeenCalled()
+    expect(manager.stateManager.state()).toBe('ABORTABLE_ERROR')
+    await manager.abort()
+    expect(manager.stateManager.state()).toBe('READY')
+  })
+
+  describe.each([1, 2])('transaction version %i', (level) => {
+    test('commit holds the commit when the coordinator cannot be found', async () => {
+      const { manager, cluster, broker } = await build({ level })
+      manager.stateManager.markOffsetsAdded()
+      const lost = notFound()
+      cluster.findGroupCoordinator.mockRejectedValueOnce(lost)
+
+      const error = await manager.commit().catch((e) => e)
+
+      expect(error).toBeInstanceOf(KafkaJSError)
+      expect(error).toMatchObject({ name: 'KafkaJSError', message: PENDING, retriable: true })
+      expect(error.cause).toBe(lost)
+      expect(broker.endTxn).not.toHaveBeenCalled()
+      expect(manager.stateManager.state()).toBe('COMMITTING')
+      expect(manager.stateManager.transaction.commitPending()).toBe(true)
+      await expect(manager.beginTransaction()).rejects.toThrow()
+    })
+
+    test('a held commit resends the same EndTxn with the same producer id and epoch', async () => {
+      const { manager, cluster, broker } = await build({ level })
+      manager.stateManager.markOffsetsAdded()
+      const epoch = manager.getProducerEpoch()
+      cluster.findGroupCoordinator.mockRejectedValueOnce(notFound())
+      await expect(manager.commit()).rejects.toMatchObject({ message: PENDING })
+
+      await manager.commit()
+
+      expect(broker.endTxn).toHaveBeenCalledTimes(1)
+      expect(broker.endTxn).toHaveBeenCalledWith({
+        producerId: '1000',
+        producerEpoch: epoch,
+        transactionalId: 'discovery',
+        transactionResult: true,
+        transactionVersion: level,
+      })
+      expect(manager.stateManager.state()).toBe('READY')
+    })
+
+    test('commit after an unacknowledged EndTxn then a failed lookup stays pending', async () => {
+      const { manager, cluster, broker } = await build({ level })
+      manager.stateManager.markOffsetsAdded()
+      const epoch = manager.getProducerEpoch()
+      broker.endTxn.mockRejectedValueOnce(createErrorFromCode(7))
+      broker.endTxn.mockRejectedValueOnce(createErrorFromCode(7))
+      broker.endTxn.mockRejectedValueOnce(createErrorFromCode(7))
+      broker.endTxn.mockRejectedValueOnce(createErrorFromCode(7))
+      await expect(manager.commit()).rejects.toMatchObject({ code: 7, retriable: true })
+      expect(manager.stateManager.transaction.commitPending()).toBe(true)
+      cluster.findGroupCoordinator.mockRejectedValueOnce(notFound())
+
+      await expect(manager.commit()).rejects.toMatchObject({ message: PENDING, retriable: true })
+
+      expect(broker.endTxn).toHaveBeenCalledTimes(4)
+      expect(manager.stateManager.state()).toBe('COMMITTING')
+      expect(manager.stateManager.transaction.commitPending()).toBe(true)
+      await manager.commit()
+      expect(broker.endTxn).toHaveBeenCalledTimes(5)
+      expect(broker.endTxn.mock.calls.map(([{ producerEpoch }]) => producerEpoch)).toEqual(
+        Array(5).fill(epoch)
+      )
+      expect(manager.stateManager.state()).toBe('READY')
+    })
+
+    test('a spent discovery budget is not retried again inside the same commit call', async () => {
+      const { manager, cluster, broker } = await build({ level })
+      manager.stateManager.markOffsetsAdded()
+      const exhausted = spent()
+      cluster.findGroupCoordinator.mockImplementation(async () => {
+        throw exhausted
+      })
+
+      const error = await manager.commit().catch((e) => e)
+
+      expect(error).toMatchObject({ message: PENDING, retriable: true })
+      expect(error.cause).toBe(exhausted)
+      expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
+      expect(broker.endTxn).not.toHaveBeenCalled()
+      expect(manager.stateManager.transaction.commitPending()).toBe(true)
+    })
+
+    /**
+     * @param {object} broker
+     * @returns {{ endTxn: Array, initProducerId: Array }} the pairs each request carried
+     */
+    const pairsSent = (broker) => ({
+      endTxn: broker.endTxn.mock.calls.map(([r]) => [
+        r.producerId,
+        r.producerEpoch,
+        r.transactionResult,
+      ]),
+      initProducerId: broker.initProducerId.mock.calls.map(([r]) => [
+        r.producerId,
+        r.producerEpoch,
+      ]),
+    })
+
+    test('an abort whose EndTxn finds no coordinator resolves READY and owes the EndTxn, which the next start sends with the pair held', async () => {
+      const { manager, cluster, broker } = await build({ level })
+      manager.stateManager.markOffsetsAdded()
+      const epoch = manager.getProducerEpoch()
+      cluster.findGroupCoordinator.mockRejectedValueOnce(notFound())
+
+      await expect(manager.abort()).resolves.toBeUndefined()
+
+      expect(manager.stateManager.state()).toBe('READY')
+      expect(pairsSent(broker)).toEqual({ endTxn: [], initProducerId: [] })
+      await manager.beginTransaction()
+      expect(pairsSent(broker)).toEqual({
+        endTxn: [['1000', epoch, false]],
+        initProducerId: level === 1 ? [['1000', epoch]] : [],
+      })
+      expect(manager.getProducerEpoch()).toBe(epoch + 1)
+      await manager.abort()
+      await manager.beginTransaction()
+      expect(broker.endTxn).toHaveBeenCalledTimes(1)
+    })
+
+    test('an owed EndTxn whose lookup runs out at the next start rejects it and stays owed, and the start after sends it', async () => {
+      const { manager, cluster, broker } = await build({ level })
+      manager.stateManager.markOffsetsAdded()
+      const epoch = manager.getProducerEpoch()
+      cluster.findGroupCoordinator.mockRejectedValueOnce(notFound())
+      await manager.abort()
+      const lost = spent()
+      cluster.findGroupCoordinator.mockResolvedValueOnce(broker).mockRejectedValueOnce(lost)
+
+      const error = await manager.beginTransaction().catch((e) => e)
+
+      expect(error).toBe(lost)
+      expect(manager.stateManager.state()).toBe('READY')
+      expect(pairsSent(broker)).toEqual({ endTxn: [], initProducerId: [] })
+      await manager.beginTransaction()
+      expect(pairsSent(broker)).toEqual({
+        endTxn: [['1000', epoch, false]],
+        initProducerId: level === 1 ? [['1000', epoch]] : [],
+      })
+      expect(manager.getProducerEpoch()).toBe(epoch + 1)
+      expect(manager.stateManager.state()).toBe('IN_TRANSACTION')
+    })
+
+    test('a fatal error armed while the owed EndTxn looked for the coordinator rejects the start with it', async () => {
+      const { manager, cluster, broker } = await build({ level })
+      manager.stateManager.markOffsetsAdded()
+      cluster.findGroupCoordinator.mockRejectedValueOnce(notFound())
+      await manager.abort()
+      const fenced = new KafkaJSApplicationRecoverableError('fenced', {
+        cause: createErrorFromCode(90),
+      })
+      cluster.findGroupCoordinator
+        .mockResolvedValueOnce(broker)
+        .mockImplementationOnce(async () => {
+          manager.stateManager.arm(fenced)
+          throw spent()
+        })
+
+      await expect(manager.beginTransaction()).rejects.toBe(fenced)
+      expect(manager.stateManager.state()).toBe('FATAL_ERROR')
+      expect(pairsSent(broker)).toEqual({ endTxn: [], initProducerId: [] })
+    })
+
+    test('a TxnOffsetCommit retry whose group lookup fails arms ABORTABLE_ERROR', async () => {
+      const { manager, cluster, broker } = await build({ level })
+      broker.txnOffsetCommit.mockRejectedValueOnce(createErrorFromCode(16))
+      cluster.findGroupCoordinator.mockImplementation(async ({ coordinatorType }) => {
+        if (
+          coordinatorType === COORDINATOR_TYPES.GROUP &&
+          lookupsOf(cluster, coordinatorType) > 1
+        ) {
+          throw notFound()
+        }
+        return broker
+      })
+
+      const error = await manager
+        .sendOffsets({ consumerGroupId: 'g', topics: TOPICS })
+        .catch((e) => e)
+
+      expect(error).toBeInstanceOf(KafkaJSTransactionAbortableError)
+      expect(lookupsOf(cluster, COORDINATOR_TYPES.GROUP)).toBe(2)
+      expect(broker.txnOffsetCommit).toHaveBeenCalledTimes(1)
+      expect(manager.stateManager.state()).toBe('ABORTABLE_ERROR')
+    })
+
+    test('an independent fatal error during a pending commit stays fatal', async () => {
+      const { manager, cluster, broker } = await build({ level })
+      manager.stateManager.markOffsetsAdded()
+      const fenced = new KafkaJSApplicationRecoverableError('fenced', {
+        cause: createErrorFromCode(90),
+      })
+      cluster.findGroupCoordinator.mockImplementationOnce(async () => {
+        manager.stateManager.arm(fenced)
+        throw notFound()
+      })
+
+      await expect(manager.commit()).rejects.toBe(fenced)
+      expect(manager.stateManager.state()).toBe('FATAL_ERROR')
+
+      const other = await build({ level })
+      other.manager.stateManager.markOffsetsAdded()
+      other.cluster.findGroupCoordinator.mockRejectedValueOnce(notFound())
+      await expect(other.manager.commit()).rejects.toMatchObject({ message: PENDING })
+      other.manager.stateManager.arm(fenced)
+
+      await expect(other.manager.commit()).rejects.toBe(fenced)
+      expect(other.manager.stateManager.state()).toBe('FATAL_ERROR')
+      expect(broker.endTxn).not.toHaveBeenCalled()
+      expect(other.broker.endTxn).not.toHaveBeenCalled()
+    })
+
+    test.each([['while its EndTxn looked for the coordinator', 1]])(
+      'abort rejects with a fatal error armed %s',
+      async (_when, lookup) => {
+        const generation = new Generation()
+        const { manager, cluster, broker } = await build({ level, generation })
+        manager.stateManager.markOffsetsAdded()
+        const fenced = new KafkaJSApplicationRecoverableError('fenced', {
+          cause: createErrorFromCode(90),
+        })
+        cluster.findGroupCoordinator.mockImplementation(async () => {
+          if (cluster.findGroupCoordinator.mock.calls.length === lookup) {
+            manager.stateManager.arm(fenced)
+          }
+          throw lookup === 1 ? notFound() : spent()
+        })
+
+        await expect(manager.abort()).rejects.toBe(fenced)
+
+        expect(generation.closed).toBe(false)
+        expect(manager.stateManager.state()).toBe('FATAL_ERROR')
+        expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(lookup)
+        expect(broker.endTxn).not.toHaveBeenCalled()
+        expect(broker.initProducerId).not.toHaveBeenCalled()
+        await expect(manager.beginTransaction()).rejects.toBe(fenced)
+        expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(lookup)
+        expect(broker.initProducerId).not.toHaveBeenCalled()
+      }
+    )
+
+    test('TRANSACTIONAL_ID_AUTHORIZATION_FAILED (53) stays fatal', async () => {
+      const { manager, broker } = await build({ level })
+      manager.stateManager.markOffsetsAdded()
+      broker.endTxn.mockRejectedValueOnce(createErrorFromCode(53))
+
+      const error = await manager.commit().catch((e) => e)
+
+      expect(error).toBeInstanceOf(KafkaJSApplicationRecoverableError)
+      expect(error.cause).toMatchObject({ code: 53 })
+      expect(manager.stateManager.state()).toBe('FATAL_ERROR')
+    })
+
+    test('PRODUCER_FENCED (90) stays fatal', async () => {
+      const { manager, broker } = await build({ level })
+      manager.stateManager.markOffsetsAdded()
+      broker.endTxn.mockRejectedValueOnce(createErrorFromCode(90))
+
+      const error = await manager.commit().catch((e) => e)
+
+      expect(error).toBeInstanceOf(KafkaJSApplicationRecoverableError)
+      expect(error.cause).toMatchObject({ code: 90 })
+      expect(manager.stateManager.state()).toBe('FATAL_ERROR')
+    })
+
+    test('group authorization failure stays abortable', async () => {
+      const { manager, broker } = await build({ level })
+      broker.txnOffsetCommit.mockRejectedValueOnce(createErrorFromCode(30))
+
+      const error = await manager
+        .sendOffsets({ consumerGroupId: 'g', topics: TOPICS })
+        .catch((e) => e)
+
+      expect(error).toBeInstanceOf(KafkaJSTransactionAbortableError)
+      expect(error.cause).toMatchObject({ code: 30 })
+      expect(manager.stateManager.state()).toBe('ABORTABLE_ERROR')
+    })
   })
 })

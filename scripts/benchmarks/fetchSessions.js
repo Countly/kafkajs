@@ -132,12 +132,15 @@ function verifyCycle(frames, { full, nodes = [0, 1, 2] }) {
 
 /**
  * Runs finite, offline frame-denominator controls, using independent header literals.
+ * @param {object} [options]
+ * @param {() => FetchObservation} [options.observe] builds each observation; the mutant control
+ *   passes one without its byte counter
  * @returns {object} fixed 334/333/333 partition shape and observed full-cycle bytes
  * @throws {Error} broken frame accounting or cycle denominator
  */
-function control() {
-  const observation = new FetchObservation()
-  const incremental = new FetchObservation()
+function control({ observe = () => new FetchObservation() } = {}) {
+  const observation = observe()
+  const incremental = observe()
   for (const [nodeId, partitions] of [334, 333, 333].entries()) {
     for (const [count, epoch, id, target] of [
       [partitions, 0, 0, observation],
@@ -202,6 +205,35 @@ function control() {
     incrementalRequestBytes: verifyCycle(idle.frames, { full: false }),
     ...result,
   }
+}
+
+/**
+ * The remove-byte-counter mutant: the known control frames through observations whose primary
+ * byte counter is removed, so only the independently kept transcript sees them. The transcript
+ * comparison must reject it.
+ * @param {object} [options]
+ * @param {(observation: FetchObservation) => void} [options.remove] removes the counter
+ * @returns {{ rejected: true, reason: string }} the comparison's refusal
+ * @throws {Error} when the mutant passes, or fails for another reason
+ */
+function mutantControl({
+  remove = (observation) => {
+    observation.counter.push = () => {}
+  },
+} = {}) {
+  try {
+    control({
+      observe: () => {
+        const observation = new FetchObservation()
+        remove(observation)
+        return observation
+      },
+    })
+  } catch (error) {
+    if (error.message.startsWith('Fetch bytes: ')) return { rejected: true, reason: error.message }
+    throw error
+  }
+  throw new Error('The remove-byte-counter mutant passed the transcript comparison')
 }
 
 /**
@@ -404,8 +436,10 @@ function deliveryControl() {
  * @param {Function} [options.wait] untimed warmup/window wait, injectable for finite controls
  * @param {Function} [options.onWindowStart] producer IPC handshake for the L2 window
  * @param {Function} [options.readRetained] identical double-GC observer
- * @returns {Promise<object>} frozen sample, with memory sampled while consumer is retained
- * @throws {Error} startup, drain, missing workload, insufficient samples or cleanup failure
+ * @returns {Promise<object>} frozen sample, with memory sampled while consumer is retained; an
+ *   active arm with fewer than 1 000 batch gaps still returns its exact sample, for the report to
+ *   mark inconclusive
+ * @throws {Error} startup, drain, missing workload, wrong accounting or cleanup failure
  */
 async function runArm(
   kafka,
@@ -471,7 +505,6 @@ async function runArm(
           deliveredMessages: target,
           handlerEntries: result.deliveredBatches,
           gapSamples: result.deliveredBatches - 1,
-          minimumGaps: 1000,
         })
       } else {
         await wait(10000)
@@ -540,8 +573,9 @@ class FrameJournal {
 
 /**
  * Runs socket-free correctness controls or one explicitly selected public live arm.
- * Live entry requires the controller's node inventory, owned directory and separate
- * producer IPC for L2. It is never invoked locally by the plan writer.
+ * A live arm requires `BENCH_NODES` (a JSON array of the three brokers' `host`, `port` and
+ * `nodeId`), `BENCH_EVIDENCE_DIR` (an existing absolute evidence directory) and separate producer
+ * IPC for L2.
  * @param {string[]} [args] --control, or --arm A --sessions false|true --topic name
  * @returns {Promise<void>} one measured JSON record and independently audited evidence
  * @throws {Error} malformed options, absent GC/IPC/workload or failed observation
@@ -553,6 +587,7 @@ async function main(args = process.argv.slice(2)) {
         frames: control(),
         delivery: deliveryControl(),
         retainedControlBytes: await memoryControl(),
+        mutant: mutantControl(),
       }) + '\n'
     )
     return
@@ -696,6 +731,7 @@ module.exports = {
   FetchObservation,
   verifyCycle,
   control,
+  mutantControl,
   SessionMeasurement,
   verifyDelivery,
   windowTotals,

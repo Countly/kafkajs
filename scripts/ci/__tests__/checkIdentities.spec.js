@@ -136,6 +136,72 @@ describe('scripts > ci > checkIdentities', () => {
     })
   })
 
+  describe('gate.json', () => {
+    /**
+     * Reads and parses a JSON file of the repository.
+     * @param {string} file Path relative to the repository root.
+     * @returns {any} The parsed content.
+     * @throws {Error} When the file cannot be read or is not valid JSON.
+     */
+    const readJson = (file) => JSON.parse(fs.readFileSync(path.join(ROOT, file), 'utf8'))
+    const gate = readJson('scripts/ci/gate.json')
+    const { scripts } = readJson('package.json')
+    const SCENARIOS = [
+      {
+        id: 'e2e-direct-consumer',
+        script: 'test:e2e:direct-consumer',
+        spec: 'src/consumer/__tests__/directConsumerLive.spec.js',
+        suite: 'src/consumer/__tests__/directConsumerLive.spec.js › Consumer > manual assignment',
+        cases: 7,
+      },
+      {
+        id: 'e2e-offset-reset',
+        script: 'test:e2e:offset-reset',
+        spec: 'src/consumer/__tests__/offsetResetLive.spec.js',
+        suite: 'src/consumer/__tests__/offsetResetLive.spec.js › Consumer > offset reset policies',
+        cases: 10,
+      },
+    ]
+
+    it('direct-consumer and offset-reset checks list both lane sets', () => {
+      for (const { id, script, suite, cases } of SCENARIOS) {
+        const { env, titles } = gate.checks.find((entry) => entry.id === id)
+        /**
+         * Lists the case names a check expects in one lane, without the suite and lane prefix.
+         * @param {string} lane Scenario lane, `fake` or `docker`.
+         * @returns {string[]} The case names in manifest order.
+         */
+        const casesOf = (lane) => {
+          const prefix = `${suite} (live, ${lane} lane) `
+          return titles
+            .filter((title) => title.startsWith(prefix))
+            .map((t) => t.slice(prefix.length))
+        }
+
+        expect(env.KAFKAJS_SCENARIO_LANES).toBe('fake,docker')
+        expect(scripts[script]).toContain('KAFKAJS_SCENARIO_LANES=fake,docker ')
+        expect(casesOf('docker')).toHaveLength(cases)
+        expect(casesOf('fake').sort()).toEqual(casesOf('docker').sort())
+        expect(titles).toHaveLength(2 * cases)
+      }
+    })
+
+    it('no title is both an expected pass and a skip', () => {
+      const clashes = gate.checks.flatMap(({ id, titles = [], allowedSkips = [] }) => {
+        const skips = new Set(allowedSkips)
+        return titles.filter((title) => skips.has(title)).map((title) => `${id}: ${title}`)
+      })
+      expect(clashes).toEqual([])
+
+      const unit = gate.checks.find((entry) => entry.id === 'unit')
+      const selectors = [...scripts[unit.jestScript].matchAll(/'([^']+)'/g)].map(([, p]) => p)
+      for (const { spec, suite } of SCENARIOS) {
+        expect(unit.allowedSkips.filter((title) => title.startsWith(suite))).toEqual([])
+        expect(selectors.filter((pattern) => new RegExp(pattern).test(spec))).toEqual([])
+      }
+    })
+  })
+
   describe('run', () => {
     let dir
     const lines = { out: [], err: [] }

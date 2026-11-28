@@ -1,7 +1,14 @@
-const { KafkaJSInvalidConfigurationError, KafkaJSInvariantViolation } = require('../errors')
-const { createErrorFromCode } = require('../protocol/error')
-const { itemRetry } = require('./itemRetry')
-const { checked, waitOf, currentDeadline } = require('./deadline')
+const {
+  KafkaJSAggregateError,
+  KafkaJSError,
+  KafkaJSInvalidConfigurationError,
+  KafkaJSInvariantViolation,
+  KafkaJSProtocolError,
+} = require('../errors')
+const { createErrorFromCode, failure } = require('../protocol/error')
+const { ON_DECODED, UNCHECKED_ROWS } = require('../broker/privateOptions')
+const { itemRetry, isLocal } = require('./itemRetry')
+const { checked, waitOf, currentDeadline, endsCall, isAnsweredError } = require('./deadline')
 const { exact, validateTopics } = require('../protocol/requests/offsetFetch/responseIdentity')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { requests } = require('../protocol/requests')
@@ -121,6 +128,57 @@ const resultOf = (row) => ({
   errorMessage: row.errorMessage ?? null,
 })
 
+/** OffsetCommit codes sent again, as the Java admin's `AlterConsumerGroupOffsetsHandler` does. */
+const COMMIT_RETRIES = [14, 15, 16, 27]
+/** OffsetCommit codes after which the coordinator is looked up again. */
+const COORDINATOR_MOVED = [15, 16]
+
+/** Whether an OffsetCommit rejection is the parser's throw for the first failed partition of the
+ * reply it decoded, rather than a transport, deadline or decode failure. Matched by topic and
+ * partition, since a code this client does not know is thrown under another code.
+ * @param {Error} error what the request rejected with
+ * @param {{responses: object[]}|null} decoded the reply this attempt decoded, if any
+ * @returns {boolean}
+ */
+const isFirstFailedPartition = (error, decoded) => {
+  if (!decoded || !(error instanceof KafkaJSProtocolError)) return false
+  for (const { topic, partitions } of decoded.responses) {
+    const failed = partitions.find((partition) => failure(partition.errorCode))
+    if (failed) return error.topic === topic && error.partition === failed.partition
+  }
+  return false
+}
+
+/** Rejects unless every committed row was accepted.
+ * @param {object[]} rows itemRetry results: errorCode 0, a broker code, or a local failure row
+ * @returns {void}
+ * @throws {Error} the local failure itself when no partition was confirmed or answered with a code;
+ *   otherwise a `KafkaJSAggregateError` with one child per partition not committed
+ */
+const assertCommitted = (rows) => {
+  const failed = rows.filter((row) => row.errorCode !== 0)
+  if (failed.length === 0) return
+  if (failed.length === rows.length && failed.every(isLocal)) throw failed[0].error
+  const children = failed.map((row) => {
+    const child = isLocal(row)
+      ? new KafkaJSError(`Offset not confirmed: ${row.error.message}`, {
+          retriable: row.error.retriable !== false,
+          cause: row.error,
+        })
+      : row.error
+    return Object.assign(child, { topic: row.topic, partition: row.partition })
+  })
+  const causes = failed.map((row) =>
+    isLocal(row)
+      ? `${row.partition} (not confirmed: ${row.error.name})`
+      : `${row.partition} (${row.error.type})`
+  )
+  throw new KafkaJSAggregateError(
+    `Offsets not committed for ${failed.length} of ${rows.length} partitions: ${causes.join(', ')}`,
+    children
+  )
+}
+
 /** Implements coordinator-routed offset calls under the enclosing admin invocation budget. */
 class OffsetAdmin {
   /**
@@ -132,7 +190,8 @@ class OffsetAdmin {
     this.retry = retry
   }
 
-  /** Deletes offsets with per-partition results and retries only unresolved cells.
+  /** Deletes offsets with per-partition results. A coordinator still loading the group (a
+   * whole-response 14) is asked again within the retry budget; every other answer is final.
    * @param {object} options groupId, topics and inherited apiTimeout
    * @returns {Promise<{topics:object[]}>} caller-ordered partition outcomes
    * @throws {Error} invalid input, API deadline, group refusal or before-work capability/auth
@@ -148,12 +207,13 @@ class OffsetAdmin {
     let coordinator
     let worked = false
     let groupFailure
+    const loading = new WeakSet()
     const rows = await itemRetry(
       {
         items,
         keyOf: cellKey,
         retry: this.retry,
-        retryable: (row) => [14, 15, 16].includes(row.errorCode),
+        retryable: (row) => loading.has(row),
         callFailure: (error) =>
           [30, 69, 24, 68].includes(error?.code) ||
           (!worked && callFailure(error)) ||
@@ -172,7 +232,9 @@ class OffsetAdmin {
         }
         if (response.errorCode !== 0) {
           if ([15, 16].includes(response.errorCode)) coordinator = null
-          return pending.map((item) => ({ ...item, errorCode: response.errorCode }))
+          const rows = pending.map((item) => ({ ...item, errorCode: response.errorCode }))
+          if (response.errorCode === 14) for (const row of rows) loading.add(row)
+          return rows
         }
         validateTopics({ errorCode: 0, topics: response.topics }, byTopic(pending))
         const rows = response.topics.flatMap(({ topic, partitions }) =>
@@ -182,10 +244,80 @@ class OffsetAdmin {
         return rows
       }
     ).catch((error) => {
+      checked(null)
+      if (endsCall(error) || isAnsweredError(error)) throw error
       if (groupFailure && error.code === groupFailure.code) throw groupFailure
       throw failureOf(error) ?? error
     })
     return { topics: byTopic(rows) }
+  }
+
+  /**
+   * Commits offsets of one topic as the group's, with one OffsetCommit that carries no member id,
+   * generation -1 and no instance id, as the Java admin's `alterConsumerGroupOffsets` does. The
+   * coordinator accepts it only while the group has no members (otherwise `UNKNOWN_MEMBER_ID`), and
+   * creates a missing group. Partitions answered 14, 15, 16 or 27 are sent again within the retry
+   * budget, alone, after a new coordinator lookup on 15 or 16; a request that got no answer is sent
+   * again after a new lookup. A confirmed partition is never sent again by this call. Every other
+   * code is final. Each cell carries only its partition and offset, so the commit stores null
+   * metadata and leader epoch -1.
+   * @param {object} options
+   * @param {string} options.groupId
+   * @param {string} options.topic
+   * @param {Array<{partition: number, offset: string}>} options.cells one per partition
+   * @returns {Promise<void>} once the coordinator accepted every cell
+   * @throws {KafkaJSAggregateError} one child per partition not committed: the coordinator's
+   *   `KafkaJSProtocolError` with `topic` and `partition`, or, for a partition whose last attempt
+   *   got no answer, a `KafkaJSError` carrying that failure as `cause`. Partitions not listed were
+   *   committed.
+   * @throws {Error} the request's own failure (a timeout, say) when no partition got a code
+   * @throws {KafkaJSInvariantViolation} for a reply that leaves out, repeats or adds a partition
+   * @throws {KafkaJSTimeout} once the API deadline passed; earlier attempts may have been applied
+   */
+  async commitOffsets({ groupId, topic, cells }) {
+    let coordinator = null
+    let worked = false
+    const rows = await itemRetry(
+      {
+        items: cells.map(({ partition, offset }) => ({ topic, partition, offset })),
+        keyOf: cellKey,
+        retry: this.retry,
+        retryable: (row) => COMMIT_RETRIES.includes(row.errorCode),
+        callFailure: (error) => !worked && callFailure(error),
+        sanitize: (message) => message,
+      },
+      async (pending) => {
+        coordinator ||= checked(await waitOf(() => this.cluster.findGroupCoordinator({ groupId })))
+        const target = coordinator
+        let decoded = null
+        // `itemRetry` refuses a missing, repeated or foreign row itself, as an invariant violation.
+        const options = { [ON_DECODED]: (reply) => (decoded = reply), [UNCHECKED_ROWS]: true }
+        const request = {
+          groupId,
+          groupGenerationId: -1,
+          memberId: '',
+          groupInstanceId: null,
+          topics: byTopic(pending),
+        }
+        try {
+          checked(await waitOf(() => target.offsetCommit(request, options)))
+        } catch (error) {
+          if (!isFirstFailedPartition(error, decoded)) {
+            if (!decoded) coordinator = null
+            throw error
+          }
+        }
+        worked = true
+        const rows = (decoded?.responses ?? []).flatMap(({ topic, partitions }) =>
+          partitions.map(({ partition, errorCode }) => ({ topic, partition, errorCode }))
+        )
+        if (rows.some((row) => COORDINATOR_MOVED.includes(row.errorCode))) coordinator = null
+        return rows
+      }
+    ).catch((error) => {
+      throw failureOf(error) ?? error
+    })
+    assertCommitted(rows)
   }
 
   /** Resolves explicitly named topics with omitted partition filters before OffsetFetch.
@@ -454,4 +586,4 @@ const createOffsets = (options) => {
     fetchOffsetsForGroups: (options) => family.fetchOffsetsForGroups(options),
   }
 }
-module.exports = { createOffsets }
+module.exports = { createOffsets, OffsetAdmin }

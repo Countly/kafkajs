@@ -27,6 +27,7 @@ const {
   KafkaJSCommitFailedError,
   KafkaJSBufferExhaustedError,
   KafkaJSRecordTooLargeError,
+  KafkaJSTopicRecreatedError,
   isPollIntervalExceeded,
 } = errors
 const createRetry = require('./retry')
@@ -166,6 +167,46 @@ describe('error wrapping preserves the protocol type', () => {
       retryTime: 100,
     })
     expect(exceeded.type).toEqual('REBALANCE_IN_PROGRESS')
+  })
+
+  it('KafkaJSNumberOfRetriesExceeded stops at a cause chain that loops, reading each link once', () => {
+    const first = new Error('the handler failed')
+    const second = new Error('the store refused it')
+    first.cause = second
+    let reads = 0
+    // A second read means the scan went round the loop; throwing ends it instead of spinning.
+    Object.defineProperty(second, 'cause', {
+      get() {
+        reads += 1
+        if (reads > 1) throw new Error('the cause of the second link was read again')
+        return first
+      },
+    })
+
+    const exceeded = new KafkaJSNumberOfRetriesExceeded(first, { retryCount: 0, retryTime: 300 })
+
+    expect(reads).toBe(1)
+    expect(exceeded).not.toHaveProperty('type')
+    expect(exceeded).not.toHaveProperty('code')
+    expect(exceeded.cause).toBe(first)
+    expect(exceeded.retryCount).toBe(0)
+    expect(exceeded.retryTime).toBe(300)
+  })
+
+  it('KafkaJSNumberOfRetriesExceeded finds the typed link of a cause chain that loops', () => {
+    const untyped = new Error('the fetch round failed')
+    const typed = Object.assign(new Error('the group is rebalancing'), {
+      type: 'REBALANCE_IN_PROGRESS',
+      code: 27,
+    })
+    untyped.cause = typed
+    typed.cause = untyped
+
+    const exceeded = new KafkaJSNumberOfRetriesExceeded(untyped, { retryCount: 2, retryTime: 100 })
+
+    expect(exceeded.type).toBe('REBALANCE_IN_PROGRESS')
+    expect(exceeded.code).toBe(27)
+    expect(exceeded.cause).toBe(untyped)
   })
 
   it('KafkaJSNonRetriableError keeps type and code for a fenced static member (code 82)', () => {
@@ -617,6 +658,24 @@ describe('KafkaJSInvalidFrameError', () => {
   })
 })
 
+describe('KafkaJSInvariantViolation', () => {
+  test('names a string with a lone surrogate in its message and its help link', () => {
+    const error = new errors.KafkaJSInvariantViolation('requested group "team-\uD800"')
+
+    expect(error.name).toBe('KafkaJSInvariantViolation')
+    expect(error.message).toBe(
+      'Invariant violated: requested group "team-\uD800". This is likely a bug and should be reported.'
+    )
+    expect(error.helpUrl).toContain('team-%EF%BF%BD%22')
+  })
+
+  test('puts an ordinary string in its help link as it is', () => {
+    const error = new errors.KafkaJSInvariantViolation('requested group "grüppe"')
+
+    expect(error.helpUrl).toContain('gr%C3%BCppe%22')
+  })
+})
+
 describe('KafkaJSCorruptRecordError', () => {
   test('is non-retriable and carries the rule the batch broke and where it starts', () => {
     const cause = new Error('while decoding')
@@ -663,6 +722,66 @@ describe('KafkaJSCorruptRecordError', () => {
     for (const key of ['nextOffset', 'codec', 'limit']) {
       expect(Object.keys(error)).not.toContain(key)
     }
+  })
+})
+
+describe('KafkaJSTopicRecreatedError', () => {
+  const OLD_ID = '01020304-0506-0708-090a-0b0c0d0e0f10'
+  const NEW_ID = '11121314-1516-1718-191a-1b1c1d1e1f20'
+
+  test('is a non-retriable error with its fields', () => {
+    const cause = new Error('seen in a metadata answer')
+    const error = new KafkaJSTopicRecreatedError('topic orders was recreated', {
+      topic: 'orders',
+      previousTopicId: OLD_ID,
+      topicId: NEW_ID,
+      groupId: 'billing',
+      cause,
+    })
+
+    expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(error).toMatchObject({
+      name: 'KafkaJSTopicRecreatedError',
+      message: 'topic orders was recreated',
+      retriable: false,
+      topic: 'orders',
+      previousTopicId: OLD_ID,
+      topicId: NEW_ID,
+      groupId: 'billing',
+    })
+    expect(error.cause).toBe(cause)
+    // A consumer without a group (manual assignment) has none.
+    const manual = new KafkaJSTopicRecreatedError('x', {
+      topic: 'orders',
+      previousTopicId: OLD_ID,
+      topicId: NEW_ID,
+    })
+    expect(manual.groupId).toBeNull()
+  })
+
+  test('it is exported from the CommonJS and ESM entry points', () => {
+    const { execFileSync } = require('child_process')
+    const path = require('path')
+    const { pathToFileURL } = require('url')
+
+    expect(typeof packageEntry.KafkaJSTopicRecreatedError).toBe('function')
+    expect(packageEntry.KafkaJSTopicRecreatedError).toBe(KafkaJSTopicRecreatedError)
+
+    // One process loads both entry points, so the comparison is of the class objects themselves.
+    const esm = pathToFileURL(path.join(__dirname, '..', 'index.mjs')).href
+    const cjs = path.join(__dirname, '..', 'index.js')
+    const script = [
+      `import * as entry from ${JSON.stringify(esm)}`,
+      `import { createRequire } from 'node:module'`,
+      `const Cjs = createRequire(${JSON.stringify(cjs)})(${JSON.stringify(cjs)}).KafkaJSTopicRecreatedError`,
+      `const Esm = entry.KafkaJSTopicRecreatedError`,
+      `console.log(JSON.stringify({ isClass: typeof Esm === 'function', same: Esm === Cjs }))`,
+    ].join('\n')
+    const output = execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+      encoding: 'utf8',
+    })
+
+    expect(JSON.parse(output)).toEqual({ isClass: true, same: true })
   })
 })
 
@@ -1011,6 +1130,30 @@ test('create-topic detail does not replace the protocol message', () => {
   expect(new KafkaJSCreateTopicError(source, 't').errorMessage).toBeNull()
 })
 
+test('KafkaJSServerDoesNotSupportApiKey keeps cause', () => {
+  const cause = createErrorFromCode(35)
+  const error = new errors.KafkaJSServerDoesNotSupportApiKey(cause, {
+    apiKey: 76,
+    apiName: 'ShareGroupHeartbeat',
+    cause,
+  })
+
+  expect(error.cause).toBe(cause)
+  expect(error).toMatchObject({
+    name: 'KafkaJSServerDoesNotSupportApiKey',
+    type: 'UNSUPPORTED_VERSION',
+    code: 35,
+    apiKey: 76,
+    apiName: 'ShareGroupHeartbeat',
+    retriable: false,
+    category: cause.category,
+    message: cause.message,
+  })
+  expect(new errors.KafkaJSServerDoesNotSupportApiKey('refused', { apiKey: 1 }).cause).toBe(
+    undefined
+  )
+})
+
 describe('share capability errors', () => {
   test.each(['api-not-advertised', 'api-version-range', 'feature-disabled', 'refused-by-broker'])(
     'preserves the unsupported API contract for %s',
@@ -1036,6 +1179,31 @@ describe('share capability errors', () => {
       )
     }
   )
+
+  test('KafkaJSShareGroupsNotSupportedError keeps cause, apiKey, apiName, reason and shareVersion', () => {
+    const cause = createErrorFromCode(35)
+    const error = new errors.KafkaJSShareGroupsNotSupportedError(cause, {
+      apiKey: 78,
+      apiName: 'ShareFetch',
+      reason: 'refused-by-broker',
+      shareVersion: 1,
+      cause,
+    })
+
+    expect(error.cause).toBe(cause)
+    expect(error).toBeInstanceOf(errors.KafkaJSServerDoesNotSupportApiKey)
+    expect(error).toMatchObject({
+      name: 'KafkaJSShareGroupsNotSupportedError',
+      type: 'UNSUPPORTED_VERSION',
+      code: 35,
+      apiKey: 78,
+      apiName: 'ShareFetch',
+      reason: 'refused-by-broker',
+      shareVersion: 1,
+      retriable: false,
+      category: cause.category,
+    })
+  })
 
   test('retains null when no feature level was reported', () => {
     expect(
@@ -1149,4 +1317,26 @@ describe('observational telemetry errors', () => {
     expect(error.name).toBe('KafkaJSTelemetryError')
     expect(() => new KafkaJSTelemetryError('x')).toThrow(TypeError)
   })
+})
+
+test('KafkaJSUnknownOutcomeError carries outcome, requests and cause and is not retriable', () => {
+  const { KafkaJSUnknownOutcomeError, KafkaJSConnectionError } = require('./errors')
+  const cause = new KafkaJSConnectionError('Connection closed')
+  const requests = [
+    { api: 'DeleteRecords', apiVersion: 2, nodeId: 1, items: [{ topic: 't', partition: 0 }] },
+  ]
+  const error = new KafkaJSUnknownOutcomeError('lost', { requests, cause })
+
+  expect(error).toBeInstanceOf(errors.KafkaJSNonRetriableError)
+  expect(error).toMatchObject({
+    name: 'KafkaJSUnknownOutcomeError',
+    message: 'lost',
+    outcome: 'unknown',
+    retriable: false,
+    category: 'applicationRecoverable',
+  })
+  expect(error.requests).toBe(requests)
+  expect(error.cause).toBe(cause)
+  expect(new KafkaJSUnknownOutcomeError('lost').requests).toEqual([])
+  expect(packageEntry.KafkaJSUnknownOutcomeError).toBe(KafkaJSUnknownOutcomeError)
 })

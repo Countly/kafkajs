@@ -165,6 +165,52 @@ describe('Protocol > Requests', () => {
       })
     })
 
+    describe('within the broker range', () => {
+      const apiKey = apiKeys.Fetch
+      const definition = (implemented) => ({
+        versions: implemented.map(String),
+        protocol: ({ version }) => ({ version }),
+      })
+
+      test('refuses a gapped set with no common version', () => {
+        const versions = { [apiKey]: { minVersion: 3, maxVersion: 4 } }
+
+        expect(() => lookup(versions)(apiKey, definition([2, 5]))).toThrow(
+          KafkaJSServerDoesNotSupportApiKey
+        )
+        expect(() => lookup(versions)(apiKey, definition([2, 5]))).toThrow(
+          /Fetch.*client implements v2-v5.*broker supports v3-v4/
+        )
+      })
+
+      test('selects the one common version inside a gap', () => {
+        const versions = { [apiKey]: { minVersion: 3, maxVersion: 4 } }
+
+        expect(lookup(versions)(apiKey, definition([2, 4, 5]))).toEqual({ version: 4 })
+      })
+
+      test('refuses a capped set below the broker minimum', () => {
+        const versions = { [apiKey]: { minVersion: 3, maxVersion: 4 } }
+        const select = lookup(versions, { [apiKey]: 6 })
+
+        expect(() => select(apiKey, definition([2, 5, 7]))).toThrow(
+          KafkaJSServerDoesNotSupportApiKey
+        )
+        expect(() => select(apiKey, definition([2, 5, 7]))).toThrow(
+          /Fetch.*client implements v2-v5.*broker supports v3-v4/
+        )
+      })
+
+      test('treats a missing minVersion as 0', () => {
+        const versions = { [apiKey]: { maxVersion: 3 } }
+
+        expect(lookup(versions)(apiKey, definition([0, 5]))).toEqual({ version: 0 })
+        expect(() => lookup(versions)(apiKey, definition([4, 5]))).toThrow(
+          /Fetch.*client implements v4-v5.*broker supports v0-v3/
+        )
+      })
+    })
+
     describe('against the real Kafka 4.x version table', () => {
       // Kafka 4.3 ranges, as recorded in docs/KafkaCompatibility.md (generated from the apache/kafka 4.3 message JSON)
       const KAFKA_4_3 = {
@@ -429,4 +475,42 @@ describe('Recorded broker captures', () => {
       expect(readBrokerCapture(line).provenance.brokerVersion).toBe(line)
     }
   })
+})
+
+test('the builder keeps args only for latched APIs inside an admin scope, and for InitProducerId and LeaveGroup only when marked', async () => {
+  jest.useFakeTimers()
+  try {
+    const { ADMIN_MUTATION } = require('../../broker/privateOptions')
+    const { runWithDeadline } = require('../../admin/deadline')
+    const versions = [
+      apiKeys.DeleteGroups,
+      apiKeys.InitProducerId,
+      apiKeys.LeaveGroup,
+      apiKeys.OffsetCommit,
+    ]
+    const ranges = Object.fromEntries(
+      versions.map((apiKey) => [apiKey, { minVersion: 0, maxVersion: 9 }])
+    )
+    const choose = lookup(ranges)
+    const groups = choose(apiKeys.DeleteGroups, requests.DeleteGroups)
+    const init = choose(apiKeys.InitProducerId, requests.InitProducerId)
+    const leave = choose(apiKeys.LeaveGroup, requests.LeaveGroup)
+    const commit = choose(apiKeys.OffsetCommit, requests.OffsetCommit)
+    expect(Object.hasOwn(groups(['g']), 'args')).toBe(false)
+    await runWithDeadline('test', 1000, () => {
+      const input = ['g']
+      const built = groups(input)
+      input[0] = 'changed'
+      expect(built.args).toEqual(['g'])
+      expect(Object.hasOwn(init({ transactionalId: 'tx' }), 'args')).toBe(false)
+      expect(Object.hasOwn(leave({ groupId: 'g' }), 'args')).toBe(false)
+      expect(Object.hasOwn(commit({ groupId: 'g', topics: [] }), 'args')).toBe(false)
+      expect(init({ transactionalId: 'tx' }, ADMIN_MUTATION).args).toEqual({
+        transactionalId: 'tx',
+      })
+      expect(leave({ groupId: 'g' }, ADMIN_MUTATION).args).toEqual({ groupId: 'g' })
+    })
+  } finally {
+    jest.useRealTimers()
+  }
 })

@@ -2,14 +2,19 @@ const HeartbeatBackoff = require('../groupProtocol/heartbeatBackoff')
 const { generateMemberId } = require('../groupProtocol/memberId')
 const { MEMBER_STATES: S, transition } = require('../groupProtocol/memberState')
 const { KafkaJSNonRetriableError } = require('../../errors')
+const { requireAssignment } = require('../../protocol/requests/responseCoverage')
 const {
   membershipAction,
+  lookupFailure,
   fatalMembershipError,
   createErrorFromCode,
 } = require('./shareErrorContract')
 
 /** Until the coordinator has answered once there is no interval; this keeps the join retry alive. */
 const INITIAL_HEARTBEAT_INTERVAL_MS = 1000
+
+/** Metadata misses of one unresolved topic ID before it is named at WARN. */
+const UNRESOLVED_WARNING_ATTEMPTS = 2
 
 /** The member epoch of a leave. */
 const LEAVE_EPOCH = -1
@@ -76,6 +81,8 @@ class ShareMembership {
     this.interval = INITIAL_HEARTBEAT_INTERVAL_MS
     this.backoff = new HeartbeatBackoff(retry)
     this.metadataBackoff = new HeartbeatBackoff(retry)
+    /** @type {Map<string, number>} misses per unresolved ID of the target, saturating at the warning count */
+    this.unresolvedMisses = new Map()
     this.coordinator = null
     this.inFlight = null
     this.resolution = null
@@ -148,11 +155,16 @@ class ShareMembership {
   /**
    * Looks up the coordinator and sends under one captured token, checked at every await and again
    * by the Broker before the write. Fields are remembered only after a current, non-regressing,
-   * successful answer; every epoch-zero payload is full.
+   * successful answer; every epoch-zero payload is full. An answer with an epoch of 0 or below, or
+   * lower than the member holds, is logged and changes nothing; an interval of 0 or below keeps the
+   * current one. An assignment no coordinator writes (a null or repeated topic id, a negative or
+   * repeated partition) changes nothing and is retried under backoff with every field sent again;
+   * the coordinator that answered stays known, so a close during that backoff still leaves.
    * @private
    * @param {() => Error|null} ordinaryGuard The caller's captured ordinary authority.
    * @returns {Promise<void>}
-   * @throws {Error} The current membership failure, after its policy has been applied.
+   * @throws {Error} The current membership failure, after its policy has been applied; for a
+   *   refused assignment the `KafkaJSPartialMessageError` naming it.
    */
   async sendHeartbeat(ordinaryGuard) {
     const token = this.token
@@ -174,38 +186,68 @@ class ShareMembership {
       subscribedTopicNames: joining || changed ? topics : null,
     }
     this.backoff.takeDue()
-    try {
-      if (!this.coordinator) {
-        const coordinator = await this.cluster.findGroupCoordinator({ groupId: this.groupId })
+    if (!this.coordinator) {
+      let coordinator
+      try {
+        coordinator = await this.cluster.findGroupCoordinator({ groupId: this.groupId })
+      } catch (error) {
         if (!current()) return
-        this.coordinator = coordinator
+        const failure = lookupFailure(error)
+        throw this.onMembershipError(failure.error, token, failure.action)
       }
+      if (!current()) return
+      this.coordinator = coordinator
+    }
+    let action
+    try {
       const response = await this.coordinator.shareGroupHeartbeat(payload, { guard })
       if (!current()) return
       if (response.errorCode) throw createErrorFromCode(response.errorCode)
-      if (response.memberEpoch < this.memberEpoch) return
-      if (payload.memberEpoch === 0 && response.memberEpoch > 0) {
+      // A regular answer carries an epoch of at least 1 and never a lower one; a leave goes
+      // through `leave()`, so -1 cannot answer this request.
+      if (response.memberEpoch <= 0 || response.memberEpoch < this.memberEpoch) {
+        this.logger.warn(
+          'Ignoring a share heartbeat answer whose member epoch this member cannot hold',
+          {
+            groupId: this.groupId,
+            memberEpoch: response.memberEpoch,
+            currentEpoch: this.memberEpoch,
+          }
+        )
+        return
+      }
+      if (response.assignment !== null) {
+        try {
+          requireAssignment('ShareGroupHeartbeat', response.assignment.topicPartitions, 'topicId')
+        } catch (error) {
+          // The coordinator answered, so it stays known and a close can still leave through it.
+          action = 'retry'
+          throw error
+        }
+      }
+      if (payload.memberEpoch === 0) {
         const previous = this.token
         this.token = Symbol('membership')
         this.targetRevision = Symbol('assignment')
         this.resolution = null
         this.metadataBackoff.reset()
+        this.unresolvedMisses.clear()
         const accepted = this.token
         this.notify(this.onInvalidate, previous, 'joined')
         if (this.closed || this.token !== accepted) return
       }
       this.memberEpoch = response.memberEpoch
-      this.interval = response.heartbeatIntervalMs
+      if (response.heartbeatIntervalMs > 0) this.interval = response.heartbeatIntervalMs
       this.sentTopics = topics
       this.sentRack = true
       this.backoff.reset()
-      if (this.memberEpoch > 0) this.state = transition(this.state, S.STABLE)
+      this.state = transition(this.state, S.STABLE)
       if (response.assignment !== null) this.adoptTarget(response.assignment.topicPartitions)
       this.publishAssignment()
       this.refreshUnresolved(ordinaryGuard)
     } catch (error) {
       if (!current()) return
-      throw this.onMembershipError(error, token)
+      throw this.onMembershipError(error, token, action)
     }
   }
 
@@ -231,6 +273,7 @@ class ShareMembership {
     this.target = target
     this.resolution = null
     this.metadataBackoff.reset()
+    this.unresolvedMisses.clear()
   }
 
   /**
@@ -246,14 +289,15 @@ class ShareMembership {
    *   `onFatal` once.
    * @param {Error} error Original decoded or transport failure.
    * @param {symbol} token Originating membership identity.
+   * @param {string} [action] The verdict when the caller classified the failure itself, as a
+   *   failed coordinator lookup is; by default the membership table's.
    * @returns {Error|null} The classified error for a current verdict, null for a discarded one.
    */
-  onMembershipError(error, token) {
+  onMembershipError(error, token, action = membershipAction(error)) {
     if (this.closed || this.state === S.FATAL || this.token !== token) return null
     this.sentTopics = null
     this.sentRack = false
     this.backoff.onFailedAttempt(performance.now())
-    const action = membershipAction(error)
     if (action === 'coordinator') this.coordinator = null
     if (action === 'fence') {
       this.state = transition(this.state, S.FENCED)
@@ -273,7 +317,8 @@ class ShareMembership {
 
   /**
    * Publishes the known target IDs; unknown IDs never hold up known partitions or revoke them.
-   * Notifies `onAssignment` only when the resolved set changed.
+   * Notifies `onAssignment` only when the resolved set changed. Forgets the misses of IDs that
+   * resolved or left the target, so an ID lost again is a new episode.
    * @private
    * @returns {void}
    */
@@ -286,6 +331,9 @@ class ShareMembership {
       else assignment.push({ topicId, topic, partitions: partitions.slice() })
     }
     this.unresolved = unresolved
+    for (const topicId of this.unresolvedMisses.keys()) {
+      if (!unresolved.includes(topicId)) this.unresolvedMisses.delete(topicId)
+    }
     const previous = JSON.stringify(this.assignment)
     this.assignment = assignment
     if (JSON.stringify(assignment) !== previous) this.notify(this.onAssignment, this.snapshot())
@@ -296,7 +344,7 @@ class ShareMembership {
    * backoff allows it. Every heartbeat answer is another chance, there is no attempt ceiling and
    * no metadata-age timer. The flight is bound to the captured token and target revision, and the
    * same predicate goes to the cluster helper, so a retired flight cannot install, follow up or
-   * publish. Misses and failures both advance the backoff.
+   * publish. Misses and failures both advance the backoff; see {@link missedResolution}.
    * @private
    * @param {() => Error|null} [ordinaryGuard] The authority of the heartbeat that started this work.
    * @returns {void}
@@ -325,15 +373,38 @@ class ShareMembership {
         await this.cluster.refreshMetadataForTopicIds(this.unresolved.slice(), { isCurrent })
         if (!isCurrent()) return
         this.publishAssignment()
-        if (this.unresolved.length) this.metadataBackoff.onFailedAttempt(performance.now())
+        if (this.unresolved.length) this.missedResolution()
         else this.metadataBackoff.reset()
       } catch (error) {
-        if (isCurrent()) this.metadataBackoff.onFailedAttempt(performance.now())
+        if (isCurrent()) this.missedResolution()
       } finally {
         if (this.resolution === flight) this.resolution = null
       }
     }
     work()
+  }
+
+  /**
+   * Advances the metadata backoff after a miss or a failed refresh and counts the miss for each
+   * unresolved ID. An ID's second miss is logged at WARN, naming every ID that reached it in this
+   * miss, so each ID is named once per episode and never per heartbeat: its count saturates and
+   * starts again only when it resolved or left the target, for a new target or after a join.
+   * @private
+   * @returns {void}
+   */
+  missedResolution() {
+    this.metadataBackoff.onFailedAttempt(performance.now())
+    const stalled = []
+    for (const topicId of this.unresolved) {
+      const misses = (this.unresolvedMisses.get(topicId) || 0) + 1
+      if (misses === UNRESOLVED_WARNING_ATTEMPTS) stalled.push(topicId)
+      this.unresolvedMisses.set(topicId, Math.min(UNRESOLVED_WARNING_ATTEMPTS, misses))
+    }
+    if (!stalled.length) return
+    this.logger.warn(
+      'Assigned topic IDs are still unresolved; their partitions are not fetched until metadata names them',
+      { groupId: this.groupId, topicIds: stalled }
+    )
   }
 
   /**
@@ -350,6 +421,7 @@ class ShareMembership {
     this.target = []
     this.resolution = null
     this.metadataBackoff.reset()
+    this.unresolvedMisses.clear()
     this.notify(this.onInvalidate, old, reason)
     this.publishAssignment()
   }
@@ -528,6 +600,16 @@ class SharePollView {
     return [...this.calls]
       .filter(([, start]) => now - start > this.maxPollInterval)
       .map(([call]) => call)
+  }
+
+  /**
+   * Stops tracking every call except `kept`: a close froze them, so a call that never returns can
+   * no longer expire a later membership.
+   * @param {object[]} kept Identities from `captureExpired` that a recovery still waits for.
+   * @returns {void}
+   */
+  retain(kept) {
+    for (const call of this.calls.keys()) if (!kept.includes(call)) this.calls.delete(call)
   }
 
   /**

@@ -13,14 +13,24 @@ below 3. Replace it with this one; spans and metrics keep their names.
 
 ## Installation
 
+The instrumentation package is first published to npm with the final `@countly/kafkajs` 3.0.0 release. During release-candidate testing, install the already built OTel tarball for the same candidate (the `otel-tarball` CI artifact); see [RELEASING.md](../RELEASING.md) for the artifact procedure.
+
+```bash
+npm install ./<downloaded-otel-tarball>.tgz @opentelemetry/api
+```
+
+After the final release:
+
 ```bash
 npm install @countly/opentelemetry-instrumentation-kafkajs @opentelemetry/api
 ```
 
 Supported: `@countly/kafkajs` `>=3.0.0-0 <4` (the 3.0.0 prereleases included), on Node.js 22 or
 later. The client is matched under either name it can be installed as: `@countly/kafkajs`, or
-`kafkajs` when it is installed through the npm alias `"kafkajs": "npm:@countly/kafkajs@3"`. A
-`kafkajs` 2.x install is left to `@opentelemetry/instrumentation-kafkajs`.
+`kafkajs` when it is installed through an npm alias such as
+`"kafkajs": "npm:@countly/kafkajs@3.0.0-rc.1"`. The range `@3` does not match release candidates
+such as `3.0.0-rc.1`, so pin the exact version to install one. A `kafkajs` 2.x install is left to
+`@opentelemetry/instrumentation-kafkajs`.
 
 ## Usage
 
@@ -126,6 +136,20 @@ message's `headers` (the caller's message object), and the consumer reads it bac
   a rejection with the same reason; and `commit()` resolves with whatever the client's `commit()`
   resolved with.
 
+## TypeScript
+
+The declarations (`src/index.d.ts`) reference Node.js's types, so `Buffer` resolves in a project
+with `"types": []`, provided `@types/node` is installed. Read these when upgrading from an earlier
+prerelease:
+
+- A hook's message headers can hold `null` values (a consumed header written with a null value);
+  guard them.
+- `message.timestamp` in a producer hook is what the application passed: a string, number, `Date`,
+  `bigint`, a `Long` (an object whose `value` is a `bigint`), `null` or `undefined`. A consumed
+  message's is a string, and its `offset` is set.
+- `producerHook` and `consumerHook` accept an explicit `undefined`, also under
+  `exactOptionalPropertyTypes`.
+
 ## Tests
 
 The upstream suite (`test/kafkajs.test.ts`) is ported to `node:test` block for block, with the
@@ -148,7 +172,8 @@ set:
 14. captures params.cluster from the wrapped factory and surfaces it on a span for that client
 
 Run them from the repository root with `npm run test:otel`, which installs the packed client into
-this directory the way an application does.
+this directory the way an application does, under both `@countly/kafkajs` and the alias `kafkajs`;
+`test/aliasInstall.test.js` checks that a `require` and an `import` of the alias are instrumented.
 
 `test/failureContainment.test.js` throws from one telemetry component at a time, at every
 observation point and for each way the wrapped call can settle, and checks the containment

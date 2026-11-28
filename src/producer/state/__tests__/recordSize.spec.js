@@ -2,9 +2,10 @@ const { Kafka } = require('../../../../index')
 const Record = require('../../../protocol/recordBatch/record/v0')
 const buildRecordBatch = require('../../../protocol/requests/produce/buildRecordBatch')
 const Long = require('../../../utils/long')
-const { createErrorFromCode } = require('../../../protocol/error')
+const { partitionResults } = require('../../../protocol/requests/produce/partitionResults')
 const { mulberry32 } = require('../../../../testHelpers/schedule')
-const { wire, held, share, chargeOf, ownedBuffer, varintSize } = require('../recordSize')
+const { wire, held, share, chargeOf, varintSize } = require('../recordSize')
+const Accumulator = require('../accumulator')
 const {
   KafkaJSInvalidConfigurationError,
   KafkaJSNonRetriableError,
@@ -16,6 +17,7 @@ const {
   deferred,
   flushAll,
   quiescent,
+  readBatch,
   watch,
 } = require('../../__tests__/fixtures/bufferHarness')
 
@@ -36,6 +38,28 @@ const readVarint = (buffer, offset) => {
     if (byte < 0x80) break
   }
   return { value: raw % 2 === 0 ? raw / 2 : -(raw + 1) / 2, next }
+}
+
+/** Makes Node start a new small-Buffer pool, of `Buffer.poolSize` bytes. */
+const rebuildPool = () => {
+  const { buffer } = Buffer.allocUnsafe(1)
+  let probe
+  do {
+    probe = Buffer.allocUnsafe(1024)
+  } while (probe.buffer === buffer)
+}
+
+/** Runs `make` with Node's small-Buffer pool rebuilt at `size`, then rebuilds it at the old size. */
+const withPool = (size, make) => {
+  const before = Buffer.poolSize
+  try {
+    Buffer.poolSize = size
+    rebuildPool()
+    return make()
+  } finally {
+    Buffer.poolSize = before
+    rebuildPool()
+  }
 }
 
 describe('Producer > the buffer > record sizes', () => {
@@ -333,24 +357,245 @@ describe('Producer > the buffer > record sizes', () => {
       })
     )
   })
+})
 
-  test('a small view of a large store is copied into a store of its own size; any other Buffer is kept', () => {
+describe('Producer > the buffer > small views of large stores', () => {
+  /** The records of a one-topic send as the producer keeps them. */
+  const snapshotOf = (messages) => Accumulator.snapshot([{ topic: TOPIC, messages }])[0].messages
+
+  test('the small views of large stores in one send are copied into one store of the sum of their lengths', () => {
     const slab = Buffer.alloc(1048576, 'a')
-    const view = slab.subarray(10, 11)
-    const copy = ownedBuffer(view)
+    slab.write('bcdefg', 10)
+    const views = [slab.subarray(10, 11), slab.subarray(11, 13), slab.subarray(13, 16)]
 
-    expect(copy).not.toBe(view)
-    expect(copy.buffer.byteLength).toBe(1)
-    slab[10] = 'z'.charCodeAt(0)
-    expect(copy.toString()).toBe('a')
+    const copies = snapshotOf(views.map((value) => ({ value }))).map(({ value }) => value)
 
+    expect(copies.map(String)).toEqual(['b', 'cd', 'efg'])
+    copies.forEach((copy, i) => expect(copy).not.toBe(views[i]))
+    expect(new Set(copies.map((copy) => copy.buffer)).size).toBe(1)
+    expect(copies[0].buffer.byteLength).toBe(6)
+    slab.fill('z')
+    expect(copies.map(String)).toEqual(['b', 'cd', 'efg'])
+  })
+
+  test('the charge of a send whose views share one copy is its held bytes and its shell, with no store excess', () => {
+    const slab = Buffer.alloc(1048576, 'a')
+    const messages = snapshotOf([
+      { key: slab.subarray(0, 3), value: slab.subarray(3, 10) },
+      { value: slab.subarray(10, 30), headers: { h: slab.subarray(30, 31) } },
+    ])
+    const heldBytes = held(messages[0]) + held(messages[1])
+    const { key, value } = messages[0]
+
+    expect(
+      new Set([key, value, messages[1].value, messages[1].headers.h].map((field) => field.buffer))
+        .size
+    ).toBe(1)
+    expect(key.buffer.byteLength).toBe(31)
+    expect(chargeOf([{ topic: TOPIC, messages }], Infinity)).toEqual({
+      total: 1536 + heldBytes,
+      shell: 1536 + 31,
+    })
+  })
+
+  test('a hole in a messages list stays a hole in the plain array the producer keeps', () => {
+    const slab = Buffer.alloc(1048576, 'a')
+    const messages = [{ value: slab.subarray(0, 1) }]
+    messages[2] = { value: slab.subarray(1, 2) }
+
+    const own = snapshotOf(messages)
+
+    expect(Object.getPrototypeOf(own)).toBe(Array.prototype)
+    expect(own).toHaveLength(3)
+    expect(1 in own).toBe(false)
+    expect(String(own[2].value)).toBe('a')
+    expect(own[2].value.buffer).toBe(own[0].value.buffer)
+    expect(own[0].value.buffer.byteLength).toBe(2)
+  })
+
+  test('independent sends of the same source view get independent copies', () => {
+    const view = Buffer.alloc(1048576, 'a').subarray(0, 1)
+
+    const [first] = snapshotOf([{ value: view }])
+    const [second] = snapshotOf([{ value: view }])
+
+    expect(first.value.buffer).not.toBe(second.value.buffer)
+    expect(first.value.buffer.byteLength).toBe(1)
+    expect(second.value.buffer.byteLength).toBe(1)
+    first.value[0] = 'z'.charCodeAt(0)
+    expect(String(second.value)).toBe('a')
+  })
+
+  test('a view at or under the thresholds, a string and a null are kept as the same objects; a view just above them is copied', () => {
     const atSixteenKiB = Buffer.alloc(16384).subarray(0, 1)
-    expect(ownedBuffer(atSixteenKiB)).toBe(atSixteenKiB)
-    const aboveSixteenKiB = Buffer.alloc(16385).subarray(0, 1)
-    expect(ownedBuffer(aboveSixteenKiB).buffer.byteLength).toBe(1)
     const atSixteenTimes = Buffer.alloc(32768).subarray(0, 2048)
-    expect(ownedBuffer(atSixteenTimes)).toBe(atSixteenTimes)
-    expect(ownedBuffer('text')).toBe('text')
+    const headers = { text: 'text', none: null, list: [atSixteenKiB, 'item'] }
+
+    const [record] = snapshotOf([{ key: atSixteenKiB, value: atSixteenTimes, headers }])
+
+    expect(record.key).toBe(atSixteenKiB)
+    expect(record.value).toBe(atSixteenTimes)
+    expect(record.headers.text).toBe('text')
+    expect(record.headers.none).toBeNull()
+    expect(record.headers.list[0]).toBe(atSixteenKiB)
+    expect(record.headers.list[1]).toBe('item')
+
+    const aboveSixteenKiB = Buffer.alloc(16385).subarray(0, 1)
+    const underSixteenTimes = Buffer.alloc(32768).subarray(0, 2047)
+    const [copied] = snapshotOf([{ key: aboveSixteenKiB, value: underSixteenTimes }])
+    expect(copied.key).not.toBe(aboveSixteenKiB)
+    expect(copied.value).not.toBe(underSixteenTimes)
+    expect(copied.key.buffer).toBe(copied.value.buffer)
+    expect(copied.key.buffer.byteLength).toBe(1 + 2047)
+  })
+
+  test("the keys, values and header values of one send, array elements included, land in one copy store; the caller's array keeps its views", () => {
+    const slab = Buffer.alloc(65536)
+    slab.write('kvhab', 0)
+    const [key, value, header, first, second] = [0, 1, 2, 3, 4].map((i) => slab.subarray(i, i + 1))
+    const list = [first, 'text', second]
+
+    const [record] = snapshotOf([{ key, value, headers: { h: header, list } }])
+    const fields = [
+      record.key,
+      record.value,
+      record.headers.h,
+      record.headers.list[0],
+      record.headers.list[2],
+    ]
+
+    expect(fields.map(String).join('')).toBe('kvhab')
+    expect(new Set(fields.map((field) => field.buffer)).size).toBe(1)
+    expect(fields[0].buffer.byteLength).toBe(5)
+    expect(record.headers.list[1]).toBe('text')
+    expect(list).toEqual([first, 'text', second])
+    expect(list[0]).toBe(first)
+  })
+
+  test("pooled Buffer values are charged by their own bytes under a 64 KiB pool, and kept as the caller's under an 8 KiB pool", () => {
+    const texts = ['{"a":1}', '{"b":22}', 'x'.repeat(300)]
+
+    withPool(65536, () => {
+      const values = texts.map((text) => Buffer.from(text))
+      expect(values.every((value) => value.buffer.byteLength >= 65536)).toBe(true)
+      const messages = snapshotOf(values.map((value) => ({ value })))
+      const heldBytes = messages.reduce((sum, message) => sum + held(message), 0)
+
+      expect(messages.map(({ value }) => String(value))).toEqual(texts)
+      expect(new Set(messages.map(({ value }) => value.buffer)).size).toBe(1)
+      expect(chargeOf([{ topic: TOPIC, messages }], Infinity)).toEqual({
+        total: 1536 + heldBytes,
+        shell: 1536 + 7 + 8 + 300,
+      })
+    })
+    withPool(8192, () => {
+      const values = texts.map((text) => Buffer.from(text))
+      expect(values.every((value) => value.buffer.byteLength <= 16384)).toBe(true)
+      const messages = snapshotOf(values.map((value) => ({ value })))
+      const heldBytes = messages.reduce((sum, message) => sum + held(message), 0)
+      const pool = values[0].buffer
+
+      messages.forEach((message, i) => expect(message.value).toBe(values[i]))
+      expect(values.every((value) => value.buffer === pool)).toBe(true)
+      expect(chargeOf([{ topic: TOPIC, messages }], Infinity)).toEqual({
+        total: 1536 + heldBytes + pool.byteLength - (7 + 8 + 300),
+        shell: 1536 + pool.byteLength,
+      })
+    })
+  })
+
+  test('a Buffer whose own copy method is replaced is copied without calling it, at its own bytes', () => {
+    const slab = Buffer.alloc(1048576, 'a')
+    slab.write('xyz', 5)
+    const key = slab.subarray(5, 8)
+    const calls = []
+    key.copy = (...args) => {
+      calls.push(args)
+      return 1000
+    }
+
+    const [record] = snapshotOf([{ key, value: slab.subarray(8, 10) }])
+
+    expect(calls).toEqual([])
+    expect(String(record.key)).toBe('xyz')
+    expect(String(record.value)).toBe('aa')
+    expect(record.value.buffer).toBe(record.key.buffer)
+    expect(record.key.buffer.byteLength).toBe(5)
+  })
+
+  test("a header-value array whose own slice returns itself is copied without it: the caller's array keeps its views and its holes", () => {
+    const slab = Buffer.alloc(65536)
+    slab.write('ab', 0)
+    const first = slab.subarray(0, 1)
+    const second = slab.subarray(1, 2)
+    const list = [first]
+    list[2] = second
+    list.slice = jest.fn(() => list)
+
+    const [record] = snapshotOf([{ headers: { list } }])
+    const copy = record.headers.list
+
+    expect(list.slice).not.toHaveBeenCalled()
+    expect(list[0]).toBe(first)
+    expect(list[2]).toBe(second)
+    expect(1 in list).toBe(false)
+    expect(copy).not.toBe(list)
+    expect(copy).toHaveLength(3)
+    expect(1 in copy).toBe(false)
+    expect(String(copy[0]) + String(copy[2])).toBe('ab')
+    expect(copy[2].buffer).toBe(copy[0].buffer)
+    expect(copy[0].buffer.byteLength).toBe(2)
+  })
+
+  test('a header-value array is copied up to the length it had when the copy began: an element getter that appends adds nothing', () => {
+    const slab = Buffer.alloc(65536)
+    slab.write('abc', 0)
+    const list = [slab.subarray(0, 1), slab.subarray(1, 2)]
+    const first = list[0]
+    Object.defineProperty(list, 0, {
+      get() {
+        list.push(slab.subarray(2, 3))
+        return first
+      },
+      enumerable: true,
+      configurable: true,
+    })
+
+    const [record] = snapshotOf([{ headers: { list } }])
+    const copy = record.headers.list
+
+    expect(list).toHaveLength(3)
+    expect(copy).toHaveLength(2)
+    expect(copy.map(String)).toEqual(['a', 'b'])
+    expect(copy[0].buffer.byteLength).toBe(2)
+  })
+
+  test("a slice of another send's copy store that is kept as it is is charged the bytes of that store it does not show", () => {
+    const slab = Buffer.alloc(1048576)
+    const [kept] = snapshotOf([
+      { value: slab.subarray(0, 100) },
+      { value: slab.subarray(100, 200) },
+    ])
+
+    const messages = snapshotOf([{ value: kept.value }])
+
+    expect(messages[0].value).toBe(kept.value)
+    expect(chargeOf([{ topic: TOPIC, messages }], Infinity)).toEqual({
+      total: 1536 + held(messages[0]) + 100,
+      shell: 1536 + 200,
+    })
+  })
+
+  test('5,000 references to one small view of a 1 MiB store are charged by their copied bytes, not the store', () => {
+    const view = Buffer.alloc(1048576).subarray(0, 10)
+
+    const messages = snapshotOf(Array.from({ length: 5000 }, () => ({ value: view })))
+
+    expect(messages[0].value.buffer.byteLength).toBe(50000)
+    expect(chargeOf([{ topic: TOPIC, messages }], Infinity)).toEqual({
+      total: 1536 + 5000 * held({ value: view }),
+      shell: 1536 + 50000,
+    })
   })
 })
 
@@ -445,15 +690,23 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     await release()
 
     expect(sent.state).toBe('fulfilled')
-    const [{ messages, bytes }] = written
-    expect(messages).toEqual([
+    const [{ bytes }] = written
+    const { records } = await readBatch(bytes)
+    expect(records).toEqual([
       {
-        key: 'k',
-        value: 'before',
-        headers: { h: 'x', list: ['a', 'b'] },
+        key: Buffer.from('k'),
+        value: Buffer.from('before'),
+        headers: { h: Buffer.from('x'), list: [Buffer.from('a'), Buffer.from('b')] },
         timestamp: '1700000000123',
+        offset: '0',
       },
-      { value: 'other', timestamp: '1700000000456' },
+      {
+        key: null,
+        value: Buffer.from('other'),
+        headers: {},
+        timestamp: '1700000000456',
+        offset: '1',
+      },
     ])
     expect(firstTimestampOf(bytes)).toBe(1700000000123n)
     expect(bytes.includes(Buffer.from('before'))).toBe(true)
@@ -506,6 +759,124 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     expect(written[0].messages[0].value).not.toBe(view)
     expect(written[0].bytes.includes(Buffer.alloc(16, 'a'))).toBe(true)
     expect(written[0].bytes.includes(Buffer.alloc(16, 'z'))).toBe(false)
+    await producer.disconnect()
+  })
+
+  test('small views of one large store in a send are admitted at their held bytes and the send shell exactly', async () => {
+    const { producer, admission, written, release } = await heldProducer()
+    const slab = Buffer.alloc(1048576, 'a')
+    const messages = [
+      { key: slab.subarray(0, 4), value: slab.subarray(4, 20) },
+      { value: slab.subarray(20, 52), headers: { h: slab.subarray(52, 53) } },
+    ]
+
+    const sent = producer.send({ topic: TOPIC, messages })
+    await flushAll()
+    expect(admission.reserved).toBe(held(messages[0]) + held(messages[1]) + 1536)
+    await release()
+    await sent
+
+    const [first, second] = written[0].messages
+    expect(first.value.buffer).toBe(first.key.buffer)
+    expect(second.value.buffer).toBe(first.key.buffer)
+    expect(second.headers.h.buffer).toBe(first.key.buffer)
+    expect(first.key.buffer.byteLength).toBe(53)
+    await producer.disconnect()
+  })
+
+  test('a send whose copied views cannot fit in bufferMemory is refused, and nothing is admitted or charged', async () => {
+    const { producer, admission, cluster, release } = await heldProducer({ capacity: 2000 })
+    const slab = Buffer.alloc(1048576)
+
+    const sent = watch(
+      producer.send({
+        topic: TOPIC,
+        messages: [{ value: slab.subarray(0, 1) }, { value: slab.subarray(1, 2001) }],
+      })
+    )
+    await flushAll()
+
+    expect(sent.state).toBe('rejected')
+    expect(sent.value).toBeInstanceOf(KafkaJSRecordTooLargeError)
+    expect(sent.value).toMatchObject({ reason: 'bufferMemory', limit: 2000 })
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    await release()
+    expect(cluster.broker.produce).not.toHaveBeenCalled()
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    await producer.disconnect()
+  })
+
+  test('a messages array whose iterator yields fresh copies still has its view copied: a one-byte view of a 1 MiB store fits a bufferMemory of 4096', async () => {
+    const { producer, admission, written, release } = await heldProducer({ capacity: 4096 })
+    const slab = Buffer.alloc(1048576, 'a')
+    slab.write('q', 7)
+    class Messages extends Array {
+      *[Symbol.iterator]() {
+        for (let i = 0; i < this.length; i++) {
+          yield { ...this[i] }
+        }
+      }
+    }
+    const messages = new Messages()
+    messages.push({ value: slab.subarray(7, 8) })
+
+    const sent = watch(producer.send({ topic: TOPIC, messages }))
+    await flushAll()
+    expect(admission.reserved).toBe(held({ value: Buffer.alloc(1) }) + 1536)
+    await release()
+
+    expect(sent.state).toBe('fulfilled')
+    const [{ messages: sentMessages }] = written
+    expect(String(sentMessages[0].value)).toBe('q')
+    expect(sentMessages[0].value.buffer.byteLength).toBe(1)
+    await producer.disconnect()
+  })
+
+  test('a view that shrinks while its send is read refuses the send instead of sending unwritten bytes', async () => {
+    const { producer, admission, cluster, release } = await heldProducer()
+    const backing = new ArrayBuffer(1048576, { maxByteLength: 1048576 })
+    const view = new Uint8Array(backing, 1048576 - 10)
+    Object.setPrototypeOf(view, Buffer.prototype)
+    let reads = 0
+    const later = {
+      get value() {
+        if (++reads === 1) {
+          backing.resize(1048576 - 5)
+        }
+        return 'x'
+      },
+    }
+
+    const sent = watch(producer.send({ topic: TOPIC, messages: [{ value: view }, later] }))
+    await flushAll()
+
+    expect(reads).toBe(1)
+    expect(sent.state).toBe('rejected')
+    expect(sent.value).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(sent.value.message).toBe('A Buffer changed size while its send was being read')
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    await release()
+    expect(cluster.broker.produce).not.toHaveBeenCalled()
+
+    const next = watch(producer.send({ topic: TOPIC, messages: [{ value: 'ok' }] }))
+    await flushAll()
+    expect(next.state).toBe('fulfilled')
+    expect(cluster.broker.produce).toHaveBeenCalledTimes(1)
+    expect(countersOf(admission)).toEqual(quiescent(admission))
+    await producer.disconnect()
+  })
+
+  test('a one-byte Buffer from a 64 KiB pool fits a bufferMemory of 4096', async () => {
+    const { producer, admission, release } = await heldProducer({ capacity: 4096 })
+    const value = withPool(65536, () => Buffer.from('v'))
+    expect(value.buffer.byteLength).toBeGreaterThanOrEqual(65536)
+
+    const sent = watch(producer.send({ topic: TOPIC, messages: [{ value }] }))
+    await flushAll()
+    expect(admission.reserved).toBe(held({ value }) + 1536)
+    await release()
+
+    expect(sent.state).toBe('fulfilled')
     await producer.disconnect()
   })
 
@@ -610,18 +981,61 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     }
   )
 
-  test('the missing-value check reads the copy, and its error names the copy', async () => {
+  test('missing-value validation uses the value read once into the copy', async () => {
     const { producer, admission } = await heldProducer()
-    const timestamp = Long.fromValue(5)
+    const reads = { count: 0 }
+    const record = { key: 'k' }
+    Object.defineProperty(record, 'value', {
+      enumerable: true,
+      get: () => {
+        reads.count += 1
+        return reads.count === 1 ? undefined : 'a later read'
+      },
+    })
+
+    const error = await producer.send({ topic: TOPIC, messages: [record] }).catch((e) => e)
+
+    expect(reads.count).toBe(1)
+    expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(error.message).toBe(`Invalid message without value for topic "${TOPIC}" at index 0`)
+    expect(admission.reserved).toBe(0)
+    await producer.disconnect()
+  })
+
+  test('a record without a value is named by topic and index, never by its contents', async () => {
+    const { producer, admission } = await heldProducer()
+    const marker = 'secret-marker-4d1f'
 
     const error = await producer
-      .send({ topic: TOPIC, messages: [{ key: 'k', timestamp }] })
+      .send({
+        topic: TOPIC,
+        messages: [
+          { value: 'ok' },
+          { key: `key-${marker}`, headers: { h: `header-${marker}` }, extra: `extra-${marker}` },
+        ],
+      })
       .catch((e) => e)
 
     expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
-    expect(error.message).toBe(
-      `Invalid message without value for topic "${TOPIC}": {"key":"k","timestamp":"5"}`
-    )
+    expect(error.message).toBe(`Invalid message without value for topic "${TOPIC}" at index 1`)
+    for (const text of [error.message, error.stack, JSON.stringify(error)]) {
+      expect(text).not.toContain(marker)
+    }
+    expect(admission.reserved).toBe(0)
+    await producer.disconnect()
+  })
+
+  test('a string record without a value is not echoed', async () => {
+    const { producer, admission } = await heldProducer()
+    const marker = 'secret-marker-9b2e'
+
+    const error = await producer.send({ topic: TOPIC, messages: [marker] }).catch((e) => e)
+
+    expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+    expect(error.message).toBe(`Invalid message without value for topic "${TOPIC}" at index 0`)
+    for (const text of [error.message, error.stack, JSON.stringify(error)]) {
+      expect(text).not.toContain(marker)
+    }
     expect(admission.reserved).toBe(0)
     await producer.disconnect()
   })
@@ -630,7 +1044,7 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     const { producer, admission } = await heldProducer()
 
     await expect(producer.send({ topic: TOPIC, messages: ['text'] })).rejects.toThrow(
-      `Invalid message without value for topic "${TOPIC}": "text"`
+      `Invalid message without value for topic "${TOPIC}" at index 0`
     )
     await expect(producer.send({ topic: TOPIC, messages: {} })).rejects.toThrow(TypeError)
     await expect(producer.sendBatch({ topicMessages: [null] })).rejects.toThrow(TypeError)
@@ -653,13 +1067,25 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     await producer.disconnect()
   })
 
-  test('an error that names a failing record names the copy: equal in its fields, not the same object', async () => {
+  test("an error that names a failing record carries a copy of its bytes, not the caller's object", async () => {
     const { producer, cluster } = bufferedProducer()
-    cluster.broker.produce.mockImplementation(async () => {
-      const error = createErrorFromCode(87)
-      Object.assign(error, { topic: TOPIC, partition: 0, recordErrors: [{ batchIndex: 0 }] })
-      return [{ topicName: TOPIC, partition: 0, errorCode: 87, error, baseOffset: '-1' }]
-    })
+    cluster.broker.produce.mockImplementation(async () =>
+      partitionResults({
+        topics: [
+          {
+            topicName: TOPIC,
+            partitions: [
+              {
+                partition: 0,
+                errorCode: 87,
+                baseOffset: '-1',
+                recordErrors: [{ batchIndex: 0, batchIndexErrorMessage: null }],
+              },
+            ],
+          },
+        ],
+      })
+    )
     await producer.connect()
     const record = { key: 'k', value: 'refused' }
 
@@ -668,7 +1094,11 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     const error = sent.value
 
     expect(sent.state).toBe('rejected')
-    expect(error.recordErrors[0].record).toEqual(record)
+    expect(error.recordErrors[0].record).toEqual({
+      key: Buffer.from('k'),
+      value: Buffer.from('refused'),
+      headers: {},
+    })
     expect(error.recordErrors[0].record).not.toBe(record)
     await producer.disconnect()
   })

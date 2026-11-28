@@ -1,0 +1,11 @@
+--- a/scripts/protocol/javaVectors/GenerateAssignorVectors.java
++++ b/scripts/protocol/javaVectors/GenerateAssignorVectors.java
+@@ -813,7 +813,7 @@
+     cases.add(vector("unassigned_topic", STICKY, twoEqualTopics, twoFresh));
+ 
+     cases.add(new CaseSpec("subscription_v0", RANGE, evenSplit, twoFresh, (short) 0, null));
+-    cases.add(new CaseSpec("subscription_v2", RANGE, evenSplit, twoFresh, (short) 2, null));
++    cases.add(new CaseSpec("subscription_v2", RANGE, evenSplit, twoFresh, (short) 1, null));
+     cases.add(vector("empty_range", RANGE, topology("t-a", 0), twoFresh));
+     for (String shape : List.of("discriminating", "copartitioned", "missing", "nonintersecting", "all_replicas", "balance")) {
+       String rack1 = shape.equals("missing") ? null : shape.equals("nonintersecting") ? "rack-x" : "rack-a";

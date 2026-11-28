@@ -954,8 +954,9 @@ describe('Consumer > topic recreation', () => {
 
         await consumerGroup.seekOffsets([{ topic: TOPIC, partitions: [0] }])
 
-        // A confirmed commit settles the reset; a local seek leaves it owed and looked up again.
-        expect(fetched).toHaveLength(autoCommit ? 0 : 1)
+        // A confirmed commit settles the reset; a local seek leaves it owed, and its position is
+        // its own fallback, so nothing is looked up for it.
+        expect(fetched).toHaveLength(0)
         expect(consumerGroup.obligations.isOwed(TOPIC, 0)).toBe(!autoCommit)
         if (autoCommit) {
           expect(offsetCommit).toHaveBeenCalled()

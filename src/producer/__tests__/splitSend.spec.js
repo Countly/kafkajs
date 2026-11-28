@@ -9,6 +9,7 @@ const Broker = require('../../broker')
 const Accumulator = require('../state/accumulator')
 const PartitionSequencer = require('../state/partitionSequencer')
 const { RequestBudget } = require('../state/recordSize')
+const { owned, takeSent } = require('./fixtures/bufferHarness')
 const { Schedule } = require('../../../testHelpers/schedule')
 const { createScriptedCluster, producerScript } = require('../../../testHelpers/scriptedCluster')
 
@@ -434,7 +435,7 @@ describe('Producer > a send larger than one request', () => {
     expect(log.written).toHaveLength(2)
   })
 
-  test('a split send with one delivered chunk and one never sent rejects with that chunk’s own unsent timeout', async () => {
+  test('a split send with delivered chunks and a never-sent chunk rejects with outcome unknown, the chunk timeout as cause', async () => {
     const { log } = await start(
       { topics: [{ name: TOPIC, leaders: [0, 1] }], nodes: 2 },
       { idempotent: true, deliveryTimeout: 600, retry: { ...RETRY, retries: 1000 } },
@@ -447,7 +448,9 @@ describe('Producer > a send larger than one request', () => {
       .catch((failure) => failure)
 
     expect(error).toBeInstanceOf(KafkaJSDeliveryTimeout)
-    expect(error.outcome).toBe('unsent')
+    expect(error.outcome).toBe('unknown')
+    expect(error.cause).toBeInstanceOf(KafkaJSDeliveryTimeout)
+    expect(error.cause.outcome).toBe('unsent')
     expect(log.written.map(({ partition, records: count }) => [partition, count])).toEqual([
       [0, 10],
       [0, 2],
@@ -545,7 +548,7 @@ describe('Producer > the parts of a refused request', () => {
     id,
     topic: TOPIC,
     partition,
-    messages: [{ value: 'x'.repeat(size) }],
+    messages: owned([{ value: 'x'.repeat(size) }]),
     acks: -1,
     timeout: 30000,
     compression: 0,
@@ -615,7 +618,7 @@ describe('Producer > the parts of a refused request', () => {
   test('a detached child keeps its immutable count for sequence retirement and cannot return a range twice', () => {
     const sequencer = new PartitionSequencer({ logger })
     const child = batch(0, 1)
-    child.messages = [{ value: 'a' }, { value: 'b' }]
+    child.messages = owned([{ value: 'a' }, { value: 'b' }])
     child.recordCount = 2
     sequencer.enqueue([child])
     sequencer.drain(0, leaders([0]), gate())
@@ -696,7 +699,10 @@ describe('Producer > the accumulator cuts a send into chunks', () => {
     })
     await new Promise((resolve) => setImmediate(resolve))
 
-    expect(handed.map(({ messages, wire }) => [messages.length, wire])).toEqual([
+    const taken = takeSent({ batches: handed })
+    const wires = handed.map(({ wire }) => wire)
+    const chunks = await taken.read()
+    expect(wires.map((wire, index) => [chunks[index].records.length, wire])).toEqual([
       [3, 675],
       [3, 675],
       [3, 675],
@@ -757,7 +763,8 @@ describe('Producer > the accumulator cuts a send into chunks', () => {
       { resolve: (v) => outside.resolved.push(v), reject: (e) => outside.rejected.push(e) },
     ]
     const [head, tail] = Accumulator.cut({ ...batch, settlers }, 1)
-    expect([head.messages.length, tail.messages.length]).toEqual([1, 3])
+    const halves = takeSent({ batches: [head, tail] })
+    expect(halves.batches.map(({ count }) => count)).toEqual([1, 3])
     head.settlers.forEach((settler) =>
       settler.resolve({ topicName: TOPIC, partition: 0, baseOffset: '10' })
     )
@@ -774,6 +781,7 @@ describe('Producer > the accumulator cuts a send into chunks', () => {
     tail.retire()
     tail.retire()
     batch.retire()
+    expect((await halves.read()).map(({ records }) => records.length)).toEqual([1, 3])
   })
 })
 
@@ -856,7 +864,7 @@ describe('Producer > retained request children at their delivery owner', () => {
     const batches = [0, 1, 2].map((partition) => ({
       topic: TOPIC,
       partition,
-      messages: [{ value: String(partition) }],
+      messages: owned([{ value: String(partition) }]),
       createdAt: partition === 1 && condition === 'expiry' ? -500 : 0,
       settlers: [{ resolve: jest.fn(), reject: jest.fn() }],
     }))
@@ -875,7 +883,7 @@ describe('Producer > retained request children at their delivery owner', () => {
           {
             topic: TOPIC,
             partition: 3,
-            messages: [{ value: 'unrelated' }],
+            messages: owned([{ value: 'unrelated' }]),
             createdAt: 0,
             settlers: [],
           },
@@ -965,7 +973,7 @@ describe('Producer > retained request children at their delivery owner', () => {
           {
             topic: TOPIC,
             partition: 0,
-            messages: [{ value: 'a' }, { value: 'b' }],
+            messages: owned([{ value: 'a' }, { value: 'b' }]),
             createdAt: 0,
             settlers: [settler],
           },
@@ -984,6 +992,78 @@ describe('Producer > retained request children at their delivery owner', () => {
     expect(sent.state).toBe('rejected')
     lookup.resolve()
     await flushAll()
+  })
+
+  test('the first half of a batch cut on the plain path gives back its records when it expires unwritten', async () => {
+    const createSendMessages = require('../sendMessages')
+    const createEosManager = require('../eosManager')
+    const createRetry = require('../../retry')
+    const Idempotence = require('../idempotence')
+    const { createFakeCluster } = require('./fixtures/fakeCluster')
+    const { deferred, flushAll, watch } = require('./fixtures/bufferHarness')
+    const logger = { debug() {}, info() {}, warn() {}, error() {} }
+    const cluster = createFakeCluster({ partitions: 1 })
+    const eosManager = createEosManager({ logger, cluster, transactional: false, retry: RETRY })
+    const lookup = deferred()
+    let blocked = false
+    const broker = {
+      ...cluster.broker,
+      nodeId: 0,
+      produce: async (request) => {
+        blocked = true
+        const refusal = request.guard(4097)
+        if (refusal) throw refusal
+        throw new Error('written')
+      },
+    }
+    cluster.findBroker.mockImplementation(async () => {
+      if (blocked) await lookup.promise
+      return broker
+    })
+    cluster.findLeaderForPartitions = () => ({ 0: [0] })
+    const sender = createSendMessages({
+      logger,
+      cluster,
+      eosManager,
+      retrier: createRetry(RETRY),
+      retry: RETRY,
+      idempotence: new Idempotence({ enabled: false, explicit: true, logger }),
+      deliveryTimeout: 1000,
+      budget: new RequestBudget({ maxRequestSize: 4096 }),
+      getConnectionStatus: () => 'connected',
+    })
+    const settler = { resolve: jest.fn(), reject: jest.fn() }
+    const detach = jest.fn()
+    const retire = jest.fn()
+    const batch = {
+      topic: TOPIC,
+      partition: 0,
+      messages: owned([{ value: 'a' }, { value: 'b' }]),
+      createdAt: 0,
+      settlers: [settler],
+      detach,
+      retire,
+    }
+    const sent = watch(
+      sender.sendPartitioned({ acks: 1, timeout: 30000, compression: 0, batches: [batch] })
+    )
+    await flushAll()
+    expect(blocked).toBe(true)
+    await jest.advanceTimersByTimeAsync(1100)
+    await flushAll()
+
+    expect(settler.reject).toHaveBeenCalledTimes(1)
+    expect(settler.reject.mock.calls[0][0]).toMatchObject({
+      name: 'KafkaJSDeliveryTimeout',
+      outcome: 'unsent',
+    })
+    expect(sent.state).toBe('rejected')
+    expect(detach).toHaveBeenCalledTimes(1)
+    expect(retire).not.toHaveBeenCalled()
+    lookup.resolve()
+    await flushAll()
+    expect(detach).toHaveBeenCalledTimes(1)
+    expect(retire).toHaveBeenCalledTimes(1)
   })
 
   test('a written part ends at that write, so its members can share a request again', async () => {
@@ -1035,7 +1115,7 @@ describe('Producer > retained request children at their delivery owner', () => {
         batches: [0, 1].map((partition) => ({
           topic: TOPIC,
           partition,
-          messages: [{ value: String(partition) }],
+          messages: owned([{ value: String(partition) }]),
           createdAt: 0,
           settlers: [],
         })),

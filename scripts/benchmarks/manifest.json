@@ -3,6 +3,7 @@
   "entries": [
     {
       "name": "compare-produce-latency",
+      "adapter": "clientCompare",
       "command": [
         "scripts/benchmarks/clientCompare.js",
         "--client",
@@ -10,19 +11,49 @@
         "--package",
         "{package}",
         "--workload",
-        "produce-latency"
+        "produce-latency",
+        "--duration-ms",
+        "30000"
       ],
       "broker": true,
       "metrics": [
         { "key": "p50", "unit": "ms" },
         { "key": "p90", "unit": "ms" },
         { "key": "p99", "unit": "ms" },
-        { "key": "messagesPerSecond", "unit": "msg/s" }
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "arms": ["fork", "kafkajs@2.2.4"]
+    },
+    {
+      "name": "compare-produce-latency-same",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-latency",
+        "--duration-ms",
+        "30000",
+        "--settings",
+        "same"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "p50", "unit": "ms" },
+        { "key": "p90", "unit": "ms" },
+        { "key": "p99", "unit": "ms" },
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "elapsedMs", "unit": "ms" }
       ],
       "arms": ["fork", "kafkajs@2.2.4"]
     },
     {
       "name": "compare-produce-throughput",
+      "adapter": "clientCompare",
       "command": [
         "scripts/benchmarks/clientCompare.js",
         "--client",
@@ -30,14 +61,32 @@
         "--package",
         "{package}",
         "--workload",
-        "produce-throughput"
+        "produce-throughput",
+        "--duration-ms",
+        "30000"
       ],
       "broker": true,
-      "metrics": [{ "key": "messagesPerSecond", "unit": "msg/s" }],
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
       "arms": ["fork", "kafkajs@2.2.4"]
     },
     {
-      "name": "compare-consume-throughput",
+      "name": "compare-produce-throughput-same",
+      "adapter": "clientCompare",
       "command": [
         "scripts/benchmarks/clientCompare.js",
         "--client",
@@ -45,10 +94,838 @@
         "--package",
         "{package}",
         "--workload",
-        "consume-throughput"
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--settings",
+        "same"
       ],
       "broker": true,
-      "metrics": [{ "key": "messagesPerSecond", "unit": "msg/s" }],
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "profile": true
+    },
+    {
+      "name": "compare-produce-throughput-1k",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--size",
+        "1024"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"]
+    },
+    {
+      "name": "compare-produce-throughput-lz4",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--compression",
+        "lz4"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"]
+    },
+    {
+      "name": "compare-produce-throughput-12p",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--partitions",
+        "12"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"]
+    },
+    {
+      "name": "compare-produce-throughput-100k",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--size",
+        "102400",
+        "--batch",
+        "8"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-1m",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--size",
+        "1000000",
+        "--batch",
+        "1"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-15k",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--size",
+        "15360",
+        "--batch",
+        "32"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-17k",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--size",
+        "17408",
+        "--batch",
+        "32"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-12p-keyed",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--partitions",
+        "12",
+        "--keys",
+        "index"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-string-200",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--value-type",
+        "string"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-string-1k",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--size",
+        "1024",
+        "--value-type",
+        "string"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-100k-gzip",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--size",
+        "102400",
+        "--batch",
+        "8",
+        "--compression",
+        "gzip"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-100k-lz4",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--size",
+        "102400",
+        "--batch",
+        "8",
+        "--compression",
+        "lz4"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-coalesced",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--partitions",
+        "1",
+        "--unawaited",
+        "100"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-fanout-100p",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--size",
+        "50",
+        "--partitions",
+        "100",
+        "--keys",
+        "index"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-custom",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--partitions",
+        "12",
+        "--partitioner",
+        "custom"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-headers",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--headers",
+        "20"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-consume-throughput",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "consume-throughput",
+        "--messages",
+        "10000000",
+        "--passes",
+        "4"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "mainThreadCpuMicrosPerMessage", "unit": "us" },
+        { "key": "fullGcCount", "unit": "collections" },
+        { "key": "eventLoopDelayP50", "unit": "ms" },
+        { "key": "eventLoopDelayP99", "unit": "ms" },
+        { "key": "eventLoopDelayMax", "unit": "ms" },
+        { "key": "fetchRequests", "unit": "requests" },
+        { "key": "bytesPerFetch", "unit": "bytes" },
+        { "key": "messagesPerFetch", "unit": "messages" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "arms": ["fork", "kafkajs@2.2.4"]
+    },
+    {
+      "name": "compare-consume-throughput-same",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "consume-throughput",
+        "--messages",
+        "10000000",
+        "--passes",
+        "4",
+        "--settings",
+        "same"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "mainThreadCpuMicrosPerMessage", "unit": "us" },
+        { "key": "fullGcCount", "unit": "collections" },
+        { "key": "eventLoopDelayP50", "unit": "ms" },
+        { "key": "eventLoopDelayP99", "unit": "ms" },
+        { "key": "eventLoopDelayMax", "unit": "ms" },
+        { "key": "fetchRequests", "unit": "requests" },
+        { "key": "bytesPerFetch", "unit": "bytes" },
+        { "key": "messagesPerFetch", "unit": "messages" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "profile": true
+    },
+    {
+      "name": "compare-consume-throughput-1k",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "consume-throughput",
+        "--messages",
+        "4000000",
+        "--size",
+        "1024",
+        "--passes",
+        "5"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "mainThreadCpuMicrosPerMessage", "unit": "us" },
+        { "key": "fullGcCount", "unit": "collections" },
+        { "key": "eventLoopDelayP50", "unit": "ms" },
+        { "key": "eventLoopDelayP99", "unit": "ms" },
+        { "key": "eventLoopDelayMax", "unit": "ms" },
+        { "key": "fetchRequests", "unit": "requests" },
+        { "key": "bytesPerFetch", "unit": "bytes" },
+        { "key": "messagesPerFetch", "unit": "messages" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "profile": true
+    },
+    {
+      "name": "compare-consume-throughput-1k-same",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "consume-throughput",
+        "--messages",
+        "4000000",
+        "--size",
+        "1024",
+        "--passes",
+        "5",
+        "--settings",
+        "same"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "mainThreadCpuMicrosPerMessage", "unit": "us" },
+        { "key": "fullGcCount", "unit": "collections" },
+        { "key": "eventLoopDelayP50", "unit": "ms" },
+        { "key": "eventLoopDelayP99", "unit": "ms" },
+        { "key": "eventLoopDelayMax", "unit": "ms" },
+        { "key": "fetchRequests", "unit": "requests" },
+        { "key": "bytesPerFetch", "unit": "bytes" },
+        { "key": "messagesPerFetch", "unit": "messages" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "profile": true
+    },
+    {
+      "name": "compare-consume-throughput-lz4",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "consume-throughput",
+        "--messages",
+        "10000000",
+        "--passes",
+        "4",
+        "--compression",
+        "lz4"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "mainThreadCpuMicrosPerMessage", "unit": "us" },
+        { "key": "fullGcCount", "unit": "collections" },
+        { "key": "eventLoopDelayP50", "unit": "ms" },
+        { "key": "eventLoopDelayP99", "unit": "ms" },
+        { "key": "eventLoopDelayMax", "unit": "ms" },
+        { "key": "fetchRequests", "unit": "requests" },
+        { "key": "bytesPerFetch", "unit": "bytes" },
+        { "key": "messagesPerFetch", "unit": "messages" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "arms": ["fork", "kafkajs@2.2.4"]
+    },
+    {
+      "name": "compare-consume-throughput-12p",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "consume-throughput",
+        "--messages",
+        "10000000",
+        "--passes",
+        "4",
+        "--partitions",
+        "12"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "mainThreadCpuMicrosPerMessage", "unit": "us" },
+        { "key": "fullGcCount", "unit": "collections" },
+        { "key": "eventLoopDelayP50", "unit": "ms" },
+        { "key": "eventLoopDelayP99", "unit": "ms" },
+        { "key": "eventLoopDelayMax", "unit": "ms" },
+        { "key": "fetchRequests", "unit": "requests" },
+        { "key": "bytesPerFetch", "unit": "bytes" },
+        { "key": "messagesPerFetch", "unit": "messages" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
       "arms": ["fork", "kafkajs@2.2.4"]
     },
     {
@@ -214,14 +1091,57 @@
       "arms": ["fork"]
     },
     {
-      "name": "stickyBalance",
-      "command": ["--expose-gc", "scripts/benchmarks/stickyBalance.js"],
+      "name": "stickyBalance-healthy",
+      "adapter": "stickyBalanceSession",
+      "command": [
+        "--expose-gc",
+        "scripts/benchmarks/stickyBalance.js",
+        "--session",
+        "--scenario",
+        "healthy",
+        "--raw",
+        "{raw}",
+        "--runs",
+        "24"
+      ],
       "broker": true,
       "metrics": [
         { "key": "recordsPerRequest", "unit": "records" },
         { "key": "balance", "unit": "ratio" },
         { "key": "p99Ms", "unit": "ms" },
         { "key": "heapRetainedBytes", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "stickyBalance-slow-broker",
+      "adapter": "stickyBalanceSession",
+      "command": [
+        "--expose-gc",
+        "scripts/benchmarks/stickyBalance.js",
+        "--session",
+        "--scenario",
+        "slow-broker",
+        "--raw",
+        "{raw}",
+        "--runs",
+        "9"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "recordsPerRequest", "unit": "records" },
+        { "key": "balance", "unit": "ratio" },
+        { "key": "p99Ms", "unit": "ms" },
+        { "key": "heapRetainedBytes", "unit": "bytes" },
+        { "key": "slowMedianMs", "unit": "ms" },
+        { "key": "otherMedianMs", "unit": "ms" },
+        { "key": "backlogAt6s", "unit": "records" },
+        { "key": "backlogMax", "unit": "records" },
+        { "key": "delivered", "unit": "records" },
+        { "key": "rejected", "unit": "records" },
+        { "key": "refused", "unit": "records" },
+        { "key": "unsettled", "unit": "records" },
+        { "key": "drainAtMs", "unit": "ms" }
       ],
       "arms": ["fork"]
     },
@@ -280,7 +1200,430 @@
       "broker": true,
       "metrics": [{ "key": "medianMs", "unit": "ms" }],
       "arms": ["fork"]
-    }
+    },
+    {
+      "name": "consumer-fetchRound",
+      "adapter": "fetchRound",
+      "contracts": ["performance/fetch-round"],
+      "command": [
+        "scripts/benchmarks/adapters/consumerSession.js",
+        "--row",
+        "consumer-fetchRound",
+        "--raw",
+        "{raw}"
+      ],
+      "broker": false,
+      "metrics": [
+        { "key": "nsPerNodeRound", "unit": "ns" },
+        { "key": "allocatedBytesPerRound", "unit": "bytes" },
+        { "key": "retainedHeapDelta", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "consumer-eachBatch",
+      "adapter": "consumeThroughput",
+      "contracts": ["performance/consume-each-batch"],
+      "command": [
+        "scripts/benchmarks/adapters/consumerSession.js",
+        "--row",
+        "consumer-eachBatch",
+        "--raw",
+        "{raw}"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "deliveryGapP99", "unit": "ms" },
+        { "key": "heapRetainedBytes", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "consumer-eachMessage",
+      "adapter": "consumeThroughput",
+      "contracts": ["performance/consume-each-message"],
+      "command": [
+        "scripts/benchmarks/adapters/consumerSession.js",
+        "--row",
+        "consumer-eachMessage",
+        "--raw",
+        "{raw}"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "deliveryGapP99", "unit": "ms" },
+        { "key": "heapRetainedBytes", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "consumer-autocommit",
+      "adapter": "consumeThroughput",
+      "contracts": ["performance/consume-autocommit"],
+      "command": [
+        "scripts/benchmarks/adapters/consumerSession.js",
+        "--row",
+        "consumer-autocommit",
+        "--raw",
+        "{raw}"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "deliveryGapP99", "unit": "ms" },
+        { "key": "heapRetainedBytes", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "consumer-listener",
+      "adapter": "consumeThroughput",
+      "contracts": ["performance/consume-listener"],
+      "command": [
+        "scripts/benchmarks/adapters/consumerSession.js",
+        "--row",
+        "consumer-listener",
+        "--raw",
+        "{raw}"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "deliveryGapP99", "unit": "ms" },
+        { "key": "heapRetainedBytes", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "consumer-partitions-1000",
+      "adapter": "consumeThroughput",
+      "contracts": ["performance/consume-partitions-1000"],
+      "command": [
+        "scripts/benchmarks/adapters/consumerSession.js",
+        "--row",
+        "consumer-partitions-1000",
+        "--raw",
+        "{raw}"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "deliveryGapP99", "unit": "ms" },
+        { "key": "heapRetainedBytes", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "consumer-sessions-S1",
+      "adapter": "fetchSessions",
+      "contracts": ["performance/fetch-sessions-s1"],
+      "command": [
+        "scripts/benchmarks/adapters/consumerSession.js",
+        "--row",
+        "consumer-sessions-S1",
+        "--raw",
+        "{raw}"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "sample.bytes", "unit": "bytes" },
+        { "key": "sample.bytesPerSecond", "unit": "bytes/s" },
+        { "key": "sample.cpuMicrosPerSecond", "unit": "us/s" },
+        { "key": "sample.messagesPerSecond", "unit": "msg/s" },
+        { "key": "sample.cpuMicrosPerMessage", "unit": "us" },
+        { "key": "sample.bytesPerMessage", "unit": "bytes" },
+        { "key": "sample.deliveryGapP99", "unit": "ms" },
+        { "key": "sample.heapRetainedBytes", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "consumer-sessions-S2",
+      "adapter": "fetchSessions",
+      "contracts": ["performance/fetch-sessions-s2"],
+      "command": [
+        "scripts/benchmarks/adapters/consumerSession.js",
+        "--row",
+        "consumer-sessions-S2",
+        "--raw",
+        "{raw}"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "sample.bytes", "unit": "bytes" },
+        { "key": "sample.bytesPerSecond", "unit": "bytes/s" },
+        { "key": "sample.cpuMicrosPerSecond", "unit": "us/s" },
+        { "key": "sample.heapRetainedBytes", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "consumer-sessions-L1",
+      "adapter": "fetchSessions",
+      "contracts": ["performance/fetch-sessions-l1"],
+      "command": [
+        "scripts/benchmarks/adapters/consumerSession.js",
+        "--row",
+        "consumer-sessions-L1",
+        "--raw",
+        "{raw}"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "sample.bytes", "unit": "bytes" },
+        { "key": "sample.bytesPerSecond", "unit": "bytes/s" },
+        { "key": "sample.cpuMicrosPerSecond", "unit": "us/s" },
+        { "key": "sample.messagesPerSecond", "unit": "msg/s" },
+        { "key": "sample.cpuMicrosPerMessage", "unit": "us" },
+        { "key": "sample.bytesPerMessage", "unit": "bytes" },
+        { "key": "sample.deliveryGapP99", "unit": "ms" },
+        { "key": "sample.heapRetainedBytes", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "consumer-sessions-L2",
+      "adapter": "fetchSessions",
+      "contracts": ["performance/fetch-sessions-l2"],
+      "command": [
+        "scripts/benchmarks/adapters/consumerSession.js",
+        "--row",
+        "consumer-sessions-L2",
+        "--raw",
+        "{raw}"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "sample.bytes", "unit": "bytes" },
+        { "key": "sample.bytesPerSecond", "unit": "bytes/s" },
+        { "key": "sample.cpuMicrosPerSecond", "unit": "us/s" },
+        { "key": "sample.messagesPerSecond", "unit": "msg/s" },
+        { "key": "sample.cpuMicrosPerMessage", "unit": "us" },
+        { "key": "sample.bytesPerMessage", "unit": "bytes" },
+        { "key": "sample.heapRetainedBytes", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "consumer-sessions-L3",
+      "adapter": "fetchSessions",
+      "contracts": ["performance/fetch-sessions-l3"],
+      "command": [
+        "scripts/benchmarks/adapters/consumerSession.js",
+        "--row",
+        "consumer-sessions-L3",
+        "--raw",
+        "{raw}"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "sample.bytes", "unit": "bytes" },
+        { "key": "sample.bytesPerSecond", "unit": "bytes/s" },
+        { "key": "sample.cpuMicrosPerSecond", "unit": "us/s" },
+        { "key": "sample.heapRetainedBytes", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "consumer-sessions-Memory",
+      "adapter": "fetchSessions",
+      "contracts": ["performance/fetch-sessions-memory"],
+      "command": [
+        "scripts/benchmarks/adapters/consumerSession.js",
+        "--row",
+        "consumer-sessions-Memory",
+        "--raw",
+        "{raw}"
+      ],
+      "broker": true,
+      "metrics": [{ "key": "sample.heapRetainedBytes", "unit": "bytes" }],
+      "arms": ["fork"]
+    },
+    {
+      "name": "consumer-subscriptionResolve",
+      "adapter": "subscriptionResolve",
+      "contracts": ["performance/subscription-resolve"],
+      "command": [
+        "scripts/benchmarks/adapters/consumerSession.js",
+        "--row",
+        "consumer-subscriptionResolve",
+        "--raw",
+        "{raw}"
+      ],
+      "broker": false,
+      "metrics": [{ "key": "evaluationMs", "unit": "ms" }],
+      "arms": ["fork"]
+    },
+    {
+      "name": "consumer-stickyAssign-g6",
+      "adapter": "stickyAssign",
+      "contracts": ["performance/sticky-assign-g6"],
+      "command": [
+        "scripts/benchmarks/adapters/consumerSession.js",
+        "--row",
+        "consumer-stickyAssign-g6",
+        "--raw",
+        "{raw}"
+      ],
+      "broker": false,
+      "metrics": [{ "key": "ms", "unit": "ms" }],
+      "arms": ["fork"]
+    },
+    {
+      "name": "consumer-recordBatchDecode",
+      "adapter": "recordBatchDecode",
+      "contracts": ["performance/record-batch-decode-no-change"],
+      "command": [
+        "scripts/benchmarks/adapters/consumerSession.js",
+        "--row",
+        "consumer-recordBatchDecode",
+        "--raw",
+        "{raw}"
+      ],
+      "broker": false,
+      "metrics": [{ "key": "nsPerOp", "unit": "ns" }],
+      "arms": ["fork"]
+    },
+    {
+      "name": "consumer-sizing-10mib",
+      "adapter": "consumeSizing",
+      "contracts": ["sizing/max-bytes-10mib"],
+      "command": [
+        "scripts/benchmarks/adapters/consumerSession.js",
+        "--row",
+        "consumer-sizing-10mib",
+        "--raw",
+        "{raw}"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "sizing.rssPeakBytes", "unit": "bytes" },
+        { "key": "sizing.rssProcessPeakBytes", "unit": "bytes" },
+        { "key": "sizing.heapRetainedBytes", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "consumer-sizing-25mib",
+      "adapter": "consumeSizing",
+      "contracts": ["sizing/max-bytes-25mib"],
+      "command": [
+        "scripts/benchmarks/adapters/consumerSession.js",
+        "--row",
+        "consumer-sizing-25mib",
+        "--raw",
+        "{raw}"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "sizing.rssPeakBytes", "unit": "bytes" },
+        { "key": "sizing.rssProcessPeakBytes", "unit": "bytes" },
+        { "key": "sizing.heapRetainedBytes", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "consumer-sizing-50mib",
+      "adapter": "consumeSizing",
+      "contracts": ["sizing/max-bytes-50mib"],
+      "command": [
+        "scripts/benchmarks/adapters/consumerSession.js",
+        "--row",
+        "consumer-sizing-50mib",
+        "--raw",
+        "{raw}"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "sizing.rssPeakBytes", "unit": "bytes" },
+        { "key": "sizing.rssProcessPeakBytes", "unit": "bytes" },
+        { "key": "sizing.heapRetainedBytes", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "consumer-rebalanceStorm-200",
+      "adapter": "rebalanceStorm",
+      "contracts": [],
+      "command": [
+        "scripts/benchmarks/adapters/consumerSession.js",
+        "--row",
+        "consumer-rebalanceStorm-200",
+        "--raw",
+        "{raw}"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "deltaBytes", "unit": "bytes" },
+        { "key": "slopeBytesPerRound", "unit": "bytes/round" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "consumer-offsetCommit-retirement",
+      "adapter": "offsetCommit",
+      "contracts": [],
+      "command": [
+        "scripts/benchmarks/adapters/consumerSession.js",
+        "--row",
+        "consumer-offsetCommit-retirement",
+        "--raw",
+        "{raw}"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "deliveryGapP99", "unit": "ms" },
+        { "key": "heapRetainedBytes", "unit": "bytes" }
+      ],
+      "arms": ["fork"]
+    },
+    {
+      "name": "consumer-session-audit",
+      "adapter": "consumerSession",
+      "contracts": ["performance/controls-and-aa", "performance/frozen-repetition"],
+      "command": ["scripts/benchmarks/adapters/consumerSession.js", "--audit", "--raw", "{raw}"],
+      "broker": false,
+      "metrics": [{ "key": "aaSpreadPercent", "unit": "%" }],
+      "arms": ["fork"]
+    },
+    {"name":"shareThroughput","adapter":"shareThroughput","command":["--expose-gc","scripts/benchmarks/shareThroughput.js","--session","batch","--raw","{raw}"],"broker":true,"metrics":[{"key":"recordsPerSecond","unit":"records/s"},{"key":"p99","unit":"ms"},{"key":"fetchPer1000","unit":"frames"},{"key":"heapDelta","unit":"bytes"}],"arms":["fork"]},
+    {"name":"shareThroughput-eachMessage","adapter":"shareThroughput","command":["--expose-gc","scripts/benchmarks/shareThroughput.js","--session","eachMessage","--raw","{raw}"],"broker":true,"metrics":[{"key":"recordsPerSecond","unit":"records/s"},{"key":"p99","unit":"ms"},{"key":"fetchPer1000","unit":"frames"},{"key":"heapDelta","unit":"bytes"}],"arms":["fork"]},
+    {"name":"shareRecordWalk-100k","adapter":"shareRecordWalk","command":["--expose-gc","scripts/benchmarks/shareRecordWalk.js","--offsets","100000","--control","0"],"broker":false,"metrics":[{"key":"nsPerOffset","unit":"ns"},{"key":"retainedHeap","unit":"bytes"},{"key":"retainedBuffers","unit":"bytes"},{"key":"retainedTotal","unit":"bytes"},{"key":"bytesPerDelivery","unit":"bytes"},{"key":"ledgerMs","unit":"ms"}],"arms":["fork"]},
+    {"name":"shareRecordWalk-1m","adapter":"shareRecordWalk","command":["--expose-gc","scripts/benchmarks/shareRecordWalk.js","--offsets","1000000","--control","0"],"broker":false,"metrics":[{"key":"nsPerOffset","unit":"ns"},{"key":"retainedHeap","unit":"bytes"},{"key":"retainedBuffers","unit":"bytes"},{"key":"retainedTotal","unit":"bytes"},{"key":"bytesPerDelivery","unit":"bytes"},{"key":"ledgerMs","unit":"ms"}],"arms":["fork"]},
+    {"name":"snappyReadback","adapter":"snappyReadback","command":["--expose-gc","scripts/benchmarks/snappyCodec.js","--session","--raw","{raw}"],"readback":".tmp/bench/snappy-java-readback.log","broker":false,"metrics":[{"key":"decodeMiBs","unit":"MiB/s"},{"key":"encodeMiBs","unit":"MiB/s"},{"key":"maxDelayMs","unit":"ms"},{"key":"maxRssRatio","unit":"ratio"}],"arms":["fork"]},
+    {"name":"telemetrySession-requests-normal","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-requests-normal","--raw","{raw}"],"broker":false,"metrics":[{"key":"cpuNsPerPair","unit":"ns"},{"key":"elapsedNsPerPair","unit":"ns"},{"key":"heapExternalDeltaBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-requests-control","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-requests-control","--raw","{raw}"],"broker":false,"metrics":[{"key":"cpuNsPerPair","unit":"ns"},{"key":"elapsedNsPerPair","unit":"ns"},{"key":"heapExternalDeltaBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-1-delta-none-compressible","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-1-delta-none-compressible","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-1-delta-none-poor","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-1-delta-none-poor","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-1-delta-gzip-compressible","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-1-delta-gzip-compressible","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-1-delta-gzip-poor","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-1-delta-gzip-poor","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-1-delta-zstd-compressible","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-1-delta-zstd-compressible","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-1-delta-zstd-poor","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-1-delta-zstd-poor","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-1-cumulative-none-compressible","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-1-cumulative-none-compressible","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-1-cumulative-none-poor","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-1-cumulative-none-poor","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-1-cumulative-gzip-compressible","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-1-cumulative-gzip-compressible","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-1-cumulative-gzip-poor","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-1-cumulative-gzip-poor","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-1-cumulative-zstd-compressible","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-1-cumulative-zstd-compressible","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-1-cumulative-zstd-poor","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-1-cumulative-zstd-poor","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-257-delta-none-compressible","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-257-delta-none-compressible","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-257-delta-none-poor","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-257-delta-none-poor","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-257-delta-gzip-compressible","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-257-delta-gzip-compressible","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-257-delta-gzip-poor","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-257-delta-gzip-poor","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-257-delta-zstd-compressible","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-257-delta-zstd-compressible","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-257-delta-zstd-poor","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-257-delta-zstd-poor","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-257-cumulative-none-compressible","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-257-cumulative-none-compressible","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-257-cumulative-none-poor","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-257-cumulative-none-poor","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-257-cumulative-gzip-compressible","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-257-cumulative-gzip-compressible","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-257-cumulative-gzip-poor","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-257-cumulative-gzip-poor","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-257-cumulative-zstd-compressible","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-257-cumulative-zstd-compressible","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-payload-257-cumulative-zstd-poor","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-payload-257-cumulative-zstd-poor","--raw","{raw}"],"broker":false,"metrics":[{"key":"sliceP99Ms","unit":"ms"},{"key":"cpuP99Ms","unit":"ms"},{"key":"wallP99Ms","unit":"ms"},{"key":"fittingPasses","unit":"passes"},{"key":"rawBytes","unit":"bytes"},{"key":"transmittedBytes","unit":"bytes"}],"arms":["fork"]},
+    {"name":"telemetrySession-delivery-normal-eachMessage","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-delivery-normal-eachMessage","--raw","{raw}"],"broker":true,"metrics":[{"key":"messagesPerSecond","unit":"msg/s"},{"key":"p99Ms","unit":"ms"},{"key":"deliveryGapP99Ms","unit":"ms"}],"arms":["fork"]},
+    {"name":"telemetrySession-delivery-normal-eachBatch","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-delivery-normal-eachBatch","--raw","{raw}"],"broker":true,"metrics":[{"key":"messagesPerSecond","unit":"msg/s"},{"key":"p99Ms","unit":"ms"},{"key":"deliveryGapP99Ms","unit":"ms"}],"arms":["fork"]},
+    {"name":"telemetrySession-delivery-control-eachMessage","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-delivery-control-eachMessage","--raw","{raw}"],"broker":true,"metrics":[{"key":"messagesPerSecond","unit":"msg/s"},{"key":"p99Ms","unit":"ms"},{"key":"deliveryGapP99Ms","unit":"ms"}],"arms":["fork"]},
+    {"name":"telemetrySession-delivery-control-eachBatch","adapter":"telemetrySession","command":["scripts/benchmarks/adapters/telemetrySession.js","--row","telemetrySession-delivery-control-eachBatch","--raw","{raw}"],"broker":true,"metrics":[{"key":"messagesPerSecond","unit":"msg/s"},{"key":"p99Ms","unit":"ms"},{"key":"deliveryGapP99Ms","unit":"ms"}],"arms":["fork"]}
   ],
   "excluded": [
     {
@@ -296,8 +1639,16 @@
       "reason": "An exit-gate decoder performance tool that compares frozen trees and exits 1 on missing evidence or an excessive slowdown, not a report entry."
     },
     {
+      "file": "consumeCoverage.js",
+      "reason": "The untimed coverage control of the consumer-partitions-1000 row, run on each tree through adapters/consumerSession.js; not a measurement."
+    },
+    {
       "file": "fetchSessions.js",
-      "reason": "Needs a controller-owned node inventory (BENCH_NODES), an evidence directory and, for one arm, controller IPC; it also uses the racks cluster."
+      "reason": "Run by the consumer-sessions-* rows through adapters/consumerSession.js, which supplies BENCH_NODES, the evidence directory, the topics and the L2 producer; never a plain entry."
+    },
+    {
+      "file": "headerHeapCost.js",
+      "reason": "An exit-gate check, not a measurement entry: per header layout it prints the heap each decoded record header retains and a sampled peak, at a fixed calibration count and at the header ceiling, and exits 1 when either pass retains more than the batch decoder's header ceiling bytes."
     },
     {
       "file": "produceFrameSize.js",
@@ -305,27 +1656,15 @@
     },
     {
       "file": "rebalanceStorm.js",
-      "reason": "A retained-heap leak gate of 200 live cooperative rounds that exits 1 on its slope limit; the memory gates own it and three runs would take too long."
-    },
-    {
-      "file": "shareRecordWalk.js",
-      "reason": "Ends in an A/A void rule that throws when two sessions differ by more than 3 %, which a shared runner cannot promise."
-    },
-    {
-      "file": "shareThroughput.js",
-      "reason": "Needs KAFKAJS_CLUSTER_MANIFEST, P9_SHARE_CORPUS and P9_SHARE_TRACE and a live guard that CI does not provide."
-    },
-    {
-      "file": "snappyCodec.js",
-      "reason": "Refuses to run without the seven Java read-back artifacts and exits 1 on its event-loop and memory limits."
+      "reason": "Run once by the consumer-rebalanceStorm-200 row through adapters/consumerSession.js, its exit shown as information; never a plain entry."
     },
     {
       "file": "stickyAssign.js",
-      "reason": "A differential check against a baseline source tree: it prints a line per shape, lets a shape run to a 10-minute limit and has no single metric."
+      "reason": "Its timing worker is run by the consumer-stickyAssign-g6 row through adapters/consumerSession.js; the differential --check is not a report entry."
     },
     {
       "file": "telemetry.js",
-      "reason": "A session controller driven by a manifest of its own, with correctness gates and its own exit codes."
+      "reason": "Run by the telemetrySession-* rows through adapters/telemetrySession.js (one row per telemetry-rows job), which checks the fixture, freezes and verifies the source snapshots, writes the session manifest and runs this controller and its --verify-session; not run directly."
     }
   ]
 }

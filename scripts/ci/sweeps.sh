@@ -3,6 +3,10 @@
 # label grep against alpha.9b, test-only exports, focused or failing tests, host paths, TODO text and leftover .orig/.rej files. Each
 # hit is compared as `file:text` (line numbers dropped) with the enumerated exceptions, as a
 # multiset, so an exception that moves still matches and a second copy of one is a new hit.
+# It also fails on planning ids (acceptance, decision or plan ids) in the shipped README, governance files and
+# guides, and on private working-process wording (a maintainer's machine, run controller, local-run rule, phase
+# process, private guard, run id or private branch) there, in the changelog, the scripts' Markdown and workflow comments,
+# and on numbered phases in changelog prose and workflow comments.
 # Usage: sweeps.sh <out directory>     Writes <out>/sweeps.txt, whose last line is the verdict.
 # Every `git grep` is checked by its own exit status (0 hits, 1 none, anything else a failure);
 # a failure stops the sweeps with `sweeps: FAIL`, never with a clean verdict.
@@ -56,8 +60,6 @@ stale_exceptions() {
 }
 
 TODOS=$(cat <<'LIST'
-src/broker/index.js:    // TODO: validate topics not null/empty
-src/broker/index.js:    // TODO: validate groupId, mandatory
 LIST
 )
 
@@ -88,6 +90,7 @@ scripts/compat/config.json:    "json": "docs/\x6bafka-compatibility.json"
 scripts/compat/index.js: *   npm run compat:generate   write docs/KafkaCompatibility.md + docs/\x6bafka-compatibility.json
 src/oauth/__tests__/oauthDocs.spec.js:      /\\/Users\\/|\\/home\\/|\\/var\\/tmp|new_countly|~\\/|C:\\\\|\x73uperpowers|\x75pgrade-ref|CLAUDE\\.md|AGENT\\.md|EXECUTION\\.md|\\b(?:Phase|Task|Wave) \\d/
 scripts/compat/__tests__/build.spec.js:      expect(JSON.parse(read('docs', '\x6bafka-compatibility.json')).generatedFrom.kafkaTag).toBe(tag)
+scripts/assertCleanOtelTarball.sh:if tar -xOzf "$1" | grep -aE '/\x76ar/tmp/|/\x68ome/[^ /]+/|\\.\x73uperpowers/'; then
 scripts/assertCleanTarball.sh:  if tar -xOf "$1" "package/docs/$guide.md" | grep -E '/\x76ar/tmp/|/\x68ome/[^ /]+/|\\.\x73uperpowers/'; then
 src/consumer/share/__tests__/shareIsolationDocs.spec.js:    expect(guide).not.toMatch(/\\/var\\/tmp\\/|\\/\x68ome\\/[^ /]+\\/|\\.\x73uperpowers\\//)
 LIST
@@ -132,6 +135,8 @@ CHANGELOG.md:### \x50hase \x39F — Client telemetry
 CHANGELOG.md:### \x50hase \x39G — Kafka 4.4 support
 CHANGELOG.md:### \x50hase 10 — Release, CI and benchmarks
 scripts/benchmarks/__tests__/telemetry.spec.js:      milestone: '\x39E',
+scripts/benchmarks/__tests__/adapters.telemetry.spec.js:      milestone: '\x39E',
+scripts/benchmarks/adapters/telemetrySession.js:  milestone: '\x39E',
 scripts/benchmarks/telemetry.js:    assert.equal(accepted.milestone, '\x39E')
 scripts/benchmarks/telemetry.js: * Candidate arms share one snapshot. Previous requires a separately hashed accepted-\x39E receipt with
 scripts/benchmarks/telemetry.js: * {milestone:'\x39E',status:'accepted',tree,sourceSha256,tarballSha256} matching its frozen inputs.
@@ -177,6 +182,23 @@ check label "$(printf '%s\n%s\n%s\n' "$baseline" "$NEW_LABELS" "$SELF_LABELS")"
 stale_exceptions label-new "$NEW_LABELS" "$out/label.hits"
 hits test-only-export -n -E 'forTest|testOnly|__test' -- 'src/*.js' ':!*.spec.js' ':!*__tests__*' ':!*/fixtures/*'
 check test-only-export ''
+# A consumer reads the process-wide handler and rebalance-callback stores only through the helpers that check
+# the store is its own; the runner's defaults and the producer's transactional enlistment are enumerated.
+hits ambient-store -n -E 'handlerContext\.current\b|RebalanceHooks\.current\b|RebalanceHooks\.refusal\(\)|\{[^}]*\bcurrent\b[^}]*\} = require\([^)]*(handlerContext|rebalanceHooks)' -- 'src/*.js' ':!*.spec.js' ':!*__tests__*' ':!*/fixtures/*'
+AMBIENT_STORE=$(cat <<'LIST'
+src/consumer/index.js:    const identity = handlerContext.current()
+src/consumer/index.js:    const record = RebalanceHooks.current()
+src/consumer/runner.js:  commitRefusal(token = this.consumerGroup.ownership?.token(), batch = handlerContext.current()) {
+src/consumer/runner.js:  autoCommitOffsets(batch = handlerContext.current() ?? null, round = null) {
+src/consumer/runner.js:  autoCommitOffsetsIfNecessary(batch = handlerContext.current() ?? null) {
+src/consumer/runner.js:    batch = handlerContext.current() ?? null,
+src/consumer/runner.js:    { operation, invocation = RebalanceHooks.current() } = {}
+src/consumer/consumerGroup.js:  async position(entry, { operation, invocation = RebalanceHooks.current() } = {}) {
+src/producer/eosManager/index.js:      const identity = handlerContext.current()
+LIST
+)
+check ambient-store "$AMBIENT_STORE"
+stale_exceptions ambient-store "$AMBIENT_STORE" "$out/ambient-store.hits"
 hits focused-or-failing -n -E '\b(it|test|describe)\.(failing|only)\(|\bf(it|describe)\(' -- src scripts testHelpers otel/test
 # Private JavaScript methods are not focused Jest calls.
 PRIVATE_METHODS=$(printf '%b\n' "$(cat <<'LIST'
@@ -188,6 +210,7 @@ check focused-or-failing "$PRIVATE_METHODS"
 hits host-path -n -E "$(printf '\057var\057tmp|\057home\057uj|(^|[^-])p[9][a-f]-')" -- . ':!.gitignore' ':!.npmignore'
 # Pinned fixture identities and the tarball path guard are not machine-local paths.
 FIXTURE_IDENTITIES=$(printf '%b\n' "$(cat <<'LIST'
+scripts/assertCleanOtelTarball.sh:if tar -xOzf "$1" | grep -aE '/\x76ar/tmp/|/\x68ome/[^ /]+/|\\.\x73uperpowers/'; then
 scripts/assertCleanTarball.sh:  if tar -xOf "$1" "package/docs/$guide.md" | grep -E '/\x76ar/tmp/|/\x68ome/[^ /]+/|\\.\x73uperpowers/'; then
 scripts/e2e/telemetry/JavaTelemetryClient.java:                topic = "\x709f-tf1-java";
 scripts/e2e/telemetry/legacy/JavaTelemetryClient.java:            producer.send(new ProducerRecord<>("\x709f-tf1-java", "k", "v")).get();
@@ -202,8 +225,6 @@ check host-path "$FIXTURE_IDENTITIES"
 hits todo -n -E '\b(TODO|FIXME|XXX|HACK)\b' -- "${SHIPPED[@]}"
 SELF_TODOS=$(printf '%b\n' "$(cat <<'LIST'
 scripts/ci/sweeps.sh:# label grep against alpha.9b, test-only exports, focused or failing tests, host paths, \x54ODO text and leftover .orig/.rej files. Each
-scripts/ci/sweeps.sh:src/broker/index.js:    // \x54ODO: validate topics not null/empty
-scripts/ci/sweeps.sh:src/broker/index.js:    // \x54ODO: validate groupId, mandatory
 scripts/ci/sweeps.sh:hits todo -n -E '\\b(\x54ODO|\x46IXME|\x58XX|\x48ACK)\\b' -- "${SHIPPED[@]}"
 scripts/ci/checkNodeTests.js:      const end = /^( *)(not ok|ok) (\\d+) - (.*?)(?: # (SKIP|\x54ODO)\\b.*)?$/.exec(line)
 scripts/ci/checkNodeTests.js:          failed: end[2] !== 'ok' || end[5] === '\x54ODO',
@@ -212,6 +233,43 @@ LIST
 )")
 check todo "$(printf '%s\n%s\n' "$TODOS" "$SELF_TODOS")"
 stale_exceptions todo "$TODOS" "$out/todo.hits"
+# Shipped README, governance files and guides never name a planning item. The generated compatibility matrix is
+# machine text and is not read. One pattern per line, joined into a single word-bounded alternation.
+DOC_PATTERNS=(
+  'A[0-9]{2}'     # acceptance id
+  'F[0-9]{2}'     # feature id
+  'P10'           # benchmark phase name
+  '9[A-G]-[0-9]+' # plan task id
+  'D[12][0-9]{2}' # decision id
+  'E[0-9]{2}'     # evidence check id
+  'O[0-9]{2}'     # requirement id
+)
+DOC_IDS="\\b($(IFS='|'; echo "${DOC_PATTERNS[*]}"))\\b"
+DOCS=(README.md RELEASING.md SECURITY.md QUARANTINE.md CONTRIBUTING.md otel/README.md 'docs/*.md' ':!docs/KafkaCompatibility.md')
+hits shipped-doc -n -E "$DOC_IDS" -- "${DOCS[@]}"
+check shipped-doc ''
+# Private working-process wording, in any case, in those files, the changelog, the scripts' Markdown and
+# full-line workflow comments. A comment after YAML on the same line is not read; a `#` line inside a block
+# scalar is read as a comment. Executable workflow lines, fixture names and release tags are not read.
+WORDING_PATTERNS=(
+  '\b(develop(ment|er)|dev)[[:blank:]-]+(host|machine)s?\b'                     # a maintainer's machine
+  '\b(run|test|acceptance) controller\b|\bcontroller (supplies|acceptance)\b'   # a private run controller
+  '\blocal (live )?(acceptance|correctness|gates?)\b|\blocal runs use\b'        # a rule for local runs
+  '\bphase[- ](merges?|prs?|blocking|exits?)\b|\bsub-phase\b'                   # private phase process
+  '\breviewed (live |cluster |shared )?guard(ed)?\b|\bsole[- ](live |cluster )?guard\b|\b(live|shared) reservation\b' # a private guard
+  '\b(runs?|rehearsal) [0-9a-f]{8,}\b'                                          # a CI or soak run id
+  '\bp(9[a-z]|1[0-2])/'                                                         # a private branch prefix
+)
+WORDING=$(IFS='|'; echo "${WORDING_PATTERNS[*]}")
+hits private-wording -n -i -E "$WORDING" -- "${DOCS[@]}" CHANGELOG.md 'scripts/*.md'
+check private-wording ''
+# A numbered phase is a private plan step in changelog prose and workflow comments; changelog ATX headings keep theirs.
+PHASE_NUMBER='\bphase[[:blank:]-]*[0-9]'
+ATX_HEADING='^ {0,3}#{1,6}([[:blank:]]|$)'
+hits changelog-phase -n -i -E -e "$PHASE_NUMBER" --and --not -e "$ATX_HEADING" -- CHANGELOG.md
+check changelog-phase ''
+hits workflow-comment -n -i -E "^[[:space:]]*#.*($WORDING|$PHASE_NUMBER)" -- '.github/workflows/*.yml'
+check workflow-comment ''
 leftovers leftover '*.orig' '*.rej' '*.swp' '*~'
 check leftover ''
 [ "$failed" = 0 ] && echo "sweeps: clean" >> "$report" || echo "sweeps: FAIL" >> "$report"

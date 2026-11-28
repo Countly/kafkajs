@@ -1,0 +1,11 @@
+--- a/src/broker/index.js
++++ b/src/broker/index.js
+@@ -1824,7 +1824,7 @@
+          * @throws {Error} for an ordinary matching-group protocol failure
+          */
+         parse: async (data) => {
+-          if (apiVersion >= 8 && data.groupId !== groupId) {
++          if (apiVersion === 8 && data.groupId !== groupId) {
+             throw new KafkaJSInvariantViolation(
+               `OffsetFetch requested group "${groupId}" but received group "${data.groupId}"`
+             )

@@ -29,6 +29,7 @@ const fakeCluster = () => ({
   ),
   useConsumerMetadataScope: jest.fn(),
   releaseConsumerMetadataScope: jest.fn(),
+  useBrokerRegex: jest.fn(),
   resetTargetTopics: jest.fn(async () => {}),
   refreshMetadataIfNecessary: jest.fn(async () => {}),
   removeBroker: jest.fn(),
@@ -187,6 +188,25 @@ describe('Consumer > configuration > maxPrefetchBatches', () => {
   })
 })
 
+describe('Consumer > configuration > maxPollInterval', () => {
+  it('an invalid maxPollInterval opens no connection', () => {
+    const socketFactory = jest.fn()
+    const client = new Kafka({
+      clientId: 'options-test',
+      brokers: ['localhost:9092'],
+      logCreator: newLogger.logCreator,
+      socketFactory,
+    })
+    const create = () => client.consumer({ groupId: 'group-a', maxPollInterval: 2147483648 })
+
+    expect(create).toThrow(KafkaJSNonRetriableError)
+    expect(create).toThrow(
+      'Consumer maxPollInterval must be an integer from 1 to 2147483647, got 2147483648'
+    )
+    expect(socketFactory).not.toHaveBeenCalled()
+  })
+})
+
 describe('Consumer > subscribe > regex', () => {
   const consumer = (config = {}) =>
     kafka().consumer({ groupId: 'group-a', groupProtocol: 'consumer', ...config })
@@ -237,6 +257,7 @@ describe('Consumer > subscribe > regex', () => {
     // The names are registered by growSubscription once the coordinator resolves the pattern, not
     // here - so a regex-only consumer legitimately starts with an empty target-topic set.
     expect(cluster.addMultipleTargetTopics).not.toHaveBeenCalled()
+    expect(cluster.useBrokerRegex.mock.calls).toEqual([[true]])
   })
 
   it('keeps client-side RegExp matching in topics under the consumer protocol', async () => {

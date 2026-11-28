@@ -1,0 +1,11 @@
+--- a/src/consumer/assigners/rangeAssigner/index.js
++++ b/src/consumer/assigners/rangeAssigner/index.js
+@@ -45,7 +45,7 @@
+    * @returns {number} remaining legal slots; balance always limits rack alignment
+    */
+   maxAssignable(member) {
+-    return Math.max(0, this.base + (this.extra > 0 ? 1 : 0) - this.assigned.get(member))
++    return this.remaining.size
+   }
+ 
+   /**

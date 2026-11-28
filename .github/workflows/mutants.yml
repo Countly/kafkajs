@@ -1,0 +1,188 @@
+# Manual mutation report (no thresholds, nothing here gates a merge or a release). `prepare` fixes the tree and
+# the record selection; each `shard` runs its share of the unit mutants in its own checkout; `live` runs the live
+# mutants against its own Compose cluster with guard evidence; `report` writes the plain-language report.
+name: Mutants
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or SHA to test (the dispatched branch when empty)
+        required: false
+        default: ''
+      shards:
+        description: Unit shards, 1-32
+        required: false
+        default: '16'
+      time-cap-minutes:
+        description: Minutes after which a shard starts no new record, 1-300
+        required: false
+        default: '40'
+      areas:
+        description: all, or comma-separated area names
+        required: false
+        default: all
+      per-area:
+        description: Generated mutants sampled per area, or all
+        required: false
+        default: '40'
+      seed:
+        description: Sampling seed (the run id when empty)
+        required: false
+        default: ''
+permissions:
+  contents: read
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.select.outputs.sha }}
+      shards: ${{ steps.select.outputs.shards }}
+      cap: ${{ steps.select.outputs.cap }}
+      shard-timeout: ${{ steps.select.outputs.shard-timeout }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          package-manager-cache: false
+      - name: Select the records
+        id: select
+        env:
+          SHARDS: ${{ inputs.shards }}
+          CAP: ${{ inputs.time-cap-minutes }}
+          AREAS: ${{ inputs.areas }}
+          PER_AREA: ${{ inputs.per-area }}
+          SEED: ${{ inputs.seed }}
+        run: |
+          set -euo pipefail
+          node scripts/mutants/generate.js --out "$RUNNER_TEMP/generated.json"
+          node scripts/mutants/select.js --historical scripts/mutants/inventory.json --generated "$RUNNER_TEMP/generated.json" \
+            --sha "$(git rev-parse HEAD)" --run-id "$GITHUB_RUN_ID" --seed "${SEED:-$GITHUB_RUN_ID}" --per-area "$PER_AREA" \
+            --areas "$AREAS" --shards "$SHARDS" --time-cap "$CAP" --out-dir selection --github-output "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mutants-selection
+          path: selection/
+  shard:
+    needs: prepare
+    runs-on: ubuntu-latest
+    # The cap only stops new records from starting; the selection adds the longest record and cleanup.
+    timeout-minutes: ${{ fromJSON(needs.prepare.outputs.shard-timeout) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.prepare.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: mutants-selection
+          path: selection
+      - name: Run the shard
+        env:
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ strategy.job-total }}
+          CAP: ${{ needs.prepare.outputs.cap }}
+        run: node scripts/mutants/runner.js selection/unit.json --shard "$SHARD/$SHARDS" --time-cap "$CAP" --out "mutants-$SHARD.jsonl"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants-${{ matrix.shard }}.jsonl
+          if-no-files-found: warn
+  live:
+    needs: prepare
+    runs-on: ubuntu-latest
+    # Twice the broker-bounce check's 30-minute cap, plus 15 for the cluster and cleanup.
+    timeout-minutes: 75
+    env:
+      KAFKA_VERSION: '4.4.0'
+      COMPOSE_FILE: docker-compose.yml
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: mutants-selection
+          path: selection
+      - name: Start the cluster and write guard evidence
+        env:
+          NODE_ENV: production
+          BROKER_BOUNCE_E2E: '1'
+          DO_NOT_STOP: '1'
+        run: ./scripts/testWithKafka.sh "node scripts/mutants/liveEvidence.js --out live-guard.json"
+      - name: Run the live class
+        env:
+          NODE_ENV: production
+          BROKER_BOUNCE_E2E: '1'
+        run: node scripts/mutants/runner.js selection/live.json --live-evidence live-guard.json --out mutants-live.jsonl
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: mutants-live
+          path: |
+            live-guard.json
+            mutants-live.jsonl
+          if-no-files-found: warn
+      - name: Stop the cluster
+        if: always()
+        run: docker compose -f "$COMPOSE_FILE" down --volumes --remove-orphans
+  report:
+    needs: [prepare, shard, live]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          package-manager-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: mutants-*
+          merge-multiple: true
+          path: artifacts
+      - name: Write the report
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          node scripts/mutants/report.js --selection artifacts/selection.json --evidence artifacts/live-guard.json \
+            --run-id "$GITHUB_RUN_ID" --out-dir report artifacts/mutants-*.jsonl
+      - name: Show the report in the job summary
+        if: always()
+        run: |
+          if [ -f report/mutation-report.md ]; then cat report/mutation-report.md >> "$GITHUB_STEP_SUMMARY"; fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: mutation-report
+          path: |
+            report/mutation-report.md
+            report/mutation-report.json
+            artifacts/selection.json
+            artifacts/live-guard.json
+            artifacts/mutants-*.jsonl
+          if-no-files-found: warn

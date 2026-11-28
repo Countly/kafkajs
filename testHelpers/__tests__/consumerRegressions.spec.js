@@ -12,10 +12,13 @@ const {
   createFetchGroup,
   prepareRecordBatches,
   fetchResponse,
+  trackFixtures,
   NODE_ID,
   TOPIC,
   TOPIC_ID,
 } = require('../../src/consumer/__tests__/fixtures/fetchHarness')
+
+trackFixtures()
 
 const NODES = [{ id: 0, host: 'node0', port: 9092 }]
 const UNKNOWN_ID = '11121314-1516-1718-191a-1b1c1d1e1f20'
@@ -80,7 +83,6 @@ describe('consumer regression fixtures', () => {
         await pending
       }
       jest.useRealTimers()
-      if (h) await h.broker.disconnect()
     })
     it('resuming a paused partition ends the current idle wait', () => {
       expect(observed).toBe(true)
@@ -95,7 +97,7 @@ describe('consumer regression fixtures', () => {
       h.group.groupMembership.coordinator.heartbeat = async () => {}
       h.group.offsetManager.autoCommitInterval = 60000
       h.group.offsetManager.autoCommitThreshold = null
-      h.group.offsetManager.lastCommit = Date.now()
+      h.group.offsetManager.lastCommit = performance.now()
       h.group.offsetManager.committedOffsets()[TOPIC][0] = '0'
       h.setResponse(fetchResponse([{ partition: 0, errorCode: 0, records: true }]))
       const batches = await h.group.fetch(NODE_ID)
@@ -122,13 +124,12 @@ describe('consumer regression fixtures', () => {
       expect(h.group.offsetManager.resolvedOffsets[TOPIC][0]).toBe('1')
       observed = commits.mock.calls.length
     })
-    afterEach(async () => {
+    afterEach(() => {
       if (runner) {
         runner.running = false
         runner.heartbeatManager.shutdown()
         runner.pollTimer.stop()
       }
-      if (h) await h.broker.disconnect()
     })
     it('batch completion preserves a configured commit interval', () => {
       expect(observed).toBe(0)
@@ -243,9 +244,6 @@ describe('consumer regression fixtures', () => {
         fetches: h.requests().filter(({ apiKey }) => apiKey === 1).length,
         rejoins: h.requestRejoin.mock.calls.length,
       }
-    })
-    afterEach(async () => {
-      if (h) await h.broker.disconnect()
     })
     it('fetches a healthy sibling without a routing-induced rejoin', () => {
       expect(observed).toEqual({ partitions: [1], fetches: 1, rejoins: 0 })
@@ -368,9 +366,6 @@ describe('offline preferred read replica', () => {
       { partitionId: 0, leader: 0, offlineReplicas: [1] },
     ]
     observed = h.group.findReadReplicaForPartitions(TOPIC, [0])
-  })
-  afterEach(async () => {
-    if (h) await h.broker.disconnect()
   })
   it('uses the leader when the preferred replica is offline', () => {
     expect(observed).toEqual({ 0: [0] })

@@ -11,6 +11,7 @@ const {
 } = require('../src/protocol/requests/fetch/__tests__/fixtures/recordBatchBytes')
 const { newLogger } = require('./index')
 const { createScriptedCluster } = require('./scriptedCluster')
+const { ShareSessionModel, installSessionModel } = require('./shareSessionModel')
 const { Schedule } = require('./schedule')
 const Kafka = require('../src')
 const { performance: monotonicClock } = require('node:perf_hooks')
@@ -535,6 +536,7 @@ const harness = async ({
      */
     async close() {
       for (const gate of gates) if (gate.settle) gate.release()
+      cluster.cancelReplyHolds()
       for (const run of runs) {
         run.loop.dispose()
         for (const timer of [...run.timers]) timer.release()
@@ -612,7 +614,11 @@ const shareClient = ({
   topics = { 'topic-a': { topicId: A, partitions: [{ leader: 0, epoch: 1 }] } },
 } = {}) => {
   const schedule = new Schedule()
-  const topology = [0, 1, 2].slice(0, nodes).map((id) => ({ id, host: `node${id}`, port: 9092 }))
+  const topology = Array.from({ length: nodes }, (_, id) => ({
+    id,
+    host: `node${id}`,
+    port: 9092,
+  }))
   const cluster = createScriptedCluster({
     nodes: topology,
     profile,
@@ -705,6 +711,7 @@ const shareClient = ({
      */
     async close() {
       for (const gate of gates) if (gate.settle) gate.release()
+      cluster.cancelReplyHolds()
       await consumer.disconnect({ timeout: 0 })
       cluster.assertClean()
     },
@@ -731,4 +738,6 @@ module.exports = {
   harness,
   heartbeatAnswer,
   shareClient,
+  ShareSessionModel,
+  installSessionModel,
 }

@@ -1,0 +1,11 @@
+--- a/scripts/protocol/javaVectors/GenerateAssignorVectors.java
++++ b/scripts/protocol/javaVectors/GenerateAssignorVectors.java
+@@ -206,7 +206,7 @@
+   private static String run(CaseSpec spec, Cluster cluster) {
+     List<Node> nodes = new ArrayList<>(cluster.nodes());
+     nodes.sort(java.util.Comparator.comparingInt(Node::id));
+-    short assignmentVersion = spec.assignor.equals(ROUND_ROBIN) ? (short) 0 : ASSIGNMENT_VERSION;
++    short assignmentVersion = ASSIGNMENT_VERSION;
+     Map<String, ConsumerPartitionAssignor.Subscription> subscriptions = new LinkedHashMap<>();
+     Map<String, String> subscriptionBytes = new LinkedHashMap<>();
+     Map<String, String> userDataBytes = new LinkedHashMap<>();

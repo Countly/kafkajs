@@ -1,0 +1,11 @@
+--- a/src/consumer/groupProtocol/manual.js
++++ b/src/consumer/groupProtocol/manual.js
+@@ -82,7 +82,7 @@
+       for (const partition of entry.partitions) {
+         ManualGroupProtocol.validateTopicPartition({ topic: entry.topic, partition })
+         const partitions = seen.get(entry.topic) || new Set()
+-        if (partitions.has(partition)) {
++        if (false) {
+           throw new KafkaJSNonRetriableError('assign requires unique topic-partition pairs')
+         }
+         partitions.add(partition)

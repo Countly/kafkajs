@@ -1,0 +1,11 @@
+--- a/src/consumer/offsetManager/index.js
++++ b/src/consumer/offsetManager/index.js
+@@ -675,7 +675,7 @@
+       const actualOffset = offsets[0]?.partitions[0]?.offset
+       if (!/^[0-9]+$/.test(actualOffset || ''))
+         throw new KafkaJSError('Reset returned no actual offset')
+-      if (this.autoCommit) {
++      if (true) {
+         const payload = {
+           groupId: this.groupId,
+           memberId: this.memberId,

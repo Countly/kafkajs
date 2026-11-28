@@ -165,4 +165,27 @@ describe('admin event listeners', () => {
       stack: failure.stack,
     })
   })
+
+  test('a listener that rejects with null is logged, not left as an unhandled rejection', async () => {
+    const cluster = { connect: jest.fn(async () => {}), disconnect: jest.fn(async () => {}) }
+    const admin = createAdmin({ logger, cluster, retry })
+    const unhandled = []
+    const onUnhandled = (reason) => unhandled.push(reason)
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      admin.on(admin.events.CONNECT, () => Promise.reject(null)) // eslint-disable-line prefer-promise-reject-errors
+      await admin.connect()
+      await new Promise((resolve) => setImmediate(resolve))
+      await new Promise((resolve) => setImmediate(resolve))
+      await admin.disconnect()
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+
+    expect(unhandled).toEqual([])
+    expect(logger.error).toHaveBeenCalledWith(
+      'Failed to execute listener: undefined',
+      expect.objectContaining({ eventName: admin.events.CONNECT })
+    )
+  })
 })

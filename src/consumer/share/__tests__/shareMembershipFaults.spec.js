@@ -2698,7 +2698,8 @@ class MembershipFaultCase extends FaultCase {
 
   /**
    * Retry and rejoin: the member and run survive, the next frame repeats every field, a coordinator
-   * code forgets and looks up the coordinator again, and a fence retires old ordinary work first.
+   * code or a transport failure forgets and looks up the coordinator again, and a fence retires old
+   * ordinary work first.
    * @param {boolean} rejoin Whether the fault is a fence code that rejoins at epoch zero.
    * @returns {Promise<void>}
    */
@@ -2717,7 +2718,7 @@ class MembershipFaultCase extends FaultCase {
     if (before || rejoin)
       assert.notEqual(recovered.membership.token, this.faultAuthority.membership)
     else assert.equal(recovered.membership.token, this.faultAuthority.membership)
-    const forgets = [14, 15, 16, 25, 110].includes(this.code)
+    const forgets = [14, 15, 16, 25, 110].includes(this.code) || this.transport !== null
     assert.equal(this.lookups(), this.lookupsBefore + (forgets ? 1 : 0), 'coordinator lookups')
     assert.equal(this.seen.crashes.length, 0)
     if (before) {
@@ -3307,7 +3308,7 @@ class MembershipFaultCase extends FaultCase {
     )
     for (let n = 0; n < 4; n++) {
       const next = await this.holdBeat(STEADY)
-      const partitions = same || n % 2 === 0 ? [0, 1, 2] : [2, 0, 1, 1]
+      const partitions = same || n % 2 === 0 ? [0, 1, 2] : [2, 0, 1]
       next.release(assignmentAnswer(next.call, partitions, { unknown: true }))
       await flush()
       assert.equal(this.member.token, token)

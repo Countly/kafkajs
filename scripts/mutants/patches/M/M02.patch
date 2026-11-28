@@ -1,0 +1,11 @@
+--- a/scripts/benchmarks/consumeThroughput.js
++++ b/scripts/benchmarks/consumeThroughput.js
+@@ -102,7 +102,7 @@
+     this.before = this.sample()
+     this.peakRSS = this.before.rss
+     this.peakHeap = this.before.heapUsed
+-    this.timer = setInterval(() => this.samplePeak(), 5)
++    this.timer = undefined
+   }
+ 
+   /**

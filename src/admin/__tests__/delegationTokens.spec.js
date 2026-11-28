@@ -148,7 +148,14 @@ describe.each(['0', '1'])('token diagnostics buffers %s', (buffers) => {
       ).admin()
       try {
         await admin.connect()
-        await expect(call(admin, api)).rejects.toThrow('Unexpected response bytes')
+        await expect(call(admin, api)).rejects.toMatchObject(
+          api === 'DescribeDelegationToken'
+            ? { message: 'Unexpected response bytes' }
+            : {
+                name: 'KafkaJSUnknownOutcomeError',
+                cause: expect.objectContaining({ message: 'Unexpected response bytes' }),
+              }
+        )
         expect(inspect(entries, { depth: null, maxArrayLength: null })).not.toContain(
           hmac.toString()
         )

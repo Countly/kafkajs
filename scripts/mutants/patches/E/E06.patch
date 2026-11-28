@@ -1,0 +1,11 @@
+--- a/src/consumer/offsetReset.js
++++ b/src/consumer/offsetReset.js
+@@ -59,7 +59,7 @@
+  * @throws Never for normalized inputs and a valid wall clock.
+  */
+ function resetTimestamp(policy, now = Date.now()) {
+-  return Math.max(0, now - policy.durationMs)
++  return now - policy.durationMs
+ }
+ /**
+  * Resolves reset boundaries without owning a ledger, cache or halt state.

@@ -53,6 +53,7 @@ describe('Protocol > Requests > OffsetFetch > v10 response', () => {
     expect(data).toEqual({
       throttleTime: 0,
       clientSideThrottleTime: ok.fields.throttleTime,
+      groupId: ok.fields.groupId,
       errorCode: 0,
       responses: [
         {
@@ -64,6 +65,12 @@ describe('Protocol > Requests > OffsetFetch > v10 response', () => {
       ],
     })
     await expect(parse(data)).resolves.toBe(data)
+  })
+
+  test("the single-group result keeps the answer's groupId", async () => {
+    const data = await decode(body({ groups: [{ groupId: 'group-B', errorCode: 16 }] }))
+
+    expect(data.groupId).toBe('group-B')
   })
 
   test('keeps an id the request did not carry, with a null topic, as an all-topics answer has', async () => {

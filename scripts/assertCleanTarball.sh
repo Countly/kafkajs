@@ -1,5 +1,5 @@
 #!/bin/bash
-# Fails when a package tarball holds a test, a fixture, a types test file or anything from otel/.
+# Fails when a package tarball holds a test, a fixture, spec-only JSON, a types test file or anything from otel/.
 # Usage: assertCleanTarball.sh <tarball.tgz>
 set -e
 
@@ -11,7 +11,7 @@ fi
 # Listing first, so a tarball tar cannot read fails the script instead of passing as empty.
 FILES="$(tar -tzf "$1")"
 
-if echo "$FILES" | grep -E '\.spec\.js$|__tests__/|__snapshots__/|types/tests|fixtures/'; then
+if echo "$FILES" | grep -E '\.spec\.js$|__tests__/|__snapshots__/|types/tests|fixtures/|layout\.json$|\.reference\.json$'; then
   echo "tarball contains test files" >&2
   exit 1
 fi
@@ -34,6 +34,11 @@ for guide in ShareConsumer ClientTelemetry; do
 done
 if echo "$FILES" | grep -E '^package/docs/' | grep -Ev '^package/docs/(ShareConsumer|ClientTelemetry)\.md$'; then
   echo "tarball contains unintended documentation" >&2
+  exit 1
+fi
+# Local run state (end-to-end evidence, mutation-record copies) stays out of the tarball.
+if echo "$FILES" | grep -E '^package/\.tmp(/|$)'; then
+  echo "tarball contains local run state" >&2
   exit 1
 fi
 # Telemetry tooling and the package-export witness stay out of the tarball.

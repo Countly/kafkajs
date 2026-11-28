@@ -109,13 +109,17 @@ describe('public share event contract', () => {
     fetchAnswer,
     part,
     recordsHex,
+    ShareClock,
     shareClient,
     until,
   } = require('../../../../testHelpers/shareHarness')
   let h
+  let clock
   const cleanups = []
   afterEach(async () => {
     try {
+      clock?.restore()
+      clock = undefined
       await h?.close()
     } finally {
       for (const cleanup of cleanups.splice(0)) await cleanup()
@@ -172,6 +176,62 @@ describe('public share event contract', () => {
     expect(h.consumer.assignment()).toEqual([])
   })
 
+  test('publishes and routes an assignment that metadata resolves between heartbeats', async () => {
+    clock = new ShareClock().install()
+    h = shareClient({ interval: 5 })
+    const seen = record(['ASSIGNMENT_CHANGED', 'HEARTBEAT'])
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({ eachMessage: async () => {} })
+    expect(seen.ASSIGNMENT_CHANGED).toHaveLength(1)
+
+    h.table.set('topic-b', { topicId: B, partitions: [{ leader: 0, epoch: 1 }] })
+    const resolution = h.hold({
+      api: 'Metadata',
+      match: ({ fields }) => fields.topics?.some((topic) => topic.topicId === B),
+    })
+    const beat = h.hold({
+      api: 'ShareGroupHeartbeat',
+      match: ({ fields }) => fields.memberEpoch > 0,
+    })
+    await clock.advance(5)
+    const call = await beat.arrived()
+    beat.release({
+      errorCode: 0,
+      errorMessage: null,
+      memberId: call.fields.memberId,
+      memberEpoch: 2,
+      heartbeatIntervalMs: 60000,
+      assignment: {
+        topicPartitions: [
+          { topicId: A, partitions: [0] },
+          { topicId: B, partitions: [0] },
+        ],
+      },
+    })
+    await resolution.arrived()
+    await until(
+      () => seen.HEARTBEAT.some(({ payload }) => payload.memberEpoch === 2),
+      'the heartbeat of epoch 2'
+    )
+    const heartbeats = h.frames(76).length
+    expect(seen.ASSIGNMENT_CHANGED).toHaveLength(1)
+
+    resolution.release()
+    await until(() => h.consumer.assignment().length === 2, 'the resolved assignment')
+    expect(seen.ASSIGNMENT_CHANGED).toHaveLength(2)
+    expect(seen.ASSIGNMENT_CHANGED[1].payload).toMatchObject({
+      memberEpoch: 2,
+      added: [{ topic: 'topic-b', partitions: [0] }],
+      removed: [],
+    })
+    await clock.advance(50)
+    await until(
+      () => h.frames(78).some(({ fields }) => fields.topics.some(({ topicId }) => topicId === B)),
+      'the fetch of the resolved partition'
+    )
+    expect(h.frames(76)).toHaveLength(heartbeats)
+  })
+
   test('publishes no assignment event for answers that repeat the assignment in another form', async () => {
     h = shareClient({
       interval: 5,
@@ -204,7 +264,7 @@ describe('public share event contract', () => {
     const answers = [
       [
         { topicId: B, partitions: [0] },
-        { topicId: A, partitions: [1, 0, 1] },
+        { topicId: A, partitions: [1, 0] },
       ],
       [
         { topicId: A, partitions: [0, 1] },
@@ -254,6 +314,56 @@ describe('public share event contract', () => {
       { topic: 'topic-a', partitions: [1] },
       { topic: 'topic-b', partitions: [0] },
     ])
+  })
+
+  test('publishes nothing for an answer with a malformed assignment, retries, and adopts the next valid answer', async () => {
+    h = shareClient({ interval: 5 })
+    const seen = record(['ASSIGNMENT_CHANGED', 'HEARTBEAT', 'CRASH'])
+    const epochs = () => seen.HEARTBEAT.map(({ payload }) => payload.memberEpoch)
+    const beats = [0, 1].map(() =>
+      h.hold({ api: 'ShareGroupHeartbeat', match: ({ fields }) => fields.memberEpoch > 0 })
+    )
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({ eachMessage: async () => {} })
+    expect(epochs()).toEqual([1])
+    expect(seen.ASSIGNMENT_CHANGED).toHaveLength(1)
+
+    const refused = await beats[0].arrived()
+    beats[0].release({
+      errorCode: 0,
+      errorMessage: null,
+      memberId: refused.fields.memberId,
+      memberEpoch: 1,
+      heartbeatIntervalMs: 5,
+      assignment: { topicPartitions: [{ topicId: A, partitions: [0, 0] }] },
+    })
+    await until(() => beats[1].call !== null, 'the heartbeat after the refused answer')
+    expect(epochs()).toEqual([1])
+    expect(seen.ASSIGNMENT_CHANGED).toHaveLength(1)
+    expect(seen.CRASH).toEqual([])
+    expect(beats[1].call.fields).toMatchObject({
+      memberEpoch: 1,
+      subscribedTopicNames: ['topic-a'],
+    })
+    expect(h.consumer.assignment()).toEqual([{ topic: 'topic-a', partitions: [0] }])
+
+    beats[1].release({
+      errorCode: 0,
+      errorMessage: null,
+      memberId: beats[1].call.fields.memberId,
+      memberEpoch: 2,
+      heartbeatIntervalMs: 5,
+      assignment: { topicPartitions: [] },
+    })
+    await until(() => epochs().length === 2, 'the heartbeat of epoch 2')
+    expect(epochs()).toEqual([1, 2])
+    expect(seen.ASSIGNMENT_CHANGED).toHaveLength(2)
+    expect(seen.ASSIGNMENT_CHANGED[1].payload).toMatchObject({
+      memberEpoch: 2,
+      assignment: [],
+      removed: [{ topic: 'topic-a', partitions: [0] }],
+    })
+    expect(seen.CRASH).toEqual([])
   })
 
   test.each(['stop', 'disconnect'])(
@@ -406,5 +516,19 @@ describe('public share event contract', () => {
       { nodeId: 0, reason: 'membership', recordsDropped: 0 },
       { nodeId: 1, reason: 'membership', recordsDropped: 0 },
     ])
+  })
+
+  test('publishes no session reset when an unopened node session with no delivered records is discarded', async () => {
+    h = shareClient()
+    const seen = record(['SESSION_RESET', 'FETCH'])
+    const opening = h.hold({ api: 'ShareFetch' })
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({ eachMessage: async () => {} })
+    await opening.arrived()
+
+    await h.consumer.disconnect({ timeout: 0 })
+    opening.release()
+    expect(seen.FETCH).toHaveLength(0)
+    expect(seen.SESSION_RESET).toEqual([])
   })
 })

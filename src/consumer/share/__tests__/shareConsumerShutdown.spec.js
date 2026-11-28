@@ -1,6 +1,7 @@
 const { ShareCloseEpisode } = require('../shareCloseEpisode')
 const { ShareRun } = require('../shareRun')
 const { KafkaJSNonRetriableError } = require('../../../errors')
+const { LEVELS } = require('../../../loggers')
 const { A, flush } = require('../../../../testHelpers/shareHarness')
 
 const TWO_NODES = {
@@ -163,6 +164,8 @@ describe('public share shutdown contract', () => {
     acquire,
     deferred,
     fetchAnswer,
+    installSessionModel,
+    part,
     shareClient,
     until,
   } = require('../../../../testHelpers/shareHarness')
@@ -295,6 +298,29 @@ describe('public share shutdown contract', () => {
     gate.release()
     expect(h.frames(79)).toHaveLength(0)
     expect(leaves()).toHaveLength(1)
+  })
+
+  test('logs a close traffic failure once and still tears the run down', async () => {
+    const lines = []
+    await start({
+      kafka: { logLevel: LEVELS.ERROR, logCreator: () => (entry) => lines.push(entry) },
+    })
+    jest
+      .spyOn(ShareRun.prototype, 'closeTraffic')
+      .mockRejectedValueOnce(new Error('close traffic failed'))
+    await h.consumer.run({ eachMessage: async () => {} })
+
+    await h.consumer.disconnect()
+    const failures = lines.filter(({ log }) => log.message === 'Share close failed')
+    expect(failures.map(({ level, log }) => [level, log.error])).toEqual([
+      [LEVELS.ERROR, 'close traffic failed'],
+    ])
+    expect(h.order).toEqual(['stop', 'disconnect'])
+    expect(h.cluster.sockets().filter((socket) => !socket.destroyed)).toHaveLength(0)
+
+    await h.consumer.subscribe({ topics: ['topic-a'] })
+    await h.consumer.run({ eachMessage: async () => {} })
+    expect(h.consumer.assignment()).toEqual([{ topic: 'topic-a', partitions: [0] }])
   })
 
   test('treats timeout zero as a synchronous traffic fence', async () => {
@@ -472,6 +498,256 @@ describe('public share shutdown contract', () => {
     expect(h.acks).toHaveLength(2)
     expect(h.consumer.assignment()).toEqual([])
   })
+
+  describe('a handler of a run that has ended', () => {
+    let clock
+    beforeEach(() => {
+      clock = new Clock()
+      clock.install()
+    })
+
+    /**
+     * @param {string} kind The public handler option.
+     * @param {(held: Promise<void>) => Promise<void>} handler The work in the original run.
+     * @returns {Promise<object>} The gate still holding the old handler after a forced close.
+     */
+    const endRun = async (kind, handler) => {
+      await start()
+      installSessionModel(h)
+      h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['old'])])])
+      const entered = deferred()
+      const resume = hold()
+      await h.consumer.run({
+        [kind]: tracked(async () => {
+          entered.resolve()
+          await handler(resume.promise)
+        }),
+      })
+      await entered.promise
+      await h.consumer.disconnect({ timeout: 0 })
+      expect(h.order).toEqual(['stop', 'disconnect'])
+      return resume
+    }
+
+    /**
+     * @param {Promise<void>} pending A control call made inside a handler.
+     * @returns {{settled: boolean, result: Promise<Error|undefined>}} The call's observable result.
+     */
+    const observe = (pending) => {
+      const call = { settled: false }
+      call.result = pending.then(
+        () => {
+          call.settled = true
+        },
+        (error) => {
+          call.settled = true
+          return error
+        }
+      )
+      return call
+    }
+
+    /**
+     * @param {() => Promise<void>} action The call to make when the old handler resumes.
+     * @param {string} [kind] The public handler option.
+     * @returns {Promise<() => Promise<Error|undefined>>} Releases the handler and awaits its call.
+     */
+    const lateCall = async (action, kind = 'eachMessage') => {
+      let call
+      const resume = await endRun(kind, async (held) => {
+        await held
+        call = observe(action())
+      })
+      return async () => {
+        resume.resolve()
+        await until(() => call, 'the ended handler calls the client')
+        await flush()
+        await clock.advanceUntil(() => call.settled, 'the ended handler call settles')
+        return call.result
+      }
+    }
+
+    /**
+     * @returns {Promise<{delivered: string[], second: object}>} A replacement with one delivery
+     *   and its next delivery held at the wire. The intervening empty fetch leaves it idle.
+     */
+    const replaceRun = async () => {
+      h.script('ShareFetch', [fetchAnswer([acquire(0, 1, ['first'])])])
+      const second = h.hold({
+        api: 'ShareFetch',
+        match: ({ fields }) => fields.shareSessionEpoch >= 2,
+      })
+      const delivered = []
+      await h.consumer.run({
+        eachMessage: async ({ message }) => delivered.push(message.offset),
+      })
+      await until(
+        () =>
+          delivered.length === 1 &&
+          h
+            .frames(78)
+            .some(({ fields, answeredOrder }) => fields.shareSessionEpoch === 1 && answeredOrder),
+        'the first replacement delivery and empty fetch'
+      )
+      await flush()
+      return { delivered, second }
+    }
+
+    /**
+     * @param {{delivered: string[], second: object}} replacement The running replacement.
+     * @returns {Promise<void>} Releases the second answer and verifies its delivery.
+     */
+    const deliverSecond = async ({ delivered, second }) => {
+      await clock.advanceUntil(() => second.settle, 'the held replacement fetch')
+      expect(delivered).toEqual(['1'])
+      second.release(fetchAnswer([acquire(0, 2, ['second'])]))
+      await until(() => delivered.length === 2, 'the second replacement delivery')
+      expect(delivered).toEqual(['1', '2'])
+    }
+
+    test.each(['eachMessage', 'eachBatch'])(
+      'its stop from an %s handler resolves and leaves the replacement run running',
+      async (kind) => {
+        const stop = await lateCall(() => h.consumer.stop(), kind)
+        const replacement = await replaceRun()
+        const leaveCount = leaves().length
+        expect(await stop()).toBeUndefined()
+        expect(h.order).toEqual(['stop', 'disconnect'])
+        expect(leaves()).toHaveLength(leaveCount)
+        expect(h.consumer.assignment()).toEqual([{ topic: 'topic-a', partitions: [0] }])
+        await deliverSecond(replacement)
+      }
+    )
+
+    test('its disconnect resolves and leaves the replacement run connected', async () => {
+      const disconnect = await lateCall(() => h.consumer.disconnect())
+      const replacement = await replaceRun()
+      expect(await disconnect()).toBeUndefined()
+      expect(h.order).toEqual(['stop', 'disconnect'])
+      await deliverSecond(replacement)
+    })
+
+    test('work it started is held to the same rule', async () => {
+      const later = hold()
+      let call
+      const resume = await endRun('eachMessage', async (held) => {
+        const work = later.promise.then(() => {
+          call = observe(h.consumer.stop())
+        })
+        settling.push(work)
+        await held
+      })
+      const replacement = await replaceRun()
+      resume.resolve()
+      await flush()
+      later.resolve()
+      await until(() => call, 'the work started by the ended handler calls stop')
+      await flush()
+      await clock.advanceUntil(() => call.settled, 'the stop settles')
+      expect(await call.result).toBeUndefined()
+      expect(h.order).toEqual(['stop', 'disconnect'])
+      await deliverSecond(replacement)
+    })
+
+    test.each(['connect', 'run'])('its %s rejects and changes nothing', async (method) => {
+      const config = { eachMessage: async () => {} }
+      const invoke = await lateCall(() =>
+        method === 'connect' ? h.consumer.connect() : h.consumer.run(config)
+      )
+      const connected = jest.fn()
+      h.consumer.on(h.consumer.events.CONNECT, connected)
+      const joins = () => h.frames(76).filter(({ fields }) => fields.memberEpoch === 0)
+      const error = await invoke()
+      expect(connected).not.toHaveBeenCalled()
+      expect(joins()).toHaveLength(1)
+      expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+      expect(error.message).toBe(
+        `${method}() cannot be called from a handler of a run that has ended`
+      )
+    })
+
+    test('its subscribe rejects with the ended-run refusal', async () => {
+      const subscribe = await lateCall(() => h.consumer.subscribe({ topics: ['topic-a'] }))
+      const error = await subscribe()
+      expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+      expect(error.message).toBe(
+        'subscribe() cannot be called from a handler of a run that has ended'
+      )
+    })
+
+    test('a handler of another share client stops that client', async () => {
+      await start()
+      const other = shareClient()
+      let call
+      try {
+        await h.consumer.run({ eachMessage: async () => {} })
+        await until(
+          () => h.frames(78).some(({ answeredOrder }) => answeredOrder),
+          'the target client fetches'
+        )
+        await other.consumer.subscribe({ topics: ['topic-a'] })
+        other.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['other'])])])
+        await other.consumer.run({
+          eachMessage: async () => {
+            call = observe(h.consumer.stop())
+          },
+        })
+        await until(() => call, 'the other client calls stop from its handler')
+        await clock.advanceUntil(() => call.settled, 'the target stop settles')
+        expect(await call.result).toBeUndefined()
+        expect(h.order).toEqual(['stop'])
+        expect(leaves()).toHaveLength(1)
+        expect(h.consumer.assignment()).toEqual([])
+        expect(other.consumer.assignment()).toEqual([{ topic: 'topic-a', partitions: [0] }])
+      } finally {
+        await other.close()
+      }
+    })
+
+    test("a share client started inside another client's handler runs its crash supervision outside that handler", async () => {
+      await start()
+      const resume = hold()
+      const recorded = deferred()
+      let attempt
+      const restartOnFailure = () => {
+        attempt = observe(h.consumer.connect())
+        recorded.resolve()
+        return false
+      }
+      const other = shareClient({ share: { retry: { restartOnFailure } } })
+      let starting
+      let closing
+      try {
+        await other.consumer.subscribe({ topics: ['topic-a'] })
+        const crashing = other.hold({ api: 'ShareFetch' })
+        h.script('ShareFetch', [fetchAnswer([acquire(0, 0, ['first'])])])
+        await h.consumer.run({
+          eachMessage: tracked(async () => {
+            starting = observe(other.consumer.run({ eachMessage: async () => {} }))
+            await resume.promise
+          }),
+        })
+        await until(() => crashing.settle, 'the second client fetches')
+        expect(await starting.result).toBeUndefined()
+        closing = h.consumer.disconnect()
+        crashing.release(fetchAnswer([part({ partition: 0, code: 2 })]))
+        try {
+          await recorded.promise
+          await flush()
+          expect(attempt.settled).toBe(false)
+        } finally {
+          resume.resolve()
+        }
+        await closing
+        expect(await attempt.result).toBeUndefined()
+      } finally {
+        resume.resolve()
+        await closing
+        await other.close()
+      }
+    })
+  })
+
   /** @returns {object[]} Every run the client starts, oldest first: state a test cannot read publicly. */
   const captureRuns = () => {
     const runs = []

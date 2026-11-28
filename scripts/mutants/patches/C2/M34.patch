@@ -1,0 +1,12 @@
+--- a/src/consumer/groupProtocol/classic.js
++++ b/src/consumer/groupProtocol/classic.js
+@@ -309,7 +309,8 @@
+    * @returns {boolean} whether it was kept
+    */
+   keepPendingMemberId(memberId, revision) {
+-    return this.changeIdentity(revision, { pendingMemberId: memberId })
++    this.pendingMemberId = memberId
++    return true
+   }
+ 
+   /**

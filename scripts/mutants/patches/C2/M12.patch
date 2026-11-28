@@ -1,0 +1,10 @@
+--- a/src/consumer/groupProtocol/classic.js
++++ b/src/consumer/groupProtocol/classic.js
+@@ -571,6 +571,7 @@
+       } of snapshot.topicMetadata) {
+         if (!wanted.has(topic)) continue
+         if (topicErrorCode) {
++          throw new Error('unavailable group topic')
+           this.logger.warn('Skipping unavailable group topic', {
+             topic,
+             topicErrorCode,

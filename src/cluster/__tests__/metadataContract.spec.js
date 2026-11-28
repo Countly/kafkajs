@@ -422,6 +422,55 @@ describe('Cluster > metadata contract', () => {
   })
 
   describe('stage 3: the call on a broker', () => {
+    test('a refresh rejects with the guard error when the guard fails while the answer is in flight', async () => {
+      const { cluster, brokers } = build({ fresh: false })
+      const expired = new KafkaJSTimeout('round expired')
+      let refusal = null
+      const guard = jest.fn(() => refusal)
+      brokers[0].metadata.mockImplementation(async () => {
+        refusal = expired
+        return answer()
+      })
+
+      const error = await cluster.brokerPool.refreshMetadata([TOPIC], { guard }).then(
+        () => 'resolved',
+        (e) => e
+      )
+
+      expect(error).toBe(expired)
+      expect(brokers[0].metadata).toHaveBeenCalledTimes(1)
+      expect(brokers[1].metadata).not.toHaveBeenCalled()
+      expect(cluster.brokerPool.metadata).toBeNull()
+      expect(cluster.metadataCache.leader(TOPIC, 0)).toBe(-1)
+    })
+
+    test('a refresh rejects with the guard error when the guard fails while a broker connects', async () => {
+      const { cluster, brokers } = build({ fresh: false })
+      const expired = new KafkaJSTimeout('round expired')
+      let refusal = null
+      const guard = jest.fn(() => refusal)
+      for (const broker of brokers) {
+        let connected = false
+        broker.isConnected = () => connected
+        broker.connect = jest.fn(async () => {
+          refusal = expired
+          connected = true
+        })
+      }
+
+      const error = await cluster.brokerPool.refreshMetadata([TOPIC], { guard }).then(
+        () => 'resolved',
+        (e) => e
+      )
+
+      expect(error).toBe(expired)
+      expect(brokers[0].connect.mock.calls.length + brokers[1].connect.mock.calls.length).toBe(1)
+      expect(brokers[0].metadata).not.toHaveBeenCalled()
+      expect(brokers[1].metadata).not.toHaveBeenCalled()
+      expect(cluster.brokerPool.metadata).toBeNull()
+      expect(cluster.metadataCache.leader(TOPIC, 0)).toBe(-1)
+    })
+
     test('a connection failure followed by a callback failure retries the connection error', async () => {
       const { cluster, brokers } = build()
       const unreachable = new KafkaJSConnectionError('connect ECONNREFUSED')

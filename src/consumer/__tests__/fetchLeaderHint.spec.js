@@ -7,7 +7,10 @@ const {
   prepareRecordBatches,
   fetchResponse,
   createFetchGroup,
+  trackFixtures,
 } = require('./fixtures/fetchHarness')
+
+trackFixtures()
 
 /** @type {Buffer} */
 let CORRUPTED_RECORD_BATCH

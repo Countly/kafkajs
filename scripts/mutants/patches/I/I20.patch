@@ -1,0 +1,10 @@
+--- a/src/consumer/runner.js
++++ b/src/consumer/runner.js
+@@ -1850,7 +1850,6 @@
+     const manager = group.offsetManager
+     const token = group.ownership?.token()
+     if (
+-      !this.autoCommit ||
+       !group.groupId ||
+       group.kind !== 'classic' ||
+       !manager ||

@@ -1,0 +1,11 @@
+--- a/scripts/protocol/javaVectors/GenerateMessageVectors.java
++++ b/scripts/protocol/javaVectors/GenerateMessageVectors.java
+@@ -3877,7 +3877,7 @@
+         boolean forgotten = name.equals("sessionForgotten");
+         boolean close = name.equals("sessionClose");
+         int id = full ? 0 : 37;
+-        int epoch = full ? 0 : forgotten ? 2 : close ? -1 : 1;
++        int epoch = full ? 0 : forgotten ? 3 : close ? -1 : 1;
+         boolean topicPresent = full || name.equals("sessionIncremental");
+         long offset = full ? 42 : 43;
+         FetchRequestData request = new FetchRequestData()

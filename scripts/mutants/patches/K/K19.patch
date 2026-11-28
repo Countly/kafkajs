@@ -1,0 +1,11 @@
+--- a/src/protocol/requests/fetch/v13/request.js
++++ b/src/protocol/requests/fetch/v13/request.js
+@@ -82,7 +82,7 @@
+  */
+ const encodeForgottenTopics = ({ topic, topicId, partitions }, topicIds) =>
+   new Encoder()
+-    .writeUuid(topicId ?? requireTopicId(topicIds, topic))
++    .writeUuid(requireTopicId(topicIds, topic))
+     .writeUVarIntArray(partitions, 'int32')
+     .writeTaggedFields()
+ 

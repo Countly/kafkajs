@@ -1,0 +1,10 @@
+--- a/src/consumer/index.js
++++ b/src/consumer/index.js
+@@ -1678,6 +1678,7 @@
+             ? new KafkaJSNonRetriableError('The assignment was superseded while it was validated')
+             : null)
+ 
++        await cluster.resetTargetTopics(names)
+         const metadata = await cluster.stageMetadata({ topics: names, guard: stale })
+         for (const { topic, partitions: wanted } of partitions) {
+           const known = new Set(

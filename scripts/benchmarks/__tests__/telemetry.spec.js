@@ -58,6 +58,8 @@ const {
   PayloadWorkload,
   DeliveryWorkload,
   TelemetrySession,
+  ReporterReset,
+  PREPARE_SECONDS,
   main,
 } = require('../telemetry')
 const Metrics = require('../../../src/telemetry/metrics')
@@ -1754,6 +1756,13 @@ const makeManifest = (jobName, extra = {}) => {
     reference: job.reference,
     runs: job.runs,
     budgetSeconds: minimumBudget(jobName),
+    ...(job.mode === 'delivery' && {
+      fixture: {
+        brokers: ['localhost:19092', 'localhost:19095', 'localhost:19098'],
+        sink: tmp(),
+        compose: { file: path.join(ROOT, 'docker-compose.telemetry.yml'), project: 'bench' },
+      },
+    }),
     ...extra,
   }
 }
@@ -1808,6 +1817,8 @@ const sessionFixture = (jobName, extra = {}, spawnOverrides = {}) => {
   const manifest = makeManifest(jobName, extra)
   const directory = path.join(tmp(), 'run')
   const io = { spawnSync: fakeSpawn(calls, spawnOverrides), verifyWorker: stubVerify }
+  if (JOBS[jobName].mode === 'delivery')
+    io.reset = { prepare: () => ({ retained: [], elapsedMs: 0 }) }
   return {
     calls,
     manifest,
@@ -1825,6 +1836,117 @@ const syntheticRows = (jobName, resultOf, derivedOf = () => ({ signedHeapExterna
   return {
     declared,
     rows: declared.rows.map((row) => ({ ...row, result: resultOf(row), derived: derivedOf(row) })),
+  }
+}
+
+/**
+ * A scripted telemetry cluster for one reporter sink with a small synthetic file cap. Like the real reporter, a
+ * started reporter begins at sequence 1 but continues from the size of the export file it finds, and a push beyond
+ * the cap leaves an overflow marker instead of a row.
+ * @param {string} sink reporter sink directory @param {{cap:number,clock:{t:number},events:string[],
+ * fail?:(action:string,count:number)=>boolean}} options `fail` makes a Compose action exit 1
+ * @returns {{docker:Function,push:Function}} the fake `docker` spawn and one client push
+ */
+const reporterCluster = (sink, { cap, clock, events, fail = () => false }) => {
+  const exportsFile = path.join(sink, 'exports-1.jsonl')
+  const proofs = () => {
+    for (const node of ['1', '2', '3'])
+      fs.writeFileSync(path.join(sink, `reporter-${node}.json`), `{"node":${node}}\n`)
+  }
+  const reporter = { running: true, seq: 0, written: 0 }
+  const counts = {}
+  proofs()
+  return {
+    docker: (command, args) => {
+      expect(command).toBe('docker')
+      expect(args.slice(0, 5)).toEqual([
+        'compose',
+        '-p',
+        'bench',
+        '-f',
+        path.join(ROOT, 'docker-compose.telemetry.yml'),
+      ])
+      const action = args[5]
+      counts[action] = (counts[action] ?? 0) + 1
+      clock.t += 1000
+      events.push(action)
+      if (fail(action, counts[action])) return { status: 1, signal: null, stdout: '', stderr: 'no' }
+      if (action === 'stop') reporter.running = false
+      if (action === 'start') {
+        Object.assign(reporter, { running: true, seq: 0 })
+        reporter.written = fs.existsSync(exportsFile) ? fs.statSync(exportsFile).size : 0
+        proofs()
+      }
+      const status = action === 'exec' && !reporter.running ? 1 : 0
+      return { status, signal: null, stdout: '', stderr: '' }
+    },
+    push: (runId) => {
+      assert(reporter.running, 'push to a stopped reporter')
+      const line = `${JSON.stringify({ node: 1, seq: reporter.seq + 1, runId })}\n`
+      if (reporter.written + line.length > cap) {
+        fs.writeFileSync(path.join(sink, 'OVERFLOW-1.json'), '{"reason":"file-cap"}\n')
+        return
+      }
+      reporter.seq += 1
+      reporter.written += line.length
+      fs.appendFileSync(exportsFile, line)
+    },
+  }
+}
+
+/** @param {string} directory session directory @returns {object[]} its journal entries */
+const journalOf = (directory) =>
+  fs
+    .readFileSync(path.join(directory, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+
+/**
+ * A delivery session whose workers push one export each and read the sink from an empty cursor, the way an
+ * active worker's archive does; a worker that finds an overflow marker fails like the real reader.
+ * @param {{fail?:Function,sleep?:Function}} [options] Compose failure script and readiness sleep
+ */
+const resetSession = ({ fail, sleep = () => {} } = {}) => {
+  const manifest = makeManifest('delivery-control')
+  const { sink } = manifest.fixture
+  const directory = path.join(tmp(), 'run')
+  const clock = { t: 0 }
+  const events = []
+  const views = []
+  const cluster = reporterCluster(sink, { cap: 80, clock, events, fail })
+  const worker = fakeSpawn([])
+  const spawnSync = (command, args, options) => {
+    const runId = options.env.TELEMETRY_BENCH_RUN
+    events.push(`child ${runId}`)
+    cluster.push(runId)
+    if (fs.existsSync(path.join(sink, 'OVERFLOW-1.json')))
+      return { status: 1, signal: null, stdout: '', stderr: 'Error: Telemetry fixture overflow' }
+    const file = path.join(sink, 'exports-1.jsonl')
+    const seen = fs
+      .readFileSync(file, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+    views.push({ runId, seen })
+    return worker(command, args, options)
+  }
+  const now = () => clock.t
+  const reset = new ReporterReset({
+    fixture: manifest.fixture,
+    retained: path.join(directory, 'sinks'),
+    run: cluster.docker,
+    sleep: (ms) => sleep(ms, clock),
+    now,
+  })
+  const io = { spawnSync, verifyWorker: stubVerify, reset, now }
+  return {
+    manifest,
+    sink,
+    directory,
+    events,
+    views,
+    session: new TelemetrySession({ manifest, directory, io }),
   }
 }
 
@@ -2254,6 +2376,89 @@ describe('telemetry benchmark session', () => {
     expect(() => session.verify()).toThrow()
     fs.writeFileSync(file, `${rows.map((r) => JSON.stringify(r)).join('\n')}\n`)
     expect(session.verify().exit).toBe(1)
+  })
+  test('a delivery session restarts the reporter with an empty sink before every observation and keeps each earlier sink', () => {
+    const { session, sink, directory, events, views } = resetSession()
+    const total = childCount('delivery-control')
+    session.run()
+    expect(views).toHaveLength(total)
+    expect(views.map(({ seen }) => seen)).toEqual(
+      views.map(({ runId }) => [{ node: 1, seq: 1, runId }])
+    )
+
+    const preparation = ['stop', 'start', 'exec', 'exec', 'exec']
+    expect(events).toEqual(views.flatMap(({ runId }) => [...preparation, `child ${runId}`]))
+    const journal = journalOf(directory)
+    for (let ordinal = 0; ordinal < total; ordinal += 1) {
+      const prepared = journal.findIndex(
+        (entry) => entry.disposition === 'prepared' && entry.ordinal === ordinal
+      )
+      const started = journal.findIndex(
+        (entry) => entry.disposition === 'started' && entry.ordinal === ordinal
+      )
+      expect(prepared).toBeGreaterThan(-1)
+      expect(started).toBe(prepared + 1)
+      expect(journal[prepared].elapsedMs).toBe(preparation.length * 1000)
+      expect(journal[started].deadline).toBe((ordinal + 1) * preparation.length * 1000 + 610000)
+      if (ordinal > 0) expect(journal[prepared - 1].completed).toBe(ordinal)
+    }
+
+    const proofs = ['reporter-1.json', 'reporter-2.json', 'reporter-3.json']
+    const retained = fs.readdirSync(path.join(directory, 'sinks')).sort()
+    expect(retained).toEqual(views.map((_, i) => String(i).padStart(4, '0')))
+    expect(fs.readdirSync(path.join(directory, 'sinks', '0000')).sort()).toEqual(proofs)
+    for (let ordinal = 1; ordinal < total; ordinal += 1) {
+      const kept = path.join(directory, 'sinks', String(ordinal).padStart(4, '0'))
+      expect(fs.readdirSync(kept).sort()).toEqual(['exports-1.jsonl', ...proofs])
+      expect(fs.readFileSync(path.join(kept, 'exports-1.jsonl'), 'utf8')).toBe(
+        `${JSON.stringify({ node: 1, seq: 1, runId: views[ordinal - 1].runId })}\n`
+      )
+    }
+    expect(fs.readdirSync(sink).sort()).toEqual(['exports-1.jsonl', ...proofs])
+    expect(journal.find((entry) => entry.ordinal === 1).retained).toEqual([
+      'exports-1.jsonl',
+      ...proofs,
+    ])
+
+    const { fixture, ...bare } = makeManifest('delivery-normal')
+    expect(fixture.sink).toEqual(expect.any(String))
+    expect(() => validateManifest(bare)).toThrow('brokers')
+    const { sink: _sink, ...unsunk } = fixture
+    expect(() => validateManifest({ ...bare, fixture: unsunk })).toThrow('reporter sink')
+    expect(() =>
+      validateManifest({ ...bare, fixture: { ...fixture, compose: { project: 'bench' } } })
+    ).toThrow('telemetry cluster')
+  })
+
+  test('a failed reporter reset stops the delivery session before its observation', () => {
+    const failed = resetSession({ fail: (action, count) => action === 'start' && count === 3 })
+    expect(() => failed.session.run()).toThrow(
+      'reporter reset before observation 2: docker compose start exited 1: no'
+    )
+    expect(failed.views).toHaveLength(2)
+    expect(failed.events.at(-1)).toBe('start')
+    const journal = journalOf(failed.directory)
+    expect(journal.filter((entry) => entry.disposition === 'started')).toHaveLength(2)
+    expect(journal.at(-1)).toMatchObject({ disposition: 'error', completed: 2 })
+    expect(journal.at(-1).message).toContain('docker compose start exited 1')
+    expect(
+      fs.readFileSync(path.join(failed.directory, 'raw.jsonl'), 'utf8').split('\n').filter(Boolean)
+    ).toHaveLength(2)
+
+    const sleeps = []
+    const unready = resetSession({
+      fail: (action) => action === 'exec',
+      sleep: (ms, clock) => {
+        sleeps.push(ms)
+        clock.t += ms
+      },
+    })
+    expect(() => unready.session.run()).toThrow(
+      `reporter reset before observation 0: the cluster was not ready within ${PREPARE_SECONDS} s`
+    )
+    expect(unready.views).toEqual([])
+    expect(sleeps.length).toBeGreaterThan(0)
+    expect(journalOf(unready.directory).map(({ disposition }) => disposition)).toEqual(['error'])
   })
 })
 

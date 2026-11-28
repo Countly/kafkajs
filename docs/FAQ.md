@@ -5,7 +5,7 @@ title: FAQ
 
 ## Is KafkaJS used in production?
 
-**Yes**. KafkaJS is used across hundreds of services running in production across businesses over the world.
+**Yes**. Upstream KafkaJS 2.x is used across hundreds of services running in production across businesses over the world. This fork, `@countly/kafkajs`, is a separate package; for its release status see the [README](../README.md).
 
 ## Why am I receiving messages for topics I'm not subscribed to?
 

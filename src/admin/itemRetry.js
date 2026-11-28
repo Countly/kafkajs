@@ -1,6 +1,16 @@
 const { KafkaJSError, KafkaJSInvariantViolation } = require('../errors')
 const { createErrorFromCode } = require('../protocol/error')
-const { retrierOf, currentDeadline, checked } = require('./deadline')
+const { retrierOf, currentDeadline, checked, endsCall, isAnsweredError } = require('./deadline')
+
+/** The result rows `run` made itself for cells that got no broker answer; a broker -1 is not one. */
+const localRows = new WeakSet()
+/**
+ * Whether a result row is a local failure `run` made itself rather than a broker row, so a caller
+ * never has to infer it from the row's code.
+ * @param {object} row a row `itemRetry` resolved with
+ * @returns {boolean}
+ */
+const isLocal = (row) => localRows.has(row)
 
 /** One new item-result call; successful and terminal cells leave its retry set permanently. */
 class ItemRetry {
@@ -53,14 +63,16 @@ class ItemRetry {
    */
   accept(item, row) {
     this.deadline?.check()
+    if (endsCall(row.error)) throw row.error
+    const answered = isAnsweredError(row.error)
     const error =
       row.errorCode === 0
         ? null
-        : row.errorCode === -1 && row.error instanceof Error
+        : answered || (row.errorCode === -1 && row.error instanceof Error)
           ? row.error
           : createErrorFromCode(row.errorCode)
     const result = { ...item, ...row, error, errorMessage: this.sanitize(row.errorMessage ?? null) }
-    if (error && this.retryable(row, item)) {
+    if (error && !answered && this.retryable(row, item)) {
       this.last.set(this.keyOf(item), result)
       return new KafkaJSError(error, { retriable: true, cause: error })
     }
@@ -75,6 +87,7 @@ class ItemRetry {
    * A malformed/missing/foreign/duplicate row is unresolved locally, never inferred success.
    * @param {(items: object[]) => Promise<object[]>} send complete per-item rows from this attempt
    * @returns {Promise<object[]>} results in caller order, errorCode -1 for unresolved local failure
+   *   (`isLocal` tells such a row from a broker's -1)
    * @throws {Error} API deadline always rejects the whole call, preserving unknown mutation outcome
    */
   async run(send) {
@@ -89,7 +102,9 @@ class ItemRetry {
           rows = checked(await send([...attempted.values()]))
           localFailure = null
         } catch (error) {
-          if (this.callFailure(error)) return bail(error)
+          this.deadline?.check()
+          if (endsCall(error) || this.callFailure(error) || isAnsweredError(error))
+            return bail(error)
           localFailure = error
           throw error
         }
@@ -112,7 +127,13 @@ class ItemRetry {
       })
     } catch (error) {
       this.deadline?.check()
-      if (this.callFailure(error) || error instanceof KafkaJSInvariantViolation) throw error
+      if (
+        endsCall(error) ||
+        this.callFailure(error) ||
+        isAnsweredError(error) ||
+        error instanceof KafkaJSInvariantViolation
+      )
+        throw error
       if (
         (error.cause && this.callFailure(error.cause)) ||
         error.cause instanceof KafkaJSInvariantViolation
@@ -122,17 +143,19 @@ class ItemRetry {
     }
     this.deadline?.check()
     for (const [key, item] of this.pending) {
-      this.results.set(
-        key,
-        localFailure || !this.last.has(key)
-          ? {
-              ...item,
-              errorCode: -1,
-              error: localFailure || outstanding,
-              errorMessage: this.sanitize((localFailure || outstanding)?.message ?? null),
-            }
-          : this.last.get(key)
-      )
+      if (!localFailure && this.last.has(key)) {
+        this.results.set(key, this.last.get(key))
+        continue
+      }
+      const error = localFailure || outstanding
+      const row = {
+        ...item,
+        errorCode: -1,
+        error,
+        errorMessage: this.sanitize(error?.message ?? null),
+      }
+      localRows.add(row)
+      this.results.set(key, row)
     }
     this.pending.clear()
     return this.items.map((item) => this.results.get(this.keyOf(item)))
@@ -155,4 +178,4 @@ const itemRetry = async (options, send) => {
   }
 }
 
-module.exports = { itemRetry }
+module.exports = { itemRetry, isLocal }

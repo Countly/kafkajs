@@ -1,0 +1,11 @@
+--- a/src/consumer/rebalanceHooks.js
++++ b/src/consumer/rebalanceHooks.js
+@@ -185,7 +185,7 @@
+         const before = this.refusal(record)
+         if (before) throw before
+         try {
+-          await hook(payload)
++          hook(payload)
+         } catch (thrownValue) {
+           const refusal = this.refusal(record)
+           if (refusal) throw refusal

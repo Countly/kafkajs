@@ -1,0 +1,10 @@
+--- a/src/consumer/assigners/rangeAssigner/index.js
++++ b/src/consumer/assigners/rangeAssigner/index.js
+@@ -159,6 +159,7 @@
+     const useRackAware = states.some((state) => state.needsRackMatching)
+     if (useRackAware)
+       for (const group of groups.values()) {
++        if (!group.some((state) => state.needsRackMatching)) continue
+         if (group.length === 1) {
+           if (group[0].needsRackMatching) group[0].assignRanges(assignment, true)
+         } else {

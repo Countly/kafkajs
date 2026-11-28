@@ -1,0 +1,11 @@
+--- a/src/consumer/offsetReset.js
++++ b/src/consumer/offsetReset.js
+@@ -162,7 +162,7 @@
+           .map(({ partition }) => ({ partition })),
+       }))
+       .filter((t) => t.partitions.length)
+-    if (missing.length) {
++    if (false && missing.length) {
+       const latest = await this.cluster.fetchTopicsOffset(missing, ...lookup)
+       for (const { topic, partitions } of latest)
+         for (const p of partitions) {

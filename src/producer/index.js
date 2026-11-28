@@ -1,3 +1,4 @@
+const describeThrown = require('../network/describeThrown')
 const { inspect } = require('util')
 const createRetry = require('../retry')
 const Generation = require('./generation')
@@ -97,18 +98,21 @@ const timeoutOf = (options, ignoreNonObject) => {
 
 /**
  * The accumulator's, the delivery deadline's and the buffer's defaults: the Java client's 4.x
- * `linger.ms`, `batch.size`, `delivery.timeout.ms`, `buffer.memory` and `max.block.ms`.
+ * `batch.size`, `delivery.timeout.ms`, `buffer.memory` and `max.block.ms`. `linger` is 0, not the
+ * Java client's 5 ms: `send` returns one promise, so a wait on every lone send would add its full
+ * length to an awaited send, as in kafkajs 2.2.4. Sends made in one turn of the event loop still
+ * merge, and an idempotent producer gathers a partition's next batch behind the one in flight.
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/ProducerConfig.java
  */
 const DEFAULTS = Object.freeze({
-  linger: 5,
+  linger: 0,
   batchSize: 16384,
   deliveryTimeout: 120000,
   bufferMemory: 33554432,
   maxBlockMs: 60000,
   maxRequestSize: 1048576,
-  // KIP-794's adaptive weighting stays off by default until its measured gate passes.
-  adaptive: false,
+  // The default partitioner weighs each pick by the partitions' queues (KIP-794's adaptive partitioning).
+  adaptive: true,
 })
 
 /**
@@ -148,7 +152,7 @@ const definedKeys = (options) =>
  *   or `acks` an error instead of a reason to turn idempotence off with a warning
  * @param {string} [params.transactionalId]
  * @param {number} [params.transactionTimeout]
- * @param {number} [params.linger=5] ms a batch waits for more records; 0 sends it at once
+ * @param {number} [params.linger=0] ms a batch waits for more records; 0 sends it at once
  * @param {number} [params.batchSize=16384] bytes of keys and values at which a batch is sent
  * @param {{ gzip?: number, zstd?: number }} [params.compressionLevels] per-codec levels
  * @param {number} [params.deliveryTimeout] ms one send may take, retries included; past it the
@@ -204,6 +208,8 @@ const createProducer = ({
   let closing = null
   /** Whether a `disconnect()` has completed since the last `connect()`: later calls do nothing. */
   let closed = false
+  /** Counts every valid `disconnect()` call, so a `connect()` waiting for a close sees a later one. */
+  let closeRequests = 0
   const isClosing = () => closing !== null
   /**
    * The lifecycle every operation of this producer captures when it starts and checks after each
@@ -324,6 +330,11 @@ const createProducer = ({
    *   `disconnect()` aborts a transaction left open through it
    */
   let lastTransaction = null
+  /**
+   * @type {Promise<void>|null} the `transaction()` call that is initializing the producer id and
+   *   beginning its transaction: the one owner at a time, which later calls wait for
+   */
+  let beginning = null
 
   /**
    * Refuses work if either identity is fatal, preserving the armed object and its cause.
@@ -400,9 +411,9 @@ const createProducer = ({
     return instrumentationEmitter.addListener(unwrapEvent(eventName), (event) => {
       event.type = wrapEvent(event.type)
       Promise.resolve(listener(event)).catch((e) => {
-        logger.error(`Failed to execute listener: ${e.message}`, {
+        logger.error(`Failed to execute listener: ${describeThrown(e)}`, {
           eventName,
-          stack: e.stack,
+          stack: describeThrown(e, 'stack'),
         })
       })
     })
@@ -431,6 +442,12 @@ const createProducer = ({
    * `sendOffsets`, `abort()` and `producer.transaction()` throw a `KafkaJSNonRetriableError` saying
    * so. A `commit()` called while another is under way joins it, as the Java producer hands a
    * repeated `commitTransaction()` the result already pending.
+   *
+   * Calls begin one at a time. A call made while another initializes the producer id or finds the
+   * transaction coordinator waits for it, then is refused with the ongoing-transaction error if that
+   * call began a transaction, before it sends any request or moves the transaction version; if that
+   * call failed, one of the waiting calls becomes the next to begin. A waiting call whose producer
+   * closed meanwhile is refused with the close error.
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-1050%3A+Consistent+error+handling+for+Transactions
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
    * @returns {Promise<Transaction>}
@@ -495,22 +512,38 @@ const createProducer = ({
       })
     const { stateManager } = transactionalEosManager
 
+    // A call that waited checks its lifecycle again; one that did not keeps the order it always had.
+    if (beginning !== null) {
+      // eslint-disable-next-line no-unmodified-loop-condition -- the owner clears it while this awaits
+      while (beginning !== null) {
+        await beginning.catch(() => {})
+      }
+      lifecycle.check()
+    }
     if (transactionalEosManager.isInTransaction()) {
       throw ongoingTransactionError()
     }
 
+    const current = (async () => {
+      try {
+        // We only initialize the producer id once
+        if (!transactionalEosManager.isInitialized()) {
+          await transactionalEosManager.initProducerId()
+        }
+        await transactionalEosManager.beginTransaction()
+      } catch (error) {
+        // Another transaction() began while this one was initializing or finding the coordinator.
+        if (transactionalEosManager.isInTransaction()) {
+          throw ongoingTransactionError()
+        }
+        throw error
+      }
+    })()
+    beginning = current
     try {
-      // We only initialize the producer id once
-      if (!transactionalEosManager.isInitialized()) {
-        await transactionalEosManager.initProducerId()
-      }
-      await transactionalEosManager.beginTransaction()
-    } catch (error) {
-      // Another transaction() began while this one was initializing or finding the coordinator.
-      if (transactionalEosManager.isInTransaction()) {
-        throw ongoingTransactionError()
-      }
-      throw error
+      await current
+    } finally {
+      if (beginning === current) beginning = null
     }
     // IN_TRANSACTION has no edge to READY. Begin sent no EndTxn and published no facade,
     // so step ABORTING then READY before the close error. abort() would write.
@@ -821,7 +854,7 @@ const createProducer = ({
       (cleanup ??= (async () =>
         cluster.disconnect(...(drainTimeout === undefined ? [] : [{ drainTimeout }])))().catch(
         (error) => {
-          logger.warn('Disconnecting the cluster failed', { error: error.message })
+          logger.warn('Disconnecting the cluster failed', { error: describeThrown(error) })
         }
       ))
     let forced = false
@@ -873,16 +906,24 @@ const createProducer = ({
     ...telemetry?.methods(),
     /**
      * Connects the producer, starting a new lifecycle after a close: it first joins a close still
-     * under way, and opens no connection while that close owns the cleanup. Operations of an
-     * earlier lifecycle stay fenced.
+     * under way, and opens no connection while that close owns the cleanup. A `disconnect()`
+     * called while it waits was asked after it, so it is refused instead of reopening the
+     * producer that call closed. Operations of an earlier lifecycle stay fenced.
      * @returns {Promise}
      * @throws {import('../errors').KafkaJSApplicationRecoverableError} as a rejection, once the
      *   producer is unusable: a connect never revives it
+     * @throws {KafkaJSNonRetriableError} as a rejection, when a `disconnect()` was called while it
+     *   waited for a close; the producer stays disconnected and no `CONNECT` is emitted
      */
     connect: guardFatal(async () => {
-      // eslint-disable-next-line no-unmodified-loop-condition -- the close clears it when it ends
-      while (closing !== null) {
+      if (closing !== null) {
+        const asked = closeRequests
         await closing
+        if (closeRequests !== asked) {
+          throw new KafkaJSNonRetriableError(
+            'The producer was disconnected while connect() waited for an earlier close; call connect() again to resume'
+          )
+        }
       }
       if (closed || generation.closed) {
         generation = new Generation()
@@ -956,8 +997,8 @@ const createProducer = ({
      * with `'unknown'`, pending retries are cancelled, no old operation opens a connection or
      * writes, an unknown commit stays unknown and is not aborted, and the connections close. The
      * first call's `timeout` governs concurrent ones, which share its one cleanup; a call after
-     * the close completed does nothing until `connect()`. The call resolves whatever the
-     * cleanup answers.
+     * the close completed does nothing until `connect()`. A `connect()` still waiting for a close
+     * is refused by a later call, joined or not. The call resolves whatever the cleanup answers.
      * @param {{ timeout?: number }} [options] `timeout` in ms, an integer from 0 to 2147483647; an
      *   argument that is not an object is ignored, so the method can be a signal handler
      * @returns {Promise<void>}
@@ -973,6 +1014,7 @@ const createProducer = ({
         return Promise.reject(error)
       }
 
+      closeRequests++
       if (closing !== null) return closing
       if (closed) return Promise.resolve()
       closing = close(startedAt, timeout)

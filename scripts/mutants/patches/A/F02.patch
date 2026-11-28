@@ -1,0 +1,11 @@
+--- a/src/consumer/__tests__/fixtures/fetchHarness.js
++++ b/src/consumer/__tests__/fixtures/fetchHarness.js
+@@ -176,7 +176,7 @@
+     .writeInt16(topLevel)
+     .writeInt32(sessionId)
+     .writeUVarIntArray(
+-      includeTopic
++      true
+         ? [
+             (apiVersion <= 12
+               ? new Encoder().writeUVarIntString(TOPIC)

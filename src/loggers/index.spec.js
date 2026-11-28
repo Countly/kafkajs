@@ -1,5 +1,7 @@
+const { AsyncLocalStorage } = require('node:async_hooks')
 const MockDate = require('mockdate')
 const { createLogger, LEVELS } = require('./index')
+const { runWithDeadline, currentDeadline, withConsumerOperation } = require('../admin/deadline')
 
 describe('Loggers', () => {
   let logger, timeNow, MyLogCreator, myLogger
@@ -145,6 +147,171 @@ describe('Loggers', () => {
 
       logger.setLogLevel(LEVELS.DEBUG)
       expect(logger.debugEnabled()).toBe(true)
+    })
+  })
+  describe('a throwing log sink', () => {
+    const throwing = () =>
+      jest.fn(({ log }) => {
+        if (log.message === 'boom') throw new Error('sink failed')
+      })
+
+    it('does not escape a root or namespaced call, and later lines still reach the sink', () => {
+      const sink = throwing()
+      const root = createLogger({ level: LEVELS.DEBUG, logCreator: () => sink })
+      const namespaced = root.namespace('Ns')
+
+      expect(root.error('boom')).toBeUndefined()
+      expect(namespaced.info('boom')).toBeUndefined()
+      namespaced.warn('after')
+
+      expect(sink).toHaveBeenCalledTimes(3)
+      expect(sink.mock.calls[2][0]).toMatchObject({ namespace: 'Ns', label: 'WARN' })
+      expect(sink.mock.calls[2][0].log.message).toBe('after')
+    })
+
+    it('is not invoked for a filtered line', () => {
+      const sink = throwing()
+      const root = createLogger({ level: LEVELS.ERROR, logCreator: () => sink })
+      root.namespace('Ns').debug('boom')
+      expect(sink).not.toHaveBeenCalled()
+    })
+
+    it('a log function whose returned promise rejects leaves no unhandled rejection, and later lines still reach it', async () => {
+      const unhandled = []
+      const track = (reason) => unhandled.push(reason)
+      process.on('unhandledRejection', track)
+      try {
+        const sink = jest.fn(({ log }) =>
+          log.message === 'boom' ? Promise.reject(new Error('sink failed')) : undefined
+        )
+        const root = createLogger({ level: LEVELS.DEBUG, logCreator: () => sink })
+
+        expect(root.error('boom')).toBeUndefined()
+        expect(root.namespace('Ns').warn('boom')).toBeUndefined()
+        root.info('after')
+        await new Promise((resolve) => setImmediate(resolve))
+        await new Promise((resolve) => setImmediate(resolve))
+
+        expect(unhandled).toEqual([])
+        expect(sink).toHaveBeenCalledTimes(3)
+        expect(sink.mock.calls[2][0].log.message).toBe('after')
+      } finally {
+        process.off('unhandledRejection', track)
+      }
+    })
+
+    it('leaves a throwing log creator failing the logger construction', () => {
+      const creator = () => {
+        throw new Error('creator failed')
+      }
+      expect(() => createLogger({ logCreator: creator })).toThrow('creator failed')
+    })
+  })
+
+  describe('a log sink called inside an admin invocation', () => {
+    const flush = async () => {
+      for (let n = 0; n < 30; n++) await Promise.resolve()
+    }
+    const loggerOf = (sink) => createLogger({ level: LEVELS.DEBUG, logCreator: () => sink })
+
+    it('calls the sink outside any admin invocation', async () => {
+      const seen = []
+      const root = loggerOf(() => {
+        seen.push(currentDeadline())
+      })
+
+      await runWithDeadline('outer', 1000, async () => root.info('x'))
+
+      expect(seen).toEqual([undefined])
+    })
+
+    it('keeps the sink outside any admin invocation after an async hop', async () => {
+      const seen = []
+      const root = loggerOf(async () => {
+        await Promise.resolve()
+        seen.push(currentDeadline())
+      })
+
+      await runWithDeadline('outer', 1000, async () => {
+        root.namespace('Ns').warn('x')
+        await flush()
+      })
+
+      expect(seen).toEqual([undefined])
+    })
+
+    it('leaves the admin invocation current for the caller once the sink returned', async () => {
+      const root = loggerOf(() => {})
+      let before
+      let after
+
+      await runWithDeadline('outer', 1000, async () => {
+        before = currentDeadline()
+        root.error('x')
+        after = currentDeadline()
+      })
+
+      expect(before.method).toBe('outer')
+      expect(after).toBe(before)
+    })
+
+    it("keeps the application's own async context in the sink, also after an async hop", async () => {
+      const own = new AsyncLocalStorage()
+      const seen = []
+      const root = loggerOf(async () => {
+        seen.push(own.getStore())
+        await Promise.resolve()
+        seen.push(own.getStore())
+      })
+
+      await own.run('request-1', () =>
+        runWithDeadline('outer', 1000, async () => {
+          root.info('x')
+          await flush()
+        })
+      )
+
+      expect(seen).toEqual(['request-1', 'request-1'])
+    })
+
+    it('runs a returned thenable inside the same boundary as the sink', async () => {
+      const reads = []
+      const lazy = {
+        get then() {
+          reads.push(['getter', currentDeadline()])
+          return () => {
+            reads.push(['method', currentDeadline()])
+          }
+        },
+      }
+      const root = loggerOf(() => lazy)
+
+      await runWithDeadline('outer', 1000, async () => root.info('x'))
+
+      expect(reads.map(([where]) => where)).toContain('getter')
+      expect(reads.map(([where]) => where)).toContain('method')
+      expect(reads.filter(([, deadline]) => deadline !== undefined)).toEqual([])
+    })
+
+    it('keeps the sink outside the admin invocation after it entered a consumer operation inline', async () => {
+      const operation = { guard: () => null }
+      const seen = []
+      const root = loggerOf(() => {
+        withConsumerOperation(operation, () => {})
+        seen.push(currentDeadline())
+      })
+      let before
+      let after
+
+      await runWithDeadline('outer', 1000, async () => {
+        before = currentDeadline()
+        root.warn('x')
+        after = currentDeadline()
+      })
+
+      expect(seen).toEqual([undefined])
+      expect(before.method).toBe('outer')
+      expect(after).toBe(before)
     })
   })
 })

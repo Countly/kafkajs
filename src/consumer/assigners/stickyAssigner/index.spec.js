@@ -146,6 +146,23 @@ describe('Consumer > assigners > StickyAssigner', () => {
     })
   })
 
+  test('assigns a recreated topic with fewer partitions exactly once when a member claims a partition it no longer has', async () => {
+    metadata['topic-A'] = partitions(1)
+
+    const result = await assigner.assign({
+      members: [
+        member('member-a', { owned: [{ topic: 'topic-A', partitions: [1] }], generationId: 1 }),
+        member('member-b', { owned: [{ topic: 'topic-A', partitions: [0] }], generationId: 1 }),
+      ],
+      topics: ['topic-A'],
+    })
+
+    expect(decodeAssignment(result)).toEqual({
+      'member-a': {},
+      'member-b': { 'topic-A': [0] },
+    })
+  })
+
   describe('#subscriptionUserData and #onAssignment', () => {
     test('sends the wire NULL until the member has ever been assigned anything', () => {
       expect(assigner.subscriptionUserData()).toBeNull()

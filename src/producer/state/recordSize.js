@@ -1,4 +1,4 @@
-const { KafkaJSRecordTooLargeError } = require('../../errors')
+const { KafkaJSNonRetriableError, KafkaJSRecordTooLargeError } = require('../../errors')
 const { Codecs, Types } = require('../../protocol/message/compression')
 const snappy = require('../../protocol/message/compression/snappy')
 
@@ -29,6 +29,11 @@ const BATCH_DEBIT = 1024
 /** A Buffer is copied when its backing store is larger than this and than 16 times the Buffer. */
 const COPY_STORES_ABOVE = 16384
 const COPY_STORES_TIMES = 16
+/** The intrinsic length of a typed array, which an own `length` property cannot change. */
+const lengthOf = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(Uint8Array.prototype),
+  'length'
+).get
 
 /**
  * Java's `ByteUtils.sizeOfVarint` of a length: the bytes of its zigzag varint.
@@ -260,24 +265,77 @@ const chargeOf = (topicMessages, limit) => {
 }
 
 /**
- * The Buffer a send keeps for a key, value or header value: the caller's own, as in 2.2.4, so its
- * bytes still reach the wire if the caller changes them, unless it is a small view over a large
- * backing store (above 16 KiB and above 16 times the view), which is copied into a store of its
- * own size so the send does not keep the large one alive. Anything else is returned as it is.
- * @param {*} field
- * @returns {*}
+ * @param {Buffer} view
+ * @returns {boolean} whether it is a small view over a large backing store: one above 16 KiB and
+ *   above 16 times the view, which a send copies so as not to keep the store alive
  */
-const ownedBuffer = (field) => {
-  if (!Buffer.isBuffer(field)) {
-    return field
+const pinsStore = (view) => {
+  const { byteLength } = view.buffer
+  return byteLength > COPY_STORES_ABOVE && byteLength > COPY_STORES_TIMES * lengthOf.call(view)
+}
+
+/**
+ * The copy of one send's Buffers that would pin a large store (`pinsStore`). While the send's own
+ * records are built, `note` remembers each such Buffer by the own container and key it was put
+ * at, with its length read once; `copy` then copies them all into one store of the sum of those
+ * lengths and puts each one's slice in its place. Every other Buffer stays the caller's own, as in
+ * 2.2.4, so its bytes still reach the wire if the caller changes them; a send with nothing to copy
+ * allocates no store. The bytes are captured after every record of the send has been read, with
+ * intrinsics only: no method or iterator of the caller runs during the copy.
+ *
+ * The store is held only through the slices in the send's records, which cover it whole, so
+ * `chargeOf` charges it no excess; it may be collected before the send's charge is released when
+ * the records still held carry no slice of it. Keeping any slice (a record kept by a custom
+ * partitioner or from a delivery error, or the slice passed again in another send) keeps the whole
+ * store alive; a later send that carries such a slice unchanged is charged the bytes of the store
+ * it does not show. A send that cannot fit is still refused, but which record the error names and
+ * the size it reports can differ from a copy per view.
+ */
+class SendCopy {
+  /** @type {Array<object|string|number|Buffer>|null} flat slots: container, key, view, length */
+  #slots = null
+  #bytes = 0
+
+  /**
+   * Remembers `container[key]` for the copy when it is a Buffer that pins a large store.
+   * @param {object} container the producer's own record, header object or header-value array
+   * @param {string|number} key
+   * @returns {void}
+   */
+  note(container, key) {
+    const view = container[key]
+    if (!Buffer.isBuffer(view) || !pinsStore(view)) {
+      return
+    }
+    const length = lengthOf.call(view)
+    this.#slots ??= []
+    this.#slots.push(container, key, view, length)
+    this.#bytes += length
   }
-  const { byteLength } = field.buffer
-  if (byteLength <= COPY_STORES_ABOVE || byteLength <= COPY_STORES_TIMES * field.length) {
-    return field
+
+  /**
+   * Copies every remembered Buffer into one store and puts its slice in its place.
+   * @returns {void}
+   * @throws {KafkaJSNonRetriableError} when a Buffer's length changed since it was remembered
+   */
+  copy() {
+    const slots = this.#slots
+    if (slots === null) {
+      return
+    }
+    const store = Buffer.allocUnsafeSlow(this.#bytes)
+    let offset = 0
+    for (let i = 0; i < slots.length; i += 4) {
+      const view = slots[i + 2]
+      const length = slots[i + 3]
+      if (lengthOf.call(view) !== length) {
+        throw new KafkaJSNonRetriableError('A Buffer changed size while its send was being read')
+      }
+      store.set(view, offset)
+      slots[i][slots[i + 1]] = store.subarray(offset, offset + length)
+      offset += length
+    }
   }
-  const copy = Buffer.allocUnsafeSlow(field.length)
-  field.copy(copy)
-  return copy
 }
 
 /** `DefaultRecordBatch.RECORD_BATCH_OVERHEAD`: the header of a v2 record batch. */
@@ -455,7 +513,7 @@ module.exports = {
   held,
   share,
   chargeOf,
-  ownedBuffer,
+  SendCopy,
   varintSize,
   framing,
   topicFraming,

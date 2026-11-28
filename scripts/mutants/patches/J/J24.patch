@@ -1,0 +1,10 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -3997,6 +3997,7 @@
+ 
+       if (metadata.leader < 0) {
+         if (routing) routing.leaderless = true
++        this.rebalanceCoordinator?.requestRejoin({ kind: "revoked", reason: "leaderless" })
+         return result
+       }
+ 

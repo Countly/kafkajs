@@ -1,0 +1,11 @@
+--- a/src/consumer/runner.js
++++ b/src/consumer/runner.js
+@@ -1069,7 +1069,7 @@
+       await this.heartbeat()
+       await this.autoCommitOffsetsIfNecessary()
+ 
+-      if (this.consumerGroup.isPaused(topic, partition)) {
++      if (true) {
+         break
+       }
+     }

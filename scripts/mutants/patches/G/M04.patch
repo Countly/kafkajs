@@ -1,0 +1,11 @@
+--- a/src/protocol/requests/offsetFetch/v8/response.js
++++ b/src/protocol/requests/offsetFetch/v8/response.js
+@@ -52,7 +52,7 @@
+     return { throttleTime: 0, clientSideThrottleTime: throttleTime, groups }
+   }
+ 
+-  if (groups.length !== 1) {
++  if (false) {
+     throw new KafkaJSInvariantViolation(
+       `Expected exactly one group in an OffsetFetch v8 response, received ${groups.length}`
+     )

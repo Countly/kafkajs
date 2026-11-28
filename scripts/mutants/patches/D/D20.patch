@@ -1,0 +1,11 @@
+--- a/src/consumer/assigners/rangeAssigner/index.js
++++ b/src/consumer/assigners/rangeAssigner/index.js
+@@ -27,7 +27,7 @@
+       partitions.map(({ partitionId, replicas = [], replicaRacks }) => [
+         partitionId,
+         new Set(
+-          replicaRacks || replicas.map((id) => brokers.get(id)).filter((rack) => rack != null)
++          replicaRacks || replicas.slice(0, 1).map((id) => brokers.get(id)).filter((rack) => rack != null)
+         ),
+       ])
+     )

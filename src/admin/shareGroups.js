@@ -7,7 +7,14 @@ const {
   KafkaJSShareGroupsNotSupportedError,
 } = require('../errors')
 const shareCapability = require('../consumer/share/shareCapability')
-const { currentDeadline, checked, waitOf, retrierOf } = require('./deadline')
+const {
+  currentDeadline,
+  checked,
+  waitOf,
+  retrierOf,
+  endsCall,
+  isAnsweredError,
+} = require('./deadline')
 const { itemRetry } = require('./itemRetry')
 
 /** @see https://github.com/apache/kafka/blob/4.4.0/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
@@ -367,11 +374,13 @@ class ShareGroups {
    */
   #refused(key, code) {
     if (code !== UNSUPPORTED_VERSION) return
-    throw new KafkaJSShareGroupsNotSupportedError(createErrorFromCode(code), {
+    const cause = createErrorFromCode(code)
+    throw new KafkaJSShareGroupsNotSupportedError(cause, {
       apiKey: key,
       apiName: APIS[key],
       reason: 'refused-by-broker',
       shareVersion: null,
+      cause,
     })
   }
 
@@ -582,6 +591,7 @@ class ShareGroups {
           this.#refused(key, group.errorCode)
           if (group.errorCode !== 0) {
             const error = createErrorFromCode(group.errorCode)
+            if (key !== LIST_OFFSETS_KEY) return bail(error)
             if (group.errorCode === COORDINATOR_LOAD_IN_PROGRESS) throw error
             if (
               [COORDINATOR_NOT_AVAILABLE, NOT_COORDINATOR].includes(group.errorCode) &&
@@ -610,7 +620,8 @@ class ShareGroups {
       })
     } catch (error) {
       currentDeadline()?.check()
-      throw causeOf(error, [KafkaJSProtocolError]) || error
+      if (endsCall(error) || isAnsweredError(error)) throw error
+      throw causeOf(error, [KafkaJSShareGroupsNotSupportedError, KafkaJSProtocolError]) || error
     }
   }
 

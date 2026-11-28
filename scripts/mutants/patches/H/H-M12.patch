@@ -1,0 +1,11 @@
+--- a/src/consumer/subscriptionState.js
++++ b/src/consumer/subscriptionState.js
+@@ -130,7 +130,7 @@
+     return Object.values(this.assignedPartitionsByTopic).map(({ topic, partitions }) => ({
+       topic,
+       partitions: partitions
+-        .filter((partition) => !this.isPaused(topic, partition) && !this.isHeld(topic, partition))
++        .filter((partition) => !this.isPaused(topic, partition))
+         .sort(),
+     }))
+   }

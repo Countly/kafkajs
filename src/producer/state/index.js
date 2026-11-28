@@ -1,7 +1,9 @@
 const createRetry = require('../../retry')
 const {
+  KafkaJSApplicationRecoverableError,
   KafkaJSDeliveryTimeout,
   KafkaJSInvariantViolation,
+  KafkaJSProtocolError,
   KafkaJSTransactionAbortableError,
 } = require('../../errors')
 const { RETRIABLE_CATEGORIES } = require('../../protocol/errorCategories')
@@ -22,7 +24,9 @@ const {
 /** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
 const OUT_OF_ORDER_SEQUENCE_NUMBER = 45
 const INVALID_PRODUCER_ID_MAPPING = 49
+const TRANSACTIONAL_ID_AUTHORIZATION_FAILED = 53
 const UNKNOWN_PRODUCER_ID = 59
+const PRODUCER_FENCED = 90
 
 /**
  * Java's message for a transaction whose expired batches left a gap the producer cannot close.
@@ -61,6 +65,8 @@ const ignore = () => {}
 class ProducerStateManager {
   #logger
   #transactional
+  /** @type {string|null} */
+  #transactionalId
   #retries
   #retry
   #retrier
@@ -77,6 +83,8 @@ class ProducerStateManager {
   /** @type {Set<Promise<void>>} every AddPartitionsToTxn not yet settled, never rejecting */
   #adds = new Set()
   #started = false
+  /** Whether an add request of the current transaction was sent, answered or not. */
+  #addSent = false
   /** Moves on every return to READY, so a late answer cannot touch the next transaction. */
   #generation = 0
   /** @type {?{ lifecycle: ?import('../generation'), promise: Promise<void> }} */
@@ -122,6 +130,7 @@ class ProducerStateManager {
   }) {
     this.#logger = logger
     this.#transactional = transactional
+    this.#transactionalId = transactionalId
     this.#retries = deliveryRetries ?? createRetry.defaults.retries
     this.#retry = retry
     this.#retrier = createRetry(retry)
@@ -233,6 +242,8 @@ class ProducerStateManager {
    * @throws {KafkaJSInvariantViolation} while a batch is in flight
    * @throws {import('../../errors').KafkaJSApplicationRecoverableError} when the coordinator did
    *   not bump; the producer is then in `FATAL_ERROR`, as after any fatal error of the request
+   * @throws {KafkaJSTransactionAbortableError} when InitProducerId itself refuses the transactional
+   *   id (53); the caller keeps the bump owed
    * @throws {Error} a retriable error, unchanged, for the caller to retry
    */
   async reinitialize() {
@@ -243,6 +254,13 @@ class ProducerStateManager {
     try {
       await this.#identity.reinitialize()
     } catch (error) {
+      // Transaction coordinator lookup handles its own code 53 and throws the armed error.
+      if (
+        error instanceof KafkaJSProtocolError &&
+        error.code === TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+      ) {
+        throw new KafkaJSTransactionAbortableError(error, { cause: error })
+      }
       this.classify(error, 'txn')
       if (transactionStateFor(error) === FATAL_ERROR) {
         this.arm(error)
@@ -304,7 +322,7 @@ class ProducerStateManager {
   arm(error) {
     const state = this.transaction.state()
     if (transactionStateFor(error) === FATAL_ERROR) {
-      this.transaction.armFatal(error)
+      this.transaction.armFatal(this.#transactional ? this.#explainFencing(error) : error)
     } else if (this.#transactional && (state === IN_TRANSACTION || state === COMMITTING)) {
       this.transaction.armAbortable(error)
     }
@@ -319,6 +337,24 @@ class ProducerStateManager {
       error: armed.message,
     })
     this.sequencer.abortQueued(armed)
+  }
+
+  /**
+   * A transactional producer's PRODUCER_FENCED (90) or INVALID_PRODUCER_ID_MAPPING (49): the
+   * coordinator no longer accepts this producer id and epoch, so the fatal error says why it may
+   * not: a takeover, a timed-out transaction, or a transactional id that expired.
+   * @param {Error} error
+   * @returns {Error} the error to arm: `error` itself for any other code
+   */
+  #explainFencing(error) {
+    if (error.code !== PRODUCER_FENCED && error.code !== INVALID_PRODUCER_ID_MAPPING) {
+      return error
+    }
+
+    return new KafkaJSApplicationRecoverableError(
+      `The transaction coordinator no longer accepts this producer's id and epoch: another producer took over transactional id ${this.#transactionalId}, its transaction timed out, or the transactional id expired (${error.message}); create a new producer`,
+      { cause: error }
+    )
   }
 
   /**
@@ -340,6 +376,7 @@ class ProducerStateManager {
       this.#nextAdd = null
       this.#partitions.clear()
       this.#started = false
+      this.#addSent = false
       this.#generation += 1
     }
   }
@@ -574,9 +611,26 @@ class ProducerStateManager {
     return this.#started
   }
 
+  /**
+   * @returns {boolean} whether the coordinator may hold the current transaction: something joined
+   *   it, or an AddPartitionsToTxn or AddOffsetsToTxn of it was attempted, answered or not. The
+   *   attempt is recorded before the coordinator lookup, so one whose lookup failed counts too.
+   */
+  transactionReached() {
+    return this.#started || this.#addSent
+  }
+
   /** Records that offsets joined the current transaction. @returns {void} */
   markOffsetsAdded() {
     this.#started = true
+  }
+
+  /**
+   * Records that an AddOffsetsToTxn of the current transaction is attempted, before its coordinator
+   * lookup. @returns {void}
+   */
+  markAddSent() {
+    this.#addSent = true
   }
 
   /**
@@ -772,6 +826,7 @@ class ProducerStateManager {
       return
     }
 
+    this.#addSent = true
     const request = [...topics].map(([topic, partitions]) => ({ topic, partitions }))
 
     try {

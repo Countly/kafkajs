@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -1624,8 +1624,6 @@
+             topics: this.topics,
+             topicsSubscribed,
+             beforeSync: () => {
+-              const refusal = attempt.guard()
+-              if (refusal) throw refusal
+               this.partitionsPerSubscribedTopic = this.generatePartitionsPerSubscribedTopic(
+                 attempt.pin?.names
+               )

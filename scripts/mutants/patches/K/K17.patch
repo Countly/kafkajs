@@ -1,0 +1,11 @@
+--- a/src/consumer/fetchSession.js
++++ b/src/consumer/fetchSession.js
+@@ -279,7 +279,7 @@
+     if (this.closing) return this.closing
+     const deadline = Number.isFinite(deadlineAt)
+       ? deadlineAt
+-      : performance.now() + Math.min(this.requestTimeout, 2000)
++      : performance.now() + this.requestTimeout
+     const entries = [...this.sessions].map(([nodeId, session]) => [nodeId, session.close()])
+     this.sessions.clear()
+     this.closing = Promise.resolve().then(async () => {

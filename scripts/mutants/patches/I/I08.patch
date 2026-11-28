@@ -1,0 +1,10 @@
+--- a/src/consumer/groupProtocol/interface.js
++++ b/src/consumer/groupProtocol/interface.js
+@@ -314,7 +314,6 @@
+       Promise.resolve(result).then((value) => {
+         this.waiters.delete(fail)
+         try {
+-          this.check()
+           resolve(value)
+         } catch (error) {
+           reject(error)

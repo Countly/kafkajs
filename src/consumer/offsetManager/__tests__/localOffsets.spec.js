@@ -84,4 +84,21 @@ describe('OffsetManager without a group', () => {
     expect(cluster.findGroupCoordinator).not.toHaveBeenCalled()
     expect(manager.resolvedOffsets.records[1]).toBe('4')
   })
+
+  test('resolves the one assigned topic from its reset policy', async () => {
+    const { manager, cluster } = create()
+    cluster.fetchTopicsOffset.mockResolvedValue([
+      {
+        topic: 'records',
+        partitions: [
+          { partition: 0, offset: '4' },
+          { partition: 1, offset: '6' },
+        ],
+      },
+    ])
+    await expect(manager.resolveOffsets()).resolves.toBe(true)
+    expect(cluster.fetchTopicsOffset).toHaveBeenCalledTimes(1)
+    expect(manager.nextOffset('records', 0).toString()).toBe('4')
+    expect(manager.nextOffset('records', 1).toString()).toBe('6')
+  })
 })

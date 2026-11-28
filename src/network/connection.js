@@ -7,6 +7,7 @@ const createRequest = require('../protocol/request')
 const Decoder = require('../protocol/decoder')
 const { NETWORK_AUTHENTICATION_FAILURE } = require('./instrumentationEvents')
 const {
+  KafkaJSError,
   KafkaJSConnectionError,
   KafkaJSNonRetriableError,
   KafkaJSConnectionClosedError,
@@ -78,8 +79,48 @@ const SENSITIVE_API_KEYS = new Set([
   apiKeys.AlterUserScramCredentials,
 ])
 
+/** APIs whose responses carry config values, or broker error text that can echo them. */
+const CONFIDENTIAL_API_KEYS = new Set([
+  apiKeys.DescribeConfigs,
+  apiKeys.CreateTopics,
+  apiKeys.AlterConfigs,
+  apiKeys.IncrementalAlterConfigs,
+])
+
+/** APIs whose responses carry records. */
+const CONTENT_API_KEYS = new Set([apiKeys.Fetch, apiKeys.ShareFetch])
+
+/**
+ * Decides what the DEBUG logs of a response may show, for both the decoded data and the raw bytes
+ * of a failed one. `sensitive` and `confidential` are never shown; `content` only when both
+ * buffer flags are set; `plain` always as data, and as raw bytes with the first flag.
+ * @param {number} apiKey
+ * @returns {'sensitive'|'confidential'|'content'|'plain'}
+ */
+const responseLogPolicy = (apiKey) => {
+  if (SENSITIVE_API_KEYS.has(apiKey)) return 'sensitive'
+  if (CONFIDENTIAL_API_KEYS.has(apiKey)) return 'confidential'
+  if (CONTENT_API_KEYS.has(apiKey)) return 'content'
+  return 'plain'
+}
+
+/**
+ * The raw bytes of a failed response as its DEBUG log may show them.
+ * @param {'sensitive'|'confidential'|'content'|'plain'} policy see `responseLogPolicy`
+ * @param {*} payload the response bytes
+ * @param {boolean} showBuffers whether the first buffer flag is set
+ * @param {boolean} showContent whether both buffer flags are set
+ * @returns {*} the payload, or its filtered stand-in
+ */
+const loggedPayload = (policy, payload, showBuffers, showContent) => {
+  if (policy === 'sensitive' || policy === 'confidential') return '[filtered]'
+  const shown = policy === 'content' ? showContent : showBuffers || !Buffer.isBuffer(payload)
+  return shown ? payload : { type: 'Buffer', data: '[filtered]' }
+}
+
 const PRIVATE = {
   SHOULD_REAUTHENTICATE: Symbol('private:Connection:shouldReauthenticate'),
+  SESSION_REFUSAL: Symbol('private:Connection:sessionRefusal'),
   AUTHENTICATE: Symbol('private:Connection:authenticate'),
   PREPARE: Symbol('private:Connection:prepare'),
   ENQUEUE: Symbol('private:Connection:enqueue'),
@@ -259,8 +300,18 @@ module.exports = class Connection {
           port: this.port,
         })
         this.setupAttempt?.fail(error)
-        this.closeGeneration(error)
+        try {
+          this.closeGeneration(error)
+        } catch (reason) {
+          try {
+            this.logError('Failed to close the timed-out connection', {
+              error: describeThrown(reason),
+              cause: reason,
+            })
+          } catch {}
+        }
       },
+      onDispatchFailure: (error) => this.failGeneration(error),
     })
 
     this.versions = null
@@ -595,13 +646,18 @@ module.exports = class Connection {
       return true
     }
 
-    this.closeGeneration(
-      new KafkaJSConnectionClosedError('Closed connection', {
-        host: this.host,
-        port: this.port,
-      }),
-      socket || this.socket
-    )
+    let teardownFailure = null
+    try {
+      this.closeGeneration(
+        new KafkaJSConnectionClosedError('Closed connection', {
+          host: this.host,
+          port: this.port,
+        }),
+        socket || this.socket
+      )
+    } catch (reason) {
+      teardownFailure = { reason }
+    }
     if (drainFailed) {
       try {
         this.logError('Failed to drain connection', {
@@ -611,6 +667,7 @@ module.exports = class Connection {
       } catch {}
     }
     this.requestQueue.emitQueueState()
+    if (teardownFailure) throw teardownFailure.reason
     try {
       this.logDebug('disconnected')
     } catch {}
@@ -642,11 +699,17 @@ module.exports = class Connection {
       return
     }
 
-    this.closeGeneration(error)
+    let teardownFailure = null
+    try {
+      this.closeGeneration(error)
+    } catch (reason) {
+      teardownFailure = { reason }
+    }
     if (messagePrefix !== null) {
       error.message = messagePrefix + describeThrown(error.cause)
     }
     this.requestQueue.emitQueueState()
+    if (teardownFailure) throw teardownFailure.reason
     try {
       this.logDebug('Generation failed', {
         cause: describeThrown(error, 'name'),
@@ -662,6 +725,8 @@ module.exports = class Connection {
    * @param {Error} error what the requests left on the connection are rejected with
    * @param {object} [socket=this.socket] the socket of the generation being ended
    * @returns {void}
+   * @throws {*} the first failure detaching or destroying the socket, once the rest of the
+   *   teardown has run; callers still run the queue observers, then rethrow or log it
    */
   closeGeneration(error, socket = this.socket) {
     clearTimeout(this.idleTimer)
@@ -681,12 +746,21 @@ module.exports = class Connection {
     }
 
     // `error` stays attached, inert once the attempt is over: a post-close error on the old socket
-    // (e.g. ECONNRESET) must not become an uncaught exception.
+    // (e.g. ECONNRESET) must not become an uncaught exception. The socket is destroyed even when
+    // detaching throws; the failure is boxed, so a falsy reason still counts.
+    let failure = null
     if (socket && !socket.destroyed) {
-      detachSocket(socket)
-      socket.destroy()
+      try {
+        detachSocket(socket)
+      } catch (reason) {
+        failure = { reason }
+      }
+      try {
+        if (!socket.destroyed) socket.destroy()
+      } catch (reason) {
+        failure ??= { reason }
+      }
     }
-
     if (this.socket === socket) {
       this.socket = null
     }
@@ -694,6 +768,7 @@ module.exports = class Connection {
     this.frames.reset()
     this.requestQueue.settleAll(error)
     this.requestQueue.destroy()
+    if (failure) throw failure.reason
   }
 
   /**
@@ -794,13 +869,20 @@ module.exports = class Connection {
    * @returns {boolean}
    */
   isAuthenticated() {
-    return this.authenticatedAt != null && !this[PRIVATE.SHOULD_REAUTHENTICATE]()
+    return (
+      this.authenticatedAt != null &&
+      !this[PRIVATE.SHOULD_REAUTHENTICATE](this.reauthenticationThreshold)
+    )
   }
 
-  /***
+  /**
+   * Whether less than `margin` milliseconds remain of the session; never for an unlimited one.
+   * A negative margin counts as 0, so a session the write would refuse is always renewed first.
    * @private
+   * @param {number} margin milliseconds that must still remain
+   * @returns {boolean}
    */
-  [PRIVATE.SHOULD_REAUTHENTICATE]() {
+  [PRIVATE.SHOULD_REAUTHENTICATE](margin) {
     if (this.sessionLifetime.equals(Long.ZERO)) {
       return false
     }
@@ -810,8 +892,25 @@ module.exports = class Connection {
       .multiply(1000)
       .add(Long.fromValue(remainingNanosSince).divide(1000000))
 
-    const reauthenticateAt = millisSince.add(this.reauthenticationThreshold)
+    const withMargin = millisSince.add(margin)
+    const reauthenticateAt = withMargin.lessThan(millisSince) ? millisSince : withMargin
     return reauthenticateAt.greaterThanOrEqual(this.sessionLifetime)
+  }
+
+  /**
+   * Why an ordinary request must not be written on this SASL connection now: a SASL exchange is
+   * running, no session is established, or the session has ended. Reads the monotonic clock at
+   * the moment of the call, so a request held in the queue is judged when it is due to be written.
+   * @private
+   * @returns {KafkaJSError|null} a retriable refusal, or null when the request may be written
+   */
+  [PRIVATE.SESSION_REFUSAL]() {
+    if (this.authEpisode || this.authenticatedAt == null || this[PRIVATE.SHOULD_REAUTHENTICATE](0))
+      return new KafkaJSError(
+        'The SASL session was not valid when the request was due to be written; it was not sent',
+        { retriable: true }
+      )
+    return null
   }
 
   /** Completes readiness once; idle tracking extends this single boundary.
@@ -839,6 +938,7 @@ module.exports = class Connection {
 
   /**
    * Shares one bounded SASL episode on this socket; never adopts a replacement token.
+   * On success, counts the session from the write of the request that set its lifetime.
    * Holds idle preparation once per episode, including token-provider work. An old
    * episode cannot decrement preparation on the replacement connection.
    * @param {{ attempt?: SetupAttempt, requestGuard?: Function|null }} [options] original setup;
@@ -896,7 +996,7 @@ module.exports = class Connection {
         )
         const refusal = guard()
         if (refusal) throw refusal
-        this.authenticatedAt = process.hrtime()
+        this.authenticatedAt = authenticator.sessionStartedAt ?? process.hrtime()
         this.sessionLifetime = Long.fromValue(authenticator.sessionLifetime)
         if (!attempt) budget.ready()
       } catch (error) {
@@ -977,11 +1077,21 @@ module.exports = class Connection {
    * @param {(frameLength?: number) => Error|null} [protocol.guard=null] A pre-write check. It runs once the request is
    *                         encoded and again at the instant of transmission; an error it returns
    *                         rejects this one request, which is then written nowhere, takes no
-   *                         in-flight slot and leaves the connection open.
+   *                         in-flight slot and leaves the connection open. It receives the frame
+   *                         length only at the instant of transmission, after every other refusal,
+   *                         so a caller may record the request as written only on that call.
+   *                         On a SASL connection an ordinary request is also refused at that
+   *                         instant, with a retriable `KafkaJSError`, while a SASL exchange runs or
+   *                         once the session has ended; the guard is then called there without a
+   *                         frame length, and its own refusal wins.
    * @param {(() => Error|null)|null} [protocol.responseGuard=null] original setup/authentication
    *                         guard, checked after decode and parse before publishing side effects
    * @param {(() => void)|null} [protocol.onWrite=null] trusted private once-only commit immediately
    *                         before socket.write; never called at encode, enqueue or response
+   * @param {((decoded: object) => void)|null} [protocol.onDecoded=null] trusted private observer of
+   *                         the decoded reply, called once in the continuation of decode, before
+   *                         the response guard, the throttle and parse, so a caller refused after
+   *                         the broker answered cannot hide what the broker accepted
    * @param {boolean} [protocol.establishedOnly=false] refuse any authentication start or refresh
    * @returns {Promise<data>} where data is the return of "response#parse"
    */
@@ -993,6 +1103,7 @@ module.exports = class Connection {
     guard = null,
     responseGuard = null,
     onWrite = null,
+    onDecoded = null,
     establishedOnly = false,
   }) {
     if (establishedOnly) {
@@ -1005,7 +1116,6 @@ module.exports = class Connection {
           : null
       }
     }
-    const sensitiveResponse = SENSITIVE_API_KEYS.has(request.apiKey)
     const attempt = this.connectAttempt
     const telemetrySink = this.telemetrySink
     const telemetrySlot = telemetrySink ? this.telemetrySlot : null
@@ -1016,12 +1126,21 @@ module.exports = class Connection {
     try {
       expectResponse = !request.expectResponse || request.expectResponse()
       const prepared = this[PRIVATE.PREPARE]({ request, expectResponse, guard, establishedOnly })
+      // Callers record a write when given the frame length, so a refused session asks without it.
+      const writeGuard =
+        this.sasl && isAuthenticatedRequest(request)
+          ? (frameLength) => {
+              const refusal = this[PRIVATE.SESSION_REFUSAL]()
+              if (refusal) return (guard && guard()) || refusal
+              return guard && guard(frameLength)
+            }
+          : guard
       const enqueue = (encoded) =>
         this[PRIVATE.ENQUEUE](
           encoded,
           requestTimeout,
           attempt,
-          guard,
+          writeGuard,
           telemetrySink,
           telemetrySlot,
           onWrite
@@ -1052,8 +1171,10 @@ module.exports = class Connection {
       return
     }
 
+    const policy = responseLogPolicy(request.apiKey)
     try {
       const payloadDecoded = await response.decode(responseBody(entry, payload))
+      if (onDecoded) onDecoded(payloadDecoded)
       const decodedRefusal = responseGuard && responseGuard()
       if (decodedRefusal) throw decodedRefusal
 
@@ -1066,42 +1187,37 @@ module.exports = class Connection {
       const data = await response.parse(payloadDecoded)
       const parsedRefusal = responseGuard && responseGuard()
       if (parsedRefusal) throw parsedRefusal
-      const isFetchApi = entry.apiName === 'Fetch'
-      this.logDebug(`Response ${requestInfo(entry)}`, {
-        correlationId,
-        size,
-        data: sensitiveResponse || (isFetchApi && !this.shouldLogFetchBuffer) ? '[filtered]' : data,
-      })
+      try {
+        this.logDebug(`Response ${requestInfo(entry)}`, {
+          correlationId,
+          size,
+          data:
+            policy === 'plain' || (policy === 'content' && this.shouldLogFetchBuffer)
+              ? data
+              : '[filtered]',
+        })
+      } catch {}
 
       return data
     } catch (e) {
       attachResponseSource(e, request.apiKey)
-      if (logResponseError) {
-        this.logError(`Response ${requestInfo(entry)}`, {
-          error: sensitiveResponse
+      try {
+        const failure =
+          policy === 'sensitive'
             ? 'Sensitive response failed'
             : this.authenticationOwner
               ? 'Telemetry response failed'
-              : e.message,
-          correlationId,
-          size,
-        })
-      }
+              : e.message
+        if (logResponseError) {
+          this.logError(`Response ${requestInfo(entry)}`, { error: failure, correlationId, size })
+        }
 
-      const isBuffer = Buffer.isBuffer(payload)
-      this.logDebug(`Response ${requestInfo(entry)}`, {
-        error: sensitiveResponse
-          ? 'Sensitive response failed'
-          : this.authenticationOwner
-            ? 'Telemetry response failed'
-            : e.message,
-        correlationId,
-        payload: sensitiveResponse
-          ? '[filtered]'
-          : isBuffer && !this.shouldLogBuffers
-            ? { type: 'Buffer', data: '[filtered]' }
-            : payload,
-      })
+        this.logDebug(`Response ${requestInfo(entry)}`, {
+          error: failure,
+          correlationId,
+          payload: loggedPayload(policy, payload, this.shouldLogBuffers, this.shouldLogFetchBuffer),
+        })
+      } catch {}
 
       throw e
     }

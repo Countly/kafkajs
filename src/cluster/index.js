@@ -1,10 +1,9 @@
 const Broker = require('../broker')
 const { checked, waitOf, shareMetadata, retrierOf, sharedSetup } = require('../admin/deadline')
-const CommittedOffsetRevisions = require('./committedOffsetRevisions')
 const describeThrown = require('../network/describeThrown')
 const BrokerPool = require('./brokerPool')
 const MetadataCache = require('./metadataCache')
-const { joinDeadlineError } = require('../consumer/rebalanceErrorContract')
+const { joinDeadlineError, isFatalTopicError } = require('../consumer/rebalanceErrorContract')
 const { CLUSTER_TOPIC_RECREATED } = require('./instrumentationEvents')
 const Lock = require('../utils/lock')
 const { isConnectionFailure } = require('../network/connectionFailure')
@@ -21,6 +20,7 @@ const {
   KafkaJSMetadataNotLoaded,
   KafkaJSTopicMetadataNotLoaded,
   KafkaJSGroupCoordinatorNotFound,
+  KafkaJSProtocolError,
   KafkaJSServerDoesNotSupportApiKey,
 } = require('../errors')
 const COORDINATOR_TYPES = require('../protocol/coordinatorTypes')
@@ -34,6 +34,8 @@ const { keys } = Object
 
 /** @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
 const LEADER_NOT_AVAILABLE = 5
+/** Least ms between two failed background refreshes, see `serveFromCache`. */
+const MIN_BACKGROUND_BACKOFF_MS = 10
 
 const mergeTopics = (obj, { topic, partitions }) =>
   Object.assign(dictionary(), obj, { [topic]: [...(obj[topic] || []), ...partitions] })
@@ -56,6 +58,13 @@ const PER_TOPIC_METADATA_ERRORS = [
  */
 const isPerTopicError = (e) => PER_TOPIC_METADATA_ERRORS.includes(e.type)
 
+/**
+ * @param {Error} e
+ * @param {boolean} surface whether the caller asked for fatal topic errors
+ * @returns {boolean}
+ */
+const surfaced = (e, surface) => surface && isFatalTopicError(e)
+
 /** A broker was asked by id and its answer reached the metadata cache. */
 const RESOLVED = 'resolved'
 /** The negotiated Metadata version cannot carry a topic id, so the ids need another route. */
@@ -70,6 +79,30 @@ const FAILED = 'failed'
  * @returns {[{ fence: import('../producer/generation') }]|[]}
  */
 const fenceArgs = (fence) => (fence ? [{ fence }] : [])
+
+/** @type {WeakMap<object[], Map<number, object>>} see `partitionsById` */
+const partitionIndexes = new WeakMap()
+
+/**
+ * A topic's partitions by id; of two with one id, the first wins, as a search would find it.
+ * Cached per `partitionMetadata` array: an answer installs new arrays, and what is written onto an
+ * installed partition in place (a leader hint, a kept leader) is read through the indexed object,
+ * so a new array is the one invalidation point. Held weakly by that array.
+ * @param {object[]} partitionMetadata
+ * @returns {Map<number, object>}
+ */
+const partitionsById = (partitionMetadata) => {
+  let byId = partitionIndexes.get(partitionMetadata)
+  if (!byId) {
+    byId = new Map()
+    for (const partition of partitionMetadata) {
+      const { partitionId } = partition
+      if (!byId.has(partitionId)) byId.set(partitionId, partition)
+    }
+    partitionIndexes.set(partitionMetadata, byId)
+  }
+  return byId
+}
 
 /**
  * A refresh's context as the trailing argument of a broker-pool call, or no argument at all: only
@@ -132,6 +165,11 @@ module.exports = class Cluster {
    *   the instance (`this.instrumentationEmitter`) and shared with the `MetadataCache` and the
    *   `BrokerPool`, so a topic recreation seen by either surfaces on the same emitter the client
    *   already wraps for its public `on()`.
+   * @param {(status: import('./brokerPool').TopicMetadataStatus) => void} [options.onTopicMetadataStatus]
+   *   given by a consumer for the cluster it owns: a refresh of the targets then isolates an
+   *   established target the broker answers `UNKNOWN_TOPIC_OR_PARTITION`, instead of failing for
+   *   every topic, and reports each change of that topic's status here (see
+   *   `BrokerPool#isolateUnknownTopics`). Producer and admin clusters do not pass it.
    */
   constructor({
     logger: rootLogger,
@@ -165,6 +203,7 @@ module.exports = class Cluster {
     metadataClusterCheck,
     metadataRecoveryRebootstrapTriggerMs,
     bootstrapResolveTimeout = 0,
+    onTopicMetadataStatus,
   }) {
     this.rootLogger = rootLogger
     this.logger = rootLogger.namespace('Cluster')
@@ -201,12 +240,23 @@ module.exports = class Cluster {
     })
 
     this.targetTopics = new Set()
+    /**
+     * See `serveFromCache`; `retryAt` is on the `performance.now()` clock.
+     * @type {?{ fence: object, running: boolean, retryAt: number, backoff: number }}
+     */
+    this.backgroundRefresh = null
     this.metadataMaxIdle = metadataMaxIdle
     this.targetTopicState = metadataMaxIdle === undefined ? null : new Map()
     this.topicPins = metadataMaxIdle === undefined ? null : new Map()
     this.nextTopicIncarnation = 0
-    /** @type {WeakMap<object, {topics: object[], byName: Map<string, object>}>} lookup index per accepted metadata object */
-    this.topicMetadataIndexes = new WeakMap()
+    /** @type {Set<string>|null} the targets the `addMultipleTargetTopics` call in progress adds */
+    this.addingTopics = null
+    /** @type {Set<string>} the targets a metadata answer accepted since they were declared */
+    this.establishedTopics = new Set()
+    /** @type {Set<string>} assigned targets `registerAssignedTopics` added that no answer accepted */
+    this.firstAddTopics = new Set()
+    /** Counts the removals of targets, so an answer to an earlier declaration establishes nothing. */
+    this.targetRevision = 0
     this.mutatingTargetTopics = new Lock({
       description: `updating target topics`,
       timeout: requestTimeout,
@@ -217,7 +267,11 @@ module.exports = class Cluster {
     // retrying, rather than a real "no such topic".
     this.allowAutoTopicCreation = allowAutoTopicCreation
     this.instrumentationEmitter = instrumentationEmitter
-    this.metadataCache = new MetadataCache({ logger: rootLogger, instrumentationEmitter })
+    this.metadataCache = new MetadataCache({
+      logger: rootLogger,
+      instrumentationEmitter,
+      isWanted: (topic) => this.targetTopics.has(topic),
+    })
     this.brokerPool = new BrokerPool({
       telemetryMetrics,
       connectionPoolBuilder: this.connectionPoolBuilder,
@@ -226,6 +280,12 @@ module.exports = class Cluster {
       metadataCache: this.metadataCache,
       captureTopics:
         this.targetTopicState === null ? undefined : (topics) => this.captureTopics(topics),
+      dropTopic:
+        this.targetTopicState === null ? undefined : (topic) => this.dropTargetTopic(topic),
+      isNewTarget:
+        this.targetTopicState === null ? undefined : (topic) => !!this.addingTopics?.has(topic),
+      onTopicMetadataStatus,
+      captureEstablishment: () => this.captureEstablishment(),
       instrumentationEmitter,
       retry,
       allowAutoTopicCreation,
@@ -244,10 +304,17 @@ module.exports = class Cluster {
 
     // A producer lifecycle's call shares nothing with another lifecycle's: each is scoped by its fence.
     const fenceOf = ({ fence } = {}) => fence
+    // Nor does a call join one started before the pool's last disconnect, which installs nothing.
+    const disconnectsOf = () => this.brokerPool.disconnects
+    const recoveriesOf = () => this.brokerPool.recoveries
 
-    this[PRIVATE.CONNECT] = shareMetadata(async ({ fence } = {}) => {
-      return await this.brokerPool.connect(...fenceArgs(fence))
-    }, fenceOf)
+    this[PRIVATE.CONNECT] = shareMetadata(
+      async ({ fence } = {}) => {
+        return await this.brokerPool.connect(...fenceArgs(fence))
+      },
+      fenceOf,
+      disconnectsOf
+    )
 
     // A refresh joins only calls of its own scope: a producer's fence, else the consumer's
     // subscription key (it moves with the generation and the declaration revision), else the
@@ -258,16 +325,21 @@ module.exports = class Cluster {
       this.brokerPool.consumerMetadataGeneration ??
       0
 
-    this[PRIVATE.REFRESH_METADATA] = shareMetadata(async ({ fence, ...scope } = {}) => {
-      fence?.check()
-      checked(null)
-      this.pruneTargetTopics()
-      if (this.targetTopicState !== null && this.targetTopics.size === 0) return
-      return await this.brokerPool.refreshMetadata(
-        Array.from(this.targetTopics),
-        ...refreshArgs({ fence, ...scope })
-      )
-    }, shareScopeOf)
+    this[PRIVATE.REFRESH_METADATA] = shareMetadata(
+      async ({ fence, ...scope } = {}) => {
+        fence?.check()
+        checked(null)
+        this.pruneTargetTopics()
+        if (this.targetTopicState !== null && this.targetTopics.size === 0) return
+        return await this.brokerPool.refreshMetadata(
+          Array.from(this.targetTopics),
+          ...refreshArgs({ fence, ...scope })
+        )
+      },
+      shareScopeOf,
+      disconnectsOf,
+      recoveriesOf
+    )
 
     this[PRIVATE.REFRESH_METADATA_IF_NECESSARY] = shareMetadata(
       async ({ fence, ...scope } = {}) => {
@@ -280,7 +352,9 @@ module.exports = class Cluster {
           ...refreshArgs({ fence, ...scope })
         )
       },
-      shareScopeOf
+      shareScopeOf,
+      disconnectsOf,
+      recoveriesOf
     )
 
     this[PRIVATE.FIND_CONTROLLER_BROKER] = shareMetadata(async () => {
@@ -525,11 +599,72 @@ module.exports = class Cluster {
    * @param {() => boolean} [options.isCurrent] see `refreshMetadata`
    * @param {boolean} [options.allowAutoTopicCreation] see `refreshMetadata`
    * @param {(metadata: object) => void} [options.onMetadata] see `refreshMetadata`
+   * @param {boolean} [options.background] producer sends only: when every target is in the cached
+   *   metadata, return at once, and when that metadata is only past `metadataMaxAge`, refresh it in
+   *   the background, as the Java producer's `waitOnMetadata` does; see `serveFromCache`
    * @returns {Promise<void>}
    * @throws {Error} the lifecycle's close error
    */
-  async refreshMetadataIfNecessary({ fence, ...scope } = {}) {
+  async refreshMetadataIfNecessary({ fence, background = false, ...scope } = {}) {
+    if (background && this.serveFromCache(fence)) return
     await this[PRIVATE.REFRESH_METADATA_IF_NECESSARY]({ fence, ...scope })
+  }
+
+  /**
+   * Serves a call from the cached metadata when it names every target: at once when it is fresh,
+   * and when it is only aged, after starting the shared conditional refresh without waiting for
+   * it. At most one is started per lifecycle at a time; a call while it runs starts nothing and
+   * waits for nothing. Its failure is logged at debug level and delays the next start by a
+   * backoff: `initialRetryTime`, doubling on each failure up to ten times `initialRetryTime` (the
+   * ratio of the Java client's `retry.backoff.ms` to `retry.backoff.max.ms`) or `maxRetryTime` when
+   * lower, and never under `MIN_BACKGROUND_BACKOFF_MS` (10 ms), so an `initialRetryTime` of 0 does
+   * not ask a failing broker back to back; a success clears it. The backoff runs on the monotonic
+   * clock (`performance.now()`), so a wall clock stepped back does not stall it. A refresh fenced
+   * by its lifecycle's close, or begun before the pool's last disconnect, installs nothing, as any
+   * fenced refresh. The state is one object, replaced when the lifecycle changes, and holds no
+   * timer.
+   * @private
+   * @param {import('../producer/generation')} [fence] the sending lifecycle
+   * @returns {boolean} whether the call was served from the cache; false sends it the awaited way
+   */
+  serveFromCache(fence) {
+    fence?.check()
+    this.pruneTargetTopics()
+    const cached = this.brokerPool.metadataState(Array.from(this.targetTopics))
+    if (cached !== 'aged') return cached === 'fresh'
+    let state = this.backgroundRefresh
+    if (!state || state.fence !== fence) {
+      state = this.backgroundRefresh = { fence, running: false, retryAt: 0, backoff: 0 }
+    }
+    if (state.running || performance.now() < state.retryAt) return true
+    state.running = true
+    this[PRIVATE.REFRESH_METADATA_IF_NECESSARY]({ fence }).then(
+      () => {
+        state.running = false
+        state.backoff = 0
+        state.retryAt = 0
+      },
+      (error) => {
+        const {
+          initialRetryTime = createRetry.defaults.initialRetryTime,
+          maxRetryTime = createRetry.defaults.maxRetryTime,
+        } = this.retryOptions
+        const initial = Math.max(initialRetryTime, MIN_BACKGROUND_BACKOFF_MS)
+        state.running = false
+        state.backoff = Math.max(
+          Math.min(state.backoff * 2 || initial, initial * 10, maxRetryTime),
+          MIN_BACKGROUND_BACKOFF_MS
+        )
+        state.retryAt = performance.now() + state.backoff
+        try {
+          this.logger.debug('Background metadata refresh failed', {
+            error: describeThrown(error),
+            retryInMs: state.backoff,
+          })
+        } catch {}
+      }
+    )
+    return true
   }
 
   /**
@@ -565,12 +700,15 @@ module.exports = class Cluster {
    * @see clients/src/main/resources/common/message/MetadataRequest.json
    * @public
    * @param {string[]} topicIds canonical uuid strings
-   * @param {{ isCurrent?: () => boolean }} [options] checked before requests and cache installs;
-   *   guarded old-version discovery reads names without installing global routing metadata
+   * @param {{ isCurrent?: () => boolean, surface?: boolean }} [options] `isCurrent` is checked
+   *   before requests and cache installs; guarded old-version discovery reads names without
+   *   installing global routing metadata. `surface` makes code 17 or 29 for an id throw, for a
+   *   consumer resolving its own current target
    * @returns {Promise<{ resolved: string[], unresolved: string[] }>} the requested ids, split by
    *   whether the cache can name them now. Duplicates and nulls are dropped from both lists.
+   * @throws {Error} only with `surface`: an id answered 17 or 29
    */
-  async refreshMetadataForTopicIds(topicIds, { isCurrent = () => true } = {}) {
+  async refreshMetadataForTopicIds(topicIds, { isCurrent = () => true, surface = false } = {}) {
     const ids = [...new Set(topicIds)].filter((topicId) => topicId != null)
 
     if (!isCurrent() || ids.length === 0) {
@@ -579,6 +717,7 @@ module.exports = class Cluster {
 
     const guarded = arguments[1]?.isCurrent !== undefined
     let outcome = null
+    let fatal = null
 
     try {
       outcome = await this.brokerPool.withBroker(async ({ broker }) => {
@@ -593,7 +732,14 @@ module.exports = class Cluster {
           return RESOLVED
         }
 
-        return await this.fetchMetadataByTopicIds(broker, ids, { isCurrent })
+        try {
+          return await this.fetchMetadataByTopicIds(broker, ids, { isCurrent, surface })
+        } catch (e) {
+          // `withBroker` would try the next broker and drop the error: the answer is the verdict.
+          if (!surfaced(e, surface)) throw e
+          fatal = e
+          return FAILED
+        }
       })
 
       if (outcome === TOO_OLD && isCurrent()) {
@@ -613,6 +759,7 @@ module.exports = class Cluster {
     }
 
     if (!isCurrent()) return { resolved: [], unresolved: [] }
+    if (fatal) throw fatal
 
     const resolution = {
       resolved: ids.filter((topicId) => this.metadataCache.topicName(topicId) != null),
@@ -646,10 +793,12 @@ module.exports = class Cluster {
    * @private
    * @param {import("../broker")} broker
    * @param {string[]} ids
-   * @param {{ isCurrent?: () => boolean }} [options] stale responses have no cache effects
+   * @param {{ isCurrent?: () => boolean, surface?: boolean }} [options] stale responses have no
+   *   cache effects; `surface` throws an id's code 17 or 29
    * @returns {Promise<'resolved'|'failed'>} whether the client managed to ask at all
+   * @throws {Error} only with `surface`: an id answered 17 or 29
    */
-  async fetchMetadataByTopicIds(broker, ids, { isCurrent = () => true } = {}) {
+  async fetchMetadataByTopicIds(broker, ids, { isCurrent = () => true, surface = false } = {}) {
     try {
       if (!isCurrent()) return FAILED
       const response = await broker.metadata(ids.map((topicId) => ({ topicId })))
@@ -658,6 +807,7 @@ module.exports = class Cluster {
       return RESOLVED
     } catch (e) {
       if (!isCurrent()) return FAILED
+      if (ids.length === 1 && surfaced(e, surface)) throw e
       if (ids.length === 1 || !isPerTopicError(e)) {
         this.logger.debug('Metadata by topic id failed; leaving the ids unresolved', {
           topicIds: ids,
@@ -679,6 +829,7 @@ module.exports = class Cluster {
           this.metadataCache.updateTopicsById(response)
         } catch (topicError) {
           if (!isCurrent()) return FAILED
+          if (surfaced(topicError, surface)) throw topicError
           this.logger.debug('Topic id could not be resolved to a name', {
             topicId,
             error: topicError.message,
@@ -867,6 +1018,9 @@ module.exports = class Cluster {
   }
 
   /**
+   * Adds topics to the targets and refreshes metadata when that changed them. On a producer
+   * cluster, a topic this call adds that the broker refuses fails the call and is rolled back,
+   * while an earlier target it refuses affects only itself (see `BrokerPool#settleTopicErrors`).
    * @public
    * @param {string[]} topics
    * @param {object} [options]
@@ -885,14 +1039,13 @@ module.exports = class Cluster {
       checked(null)
       fence?.check()
       checked(null)
-      const previousSize = this.targetTopics.size
-      const previousTopics = new Set(this.targetTopics)
+      this.addingTopics = new Set(topics.filter((topic) => !this.targetTopics.has(topic)))
+      const hasChanged = this.addingTopics.size > 0 || !this.brokerPool.metadata
+      const previousTopics = hasChanged ? new Set(this.targetTopics) : null
       for (const topic of topics) {
         this.targetTopics.add(topic)
         this.touchTargetTopic(topic)
       }
-
-      const hasChanged = previousSize !== this.targetTopics.size || !this.brokerPool.metadata
 
       if (hasChanged) {
         try {
@@ -906,14 +1059,14 @@ module.exports = class Cluster {
             e.type === 'TOPIC_AUTHORIZATION_FAILED'
           ) {
             if (this.targetTopicState === null) {
-              this.targetTopics = previousTopics
+              for (const topic of this.addingTopics) {
+                this.targetTopics.delete(topic)
+                this.establishedTopics.delete(topic)
+              }
+              this.targetRevision++
             } else {
               for (const topic of this.targetTopics) {
-                if (previousTopics.has(topic)) continue
-                this.targetTopics.delete(topic)
-                this.targetTopicState.delete(topic)
-                this.metadataCache.forget(topic)
-                this.brokerPool.forgetTopic(topic)
+                if (!previousTopics.has(topic)) this.forgetTargetTopic(topic)
               }
             }
           }
@@ -922,8 +1075,79 @@ module.exports = class Cluster {
         }
       }
     } finally {
+      this.addingTopics = null
       await this.mutatingTargetTopics.release()
     }
+  }
+
+  /**
+   * Registers names a consumer-protocol coordinator assigned, each on its own: one answer accepts
+   * some and refuses others with `UNKNOWN_TOPIC_OR_PARTITION`. A refused name stays a target
+   * without routing (a first-add row), reported unavailable once and asked for again by the
+   * consumer's refreshes until an answer accepts it, as an established target is. Only this call
+   * creates such rows; `retireFirstAddTopics` ends them. The target lock is held for the
+   * declaration only, never across the request, so a withdrawal never waits behind it. A name
+   * already accepted needs no request. The creation bit is the cluster's, as for any target, so it
+   * is off under a broker-side regex (see `useBrokerRegex`).
+   * @param {string[]} names assigned names
+   * @returns {Promise<string[]>} the names an answer has accepted; the others are pending
+   * @throws {Error} any other topic error of the answer (17 or 29, say) after this call's own
+   *   rows are retired, or the refresh's failure
+   */
+  async registerAssignedTopics(names) {
+    const fresh = names.filter((name) => !this.establishedTopics.has(name))
+    const added = []
+    if (fresh.length) {
+      await this.mutatingTargetTopics.acquire()
+      try {
+        for (const name of fresh) {
+          if (this.firstAddTopics.has(name)) continue
+          this.targetTopics.add(name)
+          this.firstAddTopics.add(name)
+          added.push(name)
+        }
+      } finally {
+        await this.mutatingTargetTopics.release()
+      }
+    }
+    if (added.length) {
+      try {
+        await this.refreshMetadata()
+      } catch (error) {
+        const own = new Set(added)
+        this.retireFirstAddTopics([...this.firstAddTopics].filter((name) => !own.has(name)))
+        throw error
+      }
+    }
+    return names.filter((name) => this.establishedTopics.has(name))
+  }
+
+  /**
+   * Ends every first-add row not in `keep`, synchronously and without the target lock: the name
+   * stops being a target, its pending status is dropped without a report, and a late answer that
+   * names it installs and reports nothing. Releases the cache's pending id resolutions not in
+   * `keep` too (`MetadataCache#releasePending`).
+   * @param {Iterable<string>} [keep] names still assigned
+   * @returns {void}
+   */
+  retireFirstAddTopics(keep = []) {
+    const kept = new Set(keep)
+    for (const topic of this.firstAddTopics) {
+      if (kept.has(topic)) continue
+      this.firstAddTopics.delete(topic)
+      this.targetTopics.delete(topic)
+      this.metadataCache.forget(topic)
+      this.brokerPool.forgetTopic(topic)
+    }
+    this.metadataCache.releasePending(kept)
+  }
+
+  /**
+   * @param {string} topic
+   * @returns {boolean} whether the name is a first-add row: registered, not yet accepted
+   */
+  isTopicPending(topic) {
+    return this.firstAddTopics.has(topic)
   }
 
   /**
@@ -974,10 +1198,64 @@ module.exports = class Cluster {
     const now = Date.now()
     for (const [topic, { lastUsed }] of this.targetTopicState) {
       if (this.topicPins.has(topic) || now - lastUsed < this.metadataMaxIdle) continue
-      this.targetTopics.delete(topic)
-      this.targetTopicState.delete(topic)
-      this.metadataCache.forget(topic)
-      this.brokerPool.forgetTopic(topic)
+      this.forgetTargetTopic(topic)
+    }
+  }
+
+  /**
+   * Forgets a producer target the broker no longer serves, unless a send still holds it: its
+   * queued and retried batches need its routing and its later refreshes. A later send adds a
+   * forgotten target again as a new incarnation.
+   * @param {string} topic target name
+   * @returns {boolean} whether it was forgotten
+   */
+  dropTargetTopic(topic) {
+    if (this.topicPins.has(topic)) return false
+    this.forgetTargetTopic(topic)
+    return true
+  }
+
+  /**
+   * Forgets one producer target, its incarnation and both cached representations; its pins stay
+   * with their owners. Used for idle expiry, a refused add, and `dropTargetTopic`.
+   * @param {string} topic target name
+   * @returns {void}
+   */
+  forgetTargetTopic(topic) {
+    this.targetTopics.delete(topic)
+    this.establishedTopics.delete(topic)
+    this.firstAddTopics.delete(topic)
+    this.targetRevision++
+    this.targetTopicState.delete(topic)
+    this.metadataCache.forget(topic)
+    this.brokerPool.forgetTopic(topic)
+  }
+
+  /**
+   * Captures, when a consumer's named refresh begins, what its answer may judge and establish. A
+   * topic is established once a metadata answer accepted it for its current declaration: the
+   * answer to an add or a refresh that named it, or the answer a manual assignment was validated
+   * with (see `resetTargetTopics`). Only an established target answered
+   * `UNKNOWN_TOPIC_OR_PARTITION` is isolated; any other target keeps the strict error, so a
+   * subscription whose validation failed still fails. A first-add row is judged as established
+   * and is accepted by any answer naming it while it is still a row. Otherwise an answer
+   * establishes nothing once a target was removed after the capture, since its names may have been
+   * declared again since.
+   * @returns {import('./brokerPool').TargetEstablishment}
+   */
+  captureEstablishment() {
+    const revision = this.targetRevision
+    return {
+      isEstablished: (topic) => this.establishedTopics.has(topic) || this.firstAddTopics.has(topic),
+      isTarget: (topic) => this.targetTopics.has(topic),
+      establish: (topics) => {
+        for (const topic of topics) {
+          if (!this.targetTopics.has(topic)) continue
+          if (this.firstAddTopics.delete(topic) || revision === this.targetRevision) {
+            this.establishedTopics.add(topic)
+          }
+        }
+      },
     }
   }
 
@@ -1013,6 +1291,17 @@ module.exports = class Cluster {
   }
 
   /**
+   * Records whether this consumer cluster's subscription is a broker-side regex. While it is, no
+   * Metadata request by name asks the broker to create a topic: every name came from the pattern,
+   * so a deleted match stays deleted, as under a client-side pattern.
+   * @param {boolean} active whether the regex subscription is in place
+   * @returns {void}
+   */
+  useBrokerRegex(active) {
+    this.brokerPool.consumerBrokerRegex = active
+  }
+
+  /**
    * Releases only the captured owner's default scope and fences every earlier refresh.
    * A late old consumer cannot detach a replacement owner's scope.
    * @param {object} scope the owner being disposed
@@ -1029,14 +1318,19 @@ module.exports = class Cluster {
    * Replaces consumer targets and prunes removed decoded/id state without issuing a request.
    * Pattern callers pass an empty list. Captured guards are rechecked after the target lock.
    * `publish` runs under that lock right after the replacement with no await between them, so a
-   * caller can make its own state and the targets change together or not at all.
+   * caller can make its own state and the targets change together or not at all. A kept target
+   * stays established; a target named in `accepted`, the answer that validated the call, is
+   * established and its id recorded, so a deletion and recreation before the first refresh is
+   * still seen as a recreation; any other new target is established by the first refresh that
+   * answers it.
    * @param {string[]} names accepted desired target names
-   * @param {{isCurrent?: () => boolean, publish?: () => void}} [options]
+   * @param {{isCurrent?: () => boolean, publish?: () => void, accepted?: object}} [options]
+   *   `accepted` is the decoded Metadata answer that validated `names`
    * @returns {Promise<boolean>} whether the replacement and `publish` ran; false when `isCurrent`
    *   refused before or after the lock, in which case nothing changed
    * @throws {Error} when acquiring the existing target lock fails
    */
-  async resetTargetTopics(names, { isCurrent = () => true, publish } = {}) {
+  async resetTargetTopics(names, { isCurrent = () => true, publish, accepted } = {}) {
     const next = new Set(names)
     if (!isCurrent()) return false
     await this.mutatingTargetTopics.acquire()
@@ -1046,10 +1340,17 @@ module.exports = class Cluster {
         if (next.has(topic)) continue
         this.metadataCache.forget(topic)
         this.brokerPool.forgetTopic(topic)
+        this.establishedTopics.delete(topic)
+        this.firstAddTopics.delete(topic)
       }
       this.targetTopics = next
-      this.topicMetadataIndexes = new WeakMap()
+      this.targetRevision++
       publish?.()
+      if (accepted) {
+        const topicMetadata = accepted.topicMetadata.filter(({ topic }) => next.has(topic))
+        for (const { topic } of topicMetadata) this.establishedTopics.add(topic)
+        this.metadataCache.updateTopicsById({ ...accepted, topicMetadata })
+      }
       return true
     } finally {
       await this.mutatingTargetTopics.release()
@@ -1190,17 +1491,7 @@ module.exports = class Cluster {
       })
     }
 
-    this.topicMetadataIndexes ??= new WeakMap()
-    let index = this.topicMetadataIndexes.get(metadata)
-    if (!index || index.topics !== metadata.topicMetadata) {
-      const byName = new Map()
-      for (const entry of metadata.topicMetadata) {
-        if (!byName.has(entry.topic)) byName.set(entry.topic, entry)
-      }
-      index = { topics: metadata.topicMetadata, byName }
-      this.topicMetadataIndexes.set(metadata, index)
-    }
-    return index.byName.get(topic)?.partitionMetadata ?? []
+    return BrokerPool.topicRowsByName(metadata).get(topic)?.partitionMetadata ?? []
   }
 
   /**
@@ -1388,14 +1679,13 @@ module.exports = class Cluster {
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/admin/internals/PartitionLeaderStrategy.java
    */
   findLeaderForPartitions(topic, partitions) {
-    const partitionMetadata = this.findTopicPartitionMetadata(topic)
-    return partitions.reduce((result, id) => {
+    const byId = partitionsById(this.findTopicPartitionMetadata(topic))
+    const result = {}
+    for (const id of partitions) {
       const partitionId = parseInt(id, 10)
-      const metadata = partitionMetadata.find((p) => p.partitionId === partitionId)
+      const metadata = byId.get(partitionId)
 
-      if (!metadata) {
-        return result
-      }
+      if (!metadata) continue
 
       if (metadata.leader === null || metadata.leader === undefined) {
         throw new KafkaJSError('Invalid partition metadata', { topic, partitionId, metadata })
@@ -1405,10 +1695,9 @@ module.exports = class Cluster {
         throw createErrorFromCode(LEADER_NOT_AVAILABLE)
       }
 
-      const { leader } = metadata
-      const current = result[leader] || []
-      return { ...result, [leader]: [...current, partitionId] }
-    }, {})
+      ;(result[metadata.leader] ??= []).push(partitionId)
+    }
+    return result
   }
 
   /**
@@ -1487,10 +1776,15 @@ module.exports = class Cluster {
    *   it closed, no broker is asked and no socket opens
    * @returns {Promise<Object>}
    * @throws {KafkaJSBrokerNotFound} when the seed broker's connection failed or timed out
-   * @throws {KafkaJSGroupCoordinatorNotFound} when no broker answered
+   * @throws {KafkaJSGroupCoordinatorNotFound} when no broker answered; its `lastError` is the
+   *   last failure a broker's FindCoordinator request ended with, and its `cause` the first
+   *   non-retriable error answer (an authorization refusal, for example), which also replaces a
+   *   later broker's connection failure
    * @throws {Error} the lifecycle's close error
    */
   async findGroupCoordinatorMetadata({ groupId, coordinatorType, fence }) {
+    let lastError
+    let refusal
     const findCoordinator = async ({ nodeId, broker }) => {
       return await this.retryFor(fence)(async (bail, retryCount, retryTime) => {
         try {
@@ -1516,6 +1810,10 @@ module.exports = class Cluster {
             groupId,
             error: e,
           })
+          lastError = e
+          if (refusal === undefined && e instanceof KafkaJSProtocolError && e.retriable === false) {
+            refusal = e
+          }
 
           if (e.type === 'GROUP_COORDINATOR_NOT_AVAILABLE') {
             this.logger.debug('Group coordinator not available, retrying...', {
@@ -1534,7 +1832,12 @@ module.exports = class Cluster {
 
     let brokerMetadata
     if (this.brokerPool.getNodeIds().length > 0) {
-      brokerMetadata = await this.brokerPool.withBroker(findCoordinator, ...fenceArgs(fence))
+      brokerMetadata = await this.brokerPool
+        .withBroker(findCoordinator, ...fenceArgs(fence))
+        .catch((e) => {
+          if (refusal === undefined || !isConnectionFailure(e)) throw e
+          return null
+        })
     } else {
       const broker = await this.brokerPool.findConnectedBroker(...fenceArgs(fence))
       brokerMetadata = await findCoordinator({
@@ -1556,7 +1859,11 @@ module.exports = class Cluster {
       return brokerMetadata
     }
 
-    throw new KafkaJSGroupCoordinatorNotFound('Failed to find group coordinator')
+    const notFound = new KafkaJSGroupCoordinatorNotFound('Failed to find group coordinator', {
+      cause: refusal,
+    })
+    notFound.lastError = lastError
+    throw notFound
   }
 
   /**
@@ -1779,12 +2086,11 @@ module.exports = class Cluster {
    * @param {string} options.topic
    * @param {string|number} options.partition
    * @param {string} options.offset
+   * @param {object|null} [ticket=null] the publishing mutation's ledger ticket, which makes the
+   *   offset the cell's durable winner when it outranks it
+   * @returns {void} the write goes through the group's ledger, the cache's one writer
    */
-  markOffsetAsCommitted({ groupId, topic, partition, offset }) {
-    const committedOffsets = this.committedOffsets({ groupId })
-
-    committedOffsets[topic] = committedOffsets[topic] || {}
-    CommittedOffsetRevisions.forCache(committedOffsets).advance(topic, partition)
-    committedOffsets[topic][partition] = offset
+  markOffsetAsCommitted({ groupId, topic, partition, offset }, ticket = null) {
+    this.offsetOperations({ groupId }).publish(ticket, topic, partition, offset)
   }
 }

@@ -1,4 +1,3 @@
-const { performance } = require('node:perf_hooks')
 const ClientTelemetry = require('./client')
 const TelemetryMetrics = require('./metrics')
 const {
@@ -7,7 +6,13 @@ const {
   KafkaJSNonRetriableError,
 } = require('../errors')
 
-const CLOCK = { now: () => performance.now(), random: Math.random, setTimeout, clearTimeout }
+// Globals are read per call so fake timers installed after load drive the default clock.
+const CLOCK = {
+  now: () => performance.now(),
+  random: Math.random,
+  setTimeout: (...args) => setTimeout(...args),
+  clearTimeout: (timer) => clearTimeout(timer),
+}
 const DEFAULTS = Object.freeze({ enableMetricsPush: false, telemetryMaxBytes: 1048576 })
 const RESOURCE_KEYS = [
   'client_rack',

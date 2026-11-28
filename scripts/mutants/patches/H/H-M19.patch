@@ -1,0 +1,27 @@
+--- a/src/consumer/rebalanceCoordinator.js
++++ b/src/consumer/rebalanceCoordinator.js
+@@ -308,6 +308,7 @@
+       const group = this.consumerGroup
+       const hooks = group.rebalanceHooks
+       const additionHold = hooks ? Object.freeze({}) : null
++      let ordinaryThrow = false
+       try {
+         if (reason) {
+           this.instrumentationEmitter.emit(REBALANCING, {
+@@ -418,11 +419,14 @@
+         // An ordinary callback failure finishes the live transitions above and then ends the chain,
+         // unchanged, before fetch admission restarts.
+         const listenerFailure = hooks && group.takeListenerFailure(round)
+-        if (listenerFailure) throw listenerFailure
++        if (listenerFailure) {
++          ordinaryThrow = true
++          throw listenerFailure
++        }
+ 
+         ;({ kind, reason } = await this.followUp(revoked.length > 0 && cooperative))
+       } finally {
+-        if (hooks) this.finishListenerRound(round, additionHold)
++        if (hooks) this.finishListenerRound(round, ordinaryThrow ? null : additionHold)
+         round.retire()
+       }
+     } while (reason)

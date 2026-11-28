@@ -1,0 +1,11 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -1649,7 +1649,7 @@
+           // KIP-848 members keep their id for life: the coordinator answers 25 for an epoch it no
+           // longer recognises, not for an id it wants replaced.
+           if (this.kind === 'classic') {
+-            this.forgetMemberId(membershipRevision)
++            this.forgetMemberId()
+           }
+ 
+           throw new KafkaJSError(e)

@@ -255,9 +255,6 @@ test('a second current refusal reports one episode', async () => {
   expect(ctx.errors).toHaveBeenCalledTimes(1)
 
   const throwing = noneGroup()
-  throwing.group.instrumentationEmitter.addListener(PARTITION_HALTED, () => {
-    throw new Error('listener failed')
-  })
   throwing.errors.mockImplementation(() => {
     throw new Error('logger failed')
   })
@@ -362,7 +359,12 @@ test('none halts unknown divergence without a reset request', async () => {
     assignmentEpoch: ctx.group.assignmentEpoch,
   }
   const setDefault = jest.spyOn(ctx.manager, 'setDefaultOffset')
-  const seek = jest.spyOn(ctx.manager, 'seek')
+  const apply = ctx.manager.reposition
+  const refusals = []
+  const seek = jest.spyOn(ctx.manager, 'reposition').mockImplementation(function (entry, bound) {
+    refusals.push(bound.guard())
+    return apply.call(this, entry, bound)
+  })
   const truncations = []
   ctx.group.instrumentationEmitter.addListener(LOG_TRUNCATION, (event) => truncations.push(event))
   const unknown = { action: 'reset', divergingOffset: null, leaderEpoch: 3 }
@@ -378,7 +380,11 @@ test('none halts unknown divergence without a reset request', async () => {
 
   const known = { action: 'truncated', divergingOffset: '4', leaderEpoch: 3 }
   await ctx.group.applyValidationOutcome(TOPIC, 1, '7', known, preparation, 2)
-  expect(seek).toHaveBeenCalledWith({ topic: TOPIC, partition: 1, offset: '4' }, preparation)
+  expect(seek).toHaveBeenCalledWith(
+    { topic: TOPIC, partition: 1, offset: '4' },
+    { guard: expect.any(Function), fence: undefined }
+  )
+  expect(refusals).toEqual([null])
   expect(ctx.halts).toHaveLength(1)
 })
 
@@ -435,19 +441,22 @@ const batchAt = async (offset) =>
   )
 
 /**
- * A public none-policy consumer over a scripted broker: partition 0 has no committed offset,
- * partition 1 is committed at 4, and each partition's log holds one record at the offsets in `logs`.
+ * A public none-policy consumer over a scripted broker: by default partition 0 has no committed
+ * offset, partition 1 is committed at 4, and each partition's log holds one record at the offsets
+ * in `logs`.
  * @param {Record<number, number[]>} logs record offsets by partition
- * @returns {Promise<object>} the consumer, the cluster and what the run observed
+ * @param {Record<number, string>} [committed] stored committed offset by partition
+ * @returns {Promise<object>} the consumer, the cluster and what the run observed, including its
+ *   error and warning logs
  */
-const startWire = async (logs) => {
+const startWire = async (logs, committed = { 0: '-1', 1: '4' }) => {
   const batches = {}
   for (const [partition, offsets] of Object.entries(logs)) {
     for (const offset of offsets) batches[`${partition}|${offset}`] = await batchAt(offset)
   }
   const cluster = groupScript(createScriptedCluster({ nodes: [WIRE_NODE] }), {
     partitions: 2,
-    committed: { 0: '-1', 1: '4' },
+    committed,
   }).answer('Fetch', async ({ maxWaitMs, topics }) => {
     const partitions = topics[0].partitions.map(({ partition, fetchOffset }) => ({
       partition,
@@ -460,14 +469,15 @@ const startWire = async (logs) => {
     }
     return { partitions }
   })
-  const state = { cluster, delivered: [], halts: [], errors: [] }
+  const state = { cluster, delivered: [], halts: [], errors: [], warnings: [] }
   const kafka = new Kafka(
     cluster.kafkaOptions({
-      logLevel: logLevel.ERROR,
+      logLevel: logLevel.WARN,
       logCreator:
         () =>
         ({ level, log }) => {
           if (level === logLevel.ERROR) state.errors.push(log)
+          if (level === logLevel.WARN) state.warnings.push(log)
         },
       retry: { retries: 2, initialRetryTime: 10, maxRetryTime: 20 },
     })
@@ -536,6 +546,30 @@ describe('a none-policy consumer on the wire', () => {
       wire.errors.filter(({ message }) => message.includes('Halted a partition'))
     ).toHaveLength(1)
     expect(wire.frames('OffsetCommit')).toEqual([])
+  })
+
+  test('a stored -500 halts only that partition, with one warning, while a committed sibling delivers', async () => {
+    wire = await startWire({ 1: [4] }, { 0: '-500', 1: '4' })
+    await wire.until(
+      () => wire.halts.length === 1 && wire.delivered.length === 1,
+      'the halt and the sibling'
+    )
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    expect(wire.halts).toHaveLength(1)
+    expect(wire.halts[0]).toMatchObject({ partition: 0, offset: null, reason: 'no-offset' })
+    expect(wire.delivered).toEqual([{ partition: 1, offset: '4' }])
+    expect(wire.frames('ListOffsets')).toEqual([])
+    const warned = wire.warnings.filter(({ storedOffset }) => storedOffset !== undefined)
+    expect(warned).toHaveLength(1)
+    expect(warned[0]).toMatchObject({
+      message: expect.stringContaining('is treated as no committed offset'),
+      groupId: 'none-group',
+      topic: TOPIC,
+      partition: 0,
+      storedOffset: '-500',
+      resetPolicy: 'none',
+    })
   })
 
   test('a seek resumes a none-halted partition at the sought offset without an automatic commit', async () => {

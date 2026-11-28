@@ -1,0 +1,11 @@
+--- a/src/protocol/requests/fetch/index.js
++++ b/src/protocol/requests/fetch/index.js
+@@ -20,7 +20,7 @@
+  * @returns {{ decode: Function, parse: Function }}
+  */
+ const withOptions = (response, options) => ({
+-  decode: (rawData) => response.decode(rawData, options),
++  decode: (rawData) => response.decode(rawData, { ...options, maxDecompressedBatchBytes: 1024 }),
+   parse: response.parse,
+ })
+ 

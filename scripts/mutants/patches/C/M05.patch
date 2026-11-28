@@ -1,0 +1,10 @@
+--- a/src/consumer/consumerGroup.js
++++ b/src/consumer/consumerGroup.js
+@@ -1813,7 +1813,6 @@
+    * @returns {void}
+    */
+   invalidateTopic(topic) {
+-    this.subscriptionState.retireTopic(topic)
+     this.preparationChanged()
+     if (!this.offsetManager || !Object.hasOwn(this.offsetManager.memberAssignment, topic)) {
+       return
