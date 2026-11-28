@@ -10,6 +10,7 @@ const {
   succeeded,
   flushAll,
   quiescent,
+  takeSent,
   transactionalProducer,
   watch,
 } = require('../../__tests__/fixtures/bufferHarness')
@@ -79,6 +80,7 @@ describe('Producer > the buffer > the bound on held records', () => {
       const population = await fill(capacity, records)
       const { admission, batches, wave } = population
       let outcomes
+      let held = null
       try {
         // the same turn admitted its sends before any of their batches existed
         expect(wave).not.toBeNull()
@@ -87,11 +89,15 @@ describe('Producer > the buffer > the bound on held records', () => {
         expect(admission.waitingBytes).toBeLessThanOrEqual(capacity)
         expect(admission.waitingBytes).toBeGreaterThan(0)
         expect(admission.debts).toBeLessThanOrEqual(1024 * batches.length)
-        const heldRecords = batches.reduce((sum, batch) => sum + batch.messages.length, 0)
+        held = takeSent({ batches })
+        const heldRecords = held.batches.reduce((sum, { count }) => sum + count, 0)
         expect(heldRecords).toBeLessThanOrEqual(Math.floor((2 * capacity) / 88))
       } finally {
         outcomes = await drain(population)
       }
+      expect((await held.read()).map(({ records }) => records.length)).toEqual(
+        held.batches.map(({ count }) => count)
+      )
       expect(outcomes.at(-1)).toMatchObject({ reason: 'queue-full' })
       expect(countersOf(admission)).toEqual(quiescent(admission))
     })
@@ -128,7 +134,8 @@ describe('Producer > the buffer > the bound on held records', () => {
     })
     await flushAll()
 
-    expect(batches.map(({ messages }) => messages.length)).toEqual([3, 3, 3, 1])
+    const chunks = takeSent({ batches })
+    expect(chunks.batches.map(({ count }) => count)).toEqual([3, 3, 3, 1])
     const last = batches.pop()
     await drain({ batches, sends: [] })
     expect(admission.reserved).toBe(1536 + 525 + 64)
@@ -146,6 +153,7 @@ describe('Producer > the buffer > the bound on held records', () => {
     await drain({ batches, sends: [sent, waiting] })
     expect(await sent).toEqual([{ topicName: TOPIC, partition: 0, baseOffset: '0' }])
     expect(countersOf(admission)).toEqual(quiescent(admission))
+    expect((await chunks.read()).map(({ records }) => records.length)).toEqual([3, 3, 3, 1])
   })
 
   test('the storage the held records retain is within what they are charged, over 0.9', () => {

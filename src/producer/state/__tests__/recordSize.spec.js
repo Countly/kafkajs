@@ -17,6 +17,7 @@ const {
   deferred,
   flushAll,
   quiescent,
+  readBatch,
   watch,
 } = require('../../__tests__/fixtures/bufferHarness')
 
@@ -690,15 +691,23 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     await release()
 
     expect(sent.state).toBe('fulfilled')
-    const [{ messages, bytes }] = written
-    expect(messages).toEqual([
+    const [{ bytes }] = written
+    const { records } = await readBatch(bytes)
+    expect(records).toEqual([
       {
-        key: 'k',
-        value: 'before',
-        headers: { h: 'x', list: ['a', 'b'] },
+        key: Buffer.from('k'),
+        value: Buffer.from('before'),
+        headers: { h: Buffer.from('x'), list: [Buffer.from('a'), Buffer.from('b')] },
         timestamp: '1700000000123',
+        offset: '0',
       },
-      { value: 'other', timestamp: '1700000000456' },
+      {
+        key: null,
+        value: Buffer.from('other'),
+        headers: {},
+        timestamp: '1700000000456',
+        offset: '1',
+      },
     ])
     expect(firstTimestampOf(bytes)).toBe(1700000000123n)
     expect(bytes.includes(Buffer.from('before'))).toBe(true)
