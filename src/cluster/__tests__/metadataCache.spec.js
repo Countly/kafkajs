@@ -80,10 +80,7 @@ const hintedEndpoint = () => {
   }
   const previous = { nodeId: 2, connectionPool: previousPool, retire: jest.fn(async () => {}) }
   cluster.brokerPool.brokers = { 2: previous }
-  cluster.brokerPool.createBroker = jest.fn(({ nodeId, connectionPool }) => ({
-    nodeId,
-    connectionPool,
-  }))
+  jest.spyOn(cluster.brokerPool, 'createBroker')
   const builds = []
   jest.spyOn(cluster.brokerPool.connectionPoolBuilder, 'build').mockImplementation(
     ({ host, port }) =>
@@ -102,6 +99,36 @@ const until = async (condition) => {
     await new Promise(setImmediate)
   }
   if (!condition()) throw new Error('the schedule never reached its hold point')
+}
+
+/**
+ * Runs production Metadata reconciliation against scripted replies on a real seed. Only builds
+ * for the hint's addresses are held. Metadata can independently adopt or replace the seed pool.
+ * @param {number} seedPort
+ */
+const seedHintRace = async (seedPort) => {
+  const cluster = new Cluster({ ...connectionOpts(), logger: newLogger(), retry: { retries: 0 } })
+  const owner = cluster.brokerPool
+  const builder = owner.connectionPoolBuilder
+  const build = builder.build.bind(builder)
+  const seedPool = await build({ host: '127.0.0.1', port: seedPort })
+  const seed = owner.createBroker({ connectionPool: seedPool, logger: newLogger() })
+  owner.seedBroker = seed
+  jest.spyOn(owner, 'findConnectedBroker').mockResolvedValue(seed)
+  const answer = jest.spyOn(seed, 'metadata')
+  const refresh = (metadata) => {
+    answer.mockResolvedValueOnce(metadata)
+    return owner.refreshMetadata(['test-topic'])
+  }
+  const held = []
+  jest.spyOn(builder, 'build').mockImplementation(async (endpoint) => {
+    const pool = await build(endpoint)
+    if (endpoint.host === '127.0.0.1') return pool
+    jest.spyOn(pool, 'retire')
+    jest.spyOn(pool, 'destroy')
+    return new Promise((resolve) => held.push({ pool, finish: () => resolve(pool) }))
+  })
+  return { cluster, owner, seed, seedPool, refresh, held }
 }
 
 describe('Cluster > MetadataCache', () => {
@@ -1139,7 +1166,7 @@ describe('Cluster > MetadataCache', () => {
       ]).toEqual([2, 8])
     })
 
-    test('Cluster#applyLeaderHint whose leader a Metadata response removes while a later endpoint pool is built installs neither endpoint, moves no route and reports the refusal', async () => {
+    test('Cluster#applyLeaderHint refuses when its leader is detached while a later endpoint pool is built', async () => {
       const { cluster, previous, builds } = hintedEndpoint()
       const hint = cluster.applyLeaderHint({
         ...HINT,
@@ -1151,7 +1178,6 @@ describe('Cluster > MetadataCache', () => {
 
       builds[0].finish()
       await until(() => builds.length === 2)
-      // What a Metadata response that no longer lists node 2 does to the table.
       cluster.brokerPool.closeObsolete(previous)
       builds[1].finish()
 
@@ -1164,6 +1190,104 @@ describe('Cluster > MetadataCache', () => {
         cluster.metadataCache.leader('test-topic', 0),
         cluster.metadataCache.leaderEpoch('test-topic', 0),
       ]).toEqual([1, 5])
+    })
+
+    test('Cluster#applyLeaderHint refuses when a staged broker becomes the seed', async () => {
+      const { cluster, owner, seed, refresh, held } = await seedHintRace(9093)
+      await refresh(response({ brokers: [1, 2] }))
+      expect(owner.brokers[1]).toBe(seed)
+      const promoted = owner.brokers[2]
+      const promotedPool = promoted.connectionPool
+      const hint = cluster.applyLeaderHint({
+        ...HINT,
+        nodeEndpoints: [
+          ...HINT.nodeEndpoints,
+          { nodeId: 3, host: '10.0.0.10', port: 9095, rack: null },
+        ],
+      })
+      await until(() => held.length === 1)
+      held[0].finish()
+      await until(() => held.length === 2)
+
+      owner.removeBroker({ host: '127.0.0.1', port: 9093 })
+      expect(owner.seedBroker).toBe(promoted)
+      held[1].finish()
+
+      await expect(hint).resolves.toBe(false)
+      expect(owner.seedBroker).toBe(promoted)
+      expect(owner.brokers).toEqual({ 2: promoted })
+      expect(promoted.connectionPool).toBe(promotedPool)
+      expect(promotedPool.retired).toBe(false)
+      expect(cluster.metadataCache.leaderEpoch('test-topic', 0)).toBe(5)
+      expect(cluster.metadataCache.leader('test-topic', 0)).toBe(1)
+      for (const { pool } of held) {
+        expect(pool.retire).toHaveBeenCalledTimes(1)
+        expect(pool.destroy).toHaveBeenCalledTimes(1)
+      }
+    })
+
+    test('Cluster#applyLeaderHint refuses to adopt a detached seed whose pool Metadata replaced', async () => {
+      const { cluster, owner, seed, seedPool, refresh, held } = await seedHintRace(9094)
+      await refresh(response({ brokers: [1] }))
+      expect(owner.brokers[2]).toBeUndefined()
+      const hint = cluster.applyLeaderHint({
+        ...HINT,
+        nodeEndpoints: [
+          { nodeId: 2, host: '127.0.0.1', port: 9094, rack: null },
+          { nodeId: 4, host: '10.0.0.10', port: 9096, rack: null },
+        ],
+      })
+      await until(() => held.length === 1)
+      const adoption = response({ brokers: [1, 3] })
+      adoption.brokers[1].port = 9094
+      await refresh(adoption)
+      expect(owner.brokers[3]).toBe(seed)
+      await refresh(response({ brokers: [1, 3] }))
+      const replacement = seed.connectionPool
+      expect(replacement).not.toBe(seedPool)
+      expect(replacement.port).toBe(9095)
+      await refresh(response({ brokers: [1] }))
+      expect(owner.brokers[3]).toBeUndefined()
+      held[0].finish()
+
+      await expect(hint).resolves.toBe(false)
+      expect(owner.brokers[2]).toBeUndefined()
+      expect(owner.brokers[4]).toBeUndefined()
+      expect(owner.seedBroker).toBe(seed)
+      expect(seed.connectionPool).toBe(replacement)
+      expect(replacement.retired).toBe(false)
+      expect(cluster.metadataCache.leader('test-topic', 0)).toBe(1)
+      expect(cluster.metadataCache.leaderEpoch('test-topic', 0)).toBe(5)
+      expect(held[0].pool.retire).toHaveBeenCalledTimes(1)
+      expect(held[0].pool.destroy).toHaveBeenCalledTimes(1)
+    })
+
+    test('Cluster#applyLeaderHint publishes both route views before listeners and telemetry binding', async () => {
+      const { cluster, builds } = hintedEndpoint()
+      const owner = cluster.brokerPool
+      const metadata = response()
+      cluster.metadataCache.update(metadata)
+      const observed = []
+      const route = () => [
+        cluster.metadataCache.leader('test-topic', 0),
+        cluster.metadataCache.leaderEpoch('test-topic', 0),
+        partition0(metadata).leader,
+        partition0(metadata).leaderEpoch,
+        owner.brokers[2].connectionPool,
+      ]
+      cluster.onPartitionRouted(() => observed.push(['listener', ...route()]))
+      jest.spyOn(owner, 'bindTelemetryNode').mockImplementation(() => {
+        observed.push(['telemetry', ...route()])
+      })
+
+      const hint = cluster.applyLeaderHint(HINT)
+      builds[0].finish()
+
+      await expect(hint).resolves.toBe(true)
+      expect(observed).toEqual([
+        ['listener', 2, 7, 2, 7, builds[0].pool],
+        ['telemetry', 2, 7, 2, 7, builds[0].pool],
+      ])
     })
 
     test('Cluster#applyLeaderHint that nothing overtook installs the endpoint, retires the old broker and moves the route', async () => {

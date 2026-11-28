@@ -236,9 +236,10 @@ module.exports = class BrokerPool {
      * holds in its ApiVersions requests, follows the pool's recovery strategy and reports a
      * REBOOTSTRAP_REQUIRED answer to `onApiVersionsFailure`.
      * @param {object} options the `Broker` options the call site chooses
+     * @param {boolean} [options.deferTelemetry] bind after a staged endpoint is published
      * @returns {Broker}
      */
-    this.createBroker = (options) => {
+    this.createBroker = ({ deferTelemetry = false, ...options }) => {
       const broker = new Broker({
         onReady: () => {
           this.bindTelemetryNode(broker)
@@ -255,7 +256,7 @@ module.exports = class BrokerPool {
         onApiVersionsFailure: (error, source) => this.onApiVersionsFailure(error, source),
         ...options,
       })
-      this.bindTelemetryNode(broker)
+      if (!deferTelemetry) this.bindTelemetryNode(broker)
       return broker
     }
 
@@ -629,11 +630,11 @@ module.exports = class BrokerPool {
       return
     }
 
-    const retirements = staged.map((endpoint) => this.installEndpoint(endpoint))
+    const afterCommit = staged.map((endpoint) => this.installEndpoint(endpoint))
     try {
       commit?.()
     } finally {
-      for (const retire of retirements) retire?.()
+      for (const finish of afterCommit) finish?.()
     }
   }
 
@@ -641,7 +642,8 @@ module.exports = class BrokerPool {
    * What installing one endpoint will depend on, read now: the broker the table holds for its node
    * and that broker's connection pool, whether that broker is the seed (whose pool is swapped in
    * place), and, for an unknown node at the address of a seed the table does not hold yet and no
-   * earlier endpoint of the call adopts, the seed it adopts. Any other new address needs a pool.
+   * earlier endpoint of the call adopts, the live seed and concrete pool it adopts. Any other
+   * new address needs a pool.
    * @private
    * @param {object} table the broker table the call started with
    * @param {{ nodeId: number, host: string, port: number, rack: string|null }} address
@@ -649,7 +651,8 @@ module.exports = class BrokerPool {
    * @returns {{ nodeId: number, host: string, port: number, rack: string|null,
    *   broker: import('../broker')|undefined,
    *   pool: import('../network/connectionPool')|undefined, isSeed: boolean,
-   *   seed: import('../broker')|undefined, needsPool: boolean,
+   *   seed: import('../broker')|undefined, seedPool: import('../network/connectionPool')|undefined,
+   *   needsPool: boolean,
    *   connectionPool: import('../network/connectionPool')|null }}
    */
   stageEndpoint(table, address, staged) {
@@ -657,6 +660,8 @@ module.exports = class BrokerPool {
     const seed =
       broker === undefined &&
       this.seedBroker &&
+      !this.seedBroker.retired &&
+      !this.seedBroker.connectionPool.retired &&
       !values(table).includes(this.seedBroker) &&
       !hasBrokerMoved(this.seedBroker, address) &&
       !staged.some((other) => other.seed !== undefined)
@@ -668,6 +673,7 @@ module.exports = class BrokerPool {
       pool: broker?.connectionPool,
       isSeed: broker !== undefined && broker === this.seedBroker,
       seed,
+      seedPool: seed?.connectionPool,
       needsPool: broker ? hasBrokerMoved(broker, address) : seed === undefined,
       connectionPool: null,
     }
@@ -675,30 +681,38 @@ module.exports = class BrokerPool {
 
   /**
    * Whether the table still holds what an endpoint was staged against (`stageEndpoint`): the same
-   * table, the same broker for its node, or still none, with the same connection pool; for the seed
-   * it swaps, the same seed, not retired; for the seed it adopts, the same seed, still outside the
-   * table.
+   * table, the same broker and pool for its node, or still none, and an unchanged seed role. A
+   * seed it adopts must still be outside the table, live and on the captured pool and address.
    * @private
    * @param {object} table the broker table the call started with
    * @param {ReturnType<BrokerPool['stageEndpoint']>} endpoint
    * @returns {boolean}
    */
-  endpointHolds(table, { nodeId, broker, pool, isSeed, seed }) {
+  endpointHolds(table, { nodeId, host, port, broker, pool, isSeed, seed, seedPool }) {
     if (this.brokers !== table || table[nodeId] !== broker) return false
     if (broker !== undefined) {
       return (
         broker.connectionPool === pool &&
-        (!isSeed || (this.seedBroker === broker && !broker.retired))
+        (this.seedBroker === broker) === isSeed &&
+        (!isSeed || (!broker.retired && !pool.retired))
       )
     }
-    return seed === undefined || (this.seedBroker === seed && !values(table).includes(seed))
+    return (
+      seed === undefined ||
+      (this.seedBroker === seed &&
+        seed.connectionPool === seedPool &&
+        !seed.retired &&
+        !seedPool.retired &&
+        !hasBrokerMoved(seed, { host, port }) &&
+        !values(table).includes(seed))
+    )
   }
 
   /**
    * Writes one staged endpoint into the table, synchronously, calling no application code; the
    * caller has checked that it still holds (`endpointHolds`). The retirement of what it replaced,
-   * and the telemetry binding of an adopted seed, are returned, for the caller to run once every
-   * write of its step is done.
+   * and the telemetry binding of an installed pool are returned for the caller to run once every
+   * endpoint and the route have been written.
    * @private
    * @param {ReturnType<BrokerPool['stageEndpoint']>} endpoint
    * @returns {(() => void)|null} the deferred work, if any
@@ -726,14 +740,19 @@ module.exports = class BrokerPool {
       }
     }
 
-    this.brokers[nodeId] = this.createBroker({
+    const replacement = this.createBroker({
       logger: this.rootLogger,
       versions: this.versions,
       connectionPool,
       nodeId,
+      deferTelemetry: true,
     })
+    this.brokers[nodeId] = replacement
     this.detachObsolete(broker)
-    return () => this.closeObsolete(broker)
+    return () => {
+      this.bindTelemetryNode(replacement)
+      this.closeObsolete(broker)
+    }
   }
 
   /**

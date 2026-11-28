@@ -203,12 +203,11 @@ module.exports = class MetadataCache {
           })
           partition.leader = cached.leader
           partition.leaderEpoch = cached.leaderEpoch
-        } else {
-          this.route(name, partition.partitionId, cached, partition.leader, partition.leaderEpoch)
         }
 
-        // Re-seated in both branches: the previous response's object is about to be discarded.
+        // The previous response's object is about to be discarded.
         cached.decoded = partition
+        this.route(name, partition.partitionId, cached, partition.leader, partition.leaderEpoch)
       }
 
       if (entry.topicId != null) {
@@ -402,11 +401,6 @@ module.exports = class MetadataCache {
             partition.leader,
             partition.leaderEpoch
           ) || changed
-
-        if (cached.decoded) {
-          cached.decoded.leader = partition.leader
-          cached.decoded.leaderEpoch = partition.leaderEpoch
-        }
       }
 
       if (entry.topicId != null) {
@@ -534,11 +528,6 @@ module.exports = class MetadataCache {
     const cached = this.topics.get(topic).partitions.get(partition)
     this.route(topic, partition, cached, leaderId, leaderEpoch)
 
-    if (cached.decoded) {
-      cached.decoded.leader = leaderId
-      cached.decoded.leaderEpoch = leaderEpoch
-    }
-
     this.publishRoutingChange()
     return true
   }
@@ -597,19 +586,12 @@ module.exports = class MetadataCache {
 
     this.route(topic, partition, cached, cached.leader, UNKNOWN_EPOCH)
 
-    // `decoded` is null for a topic released by `releaseTopicsAbsentFrom`; guarded exactly as
-    // `applyLeaderHint` guards it.
-    if (cached.decoded) {
-      cached.decoded.leaderEpoch = UNKNOWN_EPOCH
-    }
-
     this.publishRoutingChange()
     return true
   }
 
   /**
-   * Accepts a leader/epoch pair for one cached partition. When the pair changed, the partition
-   * listeners hear of it.
+   * Writes a leader/epoch pair to both views of a partition before reporting a change to listeners.
    * @private
    * @param {string} topic
    * @param {number} partition
@@ -619,11 +601,15 @@ module.exports = class MetadataCache {
    * @returns {boolean} whether the pair changed
    */
   route(topic, partition, cached, leader, leaderEpoch) {
-    if (cached.leader === leader && cached.leaderEpoch === leaderEpoch) return false
+    const changed = cached.leader !== leader || cached.leaderEpoch !== leaderEpoch
     cached.leader = leader
     cached.leaderEpoch = leaderEpoch
-    this.publishPartitionRouted(topic, partition)
-    return true
+    if (cached.decoded) {
+      cached.decoded.leader = leader
+      cached.decoded.leaderEpoch = leaderEpoch
+    }
+    if (changed) this.publishPartitionRouted(topic, partition)
+    return changed
   }
 
   /**

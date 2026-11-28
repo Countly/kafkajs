@@ -560,41 +560,35 @@ describe('returned telemetry surfaces', () => {
     expect(allowed).toBe(false)
   })
 
-  test('normal node inactivity waits for both sockets and obsolete retirement fences the slot', () => {
+  test('normal node inactivity waits for both sockets and obsolete retirement fences the slot', async () => {
     const collector = new TelemetryMetrics({ kind: 'producer' })
-    const slot = collector.bindNode({ nodeId: 1, endpoint: 'a:1', endpointRevision: 1n })
+    const { brokerPool: owner } = new Cluster({
+      logger: newLogger(),
+      brokers: ['a:1'],
+      clientId: 'c',
+      telemetryMetrics: collector,
+    })
+    const pool = new ConnectionPool({ host: 'a', port: 1, clientId: 'c', logger: newLogger() })
+    const broker = owner.createBroker({ connectionPool: pool, logger: newLogger(), nodeId: 1 })
+    const slot = pool.telemetrySlot
+    expect(slot).not.toBeNull()
+    owner.brokers[1] = broker
     const release = jest.spyOn(collector, 'releaseNode')
     const retire = jest.spyOn(collector, 'retireNode')
-    const pool = new ConnectionPool({ host: 'a', port: 1, clientId: 'c', logger: newLogger() })
     for (const connection of pool.pool) {
-      connection.setTelemetryObserver(collector, slot, pool)
       connection.connectionStatus = CONNECTION_STATUS.CONNECTED
     }
     pool.pool[0].closeGeneration(new Error('local'))
     expect(release).not.toHaveBeenCalled()
     pool.pool[1].closeGeneration(new Error('local'))
     expect(release).toHaveBeenCalledWith(slot)
-    pool.telemetrySlot = slot
-    const broker = { connectionPool: pool, retire: jest.fn(async () => {}) }
-    const owner = {
-      seedBroker: null,
-      brokers: { 1: broker },
-      retiredBrokers: new WeakSet(),
-      draining: new Map(),
-      telemetryMetrics: collector,
-      retireTelemetryNode: BrokerPool.prototype.retireTelemetryNode,
-      trackDrain: BrokerPool.prototype.trackDrain,
-      reserveDrain: BrokerPool.prototype.reserveDrain,
-      closeInBackground: (promise) => {
-        promise.catch(() => {})
-      },
-      drainTimeout: 0,
-    }
-    BrokerPool.prototype.closeObsolete.call(owner, broker)
+    const retireBroker = jest.spyOn(broker, 'retire')
+    owner.closeObsolete(broker)
     expect(retire).toHaveBeenCalledWith(slot)
-    expect(broker.retire).toHaveBeenCalledTimes(1)
+    expect(retireBroker).toHaveBeenCalledTimes(1)
     expect(owner.brokers).toEqual({})
     expect(owner.draining.has(broker)).toBe(true)
+    await owner.draining.get(broker)
   })
 
   test('a known node binds one slot per pool, an unknown node gets none and disabled binds nothing', () => {

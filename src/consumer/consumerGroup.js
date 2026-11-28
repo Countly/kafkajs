@@ -2552,10 +2552,11 @@ module.exports = class ConsumerGroup {
       // its authentication or a full queue keeps that frame off the wire; the session forgets the
       // unwritten diff, and the partitions still admitted are sent at once without it. Every
       // refusal leaves out at least one partition for good (a lapsed entry never admits again), so
-      // a round writes at most one frame per partition plus one, and a healthy partition is fetched
-      // in the round whatever another partition's routing does. Bytes already written are judged
-      // at receipt. While no admitting entry stopped admitting since `verifiedAt`, the check is one
-      // comparison; only after one did is the request walked.
+      // a round prepares at most one frame per partition plus one and stops after its first
+      // successful send. A healthy partition is fetched in the round whatever another partition's
+      // routing does. Bytes already written are judged at receipt. While no admitting entry
+      // stopped admitting since `verifiedAt`, the check is one comparison; only after one did is
+      // the request walked.
       let sent = requests
       let tracked = null
       let response
