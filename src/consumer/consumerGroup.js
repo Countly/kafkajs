@@ -722,13 +722,13 @@ module.exports = class ConsumerGroup {
    * unsubscribe: disposing it removes the listener synchronously, so a stopped, restarted or
    * disposed consumer leaves none behind.
    * A cluster without `onRoutingChange` publishes nothing: such a run is woken only by its own
-   * lifecycle events. The run also gets its fetch authority (`openAuthority`).
+   * lifecycle events. The run also gets its fetch authority (`GroupOwnership#startRun`).
    * @private
    * @returns {IdleWait} an open run with its routing subscription registered on its fence
    */
   createRun() {
     const run = new IdleWait()
-    this.openAuthority(run)
+    this.ownership.startRun(run.fence)
     const unsubscribe = this.cluster.onRoutingChange?.(() => {
       if (!run.fence.closed) this.routingChanged()
     })
@@ -738,19 +738,13 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * Opens the fetch authority: the one fence every Fetch captures at entry and checks wherever it
-   * would otherwise check the run's fence. At most one is open. It closes with its run, or earlier
-   * when the assignment is withheld (`withholdAssignment`), and only the first usable install after
-   * that opens the next; an ordinary install keeps it, so a rebalance resets no Fetch session.
-   * @private
-   * @param {IdleWait} run the run it closes with; one registration per authority
-   * @returns {void}
+   * The fetch authority: the one fence every Fetch captures at entry and checks wherever it would
+   * otherwise check the run's fence. Owned by `GroupOwnership`: it closes with its run or at a
+   * withhold, and only the next usable install opens another.
+   * @returns {Generation}
    */
-  openAuthority(run) {
-    const authority = new Generation()
-    /** @type {Generation} */
-    this.authority = authority
-    this.releaseAuthority = run.fence.register((error) => authority.close(error))
+  get authority() {
+    return this.ownership.authority
   }
 
   /**
@@ -974,8 +968,15 @@ module.exports = class ConsumerGroup {
    * inside its install and the newest desired revision is handed on afterwards. Every refresh lets
    * a partition without a leader through as leader -1, so routing skips it; a strict refresh would
    * fail until its retries end and take the fetch loop down with it.
+   *
+   * The hand-off of the newest observed snapshot to the membership is checked against the caller's
+   * fence and run immediately before the snapshot is taken: a caller whose fence closed meanwhile
+   * (a withheld assignment, a stopped run) leaves it where it is, so the next refresh of a live
+   * caller hands it on, even one that sends no request. Each observation replaces the snapshot, so
+   * whoever takes it takes the newest.
    * @param {object} [options]
-   * @param {Generation} [options.fence] the run's terminal fence, binding the refresh to the run
+   * @param {Generation} [options.fence] the caller's fence: the fetch authority on the Fetch path,
+   *   the run's terminal fence at connect; it binds the refresh and the hand-off
    * @param {boolean} [options.ifNecessary=false] refresh only when the cache is missing or expired
    * @returns {Promise<void>}
    * @throws {Error} the refresh's failure or the fence's close error
@@ -1003,10 +1004,11 @@ module.exports = class ConsumerGroup {
       ? this.cluster.refreshMetadataIfNecessary(options)
       : this.cluster.refreshMetadata(options))
 
-    if (this.discovered) {
+    const handsOff = () => isCurrent() && !fence?.closed
+    if (this.discovered && handsOff()) {
       const snapshot = this.discovered
       this.discovered = null
-      await this.updateSubscription(snapshot, { isCurrent })
+      await this.updateSubscription(snapshot, { isCurrent: handsOff })
     }
   }
 
@@ -1207,8 +1209,7 @@ module.exports = class ConsumerGroup {
     }
 
     check()
-    this.ownership?.renew()
-    if (this.authority.closed) this.openAuthority(this.idleWait)
+    this.ownership.renew()
     this.coordinatorLookup.detach()
     this.publishAssignment(currentMemberAssignment, {
       identity: { groupId, generationId, memberId, coordinator },
@@ -1227,26 +1228,25 @@ module.exports = class ConsumerGroup {
    * Refuses the current assignment synchronously, without awaiting anything or calling user code,
    * and keeps the membership: the ownership token is withheld, not renewed, so answers stamped with
    * it stay current, while every commit, resolution and seek under it is refused as
-   * `assignment-refused`. The fetch authority closes with `cause`, so a Fetch that crossed it
-   * publishes nothing, and every later Fetch parks until the next usable install opens a new one.
-   * The partitions are given up through the install's own core with an empty assignment: their
-   * acquisitions retired, queued seeks popped, halts, fetch errors, validations and preferred
-   * replicas cleared, an empty offset manager installed (`uncommittedOffsets()` is `{ topics: [] }`)
-   * and nothing advertised as owned. Assigners are not notified.
+   * `assignment-refused`. The fetch authority closes with `cause` in the same step
+   * (`GroupOwnership#withhold`), so a Fetch that crossed it publishes nothing, and every later Fetch
+   * parks until the next usable install opens a new one. The partitions are given up through the
+   * install's own core with an empty assignment: their acquisitions retired, queued seeks popped,
+   * halts, fetch errors, validations and preferred replicas cleared, and an empty offset manager
+   * installed (`uncommittedOffsets()` is `{ topics: [] }`). The membership protocol withdraws what
+   * it advertises (`withdrawOwned`) and acknowledges nothing. Assigners are not notified.
    * @param {Error} cause the refusal
    * @returns {void}
    */
   withholdAssignment(cause) {
     const lost = this.subscriptionState.assigned()
     this.ownership.withhold(cause)
-    this.releaseAuthority()
-    this.authority.close(cause)
     this.publishAssignment([], {
       identity: this,
       rebuildOffsets: true,
       added: [],
       revoked: lost,
-      notify: false,
+      withhold: true,
     })
   }
 
@@ -1266,7 +1266,8 @@ module.exports = class ConsumerGroup {
    * @param {object} [options.additionHold] holds the added partitions until released
    * @param {Buffer|null} [options.userData] the assignment's user data for the assigners
    * @param {Map<string, number[]>} [options.unionSnapshot] the leader's union snapshot to watch
-   * @param {boolean} [options.notify=true] whether the assigners are told of the assignment
+   * @param {boolean} [options.withhold=false] a withhold: the membership withdraws what it owns
+   *   instead of being told of an applied assignment, and the assigners are not notified
    * @returns {void}
    */
   publishAssignment(
@@ -1280,7 +1281,7 @@ module.exports = class ConsumerGroup {
       additionHold,
       userData,
       unionSnapshot,
-      notify = true,
+      withhold = false,
     }
   ) {
     if (round?.pin) this.publishSubscription(round.pin)
@@ -1413,9 +1414,11 @@ module.exports = class ConsumerGroup {
     }
     this.subscriptionState.update(currentMemberAssignment)
 
-    // A copy: the assignment reaches third-party assigners here, and one that sorts or splices
-    // its argument would otherwise corrupt the ownership set `setOwned` retains below.
-    if (notify) {
+    if (withhold) {
+      this.groupMembership.withdrawOwned()
+    } else {
+      // A copy: the assignment reaches third-party assigners here, and one that sorts or splices
+      // its argument would otherwise corrupt the ownership set `setOwned` retains below.
       this.groupMembership.notifyAssignment({
         partitions: currentMemberAssignment.map(({ topic, partitions }) => ({
           topic,
@@ -1423,9 +1426,8 @@ module.exports = class ConsumerGroup {
         })),
         userData: userData == null ? null : userData,
       })
+      this.groupMembership.setOwned(currentMemberAssignment)
     }
-
-    this.groupMembership.setOwned(currentMemberAssignment)
     this.clearStaleAssignmentPending()
     this.leaderUnionWatch.arm(unionSnapshot)
     this.pruneAssignmentState()
@@ -2543,13 +2545,13 @@ module.exports = class ConsumerGroup {
    * snapshot is built. A stop or restart of the run, or a preparation replaced under it, returns
    * an empty round without error; an idle round sleeps only while its snapshot is current.
    *
-   * The fetch authority captured at entry (`openAuthority`) follows the call to its end: every
-   * refresh, hint and recovery the response starts is bound to it, and each continuation checks it
-   * before it publishes. It closes with the run and when the assignment is withheld, so a response
-   * still being processed then changes nothing, returns no batch and resets only its own pending
-   * session; an ordinary install keeps it, so the response of a rebalance-crossing call is used.
-   * While the current authority is closed (withheld), the call sends nothing: it waits up to
-   * `maxWaitTime` for an install or the end of the run and returns an empty round.
+   * The fetch authority captured at entry (`GroupOwnership#authority`) follows the call to its
+   * end: every refresh, hint, recovery and discovery hand-off the response starts is bound to it,
+   * and each continuation checks it before it publishes. It closes with the run and when the
+   * assignment is withheld, so a response still being processed then changes nothing, returns no
+   * batch and resets only its own pending session; an ordinary install keeps it, so the response
+   * of a rebalance-crossing call is used. While the current authority is closed (withheld), the
+   * call sends nothing (`parkWithheld`).
    *
    * @param {number} nodeId the broker to fetch from
    * @returns {Promise<Batch[]>} one batch per fetched partition; empty when nothing was owed,
@@ -2558,14 +2560,7 @@ module.exports = class ConsumerGroup {
   async fetch(nodeId) {
     const run = this.idleWait
     const authority = this.authority
-    if (authority.closed) {
-      await run.wait(
-        this.maxWaitTime,
-        () => this.authority === authority && !run.fence.closed,
-        run.fence
-      )
-      return []
-    }
+    if (authority.closed) return this.parkWithheld(run, authority)
     const ownershipToken = this.ownership.token()
     let prepared = null
     let requestClock
@@ -2779,6 +2774,27 @@ module.exports = class ConsumerGroup {
       }
       return []
     }
+  }
+
+  /**
+   * Parks a Fetch that found the fetch authority closed (a withheld assignment): it sends nothing
+   * and returns after `maxWaitTime`, or sooner when a usable install replaces that authority or the
+   * run ends. Any other wake (a routing change, a resume) re-arms the wait for the time left, so it
+   * cannot shorten the round. There is always at least one wait, so a zero wait time cannot spin.
+   * @private
+   * @param {IdleWait} run the run of the call
+   * @param {Generation} authority the closed authority the call found
+   * @returns {Promise<Batch[]>} always empty
+   */
+  async parkWithheld(run, authority) {
+    const parked = () => this.authority === authority && !run.fence.closed
+    const deadline = performance.now() + this.maxWaitTime
+    let left = this.maxWaitTime
+    do {
+      await run.wait(left, parked, run.fence)
+      left = deadline - performance.now()
+    } while (parked() && left > 0)
+    return []
   }
 
   /**
@@ -3152,8 +3168,8 @@ module.exports = class ConsumerGroup {
    * @param {number} context.requestClock the acquisition clock when the request was built
    * @param {FetchPreparation} context.prepared the round's preparation, whose identity a refusal
    *   raised from this answer carries
-   * @param {import('../producer/generation')} [context.fence] the terminal fence of the run that
-   *   received the response; the recovery and hint work it starts is bound to it
+   * @param {import('../producer/generation')} [context.fence] the fetch authority the round
+   *   captured at entry; the recovery and hint work it starts is bound to it
    * @returns {Promise<boolean>} whether this partition asks for a metadata refresh
    * @throws {Error} the error an unclassified partition code maps to, or the fence's close error
    */
@@ -3831,7 +3847,8 @@ module.exports = class ConsumerGroup {
    * partition added to one of them reaches `checkForStaleAssignment`. A member that is no longer
    * the leader stops watching instead.
    * @private
-   * @param {Generation} fence the run's fence; a stop or restart cancels the read
+   * @param {Generation} fence the round's fetch authority; a stop, a restart or a withheld
+   *   assignment cancels the read
    * @returns {Promise<void>}
    * @throws {Error} the fence's close error
    */
@@ -3994,7 +4011,7 @@ module.exports = class ConsumerGroup {
    * Given a preparation, every step uses its captured offset manager and checks its guard before
    * popping an intent, after every await, before the resolution retry and its yield, and before
    * any local effect, so a late continuation of a retired or replaced preparation changes nothing.
-   * The retry yield is bound to the run's fence. Without one, nothing changes.
+   * The retry yield is bound to the preparation's fetch authority. Without one, nothing changes.
    * @param {import("../../types").TopicPartitions[]} topicPartitions
    * @param {FetchPreparation} [preparation] the fetch round's identity
    * @returns {Promise<void>}
@@ -4110,7 +4127,7 @@ module.exports = class ConsumerGroup {
    *   offset, which are skipped here - there is no position to check.
    * @param {FetchPreparation} [preparation] the fetch round's identity. Its refusal is never
    *   swallowed by the fail-open policy above: it is rethrown, and the entries this call put in
-   *   flight are returned to unvalidated by identity, also at once when the run's fence closes,
+   *   flight are returned to unvalidated by identity, also at once when its fetch authority closes,
    *   so a held broker reply is not needed to remove them. Without one, nothing changes.
    * @returns {Promise<void>}
    * @throws {Error} the preparation's refusal

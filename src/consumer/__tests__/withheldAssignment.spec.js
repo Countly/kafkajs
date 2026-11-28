@@ -1,3 +1,4 @@
+const ConsumerGroup = require('../consumerGroup')
 const GroupOwnership = require('../groupOwnership')
 const OffsetManager = require('../offsetManager')
 const Runner = require('../runner')
@@ -27,6 +28,11 @@ const {
   fetchResponse,
   prepareRecordBatches,
 } = require('./fixtures/fetchHarness')
+const { createPatternGroup } = require('./fixtures/patternGroup')
+const { CloseRig, batchAt } = require('./fixtures/closeRig')
+
+const ID_A = '01020304-0506-0708-090a-0b0c0d0e0f10'
+const ID_B = '11121314-1516-1718-191a-1b1c1d1e1f20'
 
 const FAKE_TIME = { now: 0, doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] }
 
@@ -158,7 +164,7 @@ const install = (h, partitions, rebuildOffsets = false) => {
   return h.group.applyRebalanceResult({ assignment: { [TOPIC]: partitions } }, { rebuildOffsets })
 }
 
-/** A usable install after a withhold. */
+/** An eager install: the usable install these tests heal a withhold with. */
 const heal = (h, partitions) => install(h, partitions, true)
 
 /** Counts the live registrations made on a fence from now on. */
@@ -405,6 +411,50 @@ describe('loss readers tell a withheld assignment from a lost one', () => {
     expect(fixture.group.commitOffsets).not.toHaveBeenCalled()
     expect(fixture.runner.commitRefusal().reason).toBe('assignment-refused')
   })
+
+  test('a heartbeat answer 27 stamped before a withhold is classified and delivered as a revoked round (withhold driven directly)', async () => {
+    fixture = buildRunner()
+    const { ownership } = fixture.group
+    const answer = stampOwnership(brokerError(27), ownership.token())
+    ownership.withhold(refusal())
+    const verdict = fixture.runner.rebalanceCoordinator.classify(answer, REBALANCE_PATHS.HEARTBEAT)
+    expect(verdict).toMatchObject({ kind: 'revoked', reason: 'rebalance-in-progress' })
+    await fixture.runner.resolveRebalanceVerdict(verdict)
+    expect(fixture.round).toHaveBeenCalledWith('rebalance-in-progress', 'revoked')
+    expect(fixture.group.discardUncommittedOffsets).not.toHaveBeenCalled()
+    expect(ownership.refusal(ownership.token()).reason).toBe('assignment-refused')
+  })
+
+  test('a heartbeat answer 82 stamped before a withhold is classified and delivered as a lost membership (withhold driven directly)', async () => {
+    fixture = buildRunner()
+    const { ownership } = fixture.group
+    const answer = stampOwnership(brokerError(82), ownership.token())
+    ownership.withhold(refusal())
+    const verdict = fixture.runner.rebalanceCoordinator.classify(answer, REBALANCE_PATHS.HEARTBEAT)
+    expect(verdict).toMatchObject({ kind: 'lost', reason: 'lost' })
+    await expect(fixture.runner.resolveRebalanceVerdict(verdict)).rejects.toBe(answer)
+    expect(fixture.group.discardUncommittedOffsets).toHaveBeenCalledTimes(1)
+    expect(fixture.round).not.toHaveBeenCalled()
+    expect(ownership.lost(ownership.token())).toBe(answer)
+    expect(ownership.refusal(ownership.token()).reason).toBe('membership-lost')
+  })
+
+  test('a commit retry after a withhold is refused before the group is asked again (withhold driven directly)', async () => {
+    fixture = buildRunner()
+    const { group, runner } = fixture
+    group.commitOffsets.mockImplementationOnce(async () => {
+      group.ownership.withhold(refusal())
+      throw brokerError(15)
+    })
+    const committing = runner
+      .commitOffsets({ topics: [{ topic: TOPIC, partitions: [{ partition: 0, offset: '1' }] }] })
+      .catch((error) => error)
+    await jest.advanceTimersByTimeAsync(10000)
+    const error = await committing
+    expect(error).toBeInstanceOf(KafkaJSCommitFailedError)
+    expect(error.reason).toBe('assignment-refused')
+    expect(group.commitOffsets).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('an install after a withhold', () => {
@@ -416,6 +466,25 @@ describe('an install after a withhold', () => {
     expect(h.group.ownership.token()).toBe(token + 1)
     expect(h.group.assigned()).toEqual([{ topic: TOPIC, partitions: [0] }])
   })
+
+  test.each(['classic', 'consumer'])(
+    'a %s withhold withdraws through the membership, which is neither told of an assignment nor acknowledges one (withhold driven directly)',
+    async (groupProtocol) => {
+      h = await opened({ partitions: [0], groupProtocol })
+      const membership = h.group.groupMembership
+      membership.setOwned([{ topic: TOPIC, partitions: [0] }])
+      const withdraw = jest.spyOn(membership, 'withdrawOwned')
+      const setOwned = jest.spyOn(membership, 'setOwned')
+      const notify = jest.spyOn(membership, 'notifyAssignment')
+      h.group.withholdAssignment(refusal())
+      expect(withdraw).toHaveBeenCalledTimes(1)
+      expect(setOwned).not.toHaveBeenCalled()
+      expect(notify).not.toHaveBeenCalled()
+      expect(membership.owned()).toEqual([])
+      await heal(h, [0])
+      expect(setOwned).toHaveBeenCalledWith([{ topic: TOPIC, partitions: [0] }])
+    }
+  )
 })
 
 describe('the fetch authority', () => {
@@ -720,8 +789,58 @@ describe('a Fetch that crosses a withhold', () => {
   })
 })
 
+describe('a pattern discovery that crosses a withhold', () => {
+  test.each([
+    ['without a heal', false],
+    ['with a heal', true],
+  ])(
+    'a closed Fetch leaves the snapshot it observed to the next live refresh, %s before its refresh settles (withhold driven directly)',
+    async (_, healFirst) => {
+      const harness = createPatternGroup({
+        catalog: { 'orders-1': ID_A },
+        group: { groupProtocol: 'consumer' },
+      })
+      const { group, cluster } = harness
+      await harness.refresh()
+      const membership = group.groupMembership
+      const published = jest.spyOn(membership, 'updateSubscription')
+
+      harness.set('orders-2', ID_B)
+      const held = gate()
+      let observed = false
+      cluster.refreshMetadataIfNecessary.mockImplementationOnce(async (options) => {
+        options.onMetadata(harness.metadata())
+        observed = true
+        await held.promise
+      })
+      const round = group.fetch(0)
+      await until(() => observed)
+      group.withholdAssignment(refusal())
+      expect(await round).toEqual([])
+      if (healFirst) {
+        group.partitionsPerSubscribedTopic = group.generatePartitionsPerSubscribedTopic()
+        await group.applyRebalanceResult({ assignment: { 'orders-1': [0, 1] } })
+        expect(group.authority.closed).toBe(false)
+      }
+      held.release()
+      for (let n = 0; n < 10; n++) await turn()
+      expect(published).not.toHaveBeenCalled()
+      expect(membership.subscribedTopicNames).not.toContain('orders-2')
+
+      cluster.refreshMetadataIfNecessary.mockImplementationOnce(async () => {})
+      if (!healFirst) {
+        group.partitionsPerSubscribedTopic = group.generatePartitionsPerSubscribedTopic()
+        await group.applyRebalanceResult({ assignment: { 'orders-1': [0, 1] } })
+      }
+      await group.refreshCluster({ fence: group.authority, ifNecessary: true })
+      expect(published).toHaveBeenCalledTimes(1)
+      expect(membership.subscribedTopicNames).toEqual(['orders-1', 'orders-2'])
+    }
+  )
+})
+
 describe('fetching while withheld', () => {
-  test('a withheld assignment parks every Fetch for its wait time with no preparation and no spin (withhold driven directly)', async () => {
+  test('a withheld assignment parks every Fetch for its wait time with no preparation and no spin, through routing changes and resumes (withhold driven directly)', async () => {
     h = await opened({ partitions: [0] })
     jest.useFakeTimers(FAKE_TIME)
     h.group.maxWaitTime = 1000
@@ -738,7 +857,13 @@ describe('fetching while withheld', () => {
       }
     })()
     for (let step = 0; step < 30; step++) {
-      await jest.advanceTimersByTimeAsync(1000)
+      for (let wake = 0; wake < 3; wake++) {
+        await jest.advanceTimersByTimeAsync(250)
+        h.installRouting()
+        h.group.resume([{ topic: TOPIC }])
+        for (let n = 0; n < 5; n++) await turn()
+      }
+      await jest.advanceTimersByTimeAsync(250)
       for (let n = 0; n < 20; n++) await turn()
     }
     expect(rounds).toBeGreaterThanOrEqual(30)
@@ -794,15 +919,23 @@ describe('fetching while withheld', () => {
     expect(h.group.acquired.size).toBe(0)
     h.group.seek({ topic: TOPIC, partition: 0, offset: '9' })
 
+    jest.useFakeTimers(FAKE_TIME)
     let woke = false
     const parked = h.group.fetch(NODE_ID).then((batches) => {
       woke = true
       return batches
     })
-    for (let n = 0; n < 5; n++) await turn()
+    for (let step = 0; step < 59; step++) {
+      await jest.advanceTimersByTimeAsync(1000)
+      h.installRouting()
+      for (let n = 0; n < 3; n++) await turn()
+    }
     expect(woke).toBe(false)
     await heal(h, [0, 1])
+    await drain()
+    expect(woke).toBe(true)
     expect(await parked).toEqual([])
+    jest.useRealTimers()
     expect(h.group.acquired.get(`${TOPIC}|0`)).not.toBe(before)
 
     h.setResponse(reply(42, [0, 1]))
@@ -992,21 +1125,47 @@ describe('commits across a withhold', () => {
     expect(c.manager.committedOffsets().t[0]).toBeUndefined()
   })
 
-  test('a loss answered to a commit written before the withhold is learned and the caller still gets assignment-refused (withhold driven directly)', async () => {
+  test('a commit refused by its guard at the final write after a withhold is never written (withhold driven directly)', async () => {
     const c = commitSetup()
-    const cause = refusal()
+    const queued = gate()
+    const written = []
+    // As the transport does: the request waits in its queue, then the guard is read just before
+    // the bytes would be written, and its refusal rejects the request unwritten.
+    c.coordinator.offsetCommit.mockImplementation(async (request, options) => {
+      await queued.promise
+      const refused = options?.guard?.()
+      if (refused) throw refused
+      written.push(request)
+      return { topics: [] }
+    })
     const sending = c.manager.commitOffsets(OFFSETS).catch((error) => error)
-    await until(() => c.held.length === 1)
-    c.ownership.withhold(cause)
-    const loss = brokerError(25)
-    c.held[0].reject(loss)
-    const error = await sending
-    expect(error).toBeInstanceOf(KafkaJSCommitFailedError)
-    expect(error.reason).toBe('assignment-refused')
-    expect(error.cause).toBe(cause)
-    expect(c.ownership.lost(c.ownership.token())).toBe(loss)
-    expect(c.lost).toEqual([loss])
+    await until(() => c.coordinator.offsetCommit.mock.calls.length === 1)
+    c.ownership.withhold(refusal())
+    queued.release()
+    expect(await sending).toMatchObject({ reason: 'assignment-refused' })
+    expect(written).toEqual([])
+    expect(c.events).toEqual([])
+    expect(c.manager.committedOffsets().t[0]).toBeUndefined()
   })
+
+  test.each([22, 25])(
+    'a loss %i answered to a commit written before the withhold is learned and the caller still gets assignment-refused (withhold driven directly)',
+    async (code) => {
+      const c = commitSetup()
+      const cause = refusal()
+      const sending = c.manager.commitOffsets(OFFSETS).catch((error) => error)
+      await until(() => c.held.length === 1)
+      c.ownership.withhold(cause)
+      const loss = brokerError(code)
+      c.held[0].reject(loss)
+      const error = await sending
+      expect(error).toBeInstanceOf(KafkaJSCommitFailedError)
+      expect(error.reason).toBe('assignment-refused')
+      expect(error.cause).toBe(cause)
+      expect(c.ownership.lost(c.ownership.token())).toBe(loss)
+      expect(c.lost).toEqual([loss])
+    }
+  )
 
   test('a withhold after the answer and before the commit event suppresses the event and the cache write (withhold driven directly)', async () => {
     const c = commitSetup()
@@ -1018,9 +1177,121 @@ describe('commits across a withhold', () => {
     expect(c.events).toEqual([])
     expect(c.manager.committedOffsets().t[0]).toBeUndefined()
   })
+
+  test.each([
+    ['a loss', false],
+    ['a loss and a usable install', true],
+  ])(
+    'a withhold, then %s, after the answer and before the commit event report no commit and cache nothing; the caller gets the loss (withhold driven directly)',
+    async (_, installs) => {
+      const c = commitSetup()
+      const loss = brokerError(25)
+      inPublicationGap(c, () => {
+        const token = c.ownership.token()
+        c.ownership.withhold(refusal())
+        c.ownership.lose(loss, token)
+        if (installs) c.ownership.renew()
+      })
+      const sending = c.manager.commitOffsets(OFFSETS).catch((error) => error)
+      await until(() => c.held.length === 1)
+      c.held[0].resolve({ topics: [] })
+      const error = await sending
+      expect(error).toMatchObject({ reason: 'membership-lost' })
+      expect(error.cause).toBe(loss)
+      expect(c.events).toEqual([])
+      expect(c.manager.committedOffsets().t[0]).toBeUndefined()
+    }
+  )
 })
 
 describe('what a withhold leaves to a running handler', () => {
+  let rig = null
+  afterEach(async () => {
+    jest.restoreAllMocks()
+    await rig?.dispose()
+    rig = null
+  })
+
+  /** @returns {object[]} every consumer group whose run connects from now on */
+  const captureGroups = () => {
+    const groups = []
+    const connect = ConsumerGroup.prototype.connect
+    jest.spyOn(ConsumerGroup.prototype, 'connect').mockImplementation(function (...args) {
+      groups.push(this)
+      return connect.apply(this, args)
+    })
+    return groups
+  }
+
+  test('a running handler reads an empty uncommittedOffsets() after a withhold and its commit is refused unwritten (withhold driven directly)', async () => {
+    const groups = captureGroups()
+    rig = await CloseRig.open()
+    const consumer = rig.consumer()
+    await consumer.connect()
+    await consumer.subscribe({ topic: TOPIC, fromBeginning: true })
+    const entered = gate()
+    const proceed = gate()
+    const seen = {}
+    await consumer.run({
+      autoCommit: false,
+      eachBatch: async ({ batch, resolveOffset, uncommittedOffsets }) => {
+        if (seen.before) return
+        resolveOffset(batch.messages[0].offset)
+        seen.before = uncommittedOffsets()
+        entered.release()
+        await proceed.promise
+        seen.after = uncommittedOffsets()
+        seen.commit = await consumer
+          .commitOffsets([{ topic: TOPIC, partition: 0, offset: '1' }])
+          .then(
+            () => 'committed',
+            (error) => error
+          )
+      },
+    })
+    await entered.promise
+    groups[0].withholdAssignment(refusal())
+    proceed.release()
+    await until(() => seen.commit !== undefined)
+
+    expect(seen.before.topics).toHaveLength(1)
+    expect(seen.after).toEqual({ topics: [] })
+    expect(seen.commit).toBeInstanceOf(KafkaJSCommitFailedError)
+    expect(seen.commit.reason).toBe('assignment-refused')
+    expect(rig.frames('OffsetCommit')).toEqual([])
+  })
+
+  test('the runner delivers no batch of a Fetch answered before a withhold once the withhold lands (withhold driven directly)', async () => {
+    const groups = captureGroups()
+    rig = await CloseRig.open({ partitions: 2, log: { '1|0': await batchAt(0) } })
+    const consumer = rig.consumer()
+    await consumer.connect()
+    await consumer.subscribe({ topic: TOPIC, fromBeginning: true })
+    const entered = gate()
+    const proceed = gate()
+    const delivered = []
+    await consumer.run({
+      autoCommit: false,
+      eachMessage: async ({ partition }) => {
+        delivered.push(partition)
+        if (delivered.length > 1) return
+        entered.release()
+        await proceed.promise
+      },
+    })
+    await entered.promise
+    groups[0].withholdAssignment(refusal())
+    proceed.release()
+    for (let n = 0; n < 50; n++) await turn()
+
+    // Both partitions had a record at offset 0 in the first Fetch, so the other batch was queued.
+    const [first] = rig.frames('Fetch')
+    expect(first.fields.topics[0].partitions.map(({ fetchOffset }) => String(fetchOffset))).toEqual(
+      ['0', '0']
+    )
+    expect(delivered).toHaveLength(1)
+  })
+
   test('uncommittedOffsets() read after a withhold is an empty set (withhold driven directly)', async () => {
     h = await opened({ partitions: [0] })
     h.setResponse(reply(42, [0]))

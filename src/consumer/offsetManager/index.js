@@ -460,9 +460,11 @@ module.exports = class OffsetManager {
    *   caller checks and any recovery, and a throw from it still releases the attempt
    * @returns {Promise<object>} the decoded response
    * @throws {Error} whatever the coordinator answered, stamped; a refusal from the caller's guard
-   *   replaces it, and only a public call's expired deadline (`isCallDeadline`) first lets the
-   *   original answer's ownership loss be learned for its own token. A retired run or a forced
-   *   close publishes nothing. `KafkaJSCommitFailedError` before any lookup or write for a
+   *   replaces it. Two caller refusals first let the original answer's ownership loss be learned
+   *   for its own token: a public call's expired deadline (`isCallDeadline`), and a withheld
+   *   assignment (`assignment-refused`), whose membership is still current; the caller still gets
+   *   the refusal its guard gave before the loss was learned. A retired run or a forced close
+   *   publishes nothing. `KafkaJSCommitFailedError` before any lookup or write for a
    *   consumer-protocol payload whose member epoch is not positive (`memberEpochRefusal`)
    */
   async sendOffsetCommit(
@@ -1642,10 +1644,11 @@ module.exports = class OffsetManager {
    * broker; the caller still gets its refusal or error. A caller whose membership was lost or whose
    * run or operation ended records nothing. Emits
    * `COMMIT_OFFSETS` with a copy of the payload sent, down to each cell, once the request
-   * succeeds, unless the run ended for good meanwhile and the caller refuses,
-   * and records after the emit, so a listener that replaces or edits the reported cells
-   * changes nothing recorded. The copy is made only when something listens: one object per topic
-   * and per cell.
+   * succeeds, unless the caller refuses and its token may no longer report
+   * (`GroupOwnership#publishes`: the run ended for good, or the token's assignment was withheld,
+   * also when a loss followed); a loss alone still reports the commit. It records after the emit,
+   * so a listener that replaces or edits the reported cells changes nothing recorded. The copy is
+   * made only when something listens: one object per topic and per cell.
    *
    * A default selection (`since`) is sent once, under this one ticket, with only its cells that
    * are still authorized at the write: a cell sought or acquired again since the selection is
@@ -1656,9 +1659,10 @@ module.exports = class OffsetManager {
    * @private
    * @param {object} payload the `Broker#offsetCommit` payload
    * @param {{topic: string, partitions: {partition: number|string, offset: string}[]}[]} topics
-   * @param {{guard?: Function, fence?: object, since?: number}} [options] the guard is checked
-   *   again before local publication; the fence binds the coordinator discovery; `since` is the
-   *   seek clock of a default selection
+   * @param {{guard?: Function, fence?: object, since?: number, token?: number}} [options] the
+   *   guard is checked again before local publication; the fence binds the coordinator discovery;
+   *   `since` is the seek clock of a default selection; `token` is the membership identity the
+   *   commit began under and retains, whose history decides whether the commit is reported
    * @returns {Promise<void>}
    * @throws {Error} whatever the commit raised; nothing is recorded then
    */
@@ -1688,11 +1692,10 @@ module.exports = class OffsetManager {
           if (this.membershipProtocol === 'consumer') sent.groupGenerationId = this.generationId
         }
       }
-      // A run ended for good, or an assignment withheld, while the answer was on its way reports
-      // no commit.
+      // A run ended for good, or an assignment withheld (even if a loss followed), while the answer
+      // was on its way reports no commit.
       const ended =
-        (this.ownership?.permanent || this.ownership?.withheld(options?.token)) &&
-        options?.guard?.()
+        this.ownership && !this.ownership.publishes(options?.token) && options?.guard?.()
       if (ended) throw ended
       if (this.instrumentationEmitter.hasListeners(COMMIT_OFFSETS)) {
         this.instrumentationEmitter.emit(COMMIT_OFFSETS, {

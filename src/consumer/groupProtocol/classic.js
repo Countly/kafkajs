@@ -964,6 +964,15 @@ module.exports = class ClassicGroupProtocol {
   }
 
   /**
+   * Gives up the whole owned set for a withheld assignment: the next JoinGroup advertises no owned
+   * partitions, and the next round counts everything it is assigned as added.
+   * @returns {void}
+   */
+  withdrawOwned() {
+    this.ownedPartitions = []
+  }
+
+  /**
    * The difference between what this member owns and what it was just assigned.
    * @param {import('./interface').TopicPartitions[]} assignment
    * @returns {{ added: import('./interface').TopicPartitions[],

@@ -319,6 +319,8 @@ module.exports = class ConsumerGroupProtocol {
     this.sentFields = new SentFields()
     this.lastRequestAt = 0
     this.immediatePending = false
+    /** A withdrawal (`withdrawOwned`) not reported yet: the next tick sends in any in-group state. */
+    this.withdrawalPending = false
     this.backoff = new HeartbeatBackoff(retry)
     // Seeded to now, not to 0: zero reads as "refreshed at the epoch", which makes the very first
     // heartbeat's staleness check fire a metadata request the reconciliation step is about to make
@@ -354,7 +356,7 @@ module.exports = class ConsumerGroupProtocol {
           return false
         }
 
-        if (this.immediatePending && shouldHeartbeatNow(this.state)) {
+        if ((this.immediatePending && shouldHeartbeatNow(this.state)) || this.withdrawalPending) {
           return this.sendHeartbeat({ sendAllFields: this.state === JOINING, guard, onAccepted })
         }
 
@@ -1244,6 +1246,7 @@ module.exports = class ConsumerGroupProtocol {
 
     this.lastRequestAt = Date.now()
     this.immediatePending = false
+    this.withdrawalPending = false
     this.backoff.takeDue()
 
     try {
@@ -2084,6 +2087,30 @@ module.exports = class ConsumerGroupProtocol {
     }
 
     this.acknowledge()
+  }
+
+  /**
+   * Gives up the whole owned set for a withheld assignment, without acknowledging anything. The
+   * owned partitions and the local assignment become empty under the same local epoch, so the next
+   * heartbeat reports no owned partitions, and the member epoch is kept. A step result not applied
+   * yet is dropped: only a later successful apply (`setOwned`) acknowledges the target.
+   *
+   * A member in the group that still holds a target it no longer owns moves to RECONCILING, so an
+   * acknowledgement in flight cannot settle it as STABLE. When partitions were advertised, the
+   * next tick sends one heartbeat in whatever in-group state the member is, also after a heartbeat
+   * in flight answers; an armed backoff still paces it. No round is asked for.
+   * @returns {void}
+   */
+  withdrawOwned() {
+    const advertised = this.localAssignment.byTopicId.size > 0
+    this.ownedPartitions = []
+    this.pendingResolved = null
+    this.localAssignment = { localEpoch: this.localAssignment.localEpoch, byTopicId: new Map() }
+    if (this.state !== STABLE && this.state !== RECONCILING && this.state !== ACKNOWLEDGING) return
+    if (this.needsReconciliation()) this.transitionTo(RECONCILING)
+    if (!advertised) return
+    this.withdrawalPending = true
+    this.requestTick()
   }
 
   /**

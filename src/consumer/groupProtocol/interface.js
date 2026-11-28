@@ -74,6 +74,9 @@ const COOPERATIVE = 'cooperative'
  * @property {() => TopicPartitions[]} owned
  * @property {(topicPartitions: TopicPartitions[]) => void} narrowOwned shrink only
  * @property {(topicPartitions: TopicPartitions[]) => void} setOwned widen to what was applied
+ * @property {() => void} withdrawOwned give up the whole owned set for a withheld assignment,
+ *   acknowledging nothing; the consumer protocol keeps its member epoch and reports no owned
+ *   partitions on its next heartbeat
  * @property {(snapshot: {names: string[], revision: number}) => void} updateSubscription takes the
  *   newest desired subscription: the consumer protocol declares it on its next heartbeat, the
  *   classic protocol on its next join
