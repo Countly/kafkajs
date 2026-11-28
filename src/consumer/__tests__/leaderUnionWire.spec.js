@@ -412,7 +412,7 @@ const assigned = async (env, members) => {
 }
 
 /** @param {ConsumerGroup} group @returns {Promise<void>} one fetch preparation on the current run */
-const prepare = (group) => group.prepareFetch(0, group.idleWait, group.ownership.token())
+const prepare = (group) => group.prepareFetch(0, group.authority, group.ownership.token())
 
 describe('leader union over the real transport', () => {
   beforeEach(() => {

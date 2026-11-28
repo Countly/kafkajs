@@ -154,7 +154,8 @@ class SentFields {
  *
  * @param {Object} protocol the membership, read for `groupId`, `memberId`, `memberEpoch`,
  *   `groupInstanceId`, `rackId`, `rebalanceTimeoutMs`, `subscribedTopicNames`,
- *   `subscribedTopicRegex`, `regexUpdated`, `serverAssignor`, `localAssignment` and `sentFields`
+ *   `subscribedTopicRegex`, `regexUpdated`, `serverAssignor`, `localAssignment`, `withdrawn` (the
+ *   owned set is sent on every heartbeat while true) and `sentFields`
  * @param {{ sendAllFields?: boolean, leaveEpoch?: number|null }} [options] `sendAllFields` is true
  *   exactly while the member is joining; `leaveEpoch` replaces the member epoch with −1 (dynamic)
  *   or −2 (static) for a leave
@@ -212,8 +213,11 @@ const buildRequest = (protocol, { sendAllFields = false, leaveEpoch = null } = {
     request.ServerAssignor = protocol.serverAssignor
   }
 
+  // A withdrawn member restates its empty owned set on every heartbeat: an omitted set reads as
+  // still owning whatever the coordinator revokes later.
   if (
     sendAllFields ||
+    protocol.withdrawn ||
     !localAssignmentEquals(sentFields.localAssignment, protocol.localAssignment)
   ) {
     request.TopicPartitions = [...protocol.localAssignment.byTopicId].map(

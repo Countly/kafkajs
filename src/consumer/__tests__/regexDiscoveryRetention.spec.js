@@ -268,19 +268,19 @@ describe('discovery through a consumer group', () => {
     group.rebalanceCoordinator = { isRebalancing: () => false, requestRejoin }
     await harness.refresh()
     await harness.round()
-    await group.prepareFetch(0, group.idleWait, group.ownership.token())
+    await group.prepareFetch(0, group.authority, group.ownership.token())
     expect(requestRejoin).not.toHaveBeenCalled()
 
     harness.set('orders-2', ID_B)
     await harness.refresh()
-    await group.prepareFetch(0, group.idleWait, group.ownership.token())
+    await group.prepareFetch(0, group.authority, group.ownership.token())
     expect(requestRejoin).toHaveBeenCalledTimes(1)
     expect(requestRejoin).toHaveBeenCalledWith(
       expect.objectContaining({ kind: 'revoked', reason: 'subscription-changed' })
     )
 
     await harness.round()
-    await group.prepareFetch(0, group.idleWait, group.ownership.token())
+    await group.prepareFetch(0, group.authority, group.ownership.token())
     expect(requestRejoin).toHaveBeenCalledTimes(1)
   })
 

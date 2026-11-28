@@ -5,6 +5,7 @@ const { createScriptedCluster, groupScript } = require('../../../testHelpers/scr
 const { RecordBatch } = require('../../protocol/recordBatch/v0')
 const RecordEncoder = require('../../protocol/recordBatch/record/v0')
 const GroupOwnership = require('../groupOwnership')
+const { FetchPreparation } = require('../fetchPreparation')
 const {
   events: { PARTITION_HALTED, LOG_TRUNCATION },
 } = require('../instrumentationEvents')
@@ -387,6 +388,54 @@ test('none halts unknown divergence without a reset request', async () => {
   expect(refusals).toEqual([null])
   expect(ctx.halts).toHaveLength(1)
 })
+
+test.each([
+  [
+    'the log sink',
+    0,
+    (ctx, withhold) => {
+      const warn = ctx.group.logger.warn.bind(ctx.group.logger)
+      jest.spyOn(ctx.group.logger, 'warn').mockImplementation((message, extra) => {
+        if (message.startsWith('Log truncation detected but')) withhold()
+        return warn(message, extra)
+      })
+    },
+  ],
+  [
+    'a PARTITION_HALTED listener',
+    1,
+    (ctx, withhold) => ctx.group.instrumentationEmitter.addListener(PARTITION_HALTED, withhold),
+  ],
+])(
+  'none announces no unknown divergence once %s withholds the assignment during it',
+  async (_, halted, arm) => {
+    const ctx = noneGroup({ committed: '3' })
+    const preparation = new FetchPreparation(
+      ctx.group,
+      ctx.group.authority,
+      PARTS,
+      Infinity,
+      ctx.group.ownership.token()
+    )
+    const truncations = []
+    ctx.group.instrumentationEmitter.addListener(LOG_TRUNCATION, (event) => truncations.push(event))
+    const cause = new Error('assignment refused')
+    arm(ctx, () => ctx.group.withholdAssignment(cause))
+    const unknown = { action: 'reset', divergingOffset: null, leaderEpoch: 3 }
+
+    const outcome = await ctx.group
+      .applyValidationOutcome(TOPIC, 0, '7', unknown, preparation, 2)
+      .then(
+        () => 'returned',
+        (error) => error
+      )
+
+    expect(ctx.group.authority.closed).toBe(true)
+    expect(truncations).toEqual([])
+    expect(ctx.halts).toHaveLength(halted)
+    expect(outcome).toBe(halted ? cause : 'returned')
+  }
+)
 
 test('seek recovers a none halt without installing automatic progress', async () => {
   const ctx = noneGroup()

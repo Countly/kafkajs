@@ -6,6 +6,7 @@ const isInvalidOffset = require('./isInvalidOffset')
 const OffsetOperations = require('./offsetOperations')
 const { fencedDelay } = require('../fetchPreparation')
 const { isStaleBatch } = require('../handlerContext')
+const GroupOwnership = require('../groupOwnership')
 const ResetObligations = require('./resetObligations')
 const { ResetResolver } = require('../offsetReset')
 const {
@@ -459,9 +460,11 @@ module.exports = class OffsetManager {
    *   caller checks and any recovery, and a throw from it still releases the attempt
    * @returns {Promise<object>} the decoded response
    * @throws {Error} whatever the coordinator answered, stamped; a refusal from the caller's guard
-   *   replaces it, and only a public call's expired deadline (`isCallDeadline`) first lets the
-   *   original answer's ownership loss be learned for its own token. A retired run or a forced
-   *   close publishes nothing. `KafkaJSCommitFailedError` before any lookup or write for a
+   *   replaces it. Two caller refusals first let the original answer's ownership loss be learned
+   *   for its own token: a public call's expired deadline (`isCallDeadline`), and a withheld
+   *   assignment (`assignment-refused`), whose membership is still current; the caller still gets
+   *   the refusal its guard gave before the loss was learned. A retired run or a forced close
+   *   publishes nothing. `KafkaJSCommitFailedError` before any lookup or write for a
    *   consumer-protocol payload whose member epoch is not positive (`memberEpochRefusal`)
    */
   async sendOffsetCommit(
@@ -534,7 +537,14 @@ module.exports = class OffsetManager {
         revision
       )
       const callerRefusal = guard?.()
-      if (!callerRefusal || isCallDeadline(callerRefusal)) {
+      // A withheld assignment keeps its membership current, so a loss the broker answered is
+      // learned; the caller's own refusal, saved above, is still what it gets.
+      if (
+        !callerRefusal ||
+        isCallDeadline(callerRefusal) ||
+        (GroupOwnership.isAssignmentRefusal(callerRefusal) &&
+          !(error instanceof KafkaJSCommitFailedError))
+      ) {
         const lost = learnOwnershipLoss(
           this.ownership,
           stamped,
@@ -1498,7 +1508,7 @@ module.exports = class OffsetManager {
     const release = this.ownership?.retain(token)
     const guard = () => this.ownership?.refusal(token) || options.guard?.() || null
     try {
-      return await this.commitWithOwnership(offsets, { ...options, guard })
+      return await this.commitWithOwnership(offsets, { ...options, guard, token })
     } finally {
       release?.()
     }
@@ -1513,13 +1523,17 @@ module.exports = class OffsetManager {
    * error reaches the caller unchanged.
    * @private
    * @param {object} offsets the selected offsets
-   * @param {{partitions?: object[], auto?: boolean, guard: Function, fence?: object}} options the
-   *   immutable guard and the caller's optional terminal fence, retained through recovery so a
-   *   replaced caller publishes no coordinator to either the manager or membership
+   * @param {{partitions?: object[], auto?: boolean, guard: Function, fence?: object,
+   *   token?: number}} options the immutable guard and the caller's optional terminal fence,
+   *   retained through recovery so a replaced caller publishes no coordinator to either the
+   *   manager or membership; the membership identity the commit began under
    * @returns {Promise<void>} automatic refusals resolve without publishing
    * @throws {Error} explicit refusals or the original broker error
    */
-  async commitWithOwnership(offsets, { partitions = null, auto = false, guard, fence } = {}) {
+  async commitWithOwnership(
+    offsets,
+    { partitions = null, auto = false, guard, fence, token } = {}
+  ) {
     const refusal = this.ownership?.refusal(this.ownership.token()) || guard?.()
     if (refusal) {
       if (auto) {
@@ -1548,7 +1562,7 @@ module.exports = class OffsetManager {
     }
 
     try {
-      await this.sendAndRecordCommit(payload, topics, { guard, fence, since })
+      await this.sendAndRecordCommit(payload, topics, { guard, fence, since, token })
       const refusal = guard?.()
       if (refusal) throw refusal
       this.lastCommit = performance.now()
@@ -1630,10 +1644,11 @@ module.exports = class OffsetManager {
    * broker; the caller still gets its refusal or error. A caller whose membership was lost or whose
    * run or operation ended records nothing. Emits
    * `COMMIT_OFFSETS` with a copy of the payload sent, down to each cell, once the request
-   * succeeds, unless the run ended for good meanwhile and the caller refuses,
-   * and records after the emit, so a listener that replaces or edits the reported cells
-   * changes nothing recorded. The copy is made only when something listens: one object per topic
-   * and per cell.
+   * succeeds, unless the caller refuses and its token may no longer report
+   * (`GroupOwnership#publishes`: the run ended for good, or the token's assignment was withheld,
+   * also when a loss followed); a loss alone still reports the commit. It records after the emit,
+   * so a listener that replaces or edits the reported cells changes nothing recorded. The copy is
+   * made only when something listens: one object per topic and per cell.
    *
    * A default selection (`since`) is sent once, under this one ticket, with only its cells that
    * are still authorized at the write: a cell sought or acquired again since the selection is
@@ -1644,9 +1659,10 @@ module.exports = class OffsetManager {
    * @private
    * @param {object} payload the `Broker#offsetCommit` payload
    * @param {{topic: string, partitions: {partition: number|string, offset: string}[]}[]} topics
-   * @param {{guard?: Function, fence?: object, since?: number}} [options] the guard is checked
-   *   again before local publication; the fence binds the coordinator discovery; `since` is the
-   *   seek clock of a default selection
+   * @param {{guard?: Function, fence?: object, since?: number, token?: number}} [options] the
+   *   guard is checked again before local publication; the fence binds the coordinator discovery;
+   *   `since` is the seek clock of a default selection; `token` is the membership identity the
+   *   commit began under and retains, whose history decides whether the commit is reported
    * @returns {Promise<void>}
    * @throws {Error} whatever the commit raised; nothing is recorded then
    */
@@ -1676,8 +1692,10 @@ module.exports = class OffsetManager {
           if (this.membershipProtocol === 'consumer') sent.groupGenerationId = this.generationId
         }
       }
-      // A run ended for good while the answer was on its way reports no commit.
-      const ended = this.ownership?.permanent && options?.guard?.()
+      // A run ended for good, or an assignment withheld (even if a loss followed), while the answer
+      // was on its way reports no commit.
+      const ended =
+        this.ownership && !this.ownership.publishes(options?.token) && options?.guard?.()
       if (ended) throw ended
       if (this.instrumentationEmitter.hasListeners(COMMIT_OFFSETS)) {
         this.instrumentationEmitter.emit(COMMIT_OFFSETS, {

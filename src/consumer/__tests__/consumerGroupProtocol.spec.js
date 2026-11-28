@@ -1807,6 +1807,164 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
     })
   })
 
+  describe('Withdrawing the owned set for a withheld assignment', () => {
+    const TARGET = assignmentOf([[TOPIC_ID_A, [0, 1]]])
+    const OWNED = [{ topic: 'topic-a', partitions: [0, 1] }]
+
+    /**
+     * Applies the next step's result and lets its acknowledgement go out and settle.
+     * @param {object} h the harness
+     * @returns {Promise<object>} the acknowledgement heartbeat as the coordinator received it
+     */
+    const applyAndAcknowledge = async (h) => {
+      const result = await h.protocol.rebalance(context())
+      expect(result.assignment).toEqual({ 'topic-a': [0, 1] })
+      h.protocol.setOwned(OWNED)
+      expect(h.protocol.state).toEqual(ACKNOWLEDGING)
+      await h.manager.tick()
+      return h.sent[h.sent.length - 1]
+    }
+
+    /**
+     * Asserts the heartbeat that reports the withdrawal and that a later apply acknowledges again.
+     * @param {object} h the harness, withdrawn and still RECONCILING
+     * @returns {Promise<void>}
+     */
+    const reportsThenReapplies = async (h) => {
+      const before = h.sent.length
+      await h.manager.tick()
+      expect(h.sent).toHaveLength(before + 1)
+      const withdrawal = h.sent[before]
+      expect(withdrawal.memberEpoch).toBe(3)
+      expect(withdrawal.topicPartitions).toEqual([])
+      expect(h.protocol.state).toEqual(RECONCILING)
+      expect(h.rebalanceCoordinator.requestRejoin).not.toHaveBeenCalled()
+
+      const ack = await applyAndAcknowledge(h)
+      expect(partitionsSentOn(ack)).toEqual([[TOPIC_ID_A, [0, 1]]])
+      expect(ack.memberEpoch).toBe(3)
+      expect(h.protocol.state).toEqual(STABLE)
+    }
+
+    it('a stable member reports no owned partitions under its epoch, acknowledges nothing, and a later apply acknowledges the target', async () => {
+      const h = build({
+        answers: [
+          heartbeatResponse({ memberEpoch: 3, assignment: TARGET }),
+          heartbeatResponse({ memberEpoch: 3 }),
+        ],
+      })
+      await await startStep(h)
+      h.protocol.setOwned(OWNED)
+      await h.manager.tick()
+      expect(h.protocol.state).toEqual(STABLE)
+      h.rebalanceCoordinator.requestRejoin.mockClear()
+      h.manager.calls.length = 0
+
+      h.protocol.withdrawOwned()
+
+      expect(h.protocol.owned()).toEqual([])
+      expect(h.protocol.memberEpoch).toBe(3)
+      expect(h.protocol.localAssignment.byTopicId.size).toBe(0)
+      expect(h.protocol.state).toEqual(RECONCILING)
+      expect(h.manager.calls).toContain('requestTick')
+      await reportsThenReapplies(h)
+    })
+
+    it('an acknowledgement in flight at the withdrawal does not settle the member as STABLE, and the next heartbeat reports the withdrawal', async () => {
+      let release
+      const held = new Promise(
+        (resolve) => (release = () => resolve(heartbeatResponse({ memberEpoch: 3 })))
+      )
+      const h = build({
+        answers: [
+          heartbeatResponse({ memberEpoch: 3, assignment: TARGET }),
+          () => held,
+          heartbeatResponse({ memberEpoch: 3 }),
+        ],
+      })
+      await await startStep(h)
+      h.protocol.setOwned(OWNED)
+      const inFlight = h.manager.tick()
+      await flushRefresh()
+      expect(partitionsSentOn(h.sent[1])).toEqual([[TOPIC_ID_A, [0, 1]]])
+      h.rebalanceCoordinator.requestRejoin.mockClear()
+
+      h.protocol.withdrawOwned()
+      release()
+      await inFlight
+
+      expect(h.protocol.state).toEqual(RECONCILING)
+      expect(h.sent).toHaveLength(2)
+      await reportsThenReapplies(h)
+    })
+
+    it('a withdrawn member restates the empty owned set on every heartbeat, through a later revocation, until an apply', async () => {
+      const h = build({
+        answers: [
+          heartbeatResponse({ memberEpoch: 3, assignment: TARGET }),
+          heartbeatResponse({ memberEpoch: 3 }),
+          heartbeatResponse({ memberEpoch: 3 }),
+          // The coordinator kept the partitions after the withdrawal and revokes them later.
+          heartbeatResponse({ memberEpoch: 4, assignment: assignmentOf([]) }),
+          heartbeatResponse({ memberEpoch: 4 }),
+        ],
+      })
+      await await startStep(h)
+      h.protocol.setOwned(OWNED)
+      await h.manager.tick()
+      expect(h.protocol.state).toEqual(STABLE)
+
+      h.protocol.withdrawOwned()
+      await h.manager.tick()
+      for (let beat = 0; beat < 3; beat++) {
+        jest.advanceTimersByTime(5000)
+        await h.manager.tick()
+      }
+
+      const withdrawn = h.sent.slice(2)
+      expect(withdrawn.map(({ memberEpoch }) => memberEpoch)).toEqual([3, 3, 4, 4])
+      for (const request of withdrawn) expect(request.topicPartitions).toEqual([])
+      expect(h.protocol.state).toEqual(STABLE)
+
+      const applied = await h.protocol.rebalance(context())
+      expect(applied.assignment).toEqual({})
+      h.protocol.setOwned([])
+      for (let beat = 0; beat < 2; beat++) {
+        jest.advanceTimersByTime(5000)
+        await h.manager.tick()
+      }
+      expect(h.sent).toHaveLength(8)
+      expect(h.sent[7].topicPartitions).toBeUndefined()
+    })
+
+    it('a reconciling member drops the step result it has not applied and acknowledges nothing until a later apply', async () => {
+      const h = build({
+        answers: [
+          heartbeatResponse({ memberEpoch: 3, assignment: TARGET }),
+          heartbeatResponse({ memberEpoch: 3 }),
+        ],
+      })
+      await await startStep(h)
+      expect(h.protocol.state).toEqual(RECONCILING)
+      expect(h.protocol.pendingResolved).not.toBeNull()
+      h.manager.calls.length = 0
+
+      h.protocol.withdrawOwned()
+
+      expect(h.protocol.pendingResolved).toBeNull()
+      expect(h.protocol.state).toEqual(RECONCILING)
+      expect(h.protocol.localAssignment).toEqual({ localEpoch: 0, byTopicId: new Map() })
+      expect(h.manager.calls).not.toContain('requestTick')
+      await h.manager.tick()
+      expect(h.sent).toHaveLength(1)
+
+      const ack = await applyAndAcknowledge(h)
+      expect(partitionsSentOn(ack)).toEqual([[TOPIC_ID_A, [0, 1]]])
+      expect(ack.memberEpoch).toBe(3)
+      expect(h.protocol.state).toEqual(STABLE)
+    })
+  })
+
   describe('Reconciliation is driven from live state', () => {
     it('reports that another step is owed after an ack that did not converge', async () => {
       const h = build({

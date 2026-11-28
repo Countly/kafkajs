@@ -1,4 +1,5 @@
 const Cluster = require('../../cluster')
+const ConsumerGroup = require('../../consumer/consumerGroup')
 const { producerScript } = require('../../../testHelpers/scriptedCluster')
 const { CloseRig, GROUP, TOPIC, gate } = require('../../consumer/__tests__/fixtures/closeRig')
 const TransactionOffsets = require('../state/transactionOffsets')
@@ -97,7 +98,7 @@ const expectFenced = (error) => {
 }
 
 describe.each(['tv1', 'tv2'])('Producer > transactional seek fence (%s)', (profile) => {
-  let rigs, producers, handlers, ledgers
+  let rigs, producers, handlers, ledgers, groups
 
   /**
    * A consumer whose first batch of partition 0 is held in a `Handler`.
@@ -147,6 +148,9 @@ describe.each(['tv1', 'tv2'])('Producer > transactional seek fence (%s)', (profi
 
   const seekBack = (consumer) => consumer.seek({ topic: TOPIC, partition: 0, offset: '0' })
 
+  /** Withholds the input consumer's assignment, as a refused rebalance will. */
+  const withhold = () => groups[0].withholdAssignment(new Error('assignment refused'))
+
   /** Opens a transaction that already holds an output record, sent from the handler. */
   const begin = async ({ rig, handler }) => {
     const producer = await openProducer(rig)
@@ -160,6 +164,12 @@ describe.each(['tv1', 'tv2'])('Producer > transactional seek fence (%s)', (profi
     producers = []
     handlers = []
     ledgers = new Set()
+    groups = []
+    const connect = ConsumerGroup.prototype.connect
+    jest.spyOn(ConsumerGroup.prototype, 'connect').mockImplementation(function (...args) {
+      groups.push(this)
+      return connect.apply(this, args)
+    })
     const snapshot = TransactionOffsets.prototype.snapshot
     jest.spyOn(TransactionOffsets.prototype, 'snapshot').mockImplementation(function (...args) {
       ledgers.add(this)
@@ -292,6 +302,51 @@ describe.each(['tv1', 'tv2'])('Producer > transactional seek fence (%s)', (profi
     await sent
 
     expect(offsetWrites(input.rig)).toEqual([[`${TOPIC}|0|1`, `${TOPIC}|1|7`]])
+    const error = await transaction.commit().catch((e) => e)
+    expectFenced(error)
+    expect(endResults(input.rig)).toEqual([])
+    await transaction.abort()
+    expect(endResults(input.rig)).toEqual([false])
+    expect(inputs()).toBeNull()
+  })
+
+  it('a withheld assignment before the TxnOffsetCommit is written refuses the whole call', async () => {
+    const input = await openInput()
+    const { transaction } = await begin(input)
+    // tv1 holds the registration's answer; tv2 holds the group coordinator lookup.
+    const held = holdAnswer(
+      input.rig.cluster,
+      profile === 'tv1' ? 'AddOffsetsToTxn' : 'FindCoordinator'
+    )
+    const sent = input.handler
+      .run(() => transaction.sendOffsets({ consumerGroupId: GROUP, topics: offsetsOf([0, '1']) }))
+      .catch((e) => e)
+    await held.arrived
+    withhold()
+    held.release()
+
+    expectFenced(await sent)
+    expect(offsetWrites(input.rig)).toEqual([])
+    await expect(transaction.commit()).rejects.toBeInstanceOf(KafkaJSTransactionAbortableError)
+    expect(endResults(input.rig)).toEqual([])
+    await transaction.abort()
+    expect(endResults(input.rig)).toEqual([false])
+    expect(inputs()).toBeNull()
+  })
+
+  it('a withheld assignment after the TxnOffsetCommit was written refuses the commit EndTxn', async () => {
+    const input = await openInput()
+    const { transaction } = await begin(input)
+    const held = holdAnswer(input.rig.cluster, 'TxnOffsetCommit')
+    const sent = input.handler.run(() =>
+      transaction.sendOffsets({ consumerGroupId: GROUP, topics: offsetsOf([0, '1']) })
+    )
+    await held.arrived
+    withhold()
+    held.release()
+    await sent
+
+    expect(offsetWrites(input.rig)).toEqual([[`${TOPIC}|0|1`]])
     const error = await transaction.commit().catch((e) => e)
     expectFenced(error)
     expect(endResults(input.rig)).toEqual([])

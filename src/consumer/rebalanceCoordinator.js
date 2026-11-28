@@ -551,7 +551,7 @@ module.exports = class RebalanceCoordinator {
    */
   lossOwed() {
     const ownership = this.consumerGroup.ownership
-    return !!ownership?.refusal(ownership.token())
+    return !!ownership?.lost(ownership.token())
   }
 
   /**

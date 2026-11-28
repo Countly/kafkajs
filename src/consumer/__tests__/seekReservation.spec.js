@@ -155,7 +155,7 @@ describe('a seek reservation', () => {
               parts,
               new FetchPreparation(
                 h.group,
-                h.group.idleWait,
+                h.group.authority,
                 parts,
                 Infinity,
                 h.group.ownership.token()
@@ -415,7 +415,7 @@ describe('a seek reservation', () => {
           parts,
           new FetchPreparation(
             h.group,
-            h.group.idleWait,
+            h.group.authority,
             parts,
             Infinity,
             h.group.ownership.token()
@@ -506,7 +506,7 @@ describe('a seek the broker accepted', () => {
     const parts = [{ topic: TOPIC, partitions: [0] }]
     return h.group.seekOffsets(
       parts,
-      new FetchPreparation(h.group, h.group.idleWait, parts, Infinity, h.group.ownership.token())
+      new FetchPreparation(h.group, h.group.authority, parts, Infinity, h.group.ownership.token())
     )
   }
   /**

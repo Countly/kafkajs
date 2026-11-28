@@ -224,6 +224,11 @@ class ManualGroupProtocol {
     this.ownedPartitions = ManualGroupProtocol.snapshot(entries)
   }
 
+  /** @returns {void} gives up the whole owned set; no membership is told */
+  withdrawOwned() {
+    this.ownedPartitions = []
+  }
+
   /** @param {object[]} entries retained assignment @returns {void} drops only revoked partitions */
   narrowOwned(entries) {
     const target = new Map(entries.map(({ topic, partitions }) => [topic, new Set(partitions)]))

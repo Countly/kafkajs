@@ -423,11 +423,11 @@ describe('idle wait on a real fetch round', () => {
       const events = instrument(h, {
         before: { seek: (n) => (n === 1 ? held.promise : undefined) },
       })
-      h.group.prepareFetch = async (nodeId, run, token) => {
-        const first = h.group.captureFetchPreparation(nodeId, run, token)
+      h.group.prepareFetch = async (nodeId, fence, token) => {
+        const first = h.group.captureFetchPreparation(nodeId, fence, token)
         await h.group.seekOffsets(first.parts, first)
         await h.group.validatePositions(first.parts, first)
-        return h.group.captureFetchPreparation(nodeId, run, token)
+        return h.group.captureFetchPreparation(nodeId, fence, token)
       }
       const pending = h.group.fetch(1)
       await drain()
@@ -1294,11 +1294,11 @@ describe('idle registration boundary', () => {
       partitionLeaders: { 0: 0, 1: 0 },
     })
     fakeTimers()
-    const tracker = trackRegistrations(h.group.idleWait.fence)
+    const tracker = trackRegistrations(h.group.authority)
     const filter = jest.spyOn(h.group, 'filterPartitionsByNode')
     const yielded = jest.spyOn(global, 'setImmediate')
     const events = instrument(h)
-    const prepared = await h.group.prepareFetch(0, h.group.idleWait, h.group.ownership.token())
+    const prepared = await h.group.prepareFetch(0, h.group.authority, h.group.ownership.token())
     expect(prepared.parts).toEqual([{ topic: TOPIC, partitions: [0, 1] }])
     expect(filter).toHaveBeenCalledTimes(1)
     expect(events.filter(([label]) => label === 'seek')).toHaveLength(1)
@@ -1354,12 +1354,12 @@ describe('run fence and preparation snapshot', () => {
   it('a snapshot is current by one version compare and bounds an idle wait by its lease', async () => {
     const { FetchPreparation } = require('../fetchPreparation')
     const group = idleGroup()
-    const run = group.idleWait
+    const fence = group.authority
     const token = group.ownership.token()
-    const open = new FetchPreparation(group, run, [], Infinity, token)
+    const open = new FetchPreparation(group, fence, [], Infinity, token)
     expect(open.isCurrent()).toBe(true)
     expect(open.idleDuration(5000)).toBe(5000)
-    const leased = new FetchPreparation(group, run, [], Date.now() + 1000, token)
+    const leased = new FetchPreparation(group, fence, [], Date.now() + 1000, token)
     expect(leased.idleDuration(5000)).toBe(1000)
     expect(leased.idleDuration(400)).toBe(400)
     group.routingChanged()
@@ -1374,7 +1374,7 @@ describe('run fence and preparation snapshot', () => {
     const { FetchPreparation, PreparationSuperseded } = require('../fetchPreparation')
     const group = idleGroup()
     const make = () =>
-      new FetchPreparation(group, group.idleWait, [], Infinity, group.ownership.token())
+      new FetchPreparation(group, group.authority, [], Infinity, group.ownership.token())
     const preparation = make()
     group.routingChanged()
     expect(preparation.guard()).toBeNull()
@@ -1428,9 +1428,12 @@ describe('terminal run cancellation of work started by a run', () => {
     jest.useRealTimers()
   })
 
-  /** Retires the running run and starts its replacement, as a stop and restart do. */
+  /**
+   * Retires the running run and starts its replacement, as a stop and restart do.
+   * @returns {Generation} the retired run's fetch authority, which its fetch work is bound to
+   */
   const restart = () => {
-    const retired = h.group.idleWait
+    const retired = h.group.authority
     h.group.onStopRequested()
     h.group.startIdleWait()
     return retired
@@ -1496,7 +1499,7 @@ describe('terminal run cancellation of work started by a run', () => {
     expect(h.cluster.refreshMetadata).toHaveBeenCalledTimes(1)
     const retired = restart()
     expect(h.cluster.refreshMetadata).toHaveBeenCalledWith(
-      expect.objectContaining({ fence: retired.fence })
+      expect.objectContaining({ fence: retired })
     )
     refresh.release()
     await expect(finish(pending)).resolves.toEqual([])
@@ -1512,7 +1515,7 @@ describe('terminal run cancellation of work started by a run', () => {
     await drain()
     const retired = restart()
     expect(h.cluster.refreshMetadata).toHaveBeenCalledWith(
-      expect.objectContaining({ fence: retired.fence })
+      expect.objectContaining({ fence: retired })
     )
     refresh.release()
     await expect(finish(pending)).resolves.toEqual([])
@@ -1533,7 +1536,7 @@ describe('terminal run cancellation of work started by a run', () => {
     await drain()
     const retired = restart()
     expect(h.cluster.refreshMetadata).toHaveBeenCalledWith(
-      expect.objectContaining({ fence: retired.fence })
+      expect.objectContaining({ fence: retired })
     )
     refresh.release()
     await expect(finish(pending)).resolves.toEqual([])
@@ -1557,7 +1560,7 @@ describe('terminal run cancellation of work started by a run', () => {
     const pending = h.group.fetch(0)
     await drain()
     const retired = restart()
-    expect(h.cluster.findGroupCoordinator.mock.calls[0][0]).toMatchObject({ fence: retired.fence })
+    expect(h.cluster.findGroupCoordinator.mock.calls[0][0]).toMatchObject({ fence: retired })
     discovery.release(h.broker)
     await expect(finish(pending)).resolves.toEqual([])
     expect(h.offsetCommit).not.toHaveBeenCalled()
@@ -1575,7 +1578,7 @@ describe('terminal run cancellation of work started by a run', () => {
     await drain()
     expect(h.cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
     const retired = restart()
-    expect(h.cluster.findGroupCoordinator.mock.calls[0][0]).toMatchObject({ fence: retired.fence })
+    expect(h.cluster.findGroupCoordinator.mock.calls[0][0]).toMatchObject({ fence: retired })
     discovery.release(h.broker)
     await expect(finish(pending)).resolves.toEqual([])
     expect(h.offsetCommit).not.toHaveBeenCalled()
@@ -1630,7 +1633,7 @@ describe('validation response continuation', () => {
     const group = idleGroup()
     group.offsetManager = { clearPendingSeeks() {} }
     const { FetchPreparation } = require('../fetchPreparation')
-    const prep = new FetchPreparation(group, group.idleWait, [], Infinity, group.ownership.token())
+    const prep = new FetchPreparation(group, group.authority, [], Infinity, group.ownership.token())
     group.offsetManager.committedOffsets = () => ({ orders: { 0: '0', 1: '0' } })
     group.offsetManager.heldOffsetAt = (topic, partition) =>
       group.offsetManager.committedOffsets()[topic][partition]

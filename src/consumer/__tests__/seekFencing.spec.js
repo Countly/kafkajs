@@ -1733,7 +1733,7 @@ describe.each(['classic', 'consumer'])('a seek, %s protocol', (protocol) => {
       const parts = [{ topic: TOPIC, partitions: [0] }]
       const round = new FetchPreparation(
         group,
-        group.idleWait,
+        group.authority,
         parts,
         Infinity,
         group.ownership.token()

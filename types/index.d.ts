@@ -3187,9 +3187,16 @@ export class KafkaJSBufferExhaustedError extends KafkaJSError {
  * `groupProtocol: 'consumer'` it also covers a commit built under a member epoch of 0 or below (a
  * member joining, or one that left the group). It is also the `cause` of the
  * `KafkaJSTransactionAbortableError` that refuses a transaction carrying offsets of such a batch.
+ * Reason `assignment-refused` means the consumer refused the assignment the work began under and
+ * holds no partitions until it installs a usable one; it keeps its group membership, and `cause` is
+ * the refusal.
  */
 export class KafkaJSCommitFailedError extends KafkaJSNonRetriableError {
-  readonly reason: 'membership-lost' | 'poll-interval-exceeded' | 'stale-assignment'
+  readonly reason:
+    | 'membership-lost'
+    | 'poll-interval-exceeded'
+    | 'stale-assignment'
+    | 'assignment-refused'
   readonly cause?: Error
   constructor(e: Error | string, options: { reason: KafkaJSCommitFailedError['reason']; cause?: Error })
 }

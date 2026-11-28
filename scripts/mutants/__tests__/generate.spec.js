@@ -775,7 +775,7 @@ describe('scripts/mutants/generate.js', () => {
         'offset manager: a commit is manual unless a caller says otherwise',
         'src/consumer/offsetManager/index.js',
         'async commitWithOwnership(',
-        '  async commitWithOwnership(offsets, { partitions = null, auto = false, guard, fence } = {}) {',
+        '    { partitions = null, auto = false, guard, fence, token } = {}',
         'constant',
         [`src/consumer/__tests__/lostMeansNoCommit.spec.js`, `${OFFSETS}/commitOffsets.spec.js`],
       ],

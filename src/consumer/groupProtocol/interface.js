@@ -7,6 +7,7 @@
  */
 
 const {
+  KafkaJSError,
   KafkaJSNonRetriableError,
   KafkaJSDeliveryTimeout,
   KafkaJSCommitFailedError,
@@ -74,6 +75,9 @@ const COOPERATIVE = 'cooperative'
  * @property {() => TopicPartitions[]} owned
  * @property {(topicPartitions: TopicPartitions[]) => void} narrowOwned shrink only
  * @property {(topicPartitions: TopicPartitions[]) => void} setOwned widen to what was applied
+ * @property {() => void} withdrawOwned give up the whole owned set for a withheld assignment,
+ *   acknowledging nothing; the consumer protocol keeps its member epoch and reports no owned
+ *   partitions on its next heartbeat
  * @property {(snapshot: {names: string[], revision: number}) => void} updateSubscription takes the
  *   newest desired subscription: the consumer protocol declares it on its next heartbeat, the
  *   classic protocol on its next join
@@ -421,6 +425,28 @@ class ConsumerOperation {
   }
 }
 
+const OWNED_WITHDRAWN = Symbol('membership:ownedWithdrawn')
+
+/**
+ * The refusal a membership frame gets at its write when it claims owned partitions that were
+ * withdrawn (`withdrawOwned`) after it was built. Nothing was written; the membership builds the
+ * frame again from what it owns now.
+ * @returns {KafkaJSError}
+ */
+const ownedWithdrawnRefusal = () =>
+  Object.assign(
+    new KafkaJSError('The request claimed owned partitions withdrawn before its write', {
+      retriable: true,
+    }),
+    { [OWNED_WITHDRAWN]: true }
+  )
+
+/**
+ * @param {unknown} error
+ * @returns {boolean} whether it is `ownedWithdrawnRefusal`'s refusal
+ */
+const isOwnedWithdrawnRefusal = (error) => error?.[OWNED_WITHDRAWN] === true
+
 module.exports = {
   EAGER,
   COOPERATIVE,
@@ -428,4 +454,6 @@ module.exports = {
   ConsumerOperation,
   markCallDeadline,
   isCallDeadline,
+  ownedWithdrawnRefusal,
+  isOwnedWithdrawnRefusal,
 }

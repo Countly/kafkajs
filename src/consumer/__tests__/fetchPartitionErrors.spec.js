@@ -35,7 +35,7 @@ describe('Consumer > fetch partition error contract', () => {
 
       expect(setDefaultOffset).toHaveBeenCalledWith(
         { topic: TOPIC, partition: 0 },
-        { guard: expect.any(Function), fence: group.idleWait.fence }
+        { guard: expect.any(Function), fence: group.authority }
       )
       expect(refusals).toEqual([null])
       expect(batches.map(({ partition }) => partition)).toEqual([1])
