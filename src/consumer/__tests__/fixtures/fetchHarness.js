@@ -640,10 +640,9 @@ const readFrameHeader = (frame) => {
  * Each socket owns the work queued for it: the playback of every frame written to it and the
  * subscription to every withheld answer of those frames. When the socket is destroyed (an
  * ordinary disconnect, a failed generation, `close()`), that work is cancelled: nothing is
- * answered or failed on a dead socket, and nothing of it runs on a later turn. Ownership is the
- * one authority for every effect of a playback: each data emission and each failure is applied
- * only while the socket still owns its work, checked after `answer`, `chunks` or a chunk iterator
- * ran, since any of them may close the fake broker before the connection destroys the socket.
+ * answered or failed on a dead socket. The playback checks ownership before and after calling
+ * fixture code or emitting data, since those calls may close the broker before the connection
+ * destroys the socket. Cancellation stops the playback and closes any open chunk iterator.
  *
  * The fake broker is open until `close()`, then closed for good. `close()` is idempotent and
  * every caller gets the same promise. At once, it refuses every later connect, connection,
@@ -669,7 +668,7 @@ const readFrameHeader = (frame) => {
  * Setup gets two minutes to tolerate coverage runner delays; Jest still bounds a hung test.
  * @param {(header: { apiKey: number, apiVersion: number, correlationId: number },
  *   frame: Buffer) => Buffer|PromiseLike<Buffer>} answer
- * @param {(frame: Buffer, header: object) => Buffer[]} [chunks] complete-frame transport chunks
+ * @param {(frame: Buffer, header: object) => Iterable<Buffer>} [chunks] complete-frame transport chunks
  * @returns {{ broker: Broker, state: { writes: Buffer[], sockets: object[] },
  *   close: () => Promise<void> }}
  */
@@ -753,20 +752,37 @@ const createFakeBroker = (answer, chunks) => {
   })
 
   /**
-   * Plays one response back through `socket`, split by `chunks` when given. Each chunk is emitted
-   * only while `socket` still owns its work, checked again before every chunk, because `chunks`, a
-   * chunk iterator or the handling of an earlier chunk may close the fake broker; the rest is
-   * dropped and the close settles the request.
+   * Plays one response back through `socket`, split by `chunks` when given. Keep the iterator
+   * open only while playback advances, and return it on early exit so its cleanup can run.
    * @param {object} socket
    * @param {{ apiKey: number, apiVersion: number, correlationId: number }} header
    * @param {Buffer} body
+   * @param {<T>(effect: () => T) => T} run the playback's ownership guard
    * @returns {void}
    */
-  const reply = (socket, header, body) => {
+  const reply = (socket, header, body, run) => {
     const emit = (_event, frame) => {
-      for (const chunk of chunks ? chunks(frame, header) : [frame]) {
-        if (!owned.has(socket)) return
-        socket.emit('data', chunk)
+      const parts = run(() => (chunks ? chunks(frame, header) : [frame]))
+      let iterator
+      try {
+        const iterate = run(() => parts[Symbol.iterator])
+        run(() => {
+          iterator = Reflect.apply(iterate, parts, [])
+        })
+        const next = run(() => iterator.next)
+        while (true) {
+          const result = run(() => Reflect.apply(next, iterator, []))
+          if (run(() => result.done)) return
+          const chunk = run(() => result.value)
+          run(() => socket.emit('data', chunk))
+        }
+      } catch (error) {
+        try {
+          iterator?.return?.()
+        } catch {
+          // Keep the playback error, as for an abrupt exit from a for-of loop.
+        }
+        throw error
       }
     }
     respondWithFrame(
@@ -791,7 +807,7 @@ const createFakeBroker = (answer, chunks) => {
   const failRequest = (socket, correlationId, error) => {
     const queue = connection.requestQueue
     const request = queue.inflight.get(correlationId)
-    if (!owned.has(socket) || connection.socket !== socket || !request) return
+    if (connection.socket !== socket || !request) return
     queue.inflight.delete(correlationId)
     try {
       queue.checkPendingRequests()
@@ -809,30 +825,54 @@ const createFakeBroker = (answer, chunks) => {
    * @returns {void}
    */
   const playBack = (socket, frame, work) => {
+    const cancelled = Symbol('playback cancelled')
+    const isOwned = () => owned.get(socket) === work
+    /**
+     * Runs one playback operation and unwinds the frame if ownership has been revoked.
+     * @template T
+     * @param {() => T} effect
+     * @returns {T}
+     */
+    const run = (effect) => {
+      if (!isOwned()) throw cancelled
+      const value = effect()
+      if (!isOwned()) throw cancelled
+      return value
+    }
+
     let header
     try {
-      header = readFrameHeader(frame)
+      header = run(() => readFrameHeader(frame))
     } catch (cause) {
-      socket.destroy(new Error('The fake broker could not read a request frame', { cause }))
+      if (isOwned()) {
+        socket.destroy(new Error('The fake broker could not read a request frame', { cause }))
+      }
       return
     }
-    const fail = (error) => failRequest(socket, header.correlationId, error)
-    const deliver = (body) => reply(socket, header, body)
+    const fail = (error) => {
+      if (isOwned()) failRequest(socket, header.correlationId, error)
+    }
+    const deliver = (body) => run(() => reply(socket, header, body, run))
     try {
-      const body = answer(header, frame)
-      if (typeof body?.then === 'function') {
-        const detach = subscribe(body, {
-          deliver: (value) => {
-            work.detaches.delete(detach)
-            deliver(value)
+      const body = run(() => answer(header, frame))
+      const then = run(() => body?.then)
+      if (typeof then === 'function') {
+        const detach = subscribe(
+          {
+            then: (resolve, reject) => run(() => Reflect.apply(then, body, [resolve, reject])),
           },
-          fail: (error) => {
-            work.detaches.delete(detach)
-            fail(error)
-          },
-        })
-        if (owned.has(socket)) work.detaches.add(detach)
-        else detach()
+          {
+            deliver: (value) => {
+              work.detaches.delete(detach)
+              deliver(value)
+            },
+            fail: (error) => {
+              work.detaches.delete(detach)
+              fail(error)
+            },
+          }
+        )
+        work.detaches.add(detach)
       } else {
         deliver(body)
       }

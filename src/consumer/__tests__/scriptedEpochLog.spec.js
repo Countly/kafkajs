@@ -740,13 +740,14 @@ describe('Test harness > fake broker close', () => {
 
   /**
    * A fake broker whose OffsetForLeaderEpoch playback closes it from the callback `closeIn` names,
-   * with the data its socket emits after connecting recorded.
-   * @param {'answer'|'answerThrows'|'chunks'|'chunkIterator'} closeIn
+   * with its splitter, iterator and data events recorded after connecting.
+   * @param {'answer'|'answerThrows'|'destroy'|'chunks'|'chunkIterator'|'data'} closeIn
    * @returns {Promise<{ broker: object, socket: object, data: Buffer[], closing: () => Promise<void>,
-   *   close: () => Promise<void> }>}
+   *   close: () => Promise<void>, playback: string[] }>}
    */
   const closingFrom = async (closeIn) => {
     let closing = null
+    const playback = []
     const closeNow = () => {
       closing = fake.close()
     }
@@ -754,6 +755,7 @@ describe('Test harness > fake broker close', () => {
       (header) => {
         if (header.apiKey === apiKeys.ApiVersions) return apiVersionsBody(18)
         if (closeIn === 'answer') closeNow()
+        if (closeIn === 'destroy') fake.state.sockets[0].destroy()
         if (closeIn === 'answerThrows') {
           closeNow()
           throw new Error('the answer closed the fake broker, then threw')
@@ -762,34 +764,49 @@ describe('Test harness > fake broker close', () => {
       },
       (frame, header) => {
         if (header.apiKey !== apiKeys.OffsetForLeaderEpoch) return [frame]
-        if (closeIn === 'chunks') {
-          closeNow()
-          return [frame]
+        playback.push('split')
+        if (closeIn === 'chunks') closeNow()
+        return {
+          *[Symbol.iterator]() {
+            try {
+              playback.push('first chunk')
+              yield frame.subarray(0, 6)
+              playback.push('second chunk')
+              if (closeIn === 'chunkIterator') closeNow()
+              yield frame.subarray(6)
+            } finally {
+              playback.push('iterator cleanup')
+            }
+          },
         }
-        if (closeIn !== 'chunkIterator') return [frame]
-        return (function* () {
-          yield frame.subarray(0, 6)
-          closeNow()
-          yield frame.subarray(6)
-        })()
       }
     )
     await fake.broker.connect()
     const [socket] = fake.state.sockets
     const data = []
-    socket.on('data', (chunk) => data.push(chunk))
-    return { broker: fake.broker, socket, data, closing: () => closing, close: fake.close }
+    socket.on('data', (chunk) => {
+      data.push(chunk)
+      if (closeIn === 'data') closeNow()
+    })
+    return { broker: fake.broker, socket, data, closing: () => closing, close: fake.close, playback }
   }
 
   test.each([
-    ['an answer that returns a body', 'answer', 0],
-    ['an answer that throws', 'answerThrows', 0],
-    ['the chunks callback', 'chunks', 0],
-    ['a chunk iterator between two chunks', 'chunkIterator', 1],
+    ['an answer that returns a body', 'answer', 0, []],
+    ['an answer that throws', 'answerThrows', 0, []],
+    ['an answer that destroys the socket', 'destroy', 0, []],
+    ['the chunks callback', 'chunks', 0, ['split']],
+    [
+      'a chunk iterator between two chunks',
+      'chunkIterator',
+      1,
+      ['split', 'first chunk', 'second chunk', 'iterator cleanup'],
+    ],
+    ['a data listener', 'data', 1, ['split', 'first chunk', 'iterator cleanup']],
   ])(
-    'close from %s rejects the request through the shutdown and emits nothing more',
-    async (_where, closeIn, chunksBeforeClose) => {
-      const { broker, socket, data, closing, close } = await closingFrom(closeIn)
+    'close from %s stops playback and rejects the request through shutdown',
+    async (_where, closeIn, chunksBeforeClose, expectedPlayback) => {
+      const { broker, socket, data, closing, close, playback } = await closingFrom(closeIn)
 
       try {
         const outcome = jest.fn()
@@ -801,6 +818,7 @@ describe('Test harness > fake broker close', () => {
 
         expect(outcome.mock.calls).toEqual([['KafkaJSConnectionClosedError']])
         expect(data).toHaveLength(chunksBeforeClose)
+        expect(playback).toEqual(expectedPlayback)
         expect(socket.destroyed).toBe(true)
       } finally {
         await close()
