@@ -96,9 +96,7 @@ const assertEncodable = (topic, messages) => {
   for (const message of messages) {
     const field = unencodableField(message)
     if (field !== null) {
-      throw new KafkaJSInvalidConfigurationError(
-        `Invalid message for topic "${topic}": its ${field} must be ${ENCODABLE[field]}`
-      )
+      throw Accumulator.recordError(topic, field)
     }
   }
 }
@@ -288,26 +286,19 @@ class BatchTracker {
 const RECORD_FIELDS = ['key', 'value', 'headers', 'timestamp', 'partition']
 
 /**
- * A timestamp the producer keeps: a `Date` or a `Long` is mutable and the encoder reads it again
- * when it builds the batch, so it is read once now and kept as its exact decimal string, which the
- * encoder and the range check read as the same instant (`Date(0)` and a `Long` of 0 stay the
- * literal epoch). A reading that throws (a `Date` whose time cannot be read, a `value` getter that
- * throws) gives `NaN`, which the encodability check refuses with the typed error it always gave,
- * without reading the caller's object again. Every other form is immutable, or is left to the
- * encodability check, and is kept.
+ * Captures an object timestamp as an exact decimal string. This keeps object zero as the
+ * literal epoch. A failed conversion is reported by the record's encodability check.
  * @param {*} timestamp
  * @returns {*}
  */
 const ownedTimestamp = (timestamp) => {
-  if (timestamp === null || typeof timestamp !== 'object') {
-    return timestamp
-  }
+  if (typeof timestamp !== 'object' && typeof timestamp !== 'function') return timestamp
   try {
     if (timestamp instanceof Date) {
       return String(timestamp.getTime())
     }
     const { value } = timestamp
-    return typeof value === 'bigint' ? String(value) : timestamp
+    return String(typeof value === 'bigint' ? value : BigInt(timestamp))
   } catch {
     return NaN
   }
@@ -393,6 +384,10 @@ const ownedRecord = (message, copies) => {
   }
   if (record.timestamp != null) {
     record.timestamp = ownedTimestamp(record.timestamp)
+  }
+  const { partition } = record
+  if (partition != null && (typeof partition === 'object' || typeof partition === 'function')) {
+    record.partition = String(partition)
   }
   return record
 }
@@ -1116,22 +1111,44 @@ class Accumulator {
    * @param {{ topic: string, messages: object[] }[]} topicMessages
    * @returns {{ topic: string, messages: object[] }[]}
    */
-  static snapshot(topicMessages) {
+  static snapshot(topicMessages, captureError) {
     const copies = new SendCopy()
     const snapshot = ownedList(topicMessages, (entry) => {
       if (entry === null || typeof entry !== 'object') {
         return entry
       }
       const { topic, messages } = entry
+      const name = topic && typeof topic !== 'string' ? String(topic) : topic
       return {
-        topic,
+        topic: name,
         messages: Array.isArray(messages)
-          ? ownedList(messages, (message) => ownedRecord(message, copies))
-          : messages,
+          ? ownedList(messages, (message) => {
+              const record = ownedRecord(message, copies)
+              if (captureError && record != null) {
+                const field = unencodableField(record)
+                if (field !== null) captureError(name, field)
+              }
+              return record
+            })
+          : captureError && messages
+            ? true
+            : messages,
       }
     })
     copies.copy()
     return snapshot
+  }
+
+  /**
+   * Builds the refusal for a record the encoder cannot write.
+   * @param {string} topic
+   * @param {keyof ENCODABLE} field
+   * @returns {KafkaJSInvalidConfigurationError}
+   */
+  static recordError(topic, field) {
+    return new KafkaJSInvalidConfigurationError(
+      `Invalid message for topic "${topic}": its ${field} must be ${ENCODABLE[field]}`
+    )
   }
 
   /**
@@ -1209,6 +1226,9 @@ class Accumulator {
    * @param {{ topic: string, messages: object[] }[]} request.topicMessages the producer's own
    *   copy, which nothing changes afterwards
    * @param {number} [request.startedAt] when the public call began, in epoch ms; now when absent
+   * @param {import('../generation')} [request.generation] the lifecycle that accepted the call
+   * @param {boolean} [request.prepared] whether input validation and eligibility ran at capture
+   * @param {() => void} [request.onAdmitted] commits a send option once a reservation is granted
    * @returns {Promise<object[]>}
    * @throws {KafkaJSInvalidConfigurationError} for a record the encoder cannot write; nothing is
    *   queued
@@ -1218,15 +1238,27 @@ class Accumulator {
    * @throws {import('../../errors').KafkaJSBufferExhaustedError} no room within `maxBlockMs`, or
    *   too many bytes already waiting
    */
-  async append({ acks, timeout, compression, codec, topicMessages, startedAt = Date.now() }) {
-    for (const { topic, messages } of topicMessages) {
-      assertEncodable(topic, messages)
+  async append({
+    acks,
+    timeout,
+    compression,
+    codec,
+    topicMessages,
+    startedAt = Date.now(),
+    generation = this.#getGeneration(),
+    prepared = false,
+    onAdmitted,
+  }) {
+    if (!prepared) {
+      for (const { topic, messages } of topicMessages) {
+        assertEncodable(topic, messages)
+      }
     }
     if (!hasRecords(topicMessages)) {
       return []
     }
 
-    this.#getGeneration()?.check()
+    if (!prepared) generation?.check()
     const send = new PendingSend(
       topicMessages,
       new Deadline(startedAt, this.#deadline),
@@ -1236,19 +1268,31 @@ class Accumulator {
       throw this.#expired(this.#timedOut(send))
     }
 
+    let charge
+    try {
+      this.#assertFits(topicMessages, compression, codec)
+      charge = chargeOf(topicMessages, this.#admission.capacity)
+    } catch (error) {
+      throw this.#expired(error)
+    }
     this.#appending += 1
     send.holdTopics()
     send.lanes = send.topics
     this.#order.enter(send)
     this.track(send)
+    let reservation
     try {
-      this.#assertFits(topicMessages, compression, codec)
-      const charge = chargeOf(topicMessages, this.#admission.capacity)
       const granted = this.#admission.acquire(charge.total, send.deadline)
-      send.admit(granted instanceof Promise ? this.#granted(await granted) : granted, charge)
+      reservation = granted instanceof Promise ? this.#granted(await granted, generation) : granted
+      send.admit(reservation, charge)
+      if (onAdmitted) {
+        onAdmitted()
+        generation?.check()
+      }
     } catch (error) {
       send.records = null
       send.settled = true
+      reservation?.releaseAll()
       send.releaseTopics()
       send.untrack()
       this.#end()
@@ -1267,8 +1311,7 @@ class Accumulator {
    * @throws {KafkaJSApplicationRecoverableError} the exact armed error when initial fencing
    *   revoked the lifecycle before the admission continuation resumed
    */
-  #granted(reservation) {
-    const lifecycle = this.#getGeneration()
+  #granted(reservation, lifecycle) {
     if (lifecycle?.closed) {
       reservation.releaseAll()
       if (lifecycle.error instanceof KafkaJSApplicationRecoverableError) throw lifecycle.error

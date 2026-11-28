@@ -18,6 +18,7 @@ const COORDINATOR_TYPES = require('../../protocol/coordinatorTypes')
 const { isUsableTopicId, usableTopicIds } = require('../../protocol/requests/topicIds')
 const ProducerStateManager = require('../state')
 const TransactionOffsets = require('../state/transactionOffsets')
+const { int32, text } = require('../state/offsetFields')
 const { transactionStateFor } = require('../state/errorClassifier')
 const assert = require('assert')
 
@@ -1233,6 +1234,7 @@ const createEosManager = ({
      * @param {() => ?Error} [refusalOf] the transaction's own eligibility, asked once after the
      *   reads: the error the call is refused with now, or null; a call with none is never refused
      *   by it
+     * @param {(operation: Promise<void>) => Promise<void>} [track] tracks accepted offset work
      * @returns {Promise<void>}
      * @throws {KafkaJSNonRetriableError} when both `consumerGroupMetadata` and `consumerGroupId`
      *   are given, or neither; nothing is armed then
@@ -1258,16 +1260,19 @@ const createEosManager = ({
      * @property {number} [leaderEpoch] the committed leader epoch; -1 when absent
      * @property {string|null} [metadata]
      */
-    async sendOffsets(
-      { consumerGroupId, consumerGroupMetadata, topics } = {},
-      refusalOf = NOT_REFUSED
-    ) {
+    async sendOffsets(request = {}, refusalOf = NOT_REFUSED, track = (operation) => operation) {
       const generation = getGeneration()
-      stateManager.transaction.guard('sendOffsets')
-      const { groupId, generationId, memberId, groupInstanceId } = consumerGroupOf({
+      if (refusalOf === NOT_REFUSED) stateManager.transaction.guard('sendOffsets')
+      const { consumerGroupId, consumerGroupMetadata, topics } = request
+      const group = consumerGroupOf({
         consumerGroupId,
         consumerGroupMetadata,
       })
+      const { generationId: memberGeneration = -1 } = group
+      const groupId = text(group.groupId)
+      const generationId = int32(memberGeneration)
+      const memberId = text(group.memberId)
+      const groupInstanceId = text(group.groupInstanceId)
       assert(topics, 'Missing offset topics')
       const copied = TransactionOffsets.copy(topics)
       // The caller's values are all read: what they did to the producer or the transaction while
@@ -1300,7 +1305,7 @@ const createEosManager = ({
         stateManager.offsets.abandon(snapshot)
         throw armWith(refusal)
       }
-      return stateManager.offsets.enqueue(snapshot, async () => {
+      const queued = stateManager.offsets.enqueue(snapshot, async () => {
         const transactionVersion = stateManager.transactionVersion()
 
         try {
@@ -1400,6 +1405,7 @@ const createEosManager = ({
           throw armWith(isDiscoveryExhausted(error) ? abortOnly(error) : error)
         }
       })
+      return track(queued)
     },
   }
 

@@ -1,4 +1,5 @@
 const { isSuperseded } = require('../../consumer/handlerContext')
+const { int32, int64, text } = require('./offsetFields')
 
 /**
  * Holds immutable transactional offset calls until a confirmed commit. Fences belong to the
@@ -69,13 +70,22 @@ class TransactionOffsets {
    */
   static copy(topics) {
     const byTopic = new Map()
-    topics.forEach(({ topic, partitions }) => {
-      const byPartition = byTopic.get(topic) ?? new Map()
-      byTopic.set(topic, byPartition)
-      partitions.forEach(({ partition, offset, leaderEpoch, metadata }) => {
+    if (!Array.isArray(topics)) throw new TypeError('Offset topics must be an array')
+    Array.prototype.forEach.call(topics, ({ topic, partitions }) => {
+      const name = text(topic)
+      const byPartition = byTopic.get(name) ?? new Map()
+      byTopic.set(name, byPartition)
+      if (!Array.isArray(partitions)) throw new TypeError('Offset partitions must be an array')
+      Array.prototype.forEach.call(partitions, ({ partition, offset, leaderEpoch, metadata }) => {
+        const id = int32(partition)
         byPartition.set(
-          Number(partition),
-          Object.freeze({ partition, offset, leaderEpoch, metadata })
+          id,
+          Object.freeze({
+            partition: id,
+            offset: int64(offset),
+            leaderEpoch: leaderEpoch == null ? leaderEpoch : int32(leaderEpoch),
+            metadata: text(metadata),
+          })
         )
       })
     })
@@ -146,7 +156,7 @@ class TransactionOffsets {
     if (snapshot.ended) return
     for (const { topic, partitions } of snapshot.topics) {
       for (const fields of partitions) {
-        const key = JSON.stringify([snapshot.groupId, topic, Number(fields.partition)])
+        const key = JSON.stringify([snapshot.groupId, topic, fields.partition])
         const previous = this.entries.get(key)
         snapshot.remaining += 1
         this.entries.set(key, { snapshot, topic, fields })

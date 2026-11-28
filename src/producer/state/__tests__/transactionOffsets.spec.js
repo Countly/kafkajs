@@ -15,6 +15,29 @@ const build = () => {
 }
 
 describe('Transactional offset staging', () => {
+  test('a raw cell conversion failure leaves the ledger untouched', () => {
+    const ledger = new OffsetOperations()
+    const error = new Error('cannot convert partition')
+    const partition = {
+      valueOf() {
+        throw error
+      },
+    }
+    expect(() =>
+      ledger.begin(
+        [
+          { topic: 'topic', partition: 0 },
+          { topic: 'topic', partition },
+        ],
+        { mutation: true }
+      )
+    ).toThrow(error)
+    expect(ledger.openTickets).toBe(0)
+    expect(ledger.clock).toBe(0)
+    expect(ledger.intent).toBe(0)
+    expect(ledger.size()).toBe(0)
+  })
+
   test('wire fields are immutable copies and the fence precedes an applied mutation', () => {
     const { offsets, ledger, cluster, call } = build()
     const input = topics('9')

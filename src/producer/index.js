@@ -10,6 +10,7 @@ const RackPreference = require('./partitioners/rackPreference')
 const InstrumentationEventEmitter = require('../instrumentation/emitter')
 const createEosManager = require('./eosManager')
 const createMessageProducer = require('./messageProducer')
+const { connectionStatusError } = require('./sendMessages')
 const Idempotence = require('./idempotence')
 const { Admission } = require('./state/admission')
 const { RequestBudget } = require('./state/recordSize')
@@ -316,6 +317,7 @@ const createProducer = ({
     instrumentationEmitter,
     INITIALIZED,
     getGeneration,
+    fatalRefusal: () => fatalRefusal(),
   })
   const { send, sendBatch, ensureInitialized, depthOf } = ownMessageProducer
 
@@ -336,15 +338,22 @@ const createProducer = ({
   /**
    * Refuses work if either identity is fatal, preserving the armed object and its cause.
    * Cleanup and event observations remain usable; reconnect never resets fatal state.
-   * @returns {void} when neither identity is fatal
+   * @returns {Error|null} the armed fatal error, or null
    * @throws {import('../errors').KafkaJSApplicationRecoverableError} the armed fatal error
    */
-  const throwIfFatal = () => {
+  const fatalRefusal = () => {
     for (const manager of [idempotentEosManager, transactionalEosManager]) {
       if (manager?.stateManager.state() === 'FATAL_ERROR') {
-        throw manager.stateManager.transaction.armedError()
+        return manager.stateManager.transaction.armedError()
       }
     }
+    return null
+  }
+
+  /** @returns {void} @throws {Error} the producer's armed fatal error */
+  const throwIfFatal = () => {
+    const error = fatalRefusal()
+    if (error) throw error
   }
 
   /**
@@ -551,6 +560,7 @@ const createProducer = ({
     lifecycle.check()
     throwIfFatal()
 
+    transactionalMessageProducer.resetCallbacks()
     let transactionDidEnd = false
     endPrevious()
     endPrevious = () => {
@@ -598,22 +608,15 @@ const createProducer = ({
       return ending !== null || state !== IN_TRANSACTION ? endedTransactionError() : null
     }
 
-    /**
-     * Wraps `sendOffsets` with `refusalOf` at the call, and tracks it; `send` and `sendBatch` use
-     * it the same way, and the operation asks `refusalOf` again after reading its input.
-     * @param {string} method the name the pending-commit error gives the call
-     * @param {Function} fn
-     * @returns {Function}
-     */
-    const transactionGuard =
-      (method, fn) =>
-      (...args) => {
-        const refused = refusalOf(method)
-        return refused === null ? track(fn(...args)) : Promise.reject(refused)
-      }
+    const { send: sendTxn, sendBatch: sendBatchTxn } = transactionalMessageProducer.sendersWith(
+      refusalOf,
+      track
+    )
 
-    const { send: sendTxn, sendBatch: sendBatchTxn } =
-      transactionalMessageProducer.sendersWith(refusalOf)
+    /** @returns {Error|null} refusal of captured transactional offsets before any fence is taken */
+    const offsetRefusal = () =>
+      refusalOf('sendOffsets') ??
+      connectionStatusError(isClosing() ? CONNECTION_STATUS.DISCONNECTING : connectionStatus)
 
     /**
      * Ends the transaction once its own operations have settled. A `commit()` or `abort()` called
@@ -655,15 +658,17 @@ const createProducer = ({
      *   unusable
      */
     const abort = () => {
+      const droppedError = new KafkaJSTransactionAbortableError(
+        'The transaction was aborted while this batch was waiting to be sent'
+      )
+      if (ending === null && stateManager.state() === IN_TRANSACTION) {
+        transactionalMessageProducer.interruptCallbacks(droppedError, { block: true })
+      }
       // The accumulated batches join the queue, so the abort rejects them with the rest.
       transactionalMessageProducer.flush()
       const dropped =
         ending === null && stateManager.state() === IN_TRANSACTION
-          ? stateManager.sequencer.abortQueued(
-              new KafkaJSTransactionAbortableError(
-                'The transaction was aborted while this batch was waiting to be sent'
-              )
-            )
+          ? stateManager.sequencer.abortQueued(droppedError)
           : []
       const droppedSequences = dropped.some(({ firstSequence }) => firstSequence !== null)
       const ended = endWith(() => transactionalEosManager.abort({ droppedSequences }))
@@ -675,8 +680,8 @@ const createProducer = ({
     const isActive = () => transactionalEosManager.isInTransaction() && !transactionDidEnd
 
     return {
-      sendBatch: transactionGuard('sendBatch', sendBatchTxn),
-      send: transactionGuard('send', sendTxn),
+      sendBatch: sendBatchTxn,
+      send: sendTxn,
       abort,
       /**
        * Commit the ongoing transaction, once every send and `sendOffsets` of it has settled. The
@@ -698,6 +703,9 @@ const createProducer = ({
         if (transactionDidEnd) {
           return Promise.reject(endedTransactionError())
         }
+        transactionalMessageProducer.interruptCallbacks(endedTransactionError(), {
+          reentrant: true,
+        })
         if (committing === null) {
           transactionalMessageProducer.flush(
             joinable(endWith(() => transactionalEosManager.commit()))
@@ -715,15 +723,7 @@ const createProducer = ({
        * @throws {KafkaJSNonRetriableError} If transaction has ended, or when both or neither of
        *   `consumerGroupMetadata` and `consumerGroupId` are given
        */
-      sendOffsets: transactionGuard(
-        'sendOffsets',
-        async ({ consumerGroupMetadata, consumerGroupId, topics }) => {
-          await transactionalEosManager.sendOffsets(
-            { consumerGroupMetadata, consumerGroupId, topics },
-            () => refusalOf('sendOffsets')
-          )
-        }
-      ),
+      sendOffsets: (request) => transactionalEosManager.sendOffsets(request, offsetRefusal, track),
       isActive,
     }
   }
@@ -1022,10 +1022,19 @@ const createProducer = ({
       }
 
       closeRequests++
-      if (closing !== null) return closing
       if (closed) return Promise.resolve()
-      closing = close(startedAt, timeout)
-      return closing
+      const refusal = connectionStatusError(CONNECTION_STATUS.DISCONNECTING)
+      ownMessageProducer.interruptCallbacks(refusal, { reentrant: true })
+      transactionalMessageProducer?.interruptCallbacks(refusal, { reentrant: true })
+      if (closing !== null) return closing
+      let resolve, reject
+      const promise = new Promise((done, failed) => {
+        resolve = done
+        reject = failed
+      })
+      closing = promise
+      close(startedAt, timeout).then(resolve, reject)
+      return promise
     },
     /**
      * @returns {boolean} whether the producer sends idempotently; false once a configuration
@@ -1039,13 +1048,13 @@ const createProducer = ({
      * @returns {Promise<*>} metadata
      * @throws {Error} a delivery error or the producer's armed fatal error
      */
-    send: guardFatal(send),
+    send,
     /**
      * @param {object} request batch options
      * @returns {Promise<*>} metadata
      * @throws {Error} a delivery error or the producer's armed fatal error
      */
-    sendBatch: guardFatal(sendBatch),
+    sendBatch,
     /**
      * @returns {Promise<object>} new transaction
      * @throws {Error} a transaction error or the producer's armed fatal error

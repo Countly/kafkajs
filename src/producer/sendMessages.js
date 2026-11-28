@@ -22,9 +22,10 @@ const { surfaceInTransaction } = require('./eosManager')
 const groupMessagesPerPartition = require('./groupMessagesPerPartition')
 const Fifo = require('../utils/fifo')
 const { Deadline, ExpiryTimer, MAX_DELAY } = require('./deadline')
-const { Types: Compression } = require('../protocol/message/compression')
+const { Types: Compression, BUILT_IN } = require('../protocol/message/compression')
+const { isBuiltIn } = require('./partitioners/builtIn')
 const Accumulator = require('./state/accumulator')
-const { RequestBudget, recordsBytes } = require('./state/recordSize')
+const { RequestBudget, recordsBytes, ownedBuffer } = require('./state/recordSize')
 
 const { keys } = Object
 
@@ -313,13 +314,22 @@ class ProduceAttempt {
    *   loop's also settles every other due delivery
    * @param {number} [maxRequestSize=Infinity] cap checked at transmission
    * @param {import('./generation')} [generation] captured lifecycle; never recaptured
+   * @param {import('./deliveryCallbacks')} [callbacks] the delivery owner
    */
-  constructor(deliveries, getConnectionStatus, expire, maxRequestSize = Infinity, generation) {
+  constructor(
+    deliveries,
+    getConnectionStatus,
+    expire,
+    maxRequestSize = Infinity,
+    generation,
+    callbacks
+  ) {
     this.deliveries = deliveries.slice()
     this.getConnectionStatus = getConnectionStatus
     this.expire = expire
     this.maxRequestSize = maxRequestSize
     this.generation = generation
+    this.callbacks = callbacks
     this.written = false
     this.revoked = false
     for (const delivery of this.deliveries) delivery.currentAttempt = this
@@ -338,7 +348,7 @@ class ProduceAttempt {
    */
   guard = (frameLength) => {
     if (this.revoked) return new ProduceAttemptRefused('The Produce attempt was revoked')
-    const closed = this.generation?.guard()
+    const closed = this.generation?.guard() ?? this.callbacks?.refusal()
     if (closed) return closed
     const statusError = connectionStatusError(this.getConnectionStatus())
     if (statusError) return statusError
@@ -361,6 +371,33 @@ class ProduceAttempt {
       delivery.batch.child = null
     }
     return null
+  }
+}
+
+/**
+ * Keeps the pinned factory identity for batching and bounds. Only the actual encoder gets this
+ * wrapper, which gives caller factories and compressors their original receivers.
+ * @param {?Function} codec
+ * @param {number} compression
+ * @param {ProduceAttempt} attempt
+ * @param {import('./deliveryCallbacks')} [callbacks]
+ * @returns {?Function}
+ */
+const codecFor = (codec, compression, attempt, callbacks) => {
+  if (!callbacks || !codec || BUILT_IN[compression] === codec) return codec
+  return function guardedFactory() {
+    const implementation = callbacks.run(() => Reflect.apply(codec, this, []), attempt.guard)
+    return {
+      compress: (...args) =>
+        callbacks.run(
+          async () => {
+            const result = await implementation.compress(...args)
+            return Buffer.isBuffer(result) ? ownedBuffer(result) : result
+          },
+          attempt.guard,
+          true
+        ),
+    }
   }
 }
 
@@ -575,6 +612,7 @@ class DrainLoop {
   #getConnectionStatus
   #budget
   #generation
+  #callbacks
   /** @type {Set<Send>} */
   #sends = new Set()
   /** @type {Map<string, Map<number, Fifo<Delivery>>>} every partition's live batches, by enqueue order */
@@ -622,6 +660,7 @@ class DrainLoop {
     getConnectionStatus,
     budget = new RequestBudget(),
     generation,
+    callbacks,
   }) {
     this.#logger = logger
     this.#cluster = cluster
@@ -633,6 +672,7 @@ class DrainLoop {
     this.#getConnectionStatus = getConnectionStatus
     this.#budget = budget
     this.#generation = generation
+    this.#callbacks = callbacks
     this.#expiry = new ExpiryTimer(this.#expireDue)
   }
 
@@ -1161,7 +1201,8 @@ class DrainLoop {
       this.#getConnectionStatus,
       () => this.#expireDue(Date.now()),
       this.#budget.maxRequestSize,
-      this.#generation
+      this.#generation,
+      this.#callbacks
     )
     for (const batch of batches) {
       deliveryOf(batch).dispatched = true
@@ -1215,7 +1256,7 @@ class DrainLoop {
       acks,
       timeout,
       compression,
-      compressionCodec: codec,
+      compressionCodec: codecFor(codec, compression, attempt, this.#callbacks),
       compressionLevel:
         compression === Compression.GZIP
           ? this.#compressionLevels?.gzip
@@ -1693,6 +1734,7 @@ const createSendMessages = ({
   getConnectionStatus,
   budget = new RequestBudget(),
   getGeneration = () => undefined,
+  callbacks,
 }) => {
   const isIdempotent = () => idempotence !== undefined && idempotence.isEnabled()
   let loop = null
@@ -1933,6 +1975,11 @@ const createSendMessages = ({
         recordsOf(send)
         await cluster.refreshMetadataIfNecessary({ fence, background: true })
         fence?.check()
+        const closed = callbacks?.refusal()
+        if (closed) {
+          send.refused = true
+          throw closed
+        }
 
         const entries = []
         for (const { topic, messages } of recordsOf(send)) {
@@ -1941,11 +1988,19 @@ const createSendMessages = ({
             throw new KafkaJSMetadataNotLoaded('Producing to topic without metadata')
           }
 
+          const guardedPartitioner =
+            !callbacks || isBuiltIn(partitioner)
+              ? partitioner
+              : (args) =>
+                  callbacks.run(
+                    () => partitioner(args),
+                    () => fence?.guard()
+                  )
           const grouped = groupMessagesPerPartition({
             topic,
             partitionMetadata,
             messages,
-            partitioner,
+            partitioner: guardedPartitioner,
             send,
           })
           for (const id of keys(grouped)) {
@@ -2040,6 +2095,7 @@ const createSendMessages = ({
         getConnectionStatus,
         budget,
         generation,
+        callbacks,
       })
     }
     return loop.send({ acks, timeout, compression, codec, batches })
@@ -2247,7 +2303,7 @@ const createSendMessages = ({
         acks,
         timeout,
         compression,
-        compressionCodec: codec,
+        compressionCodec: codecFor(codec, compression, attempt, callbacks),
         compressionLevel:
           compression === Compression.GZIP
             ? compressionLevels?.gzip
@@ -2378,7 +2434,8 @@ const createSendMessages = ({
         getConnectionStatus || (() => CONNECTION_STATUS.CONNECTED),
         expire,
         budget.maxRequestSize,
-        generation
+        generation,
+        callbacks
       )
       /** The request ended: a batch that settled meanwhile detaches now. @returns {void} */
       const ended = () => {

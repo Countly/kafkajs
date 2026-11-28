@@ -1,3 +1,4 @@
+const { types } = require('node:util')
 const { KafkaJSNonRetriableError, KafkaJSRecordTooLargeError } = require('../../errors')
 const { Codecs, BUILT_IN, Types } = require('../../protocol/message/compression')
 const snappy = require('../../protocol/message/compression/snappy')
@@ -34,6 +35,31 @@ const lengthOf = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(Uint8Array.prototype),
   'length'
 ).get
+const typedArray = Object.getPrototypeOf(Uint8Array.prototype)
+const bufferOf = Object.getOwnPropertyDescriptor(typedArray, 'buffer').get
+const byteOffsetOf = Object.getOwnPropertyDescriptor(typedArray, 'byteOffset').get
+const arrayBufferLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get
+const sharedBufferLength = Object.getOwnPropertyDescriptor(
+  SharedArrayBuffer.prototype,
+  'byteLength'
+).get
+
+/**
+ * @param {ArrayBuffer|SharedArrayBuffer} buffer
+ * @returns {number} the backing store's length, without reading its properties
+ */
+const storeLength = (buffer) =>
+  types.isSharedArrayBuffer(buffer)
+    ? sharedBufferLength.call(buffer)
+    : arrayBufferLength.call(buffer)
+
+/**
+ * Captures the extent of a Buffer in a library-owned view. The byte storage remains shared.
+ * @param {Buffer} view
+ * @returns {Buffer}
+ */
+const ownedBuffer = (view) =>
+  Buffer.from(bufferOf.call(view), byteOffsetOf.call(view), lengthOf.call(view))
 
 /**
  * Java's `ByteUtils.sizeOfVarint` of a length: the bytes of its zigzag varint.
@@ -206,7 +232,7 @@ const storeCharge = (stores, view) => {
   const spans = stores.get(view.buffer)
   if (spans === undefined) {
     stores.set(view.buffer, [start, end])
-    return view.buffer.byteLength - view.length
+    return storeLength(view.buffer) - view.length
   }
   return -cover(spans, start, end)
 }
@@ -270,7 +296,7 @@ const chargeOf = (topicMessages, limit) => {
  *   above 16 times the view, which a send copies so as not to keep the store alive
  */
 const pinsStore = (view) => {
-  const { byteLength } = view.buffer
+  const byteLength = storeLength(view.buffer)
   return byteLength > COPY_STORES_ABOVE && byteLength > COPY_STORES_TIMES * lengthOf.call(view)
 }
 
@@ -304,12 +330,17 @@ class SendCopy {
    */
   note(container, key) {
     const view = container[key]
-    if (!Buffer.isBuffer(view) || !pinsStore(view)) {
+    if (!Buffer.isBuffer(view)) {
       return
     }
-    const length = lengthOf.call(view)
+    const owned = ownedBuffer(view)
+    if (!pinsStore(owned)) {
+      container[key] = owned
+      return
+    }
+    const { length } = owned
     this.#slots ??= []
-    this.#slots.push(container, key, view, length)
+    this.#slots.push(container, key, owned, length)
     this.#bytes += length
   }
 
@@ -517,6 +548,7 @@ module.exports = {
   share,
   chargeOf,
   SendCopy,
+  ownedBuffer,
   varintSize,
   framing,
   topicFraming,

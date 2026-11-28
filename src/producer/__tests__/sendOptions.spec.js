@@ -8,6 +8,7 @@ const {
   KafkaJSProducerClosedError,
 } = require('../../errors')
 const handlerContext = require('../../consumer/handlerContext')
+const Cluster = require('../../cluster')
 const OffsetOperations = require('../../consumer/offsetManager/offsetOperations')
 const TransactionOffsets = require('../state/transactionOffsets')
 const apiKeys = require('../../protocol/requests/apiKeys')
@@ -17,6 +18,7 @@ const snappy = require('../../protocol/message/compression/snappy')
 const lz4 = require('../../protocol/message/compression/lz4')
 const zstd = require('../../protocol/message/compression/zstd')
 const { Admission } = require('../state/admission')
+const Accumulator = require('../state/accumulator')
 const { RequestBudget } = require('../state/recordSize')
 const { readRequestHeader } = require('../../../testHelpers/fakeSocket')
 const { createScriptedCluster, producerScript } = require('../../../testHelpers/scriptedCluster')
@@ -1181,7 +1183,7 @@ describe('Producer > send options', () => {
           }),
         ],
       ]
-      let begin, hold, enlist
+      let begin, hold, enlist, groups
 
       /** The offset requests the cluster saw. */
       const offsetRequests = () =>
@@ -1194,6 +1196,7 @@ describe('Producer > send options', () => {
         begin = jest.spyOn(OffsetOperations.prototype, 'begin')
         hold = jest.spyOn(TransactionOffsets.prototype, 'hold')
         enlist = jest.spyOn(TransactionOffsets.prototype, 'enlist')
+        groups = jest.spyOn(Cluster.prototype, 'offsetOperations')
       })
 
       test.each(SITES)(
@@ -1220,6 +1223,7 @@ describe('Producer > send options', () => {
           expect(begin).not.toHaveBeenCalled()
           expect(hold).not.toHaveBeenCalled()
           expect(enlist).not.toHaveBeenCalled()
+          expect(groups).not.toHaveBeenCalled()
           expect(offsetRequests()).toEqual([])
           expect(transaction.isActive()).toBe(false)
         }
@@ -1244,12 +1248,14 @@ describe('Producer > send options', () => {
             () => null,
             (failure) => failure
           )
+        expect(closed).not.toBeNull()
         await closed
 
         expect(error).toBeInstanceOf(KafkaJSProducerClosedError)
         expect(begin).not.toHaveBeenCalled()
         expect(hold).not.toHaveBeenCalled()
         expect(enlist).not.toHaveBeenCalled()
+        expect(groups).not.toHaveBeenCalled()
         expect(offsetRequests()).toEqual([])
       })
 
@@ -1258,24 +1264,95 @@ describe('Producer > send options', () => {
         const transaction = await rig.producer.transaction()
         let reads = 0
 
+        let conversions = 0
+        const partition = {
+          valueOf() {
+            if (++conversions !== 1) throw new Error('partition read twice')
+            return 0
+          },
+        }
         await handlerContext.run(BATCH, () =>
           transaction.sendOffsets({
             consumerGroupId: GROUP,
             get topics() {
               reads += 1
-              return ROWS
+              return [{ topic: TOPIC, partitions: [{ partition, offset: '5' }] }]
             },
           })
         )
-        await transaction.commit()
-
         expect(reads).toBe(1)
-        expect(begin).toHaveBeenCalled()
+        expect(conversions).toBe(1)
+        expect(begin).toHaveBeenCalledTimes(1)
+        expect(begin).toHaveBeenCalledWith([{ topic: TOPIC, partition: 0 }], { mutation: true })
+        const [ledger] = begin.mock.contexts
+        expect(ledger.openTickets).toBe(1)
+        await transaction.commit()
+        expect(ledger.openTickets).toBe(0)
         expect(hold).toHaveBeenCalledTimes(1)
         expect(enlist).toHaveBeenCalledTimes(1)
         expect(offsetRequests()).toEqual(
           profile === 'tv1' ? ['AddOffsetsToTxn', 'TxnOffsetCommit'] : ['TxnOffsetCommit']
         )
+      })
+
+      test('a wire field that starts graceful close takes no offset ticket or input dependency', async () => {
+        rig = await Rig.start({ transactionalId: 'reading' }, { profile })
+        const transaction = await rig.producer.transaction()
+        const delivery = rig.cluster.holdReply({ api: 'Produce' })
+        const sending = transaction.send({ topic: TOPIC, messages: MESSAGES })
+        expect(await delivery.executed()).not.toBeNull()
+        let closed
+        const leaderEpoch = {
+          valueOf() {
+            closed = rig.producer.disconnect()
+            return 1
+          },
+        }
+
+        await expect(
+          handlerContext.run(BATCH, () =>
+            transaction.sendOffsets({
+              consumerGroupId: GROUP,
+              topics: [{ topic: TOPIC, partitions: [{ partition: 0, offset: '5', leaderEpoch }] }],
+            })
+          )
+        ).rejects.toThrow('The producer is disconnecting')
+        expect(closed).toBeDefined()
+        expect(groups).not.toHaveBeenCalled()
+        expect(begin).not.toHaveBeenCalled()
+        expect(hold).not.toHaveBeenCalled()
+        expect(enlist).not.toHaveBeenCalled()
+        expect(offsetRequests()).toEqual([])
+        delivery.deliver()
+        await sending
+        await closed
+      })
+
+      test('a throwing offset value takes no ticket and a later offset call succeeds', async () => {
+        rig = await Rig.start({ transactionalId: 'reading' }, { profile })
+        const transaction = await rig.producer.transaction()
+        const error = new Error('offset cannot be converted')
+        const offset = {
+          valueOf() {
+            throw error
+          },
+        }
+        await expect(
+          handlerContext.run(BATCH, () =>
+            transaction.sendOffsets({
+              consumerGroupId: GROUP,
+              topics: [{ topic: TOPIC, partitions: [{ partition: 0, offset }] }],
+            })
+          )
+        ).rejects.toBe(error)
+        expect(groups).not.toHaveBeenCalled()
+        expect(begin).not.toHaveBeenCalled()
+        expect(hold).not.toHaveBeenCalled()
+        expect(enlist).not.toHaveBeenCalled()
+        expect(offsetRequests()).toEqual([])
+        await transaction.sendOffsets({ consumerGroupId: GROUP, topics: ROWS })
+        await transaction.commit()
+        expect(begin).toHaveBeenCalledTimes(1)
       })
     }
   )
@@ -1327,7 +1404,7 @@ describe('Producer > send options', () => {
         `Invalid message without value for topic "${TOPIC}" at index 0`,
       ],
       [
-        'a record list that is not an array',
+        'a null record list',
         { topic: TOPIC, messages: null },
         `Invalid messages array [null] for topic "${TOPIC}"`,
       ],
@@ -1357,6 +1434,196 @@ describe('Producer > send options', () => {
       await rig.producer.send({ topic: TOPIC, messages: MESSAGES, acks: 1 })
 
       expect(rig.producer.isIdempotent()).toBe(false)
+    })
+  })
+
+  describe('producer input and delivery boundaries', () => {
+    /** @returns {object} the request taking these records through the named public method */
+    const requestWith = (method, messages) =>
+      method === 'send'
+        ? { topic: TOPIC, messages }
+        : { topicMessages: [{ topic: TOPIC, messages }] }
+
+    test.each(SENDS)(
+      '%s validates values before flushing or disabling idempotence',
+      async (method) => {
+        rig = await Rig.start({ linger: 60000 })
+        const older = rig.producer.send({ topic: TOPIC, messages: MESSAGES })
+        for (let turn = 0; turn < 2000 && debit.mock.calls.length === 0; turn++) await tick()
+        expect(debit).toHaveBeenCalledTimes(1)
+        const flush = jest.spyOn(Accumulator.prototype, 'flush')
+        acquire.mockClear()
+        const messages = [{ value: {} }]
+        const request = requestWith(method, messages)
+
+        await expect(rig.producer[method]({ ...request, acks: 1 })).rejects.toThrow('its value')
+        expect(flush).not.toHaveBeenCalled()
+        expect(acquire).not.toHaveBeenCalled()
+        expect(rig.produced()).toEqual([])
+        expect(rig.producer.isIdempotent()).toBe(true)
+        await rig.producer.flush()
+        await expect(older).resolves.toHaveLength(1)
+        expect(rig.produced()).toHaveLength(1)
+      }
+    )
+
+    test.each(SENDS)(
+      '%s captures a timestamp conversion before transaction eligibility',
+      async (method) => {
+        rig = await Rig.start({ transactionalId: 'reading' }, { profile: 'tv2' })
+        const transaction = await rig.producer.transaction()
+        let aborted
+        const timestamp = {
+          valueOf() {
+            aborted = transaction.abort()
+            return 1
+          },
+        }
+        const messages = [{ value: VALUE, timestamp }]
+        const request = requestWith(method, messages)
+
+        await expect(transaction[method](request)).rejects.toThrow('transaction once ended')
+        expect(aborted).toBeDefined()
+        await aborted
+        expect(acquire).not.toHaveBeenCalled()
+        expect(debit).not.toHaveBeenCalled()
+        expect(rig.produced()).toEqual([])
+        const next = await rig.producer.transaction()
+        await expect(next.send({ topic: TOPIC, messages: MESSAGES })).resolves.toHaveLength(1)
+        await next.commit()
+      }
+    )
+
+    test.each(SENDS)(
+      '%s refuses a timestamp that force-closes before admission',
+      async (method) => {
+        rig = await Rig.start()
+        let closed
+        const timestamp = {
+          valueOf() {
+            closed = rig.producer.disconnect({ timeout: 0 })
+            return 1
+          },
+        }
+        const request = requestWith(method, [{ value: VALUE, timestamp }])
+        await expect(rig.producer[method]({ ...request, acks: 1 })).rejects.toThrow(
+          'The producer is disconnecting'
+        )
+        expect(closed).toBeDefined()
+        await closed
+        expect(acquire).not.toHaveBeenCalled()
+        expect(debit).not.toHaveBeenCalled()
+        expect(rig.produced()).toEqual([])
+        expect(rig.producer.isIdempotent()).toBe(true)
+        await rig.producer.connect()
+        await expect(rig.producer[method](requestWith(method, MESSAGES))).resolves.toHaveLength(1)
+      }
+    )
+
+    const RECORD_FIELDS = {
+      key: 'k',
+      value: VALUE,
+      headers: { name: 'v' },
+      partition: 0,
+      timestamp: 1000,
+    }
+    const GETTER_CASES = SENDS.flatMap(([method]) =>
+      Object.keys(RECORD_FIELDS).flatMap((field) =>
+        ['throw', 'abort', 'force-close', 'graceful close'].map((action) => [method, field, action])
+      )
+    )
+
+    test.each(GETTER_CASES)(
+      '%s refuses a %s getter that initiates %s',
+      async (method, field, action) => {
+        const transactional = action === 'abort'
+        rig = await Rig.start(transactional ? { transactionalId: 'reading' } : {}, {
+          profile: 'tv2',
+        })
+        const transaction = transactional ? await rig.producer.transaction() : null
+        const owner = transaction ?? rig.producer
+        const error = new Error('getter failed')
+        let ended
+        let reads = 0
+        const message = Object.defineProperty({ value: VALUE }, field, {
+          enumerable: true,
+          get() {
+            reads += 1
+            if (action === 'throw') throw error
+            ended = transactional
+              ? transaction.abort()
+              : rig.producer.disconnect(action === 'force-close' ? { timeout: 0 } : undefined)
+            return RECORD_FIELDS[field]
+          },
+        })
+        const sent = owner[method](requestWith(method, [message]))
+        const reason = transactional ? 'transaction once ended' : 'The producer is disconnecting'
+        if (action === 'throw') {
+          await expect(sent).rejects.toBe(error)
+        } else {
+          await expect(sent).rejects.toThrow(reason)
+          expect(ended).toBeDefined()
+          await ended
+        }
+        expect(reads).toBe(1)
+        expect(acquire).not.toHaveBeenCalled()
+        expect(debit).not.toHaveBeenCalled()
+        expect(rig.produced()).toEqual([])
+        if (action === 'force-close' || action === 'graceful close') await rig.producer.connect()
+        await expect(rig.producer[method](requestWith(method, MESSAGES))).resolves.toHaveLength(1)
+      }
+    )
+
+    test.each([
+      ['partitioner', 'abort'],
+      ['partitioner', 'force-close'],
+      ['partitioner', 'graceful close'],
+      ['codec', 'abort'],
+      ['codec', 'force-close'],
+      ['codec', 'graceful close'],
+    ])('a custom %s that starts %s cannot write its delivery', async (extension, action) => {
+      let ended
+      /** @returns {Promise<void>} the end started by the delivery callback */
+      const stop = () =>
+        (ended ??=
+          action === 'abort'
+            ? transaction.abort()
+            : rig.producer.disconnect(action === 'force-close' ? { timeout: 0 } : undefined))
+      const createPartitioner =
+        extension === 'partitioner'
+          ? () => () => {
+              stop()
+              return 0
+            }
+          : undefined
+      if (extension === 'codec') {
+        CompressionCodecs[CompressionTypes.GZIP] = () => ({
+          async compress(encoder) {
+            await stop()
+            return gzip.compress(encoder)
+          },
+        })
+      }
+      rig = await Rig.start({ transactionalId: 'callback', createPartitioner }, { profile: 'tv2' })
+      const transaction = await rig.producer.transaction()
+
+      const sent = await outcome(
+        transaction.send({
+          topic: TOPIC,
+          messages: MESSAGES,
+          compression: extension === 'codec' ? CompressionTypes.GZIP : CompressionTypes.None,
+        })
+      )
+      expect(ended).toBeDefined()
+      expect(sent.status).toBe('rejected')
+      expect(await outcome(ended)).toEqual({ status: 'fulfilled', value: undefined })
+      expect(rig.produced()).toEqual([])
+      const [admission] = acquire.mock.contexts
+      expect(admission.reserved).toBe(0)
+      expect(admission.waitingBytes).toBe(0)
+      expect(admission.debts).toBe(0)
+      if (action !== 'abort') await rig.producer.connect()
+      await expect(rig.producer.send({ topic: TOPIC, messages: MESSAGES })).resolves.toHaveLength(1)
     })
   })
 })

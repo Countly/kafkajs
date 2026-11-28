@@ -425,18 +425,19 @@ describe('Producer > the buffer > small views of large stores', () => {
     expect(String(second.value)).toBe('a')
   })
 
-  test('a view at or under the thresholds, a string and a null are kept as the same objects; a view just above them is copied', () => {
+  test('views at or under the thresholds share storage and a view just above them is copied', () => {
     const atSixteenKiB = Buffer.alloc(16384).subarray(0, 1)
     const atSixteenTimes = Buffer.alloc(32768).subarray(0, 2048)
     const headers = { text: 'text', none: null, list: [atSixteenKiB, 'item'] }
 
     const [record] = snapshotOf([{ key: atSixteenKiB, value: atSixteenTimes, headers }])
 
-    expect(record.key).toBe(atSixteenKiB)
-    expect(record.value).toBe(atSixteenTimes)
+    expect(record.key).not.toBe(atSixteenKiB)
+    expect(record.key.buffer).toBe(atSixteenKiB.buffer)
+    expect(record.value.buffer).toBe(atSixteenTimes.buffer)
     expect(record.headers.text).toBe('text')
     expect(record.headers.none).toBeNull()
-    expect(record.headers.list[0]).toBe(atSixteenKiB)
+    expect(record.headers.list[0].buffer).toBe(atSixteenKiB.buffer)
     expect(record.headers.list[1]).toBe('item')
 
     const aboveSixteenKiB = Buffer.alloc(16385).subarray(0, 1)
@@ -471,7 +472,7 @@ describe('Producer > the buffer > small views of large stores', () => {
     expect(list[0]).toBe(first)
   })
 
-  test("pooled Buffer values are charged by their own bytes under a 64 KiB pool, and kept as the caller's under an 8 KiB pool", () => {
+  test('pooled Buffer values are charged by their own bytes under a 64 KiB pool and share an 8 KiB pool', () => {
     const texts = ['{"a":1}', '{"b":22}', 'x'.repeat(300)]
 
     withPool(65536, () => {
@@ -494,7 +495,7 @@ describe('Producer > the buffer > small views of large stores', () => {
       const heldBytes = messages.reduce((sum, message) => sum + held(message), 0)
       const pool = values[0].buffer
 
-      messages.forEach((message, i) => expect(message.value).toBe(values[i]))
+      messages.forEach((message) => expect(message.value.buffer).toBe(pool))
       expect(values.every((value) => value.buffer === pool)).toBe(true)
       expect(chargeOf([{ topic: TOPIC, messages }], Infinity)).toEqual({
         total: 1536 + heldBytes + pool.byteLength - (7 + 8 + 300),
@@ -578,7 +579,7 @@ describe('Producer > the buffer > small views of large stores', () => {
 
     const messages = snapshotOf([{ value: kept.value }])
 
-    expect(messages[0].value).toBe(kept.value)
+    expect(messages[0].value.buffer).toBe(kept.value.buffer)
     expect(chargeOf([{ topic: TOPIC, messages }], Infinity)).toEqual({
       total: 1536 + held(messages[0]) + 100,
       shell: 1536 + 200,
@@ -731,7 +732,7 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     await release()
     await sent
 
-    expect(written[0].messages[0].value).toBe(value)
+    expect(written[0].messages[0].value.buffer).toBe(value.buffer)
     expect(written[0].bytes.includes(Buffer.from('mutated!'))).toBe(true)
   })
 
@@ -1043,7 +1044,7 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     await producer.disconnect()
   })
 
-  test('a Buffer key is kept as a Buffer value is, and a timestamp object other than a Date or a Long is left to the encoder', async () => {
+  test('a Buffer key gets a private view and a timestamp object is converted before delivery', async () => {
     const { producer, written, release } = await heldProducer()
     const key = Buffer.alloc(4, 'k')
     const timestamp = { valueOf: () => 1700000000999 }
@@ -1052,8 +1053,9 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     await release()
     await sent
 
-    expect(written[0].messages[0].key).toBe(key)
-    expect(written[0].messages[0].timestamp).toBe(timestamp)
+    expect(written[0].messages[0].key).not.toBe(key)
+    expect(written[0].messages[0].key.buffer).toBe(key.buffer)
+    expect(written[0].messages[0].timestamp).toBe('1700000000999')
     expect(firstTimestampOf(written[0].bytes)).toBe(1700000000999n)
     await producer.disconnect()
   })
