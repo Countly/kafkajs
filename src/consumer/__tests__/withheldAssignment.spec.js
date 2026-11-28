@@ -30,7 +30,8 @@ const {
   trackFixtures,
 } = require('./fixtures/fetchHarness')
 const { createPatternGroup } = require('./fixtures/patternGroup')
-const { CloseRig, batchAt } = require('./fixtures/closeRig')
+const { CloseRig, batchAt, until: waitFor } = require('./fixtures/closeRig')
+const { cooperativeSticky } = require('../assigners')
 
 const ID_A = '01020304-0506-0708-090a-0b0c0d0e0f10'
 const ID_B = '11121314-1516-1718-191a-1b1c1d1e1f20'
@@ -1206,6 +1207,179 @@ describe('commits across a withhold', () => {
   )
 })
 
+/** @returns {object[]} every consumer group whose run connects from now on */
+const captureGroups = () => {
+  const groups = []
+  const connect = ConsumerGroup.prototype.connect
+  jest.spyOn(ConsumerGroup.prototype, 'connect').mockImplementation(function (...args) {
+    groups.push(this)
+    return connect.apply(this, args)
+  })
+  return groups
+}
+
+/** @param {object} group a running consumer group @returns {number} requests queued unwritten */
+const queuedRequests = (group) =>
+  Object.values(group.cluster.brokerPool.brokers).reduce(
+    (count, broker) =>
+      count +
+      broker.connectionPool.pool.reduce(
+        (sum, connection) => sum + connection.requestQueue.pending.length,
+        0
+      ),
+    0
+  )
+
+describe('requests queued before their write across a withhold', () => {
+  let rig = null
+  const blockers = []
+  afterEach(async () => {
+    for (const blocker of blockers.splice(0)) if (blocker.settle) blocker.release()
+    jest.restoreAllMocks()
+    await rig?.dispose()
+    rig = null
+  })
+
+  /**
+   * Starts a consumer with one request in flight per connection and waits for its first delivery.
+   * @param {object} [options] `CloseRig.open` options and `consumer` options
+   * @returns {Promise<{consumer: object, group: object, events: object[]}>}
+   */
+  const running = async ({ consumer: consumerOptions = {}, ...rigOptions } = {}) => {
+    const groups = captureGroups()
+    rig = await CloseRig.open(rigOptions)
+    const consumer = rig.consumer({ maxInFlightRequests: 1, ...consumerOptions })
+    const events = []
+    consumer.on(consumer.events.COMMIT_OFFSETS, (event) => events.push(event))
+    await consumer.connect()
+    await consumer.subscribe({ topic: TOPIC, fromBeginning: true })
+    let delivered = false
+    await consumer.run({
+      autoCommit: false,
+      eachMessage: async () => {
+        delivered = true
+      },
+    })
+    await waitFor(() => delivered, 'the first delivery')
+    return { consumer, group: groups[0], events }
+  }
+
+  /**
+   * Holds the answer of the next request of `api`, so the one connection it goes to has no free
+   * slot, and starts that request with `start`.
+   * @param {string} api the blocking request's API
+   * @param {() => Promise<unknown>} start sends it
+   * @returns {Promise<{release: () => void, settled: Promise<unknown>}>} once it is on the wire
+   */
+  const occupy = async (api, start) => {
+    const blocker = rig.cluster.schedule.hold({ api })
+    blockers.push(blocker)
+    const settled = start().catch((error) => error)
+    await waitFor(() => blocker.call != null, `the blocking ${api} on the wire`)
+    return { release: () => blocker.release(), settled }
+  }
+
+  test.each([
+    ['is refused unwritten when a withhold comes first', true],
+    ['is written when no withhold comes first', false],
+  ])('an OffsetCommit queued behind a held heartbeat %s', async (_, withholds) => {
+    const { consumer, group, events } = await running()
+    const blocker = await occupy('Heartbeat', () => group.heartbeat({ interval: 0 }))
+    const queued = queuedRequests(group)
+    const commit = consumer.commitOffsets([{ topic: TOPIC, partition: 0, offset: '1' }]).then(
+      () => 'committed',
+      (error) => error
+    )
+    await waitFor(() => queuedRequests(group) > queued, 'the commit queued before its write')
+    if (withholds) group.withholdAssignment(refusal())
+    blocker.release()
+    const outcome = await commit
+    await blocker.settled
+
+    if (withholds) {
+      expect(outcome).toBeInstanceOf(KafkaJSCommitFailedError)
+      expect(outcome.reason).toBe('assignment-refused')
+      expect(rig.frames('OffsetCommit')).toEqual([])
+      expect(events).toEqual([])
+    } else {
+      expect(outcome).toBe('committed')
+      expect(rig.frames('OffsetCommit')).toHaveLength(1)
+      expect(events).toHaveLength(1)
+    }
+  })
+
+  test.each([
+    ['is refused and rebuilt with none when a withhold comes first', true],
+    ['is written with them when no withhold comes first', false],
+  ])('a consumer-protocol heartbeat queued with the owned partitions %s', async (_, withholds) => {
+    const { consumer, group } = await running({ protocol: 'consumer' })
+    const membership = group.groupMembership
+    await waitFor(() => membership.state === 'STABLE', 'a stable member')
+    const blocker = await occupy('OffsetCommit', () =>
+      consumer.commitOffsets([{ topic: TOPIC, partition: 0, offset: '1' }])
+    )
+    const before = rig.frames('ConsumerGroupHeartbeat').length
+    // As after a heartbeat no answer reached: the next one states every field, the owned set too.
+    membership.sentFields.reset()
+    const queued = queuedRequests(group)
+    const heartbeat = membership.sendHeartbeat({ guard: () => null }).catch((error) => error)
+    await waitFor(() => queuedRequests(group) > queued, 'the heartbeat queued before its write')
+    if (withholds) group.withholdAssignment(refusal())
+    blocker.release()
+    expect(await heartbeat).toBe(!withholds)
+    await waitFor(
+      () =>
+        rig
+          .frames('ConsumerGroupHeartbeat')
+          .slice(before)
+          .some(({ fields }) => fields.topicPartitions !== null),
+      'a heartbeat stating the owned set'
+    )
+    await blocker.settled
+
+    const stated = rig
+      .frames('ConsumerGroupHeartbeat')
+      .slice(before)
+      .map(({ fields }) => fields.topicPartitions)
+      .filter((owned) => owned !== null)
+    const claimed = stated.flatMap((owned) => owned.flatMap(({ partitions }) => partitions))
+    if (withholds) {
+      expect(claimed).toEqual([])
+      expect(stated[0]).toEqual([])
+    } else {
+      expect(claimed).toContain(0)
+    }
+  })
+
+  test.each([
+    ['is refused and rebuilt with none when a withhold comes first', true],
+    ['is written with them when no withhold comes first', false],
+  ])('a cooperative JoinGroup queued with the owned partitions %s', async (_, withholds) => {
+    const { group } = await running({ consumer: { partitionAssigners: [cooperativeSticky] } })
+    const membership = group.groupMembership
+    expect(membership.owned()).toEqual([{ topic: TOPIC, partitions: [0] }])
+    const blocker = await occupy('Heartbeat', () => group.heartbeat({ interval: 0 }))
+    const before = rig.frames('JoinGroup').length
+    const queued = queuedRequests(group)
+    const joining = membership.join({ topicsSubscribed: [TOPIC] }).then(
+      () => 'joined',
+      (error) => error
+    )
+    await waitFor(() => queuedRequests(group) > queued, 'the JoinGroup queued before its write')
+    if (withholds) group.withholdAssignment(refusal())
+    blocker.release()
+    expect(await joining).toBe('joined')
+    await blocker.settled
+
+    const written = rig.frames('JoinGroup').slice(before)
+    expect(written).toHaveLength(1)
+    const { metadata } = written[0].fields.groupProtocols[0]
+    const subscription = membership.decodeSubscription(Buffer.from(metadata, 'hex'))
+    const claimed = (subscription.ownedPartitions ?? []).flatMap(({ partitions }) => partitions)
+    expect(claimed).toEqual(withholds ? [] : [0])
+  })
+})
+
 describe('what a withhold leaves to a running handler', () => {
   let rig = null
   afterEach(async () => {
@@ -1213,17 +1387,6 @@ describe('what a withhold leaves to a running handler', () => {
     await rig?.dispose()
     rig = null
   })
-
-  /** @returns {object[]} every consumer group whose run connects from now on */
-  const captureGroups = () => {
-    const groups = []
-    const connect = ConsumerGroup.prototype.connect
-    jest.spyOn(ConsumerGroup.prototype, 'connect').mockImplementation(function (...args) {
-      groups.push(this)
-      return connect.apply(this, args)
-    })
-    return groups
-  }
 
   test('a running handler reads an empty uncommittedOffsets() after a withhold and its commit is refused unwritten (withhold driven directly)', async () => {
     const groups = captureGroups()

@@ -2,7 +2,7 @@ const sharedPromiseTo = require('../../utils/sharedPromiseTo')
 const dictionary = require('../../utils/dictionary')
 const HeartbeatBackoff = require('./heartbeatBackoff')
 const apiKeys = require('../../protocol/requests/apiKeys')
-const { COOPERATIVE } = require('./interface')
+const { COOPERATIVE, ownedWithdrawnRefusal, isOwnedWithdrawnRefusal } = require('./interface')
 const { generateMemberId } = require('./memberId')
 const CoordinatorLookup = require('../coordinatorLookup')
 const { SentFields, buildRequest } = require('./heartbeatState')
@@ -321,6 +321,13 @@ module.exports = class ConsumerGroupProtocol {
     this.immediatePending = false
     /** A withdrawal (`withdrawOwned`) not reported yet: the next tick sends in any in-group state. */
     this.withdrawalPending = false
+    /**
+     * Whether the owned set was withdrawn and no apply has installed one since: every heartbeat then
+     * carries the empty owned set explicitly (`buildRequest`).
+     */
+    this.withdrawn = false
+    /** How many withdrawals there were; a frame built before the latest one claims nothing. */
+    this.withdrawals = 0
     this.backoff = new HeartbeatBackoff(retry)
     // Seeded to now, not to 0: zero reads as "refreshed at the epoch", which makes the very first
     // heartbeat's staleness check fire a metadata request the reconciliation step is about to make
@@ -1190,6 +1197,11 @@ module.exports = class ConsumerGroupProtocol {
    * ordinary call returns false. Only the wire outcome is classified: a HEARTBEAT listener's throw,
    * of any value, is logged, and the guard is checked again after it before the success applies.
    *
+   * A frame that claims owned partitions also carries the withdrawal count it was built at to the
+   * transport's final write: a withdrawal while it waits there (`withdrawOwned`) refuses it
+   * unwritten, unclassified and unremembered, and the next tick sends a frame built from the
+   * withdrawn state. A frame already written is answered and applied as any other.
+   *
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractHeartbeatRequestManager.java
    * @param {{ sendAllFields?: boolean, leaveEpoch?: number|null, guard?: () => Error|null,
    *   onAccepted?: () => void, fenced?: boolean }} options `guard` is the caller's pre-write and
@@ -1244,6 +1256,16 @@ module.exports = class ConsumerGroupProtocol {
     const stateAtRequest = this.state
     const assignmentAtRequest = this.localAssignment
 
+    // A frame that claims partitions is written only while no withdrawal came after its build.
+    const withdrawalsAtRequest = this.withdrawals
+    const claims = request.TopicPartitions !== undefined && request.TopicPartitions.length > 0
+    const writeGuard = claims
+      ? () =>
+          refusal?.() ||
+          (this.withdrawals === withdrawalsAtRequest ? null : ownedWithdrawnRefusal())
+      : refusal
+    let unwritten = false
+
     this.lastRequestAt = Date.now()
     this.immediatePending = false
     this.withdrawalPending = false
@@ -1254,9 +1276,17 @@ module.exports = class ConsumerGroupProtocol {
       try {
         response = await this.coordinator.consumerGroupHeartbeat({
           ...toBrokerPayload(request),
-          ...(refusal && { guard: refusal }),
+          ...(writeGuard && { guard: writeGuard }),
         })
       } catch (error) {
+        if (isOwnedWithdrawnRefusal(error)) {
+          // Never written, so nothing was sent and nothing is classified: the next tick builds the
+          // frame again from the withdrawn state.
+          unwritten = true
+          this.withdrawalPending = true
+          this.requestTick()
+          return false
+        }
         const owned =
           leaveEpoch == null
             ? current()
@@ -1300,7 +1330,7 @@ module.exports = class ConsumerGroupProtocol {
       onAccepted?.()
       return true
     } finally {
-      if (leaveEpoch != null ? leaveOwned() : current()) {
+      if (!unwritten && (leaveEpoch != null ? leaveOwned() : current())) {
         this.onRequestGenerated({ leaveEpoch, stateAtRequest, assignmentAtRequest })
       }
     }
@@ -2057,6 +2087,7 @@ module.exports = class ConsumerGroupProtocol {
 
   /**
    * Widens `owned` to what was applied AND, when a reconciliation was under way, acknowledges it.
+   * An apply also ends a withdrawal: heartbeats go back to sending the owned set only on a change.
    *
    * What is acknowledged is what was **applied**, which is not always what the step returned: the
    * apply legitimately drops topics the consumer is no longer subscribed to before it calls back
@@ -2071,6 +2102,7 @@ module.exports = class ConsumerGroupProtocol {
    */
   setOwned(topicPartitions) {
     this.ownedPartitions = topicPartitions
+    this.withdrawn = false
 
     const resolved = this.pendingResolved
     this.pendingResolved = null
@@ -2095,6 +2127,13 @@ module.exports = class ConsumerGroupProtocol {
    * heartbeat reports no owned partitions, and the member epoch is kept. A step result not applied
    * yet is dropped: only a later successful apply (`setOwned`) acknowledges the target.
    *
+   * Until a usable apply (`setOwned`), every heartbeat carries the empty owned set explicitly
+   * (`withdrawn`): the coordinator reads an omitted set as "unchanged" and, for partitions it later
+   * revokes, as still owned (Kafka 4.0.0 to 4.4.0 `CurrentAssignmentBuilder#ownsRevokedPartitions`),
+   * so only the explicit empty set lets it complete a revocation before its rebalance timeout. A
+   * frame built before the withdrawal that claims partitions is refused at its write and built
+   * again (`sendHeartbeat`).
+   *
    * A member in the group that still holds a target it no longer owns moves to RECONCILING, so an
    * acknowledgement in flight cannot settle it as STABLE. When partitions were advertised, the
    * next tick sends one heartbeat in whatever in-group state the member is, also after a heartbeat
@@ -2103,6 +2142,8 @@ module.exports = class ConsumerGroupProtocol {
    */
   withdrawOwned() {
     const advertised = this.localAssignment.byTopicId.size > 0
+    this.withdrawn = true
+    this.withdrawals += 1
     this.ownedPartitions = []
     this.pendingResolved = null
     this.localAssignment = { localEpoch: this.localAssignment.localEpoch, byTopicId: new Map() }

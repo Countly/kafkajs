@@ -3456,7 +3456,7 @@ module.exports = class ConsumerGroup {
    * @param {number} partition
    * @param {{offset: string|null, reason: 'no-offset'|'offset-out-of-range', error: Error}} marker
    * @param {object|null} context the identity the refusal was raised under
-   * @returns {void}
+   * @returns {boolean} whether the halt was installed and reported
    */
   installReset(topic, partition, marker, context) {
     if (
@@ -3464,7 +3464,9 @@ module.exports = class ConsumerGroup {
       this.acceptHalt(topic, partition, marker, context)
     ) {
       this.reportHalt(topic, partition, marker)
+      return true
     }
+    return false
   }
 
   /**
@@ -4533,7 +4535,10 @@ module.exports = class ConsumerGroup {
    * A truncation is marked changed and announced with `LOG_TRUNCATION` unless its reposition
    * applied nothing and the partition has since left the validated position: it is no longer
    * owned, or a seek, reset or other position change took the rewind's place. A reposition that
-   * applied nothing while the position is still the validated one is announced as before.
+   * applied nothing while the position is still the validated one is announced as before. An
+   * unknown divergence under the `none` policy is announced only when its halt was installed, and
+   * nothing is announced once the preparation's fetch authority closed, also when user code (the
+   * log sink, a halt listener) closed it during this call.
    *
    * @private
    * @param {string} topic
@@ -4587,7 +4592,7 @@ module.exports = class ConsumerGroup {
         offset,
       })
       if (this.topicConfigurations[topic]?.resetPolicy?.kind === 'none') {
-        this.installReset(
+        const installed = this.installReset(
           topic,
           partition,
           {
@@ -4601,6 +4606,7 @@ module.exports = class ConsumerGroup {
           },
           preparation && this.fetchedResetContext(preparation, requestClock)
         )
+        if (!installed) return
       } else {
         await manager.setDefaultOffset({ topic, partition }, bound)
         preparation?.check()
@@ -4611,6 +4617,9 @@ module.exports = class ConsumerGroup {
       return
     }
 
+    // The log sink and a PARTITION_HALTED listener above run user code, which may withhold the
+    // assignment: the announcement is checked against the fetch authority after them.
+    preparation?.check()
     this.instrumentationEmitter.emit(LOG_TRUNCATION, {
       topic,
       partition,

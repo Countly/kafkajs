@@ -7,6 +7,7 @@
  */
 
 const {
+  KafkaJSError,
   KafkaJSNonRetriableError,
   KafkaJSDeliveryTimeout,
   KafkaJSCommitFailedError,
@@ -424,6 +425,28 @@ class ConsumerOperation {
   }
 }
 
+const OWNED_WITHDRAWN = Symbol('membership:ownedWithdrawn')
+
+/**
+ * The refusal a membership frame gets at its write when it claims owned partitions that were
+ * withdrawn (`withdrawOwned`) after it was built. Nothing was written; the membership builds the
+ * frame again from what it owns now.
+ * @returns {KafkaJSError}
+ */
+const ownedWithdrawnRefusal = () =>
+  Object.assign(
+    new KafkaJSError('The request claimed owned partitions withdrawn before its write', {
+      retriable: true,
+    }),
+    { [OWNED_WITHDRAWN]: true }
+  )
+
+/**
+ * @param {unknown} error
+ * @returns {boolean} whether it is `ownedWithdrawnRefusal`'s refusal
+ */
+const isOwnedWithdrawnRefusal = (error) => error?.[OWNED_WITHDRAWN] === true
+
 module.exports = {
   EAGER,
   COOPERATIVE,
@@ -431,4 +454,6 @@ module.exports = {
   ConsumerOperation,
   markCallDeadline,
   isCallDeadline,
+  ownedWithdrawnRefusal,
+  isOwnedWithdrawnRefusal,
 }

@@ -1898,6 +1898,45 @@ describe('Consumer > groupProtocol > ConsumerGroupProtocol', () => {
       await reportsThenReapplies(h)
     })
 
+    it('a withdrawn member restates the empty owned set on every heartbeat, through a later revocation, until an apply', async () => {
+      const h = build({
+        answers: [
+          heartbeatResponse({ memberEpoch: 3, assignment: TARGET }),
+          heartbeatResponse({ memberEpoch: 3 }),
+          heartbeatResponse({ memberEpoch: 3 }),
+          // The coordinator kept the partitions after the withdrawal and revokes them later.
+          heartbeatResponse({ memberEpoch: 4, assignment: assignmentOf([]) }),
+          heartbeatResponse({ memberEpoch: 4 }),
+        ],
+      })
+      await await startStep(h)
+      h.protocol.setOwned(OWNED)
+      await h.manager.tick()
+      expect(h.protocol.state).toEqual(STABLE)
+
+      h.protocol.withdrawOwned()
+      await h.manager.tick()
+      for (let beat = 0; beat < 3; beat++) {
+        jest.advanceTimersByTime(5000)
+        await h.manager.tick()
+      }
+
+      const withdrawn = h.sent.slice(2)
+      expect(withdrawn.map(({ memberEpoch }) => memberEpoch)).toEqual([3, 3, 4, 4])
+      for (const request of withdrawn) expect(request.topicPartitions).toEqual([])
+      expect(h.protocol.state).toEqual(STABLE)
+
+      const applied = await h.protocol.rebalance(context())
+      expect(applied.assignment).toEqual({})
+      h.protocol.setOwned([])
+      for (let beat = 0; beat < 2; beat++) {
+        jest.advanceTimersByTime(5000)
+        await h.manager.tick()
+      }
+      expect(h.sent).toHaveLength(8)
+      expect(h.sent[7].topicPartitions).toBeUndefined()
+    })
+
     it('a reconciling member drops the step result it has not applied and acknowledges nothing until a later apply', async () => {
       const h = build({
         answers: [

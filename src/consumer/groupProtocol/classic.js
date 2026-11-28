@@ -12,7 +12,12 @@ const {
 const {
   events: { HEARTBEAT },
 } = require('../instrumentationEvents')
-const { EAGER, COOPERATIVE } = require('./interface')
+const {
+  EAGER,
+  COOPERATIVE,
+  ownedWithdrawnRefusal,
+  isOwnedWithdrawnRefusal,
+} = require('./interface')
 const LeaderUnionWatch = require('../leaderUnionWatch')
 const CoordinatorLookup = require('../coordinatorLookup')
 const {
@@ -139,6 +144,8 @@ module.exports = class ClassicGroupProtocol {
 
     /** @type {import('./interface').TopicPartitions[]} */
     this.ownedPartitions = []
+    /** How many withdrawals there were; a JoinGroup built before the latest one claims nothing. */
+    this.withdrawals = 0
 
     /** @type {Object|null} set by `attach`, absent until a `Runner` exists */
     this.rebalanceCoordinator = null
@@ -419,7 +426,8 @@ module.exports = class ClassicGroupProtocol {
    * with the retriable join-deadline error, so a late response never restores a departed identity.
    * The same check guards both sends of the handshake, so a membership retired before the
    * MEMBER_ID_REQUIRED answer arrives writes no follow-up JoinGroup that could acquire a member
-   * nothing owns.
+   * nothing owns. A request whose metadata claims owned partitions is also refused at its write,
+   * either send, once they were withdrawn (`withdrawOwned`), and is built again at once.
    *
    * The attached heartbeat manager, when there is one, is disabled for the duration of the
    * JoinGroup request and re-enabled in a `finally`, so a join that throws or is retried keeps
@@ -460,23 +468,40 @@ module.exports = class ClassicGroupProtocol {
         this.heartbeatManager.disable()
       }
 
-      groupData = await this.coordinator.joinGroup(
-        {
-          groupId,
-          sessionTimeout,
-          rebalanceTimeout,
-          memberId: this.memberId || this.pendingMemberId || '',
-          groupInstanceId,
-          protocolType: PROTOCOL_TYPE,
-          groupProtocols: this.assigners.map((assigner) =>
-            this.subscriptionFor(assigner, topicsSubscribed)
-          ),
-        },
-        {
-          guard: joinRefusal,
-          onMemberIdRequired: (assigned) => this.keepPendingMemberId(assigned, membershipRevision),
+      // A request that claims owned partitions is written only while no withdrawal came after its
+      // build, the MEMBER_ID_REQUIRED resend included; a refused one is built again from what the
+      // member owns now. Each withdrawal empties the owned set, so the rebuilt one claims nothing.
+      for (;;) {
+        const withdrawals = this.withdrawals
+        const guard =
+          this.ownedPartitions.length > 0
+            ? () =>
+                joinRefusal() || (this.withdrawals === withdrawals ? null : ownedWithdrawnRefusal())
+            : joinRefusal
+        try {
+          groupData = await this.coordinator.joinGroup(
+            {
+              groupId,
+              sessionTimeout,
+              rebalanceTimeout,
+              memberId: this.memberId || this.pendingMemberId || '',
+              groupInstanceId,
+              protocolType: PROTOCOL_TYPE,
+              groupProtocols: this.assigners.map((assigner) =>
+                this.subscriptionFor(assigner, topicsSubscribed)
+              ),
+            },
+            {
+              guard,
+              onMemberIdRequired: (assigned) =>
+                this.keepPendingMemberId(assigned, membershipRevision),
+            }
+          )
+          break
+        } catch (error) {
+          if (!isOwnedWithdrawnRefusal(error)) throw error
         }
-      )
+      }
       const stale = round?.guard()
       if (stale) throw stale
       const installed = this.changeIdentity(membershipRevision, {
@@ -965,11 +990,13 @@ module.exports = class ClassicGroupProtocol {
 
   /**
    * Gives up the whole owned set for a withheld assignment: the next JoinGroup advertises no owned
-   * partitions, and the next round counts everything it is assigned as added.
+   * partitions, and the next round counts everything it is assigned as added. A JoinGroup built
+   * before it that claims partitions is refused at its write and built again (`join`).
    * @returns {void}
    */
   withdrawOwned() {
     this.ownedPartitions = []
+    this.withdrawals += 1
   }
 
   /**
