@@ -160,10 +160,10 @@ describe.each(['tv1', 'tv2'])('Producer > transactional seek fence (%s)', (profi
     producers = []
     handlers = []
     ledgers = new Set()
-    const snapshot = TransactionOffsets.prototype.snapshot
-    jest.spyOn(TransactionOffsets.prototype, 'snapshot').mockImplementation(function (...args) {
+    const hold = TransactionOffsets.prototype.hold
+    jest.spyOn(TransactionOffsets.prototype, 'hold').mockImplementation(function (...args) {
       ledgers.add(this)
-      return snapshot.apply(this, args)
+      return hold.apply(this, args)
     })
   })
 

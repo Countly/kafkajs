@@ -1,4 +1,5 @@
 const { isSuperseded } = require('../../consumer/handlerContext')
+const { int32, int64, text } = require('./offsetFields')
 
 /**
  * Holds immutable transactional offset calls until a confirmed commit. Fences belong to the
@@ -59,10 +60,46 @@ class TransactionOffsets {
   }
 
   /**
-   * Copies every wire field and takes the mutation fence synchronously, before any await.
-   * Empty input owns no fence. Neither wire retries nor staging reads the caller's arrays.
+   * Copies every wire field of the offsets: the one read of the caller's arrays, rows and getters,
+   * and it changes no state. Neither wire retries nor staging reads the caller's arrays again.
+   * A primitive field is copied as given, so the request and the committed-offset cache see the
+   * caller's values as before; an object field is converted once here (`offsetFields`).
    * A topic or partition given more than once is copied once, in first-seen order, with the
    * partition's last entry, as the broker would store it and as the Java client's map sends it.
+   * @param {object[]} topics
+   * @returns {ReadonlyArray<{ topic: string, partitions: ReadonlyArray<object> }>} the frozen copy
+   * @throws {TypeError} for malformed offset arrays, before transmission
+   */
+  static copy(topics) {
+    const byTopic = new Map()
+    if (!Array.isArray(topics)) throw new TypeError('Offset topics must be an array')
+    Array.prototype.forEach.call(topics, ({ topic, partitions }) => {
+      const name = text(topic)
+      const byPartition = byTopic.get(name) ?? new Map()
+      byTopic.set(name, byPartition)
+      if (!Array.isArray(partitions)) throw new TypeError('Offset partitions must be an array')
+      Array.prototype.forEach.call(partitions, ({ partition, offset, leaderEpoch, metadata }) => {
+        const id = int32(partition)
+        byPartition.set(
+          Number(id),
+          Object.freeze({
+            partition: id,
+            offset: int64(offset),
+            leaderEpoch: int32(leaderEpoch),
+            metadata: text(metadata),
+          })
+        )
+      })
+    })
+    return Object.freeze(
+      Array.from(byTopic, ([topic, byPartition]) =>
+        Object.freeze({ topic, partitions: Object.freeze([...byPartition.values()]) })
+      )
+    )
+  }
+
+  /**
+   * `copy` and `hold` in one step, for a caller with nothing to check between them.
    * @param {import('../../consumer/offsetManager/offsetOperations')} ledger
    * @param {string} groupId
    * @param {object[]} topics
@@ -70,22 +107,19 @@ class TransactionOffsets {
    * @throws {TypeError} for malformed offset arrays, before transmission
    */
   snapshot(ledger, groupId, topics) {
-    const byTopic = new Map()
-    topics.forEach(({ topic, partitions }) => {
-      const byPartition = byTopic.get(topic) ?? new Map()
-      byTopic.set(topic, byPartition)
-      partitions.forEach(({ partition, offset, leaderEpoch, metadata }) => {
-        byPartition.set(
-          Number(partition),
-          Object.freeze({ partition, offset, leaderEpoch, metadata })
-        )
-      })
-    })
-    const copied = Object.freeze(
-      Array.from(byTopic, ([topic, byPartition]) =>
-        Object.freeze({ topic, partitions: Object.freeze([...byPartition.values()]) })
-      )
-    )
+    return this.hold(ledger, groupId, TransactionOffsets.copy(topics))
+  }
+
+  /**
+   * Takes the mutation fence of copied offsets synchronously, before any await. Empty input owns
+   * no fence. It is the first state change of an offset call: the caller copies the offsets, checks
+   * that the call may still go on, and only then holds them.
+   * @param {import('../../consumer/offsetManager/offsetOperations')} ledger
+   * @param {string} groupId
+   * @param {ReturnType<typeof TransactionOffsets.copy>} copied
+   * @returns {object} the call and its lifetime permit
+   */
+  hold(ledger, groupId, copied) {
     const cells = copied.flatMap(({ topic, partitions }) =>
       partitions.map(({ partition }) => ({ topic, partition }))
     )

@@ -2068,7 +2068,7 @@ describe('Producer > the accumulator', () => {
             compression,
             partitions[0].values,
           ])
-        ).toEqual([[undefined, ['a']]])
+        ).toEqual([[0, ['a']]])
 
         await jest.advanceTimersByTimeAsync(LINGER)
 
@@ -2078,7 +2078,7 @@ describe('Producer > the accumulator', () => {
             partitions[0].values,
           ])
         ).toEqual([
-          [undefined, ['a']],
+          [0, ['a']],
           [GZIP, ['b']],
         ])
       })
@@ -2862,6 +2862,7 @@ describe('Producer > the accumulator', () => {
       expect(await produced()).toEqual([
         {
           acks: -1,
+          compression: 0,
           producerId: -1,
           partitions: [{ partition: 0, firstSequence: undefined, values: ['a', 'b'] }],
         },
@@ -2944,11 +2945,13 @@ describe('Producer > the accumulator', () => {
       expect(await produced()).toEqual([
         {
           acks: -1,
+          compression: 0,
           producerId: '1000',
           partitions: [{ partition: 0, firstSequence: 0, values: ['a'] }],
         },
         {
           acks: 1,
+          compression: 0,
           producerId: -1,
           partitions: [{ partition: 0, firstSequence: undefined, values: ['b'] }],
         },

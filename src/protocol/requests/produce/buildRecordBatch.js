@@ -40,6 +40,7 @@ const toExactTimestamp = (timestamp, dateNow) => {
  * @param {object} options
  * @param {import('../../message/compression').CompressionTypes} options.compression
  * @param {number} [options.compressionLevel] codec-specific compression level
+ * @param {?Function} [options.compressionCodec] the codec factory a producer send pinned
  * @param {object[]} options.messages
  * @param {string} [options.transactionalId]
  * @param {number} [options.firstSequence]
@@ -51,6 +52,7 @@ const toExactTimestamp = (timestamp, dateNow) => {
 module.exports = async ({
   compression,
   compressionLevel,
+  compressionCodec,
   messages,
   transactionalId,
   firstSequence,
@@ -90,6 +92,7 @@ module.exports = async ({
   return RecordBatch({
     compression,
     compressionLevel,
+    compressionCodec,
     records,
     firstTimestamp,
     maxTimestamp,

@@ -1746,11 +1746,31 @@ interface RecordBatchEntry {
 
 export type KafkaMessage = MessageSetEntry | RecordBatchEntry
 
+/**
+ * A send's options are read once, when `send()` is called, and converted before anything is
+ * queued: `acks` and `timeout` once, `compression` twice (the number hint gives the batch header
+ * bits, the string hint the registry key). A value that does not convert to a valid one rejects
+ * the call with `KafkaJSInvalidConfigurationError`. A call that is refused, including by a getter or
+ * conversion of yours that closes the producer or ends the transaction, changes nothing.
+ */
 export interface ProducerRecord {
   topic: string
   messages: Message[]
+  /**
+   * -1 (all in-sync replicas, the default), 1 (the leader) or 0 (none: resolves once written).
+   * Only an exact zero means none; any other number must truncate toward zero to -1 or 1. A value
+   * that converts to -1 keeps idempotence on.
+   */
   acks?: number
+  /** Broker wait in ms, -2147483648 to 2147483647; omitted, the broker default of 30000. */
   timeout?: number
+  /**
+   * The codec, looked up in `CompressionCodecs` at the call and kept for this send: at the key the
+   * value converts to and, only when that key is not the text of its batch header bits, again at
+   * the bits. None when omitted or 0, or when the header bits are 0 and the key is `'0'` with no
+   * callable codec registered under it; otherwise the codec of the key must be the codec of the
+   * header bits (1 to 4), an alias registered as that same function included.
+   */
   compression?: CompressionTypes
 }
 
@@ -1770,9 +1790,13 @@ export interface TopicMessages {
   messages: Message[]
 }
 
+/** The options of `sendBatch()`, read and converted once as `ProducerRecord`'s are. */
 export interface ProducerBatch {
+  /** As `ProducerRecord.acks`. */
   acks?: number
+  /** As `ProducerRecord.timeout`. */
   timeout?: number
+  /** As `ProducerRecord.compression`. */
   compression?: CompressionTypes
   topicMessages?: TopicMessages[]
 }

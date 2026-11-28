@@ -32,6 +32,7 @@ const buildRecordBatch = require('../buildRecordBatch')
  * @param timeout {number} see producer request v0
  * @param [compression=CompressionTypes.None] {CompressionTypes}
  * @param [compressionLevel] {number} optional codec level
+ * @param [compressionCodec] {Function} the codec factory a producer send pinned
  * @param topicData {Array}
  */
 module.exports = ({
@@ -42,6 +43,7 @@ module.exports = ({
   producerEpoch = 0,
   compression = Types.None,
   compressionLevel,
+  compressionCodec,
   topicData,
 }) => ({
   apiKey,
@@ -49,7 +51,7 @@ module.exports = ({
   apiName: 'Produce',
   expectResponse: () => acks !== 0,
   encode: async () => {
-    const encodeTopic = topicEncoder(compression, compressionLevel)
+    const encodeTopic = topicEncoder(compression, compressionLevel, compressionCodec)
     const encodedTopicData = []
 
     for (const data of topicData) {
@@ -68,9 +70,9 @@ module.exports = ({
 })
 
 const topicEncoder =
-  (compression, compressionLevel) =>
+  (compression, compressionLevel, compressionCodec) =>
   async ({ topic, partitions, transactionalId, producerId, producerEpoch }) => {
-    const encodePartitions = partitionsEncoder(compression, compressionLevel)
+    const encodePartitions = partitionsEncoder(compression, compressionLevel, compressionCodec)
     const encodedPartitions = []
 
     for (const data of partitions) {
@@ -86,11 +88,12 @@ const topicEncoder =
   }
 
 const partitionsEncoder =
-  (compression, compressionLevel) =>
+  (compression, compressionLevel, compressionCodec) =>
   async ({ partition, messages, transactionalId, firstSequence, producerId, producerEpoch }) => {
     const recordBatch = await buildRecordBatch({
       compression,
       compressionLevel,
+      compressionCodec,
       messages,
       transactionalId,
       firstSequence,

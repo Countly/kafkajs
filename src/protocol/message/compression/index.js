@@ -17,23 +17,61 @@ const NAMES = {
   [Types.ZSTD]: 'zstd',
 }
 
+/**
+ * Publishes one immutable codec facade without exposing the implementation module.
+ * @param {() => object} load
+ * @returns {() => object}
+ */
+const builtIn = (load) => {
+  let codec
+  return () => {
+    if (codec === undefined) {
+      const implementation = load()
+      codec = Object.freeze({
+        ...implementation,
+        compress: (...args) => implementation.compress(...args),
+        decompress: (...args) => implementation.decompress(...args),
+      })
+    }
+    return codec
+  }
+}
+
 const Codecs = {
-  [Types.GZIP]: () => require('./gzip'),
+  [Types.GZIP]: builtIn(() => require('./gzip')),
   [Types.Snappy]: () => require('./snappy'),
-  [Types.LZ4]: () => {
+  [Types.LZ4]: builtIn(() => {
     const lz4 = require('./lz4')
     if (!lz4.isSupported) {
       throw new KafkaJSNotImplemented(lz4.NOT_SUPPORTED_MESSAGE)
     }
     return lz4
-  },
-  [Types.ZSTD]: () => {
+  }),
+  [Types.ZSTD]: builtIn(() => {
     const zstd = require('./zstd')
     if (!zstd.isSupported) {
       throw new KafkaJSNotImplemented(zstd.NOT_SUPPORTED_MESSAGE)
     }
     return zstd
-  },
+  }),
+}
+
+/** The factories registered at load, by which a built-in codec is told from one registered later. */
+const BUILT_IN = Object.freeze({ ...Codecs })
+
+/**
+ * Why a built-in codec factory cannot run on this platform, found without calling it.
+ * @param {Function} factory a registry factory
+ * @returns {?string} the codec's `NOT_SUPPORTED_MESSAGE`; null when it runs or is not LZ4 or ZSTD
+ */
+const unsupportedReason = (factory) => {
+  const codec =
+    factory === BUILT_IN[Types.LZ4]
+      ? require('./lz4')
+      : factory === BUILT_IN[Types.ZSTD]
+        ? require('./zstd')
+        : null
+  return codec === null || codec.isSupported ? null : codec.NOT_SUPPORTED_MESSAGE
 }
 
 /**
@@ -43,6 +81,16 @@ const Codecs = {
  *   platform requirement isn't met (see each codec's `NOT_SUPPORTED_MESSAGE`)
  */
 const lookupCodec = (type) => (Codecs[type] ? Codecs[type]() : null)
+
+/**
+ * Runs a registry factory the way a lookup does, with the registry as `this`, for a factory that
+ * was taken from it earlier and must not be looked up again. A factory registered by the caller
+ * may rely on that receiver. The call operation is the language's own, not a `call` property.
+ * @param {Function} factory a function read from `Codecs`
+ * @returns {object} the codec
+ * @throws {KafkaJSNotImplemented} same as `lookupCodec`
+ */
+const createCodec = (factory) => Reflect.apply(factory, Codecs, [])
 
 /**
  * @param {number} attributes the record batch / message-set attributes byte
@@ -116,7 +164,10 @@ const decompressBounded = async (codec, attributes, buffer, limit) => {
 module.exports = {
   Types,
   Codecs,
+  BUILT_IN,
+  unsupportedReason,
   lookupCodec,
+  createCodec,
   lookupCodecByAttributes,
   decompressBounded,
   codecName,

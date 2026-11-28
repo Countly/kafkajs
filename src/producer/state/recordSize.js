@@ -1,5 +1,6 @@
+const { types } = require('node:util')
 const { KafkaJSNonRetriableError, KafkaJSRecordTooLargeError } = require('../../errors')
-const { Codecs, Types } = require('../../protocol/message/compression')
+const { Codecs, BUILT_IN, Types } = require('../../protocol/message/compression')
 const snappy = require('../../protocol/message/compression/snappy')
 
 /**
@@ -34,6 +35,31 @@ const lengthOf = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(Uint8Array.prototype),
   'length'
 ).get
+const typedArray = Object.getPrototypeOf(Uint8Array.prototype)
+const bufferOf = Object.getOwnPropertyDescriptor(typedArray, 'buffer').get
+const byteOffsetOf = Object.getOwnPropertyDescriptor(typedArray, 'byteOffset').get
+const arrayBufferLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get
+const sharedBufferLength = Object.getOwnPropertyDescriptor(
+  SharedArrayBuffer.prototype,
+  'byteLength'
+).get
+
+/**
+ * @param {ArrayBuffer|SharedArrayBuffer} buffer
+ * @returns {number} the backing store's length, without reading its properties
+ */
+const storeLength = (buffer) =>
+  types.isSharedArrayBuffer(buffer)
+    ? sharedBufferLength.call(buffer)
+    : arrayBufferLength.call(buffer)
+
+/**
+ * Captures the extent of a Buffer in a library-owned view. The byte storage remains shared.
+ * @param {Buffer} view
+ * @returns {Buffer}
+ */
+const ownedBuffer = (view) =>
+  Buffer.from(bufferOf.call(view), byteOffsetOf.call(view), lengthOf.call(view))
 
 /**
  * Java's `ByteUtils.sizeOfVarint` of a length: the bytes of its zigzag varint.
@@ -206,7 +232,7 @@ const storeCharge = (stores, view) => {
   const spans = stores.get(view.buffer)
   if (spans === undefined) {
     stores.set(view.buffer, [start, end])
-    return view.buffer.byteLength - view.length
+    return storeLength(view.buffer) - view.length
   }
   return -cover(spans, start, end)
 }
@@ -270,7 +296,7 @@ const chargeOf = (topicMessages, limit) => {
  *   above 16 times the view, which a send copies so as not to keep the store alive
  */
 const pinsStore = (view) => {
-  const { byteLength } = view.buffer
+  const byteLength = storeLength(view.buffer)
   return byteLength > COPY_STORES_ABOVE && byteLength > COPY_STORES_TIMES * lengthOf.call(view)
 }
 
@@ -304,12 +330,17 @@ class SendCopy {
    */
   note(container, key) {
     const view = container[key]
-    if (!Buffer.isBuffer(view) || !pinsStore(view)) {
+    if (!Buffer.isBuffer(view)) {
       return
     }
-    const length = lengthOf.call(view)
+    const owned = ownedBuffer(view)
+    if (!pinsStore(owned)) {
+      container[key] = owned
+      return
+    }
+    const { length } = owned
     this.#slots ??= []
-    this.#slots.push(container, key, view, length)
+    this.#slots.push(container, key, owned, length)
     this.#bytes += length
   }
 
@@ -344,8 +375,6 @@ const BATCH_OVERHEAD = 61
 const PARTITION_FRAMING = 16
 /** The wire size of a record with no key, an empty value and no header. */
 const EMPTY_RECORD = 24
-/** The codecs this client registers itself; a factory assigned later is the caller's plugin. */
-const BUILT_IN = { ...Codecs }
 
 /**
  * @param {*} text a client id, transactional id or topic name; null and absent count 0
@@ -394,16 +423,18 @@ const batchBytes = (records) => BATCH_OVERHEAD + recordsBytes(records)
 /**
  * The most `n` bytes of records can take once a built-in codec compressed them, from each codec's
  * own worst case; `n` for no compression, and for a codec the caller registered, whose bound is
- * unknown (the write-boundary guard catches what it adds).
+ * unknown (the write-boundary guard catches what it adds). A codec is built in when its factory
+ * is the one this client registered for those attribute bits.
  * @see https://github.com/madler/zlib/blob/v1.3.1/deflate.c (`deflateBound`, gzip wrapper)
  * @see https://github.com/facebook/zstd/blob/dev/lib/zstd.h (`ZSTD_COMPRESSBOUND`)
  * @see https://github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md
  * @param {number} codec the request's `compression`, one of `Types`
  * @param {number} n uncompressed bytes
+ * @param {?Function} [factory] the codec factory a send pinned; absent, the registry's for `codec`
  * @returns {number}
  */
-const encodedBound = (codec, n) => {
-  if (Codecs[codec] === undefined || Codecs[codec] !== BUILT_IN[codec]) {
+const encodedBound = (codec, n, factory = Codecs[codec]) => {
+  if (factory == null || factory !== BUILT_IN[codec]) {
     return n
   }
   switch (codec) {
@@ -466,36 +497,39 @@ class RequestBudget {
   }
 
   /**
-   * @param {{ compression?: number, messages: object[], wire?: number }} batch `wire` is its
-   *   records' wire bytes, computed from `messages` when absent
+   * @param {{ compression?: number, codec?: ?Function, messages: object[], wire?: number }} batch
+   *   `codec` is its pinned codec factory; `wire` is its records' wire bytes, computed from
+   *   `messages` when absent
    * @returns {number} the planned bytes of the batch in a request, its topic's framing apart
    */
-  batchBytes({ compression, messages, wire: bytes = recordsBytes(messages) }) {
-    return PARTITION_FRAMING + BATCH_OVERHEAD + encodedBound(compression, bytes)
+  batchBytes({ compression, codec, messages, wire: bytes = recordsBytes(messages) }) {
+    return PARTITION_FRAMING + BATCH_OVERHEAD + encodedBound(compression, bytes, codec)
   }
 
   /**
    * The most wire bytes of records one batch of `topic` may carry for a request of that batch
    * alone to fit: the largest `R` whose plan, `framing + topicFraming + 16 + 61 +
    * encodedBound(codec, R)`, is at most `maxRequestSize`. Found by bisection over the monotone
-   * bound, and kept per codec and topic name length.
+   * bound, and kept per codec, whether it is built in, and topic name length.
    * @param {string} topic
    * @param {number} [codec]
+   * @param {?Function} [factory] the codec factory a send pinned; absent, the registry's for `codec`
    * @returns {number} Infinity without a limit; -1 when not even an empty batch fits
    */
-  chunkCapacity(topic, codec) {
+  chunkCapacity(topic, codec, factory = Codecs[codec]) {
     if (this.maxRequestSize === Infinity) {
       return Infinity
     }
     const fixed = this.#framing + topicFraming(topic) + PARTITION_FRAMING + BATCH_OVERHEAD
-    const key = `${codec}/${Codecs[codec] === BUILT_IN[codec]}/${fixed}`
+    const builtIn = factory != null && factory === BUILT_IN[codec]
+    const key = `${codec}/${builtIn}/${fixed}`
     let capacity = this.#capacities.get(key)
     if (capacity === undefined) {
       let low = -1
       let high = Math.max(-1, this.maxRequestSize - fixed)
       while (low < high) {
         const middle = Math.ceil((low + high) / 2)
-        if (fixed + encodedBound(codec, middle) <= this.maxRequestSize) {
+        if (fixed + encodedBound(codec, middle, factory) <= this.maxRequestSize) {
           low = middle
         } else {
           high = middle - 1
@@ -514,6 +548,7 @@ module.exports = {
   share,
   chargeOf,
   SendCopy,
+  ownedBuffer,
   varintSize,
   framing,
   topicFraming,

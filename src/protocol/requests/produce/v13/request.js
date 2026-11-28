@@ -19,6 +19,7 @@ const { KafkaJSInvariantViolation } = require('../../../../errors')
  * @param timeout {number} see producer request v0
  * @param [compression=CompressionTypes.None] {CompressionTypes}
  * @param [compressionLevel] {number} optional codec level
+ * @param [compressionCodec] {Function} the codec factory a producer send pinned
  * @param topicData {Array}
  * @param {Map<string, string>} topicIds topic name to topic id. `TopicId` is a `mapKey`, so each
  *   topic appears exactly once per request - which `src/producer/sendMessages.js` already
@@ -33,6 +34,7 @@ module.exports = ({
   producerEpoch = 0,
   compression = Types.None,
   compressionLevel,
+  compressionCodec,
   topicData,
   topicIds,
 }) => ({
@@ -41,7 +43,7 @@ module.exports = ({
   apiName: 'Produce',
   expectResponse: () => acks !== 0,
   encode: async () => {
-    const encodeTopic = topicEncoder(compression, compressionLevel)
+    const encodeTopic = topicEncoder(compression, compressionLevel, compressionCodec)
     const encodedTopicData = []
 
     for (const data of topicData) {
@@ -81,9 +83,9 @@ const requireTopicId = (topicIds, topic) => {
 }
 
 const topicEncoder =
-  (compression, compressionLevel) =>
+  (compression, compressionLevel, compressionCodec) =>
   async ({ topic, partitions, transactionalId, producerId, producerEpoch, topicIds }) => {
-    const encodePartitions = partitionsEncoder(compression, compressionLevel)
+    const encodePartitions = partitionsEncoder(compression, compressionLevel, compressionCodec)
     const encodedPartitions = []
 
     for (const data of partitions) {
@@ -99,11 +101,12 @@ const topicEncoder =
   }
 
 const partitionsEncoder =
-  (compression, compressionLevel) =>
+  (compression, compressionLevel, compressionCodec) =>
   async ({ partition, messages, transactionalId, firstSequence, producerId, producerEpoch }) => {
     const recordBatch = await buildRecordBatch({
       compression,
       compressionLevel,
+      compressionCodec,
       messages,
       transactionalId,
       firstSequence,

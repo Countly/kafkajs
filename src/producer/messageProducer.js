@@ -4,6 +4,7 @@ const Accumulator = require('./state/accumulator')
 const { CONNECTION_STATUS } = require('../network/connectionStatus')
 const { KafkaJSNonRetriableError, KafkaJSInvalidConfigurationError } = require('../errors')
 const sharedPromiseTo = require('../utils/sharedPromiseTo')
+const { classifyAcks, classifyTimeout, classifyCompression } = require('./sendOptions')
 
 /**
  * `send()`/`sendBatch()` over one eosManager: validation, the `acks` rule of an idempotent
@@ -32,8 +33,10 @@ const sharedPromiseTo = require('../utils/sharedPromiseTo')
  * @param {object} options.instrumentationEmitter
  * @param {string} options.INITIALIZED
  * @param {() => import('./generation')|undefined} [options.getGeneration] current producer lifecycle
- * @returns {{ send: Function, sendBatch: Function, ensureInitialized: Function, flush: Function,
- *   close: Function, unsettled: () => Promise<void>[], forceClose: (surfaced?: Error) => void,
+ * @param {() => ?Error} [options.fatalRefusal] the producer-wide armed fatal error
+ * @param {import('./deliveryCallbacks')} [options.callbacks] the producer's callback context
+ * @returns {{ send: Function, sendBatch: Function, sendersWith: Function,
+ *   ensureInitialized: Function, flush: Function, close: Function, unsettled: () => Promise<void>[], forceClose: (surfaced?: Error) => void,
  *   depthOf: (topic: string, partition: number) => number }} `depthOf` counts the batches
  *   waiting for a partition (see `Accumulator#depthOf`)
  */
@@ -56,6 +59,8 @@ module.exports = ({
   instrumentationEmitter,
   INITIALIZED,
   getGeneration = () => undefined,
+  fatalRefusal,
+  callbacks,
 }) => {
   const idempotentSend = createSendMessages({
     logger,
@@ -70,6 +75,7 @@ module.exports = ({
     getConnectionStatus,
     budget,
     getGeneration,
+    callbacks,
   })
   let plainSend = null
   /** How many `flush(until)` calls are waiting for their `until`: batches linger only at 0. */
@@ -99,6 +105,7 @@ module.exports = ({
         partitioner,
         budget,
         getGeneration,
+        callbacks,
         eosManager: createEosManager({ logger, cluster, transactional: false }),
       })
     return plainSend
@@ -231,37 +238,99 @@ module.exports = ({
    * @property {number} [timeout=30000] The time to await a response in ms
    * @property {Compression.Types} [compression=Compression.Types.None] Compression codec
    *
+   * Each option is read once before admission. Object compression uses separate number and
+   * property-key conversions, with a conditional canonical lookup. The selected factory is pinned.
    * The records are read once, at this call (`Accumulator.snapshot`): changing a record, its
    * headers or a `Date` or `Long` timestamp afterwards changes neither what is sent nor what is
-   * charged against `bufferMemory`. The bytes of a Buffer are not copied, except a small view of a
-   * large backing store: all of those in the send are copied into one store (`SendCopy`).
-   * @param {SendBatchRequest}
+   * charged against `bufferMemory`. Each Buffer gets a private view. Small views of large stores
+   * are copied into one store (`SendCopy`).
+   * @param {SendBatchRequest} request
+   * @returns {Promise}
+   * @throws {KafkaJSInvalidConfigurationError} as a rejection, an option `sendOptions.js` refuses
+   */
+  const sendBatch = (request) => sendBatchBy(request, fatalRefusal)
+
+  /**
+   * Captures a batch against the lifecycle that received it.
+   * @param {SendBatchRequest} request
+   * @param {(() => ?Error)|undefined} refusal
+   * @param {(operation: Promise<object[]>) => Promise<object[]>} [track]
    * @returns {Promise}
    */
-  const sendBatch = async ({ acks = -1, timeout, compression, topicMessages: given = [] }) => {
-    // The delivery deadline counts from here, validation included.
+  const sendBatchBy = async (request, refusal, track) => {
+    // The delivery deadline counts from here, the option reads included.
     const startedAt = Date.now()
-    // Every check below, the charge and the encoder read this copy, never the caller's records.
-    const topicMessages = Accumulator.snapshot(given)
+    const generation = getGeneration()
+    return produce(startedAt, request, false, generation, refusal, track)
+  }
+
+  /**
+   * Reads one send's request, options and records. An encodability error is retained so that the
+   * caller sees it after the ordinary request and connection checks.
+   * @param {ProduceRequest|SendBatchRequest} request
+   * @param {boolean} single a request for one topic
+   * @returns {object}
+   */
+  const capture = (request, single) => {
+    const { acks: givenAcks, timeout: givenTimeout, compression: givenCompression } = request
+    let given
+    if (single) {
+      const { topic, messages } = request
+      given = [{ topic, messages }]
+    } else {
+      const { topicMessages = [] } = request
+      given = topicMessages
+    }
+    const acks = classifyAcks(givenAcks)
+    const timeout = classifyTimeout(givenTimeout)
+    const { bits: compression, factory: codec } = classifyCompression(givenCompression)
+    let recordError
+    const topicMessages = Accumulator.snapshot(given, (topic, field) => {
+      recordError ??= Accumulator.recordError(topic, field)
+    })
+    return { acks, timeout, compression, codec, topicMessages, recordError }
+  }
+
+  /**
+   * Converts a send's options, validates it and appends it to the accumulator. Everything the
+   * caller's code can touch is read first; then every refusal is decided (`refusal`, the topic,
+   * the config rule for `acks`, the records, the connection status); only then does the send change
+   * anything. A successful admission can downgrade idempotence for acks other than -1.
+   * @param {number} startedAt when the public call began, in epoch ms
+   * @param {ProduceRequest|SendBatchRequest} request
+   * @param {boolean} single
+   * @param {import('./generation')|undefined} generation the lifecycle that received the call
+   * @param {(() => ?Error)|undefined} refusal asked once the caller's code has run (the options'
+   *   conversions, the records' getters) and before anything changes: the error the send is
+   *   refused with, or null
+   * @param {(operation: Promise<object[]>) => Promise<object[]>} [track]
+   * @returns {Promise<object[]>}
+   * @throws {Error} what `refusal` returned, or the refusal of the topic, the records, the `acks`
+   *   rule or the connection status, which includes a producer a conversion has closed
+   */
+  const produce = (startedAt, request, single, generation, refusal, track) => {
+    let prepared
+    let captureError
+    try {
+      prepared = capture(request, single)
+    } catch (error) {
+      captureError = error
+    }
+    const refused = refusal?.() ?? null
+    if (refused !== null) {
+      throw refused
+    }
+    if (!prepared) throw captureError
+    const { acks, timeout, compression, codec, topicMessages, recordError } = prepared
 
     if (topicMessages.some(({ topic }) => !topic)) {
       throw new KafkaJSNonRetriableError(`Invalid topic`)
     }
 
-    if (idempotence.isEnabled() && acks !== -1) {
-      if (idempotence.isExplicit()) {
-        throw new KafkaJSInvalidConfigurationError(
-          `Not requiring ack for all messages invalidates the idempotent producer's EoS guarantees`
-        )
-      }
-
-      // Accumulated batches still carry the producer id: they go out idempotently first.
-      flush()
-      idempotence.disable(
-        'acks',
-        `Idempotence disabled: a send asked for acks ${acks}, and an idempotent producer needs ` +
-          'acks -1 (all). Send with acks -1 to keep idempotence, or create the producer with ' +
-          'idempotent: false to silence this warning.'
+    const disablesIdempotence = idempotence.isEnabled() && acks !== -1
+    if (disablesIdempotence && idempotence.isExplicit()) {
+      throw new KafkaJSInvalidConfigurationError(
+        `Not requiring ack for all messages invalidates the idempotent producer's EoS guarantees`
       )
     }
 
@@ -270,6 +339,9 @@ module.exports = ({
         throw new KafkaJSNonRetriableError(
           `Invalid messages array [${messages}] for topic "${topic}"`
         )
+      }
+      if (!Array.isArray(messages)) {
+        throw new TypeError('messages.findIndex is not a function')
       }
 
       const index = messages.findIndex((message) => message.value === undefined)
@@ -281,6 +353,21 @@ module.exports = ({
     }
 
     validateConnectionStatus()
+    generation?.check()
+    if (recordError) throw recordError
+
+    /** Hands older batches on with their original producer id before switching to plain sends. */
+    const downgrade = () => {
+      if (!idempotence.isEnabled()) return
+      // Accumulated batches still carry the producer id: they go out idempotently first.
+      flush()
+      idempotence.disable(
+        'acks',
+        `Idempotence disabled: a send asked for acks ${acks}, and an idempotent producer needs ` +
+          'acks -1 (all). Send with acks -1 to keep idempotence, or create the producer with ' +
+          'idempotent: false to silence this warning.'
+      )
+    }
 
     const mergedTopicMessages = topicMessages.reduce((merged, { topic, messages }) => {
       const index = merged.findIndex(({ topic: mergedTopic }) => topic === mergedTopic)
@@ -295,18 +382,25 @@ module.exports = ({
     }, [])
 
     // The accumulator acquires the producer id itself, so `close()` waits for this send from here.
-    return accumulator.append({
+    const delivery = accumulator.append({
       acks,
       timeout,
       compression,
+      codec,
       topicMessages: mergedTopicMessages,
       startedAt,
+      generation,
+      prepared: true,
+      onAdmitted: disablesIdempotence ? downgrade : undefined,
     })
+    return track ? track(delivery) : delivery
   }
 
   /**
-   * @param {ProduceRequest} ProduceRequest
+   * One topic's `sendBatch`, its options read and converted the same way.
+   * @param {ProduceRequest} request
    * @returns {Promise}
+   * @throws {KafkaJSInvalidConfigurationError} as a rejection, an option `sendOptions.js` refuses
    *
    * @typedef {Object} ProduceRequest
    * @property {string} topic
@@ -319,24 +413,49 @@ module.exports = ({
    * @property {number} [timeout=30000] The time to await a response in ms
    * @property {Compression.Types} [compression=Compression.Types.None] Compression codec
    */
-  const send = async ({ acks, timeout, compression, topic, messages }) => {
-    const topicMessage = { topic, messages }
-    return sendBatch({
-      acks,
-      timeout,
-      compression,
-      topicMessages: [topicMessage],
-    })
+  const send = (request) => sendBy(request, fatalRefusal)
+
+  /**
+   * `send` for a caller that can lose the right to send while the call's own conversions run.
+   * @param {ProduceRequest} request
+   * @param {(() => ?Error)|undefined} refusal see `produce`
+   * @param {(operation: Promise<object[]>) => Promise<object[]>} [track]
+   * @returns {Promise}
+   */
+  const sendBy = async (request, refusal, track) => {
+    const startedAt = Date.now()
+    const generation = getGeneration()
+    return produce(startedAt, request, true, generation, refusal, track)
+  }
+
+  /**
+   * The two sends of a caller that must be checked before a send is admitted, such as a
+   * transaction, which can end while a send's option conversions run. They take exactly the
+   * request: nothing a caller of the public methods passes can reach `refusal`.
+   * @param {(method: 'send'|'sendBatch') => ?Error} refusal the error the named send must be
+   *   refused with now, or null
+   * @param {(operation: Promise<object[]>) => Promise<object[]>} track accepted sends
+   * @returns {{ send: (request: ProduceRequest) => Promise, sendBatch: (request: SendBatchRequest) => Promise }}
+   */
+  const sendersWith = (refusal, track) => {
+    const sendRefusal = () => refusal('send')
+    const sendBatchRefusal = () => refusal('sendBatch')
+    return {
+      send: (request) => sendBy(request, sendRefusal, track),
+      sendBatch: (request) => sendBatchBy(request, sendBatchRefusal, track),
+    }
   }
 
   return {
     send,
     sendBatch,
+    sendersWith,
     ensureInitialized,
     flush,
     close,
     unsettled,
     forceClose,
+    abortUnwritten: idempotentSend.abortUnwritten,
     depthOf: (topic, partition) => accumulator.depthOf(topic, partition),
   }
 }

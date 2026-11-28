@@ -70,25 +70,28 @@ class OffsetOperations {
    * @returns {object} a ticket, open until `end`
    */
   begin(cells, { mutation = false, owner = null } = {}) {
+    const captured = Array.from(cells, ({ topic, partition }) => ({
+      topic,
+      partition: typeof partition === 'number' ? partition : Number(partition),
+    }))
     this.openTickets += 1
     const ticket = {
       began: ++this.clock,
       intent: mutation ? ++this.intent : 0,
       mutation,
       owner,
-      cells: [],
+      cells: captured,
       ended: false,
     }
 
-    for (const { topic, partition } of cells) {
-      const number = Number(partition)
+    for (const { topic, partition } of captured) {
       let partitions = this.topics.get(topic)
       if (!partitions) {
         partitions = new Map()
         this.topics.set(topic, partitions)
       }
 
-      let state = partitions.get(number)
+      let state = partitions.get(partition)
       if (!state) {
         state = {
           open: 0,
@@ -100,12 +103,11 @@ class OffsetOperations {
           ownerBarriers: null,
           reservation: null,
         }
-        partitions.set(number, state)
+        partitions.set(partition, state)
         this.cells += 1
       }
 
       state.open += 1
-      ticket.cells.push({ topic, partition: number })
     }
 
     return ticket

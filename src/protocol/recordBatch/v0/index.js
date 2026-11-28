@@ -4,6 +4,7 @@ const crc32C = require('../crc32C')
 const {
   Types: Compression,
   lookupCodec,
+  createCodec,
   COMPRESSION_CODEC_MASK,
 } = require('../../message/compression')
 
@@ -34,6 +35,8 @@ const TRANSACTIONAL_MASK = 16 // The fifth lowest bit
  * @param {object} options batch fields
  * @param {number} [options.compression=Compression.None] codec id
  * @param {number} [options.compressionLevel] codec level; omission retains codec defaults
+ * @param {?Function} [options.compressionCodec] the codec factory a producer send pinned; absent,
+ *   the registry's factory for `compression` at this call
  * @param {Long|number|string} [options.firstOffset] first record offset, default 0
  * @param {number} [options.firstTimestamp] first record time, default current epoch milliseconds
  * @param {number} [options.maxTimestamp] largest record time, default current epoch milliseconds
@@ -50,6 +53,7 @@ const TRANSACTIONAL_MASK = 16 // The fifth lowest bit
 const RecordBatch = async ({
   compression = Compression.None,
   compressionLevel,
+  compressionCodec,
   firstOffset = Long.fromInt(0),
   firstTimestamp = Date.now(),
   maxTimestamp = Date.now(),
@@ -83,6 +87,7 @@ const RecordBatch = async ({
   } else {
     const compressedRecords = await compressRecords(compression, records, {
       level: compressionLevel,
+      factory: compressionCodec,
     })
     batchBody.writeInt32(records.length).writeBuffer(compressedRecords)
   }
@@ -103,12 +108,13 @@ const RecordBatch = async ({
  * Compresses encoded records with the selected codec and optional level.
  * @param {number} compression codec id
  * @param {object[]} records encodable records
- * @param {{ level?: number }} options codec options
+ * @param {{ level?: number, factory?: ?Function }} options codec options; `factory` the pinned
+ *   codec factory, the registry's for `compression` when absent
  * @returns {Promise<Buffer>} compressed record data
  * @throws {Error} for unavailable codecs or compression failures
  */
-const compressRecords = async (compression, records, { level }) => {
-  const codec = lookupCodec(compression)
+const compressRecords = async (compression, records, { level, factory }) => {
+  const codec = factory ? createCodec(factory) : lookupCodec(compression)
   const recordsEncoder = new Encoder()
 
   recordsEncoder.writeEncoderArray(records)

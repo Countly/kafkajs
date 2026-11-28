@@ -22,9 +22,10 @@ const { surfaceInTransaction } = require('./eosManager')
 const groupMessagesPerPartition = require('./groupMessagesPerPartition')
 const Fifo = require('../utils/fifo')
 const { Deadline, ExpiryTimer, MAX_DELAY } = require('./deadline')
-const { Types: Compression } = require('../protocol/message/compression')
+const { Types: Compression, BUILT_IN } = require('../protocol/message/compression')
+const { isBuiltIn } = require('./partitioners/builtIn')
 const Accumulator = require('./state/accumulator')
-const { RequestBudget, recordsBytes } = require('./state/recordSize')
+const { RequestBudget, recordsBytes, ownedBuffer } = require('./state/recordSize')
 
 const { keys } = Object
 
@@ -321,13 +322,37 @@ class ProduceAttempt {
     this.maxRequestSize = maxRequestSize
     this.generation = generation
     this.written = false
-    this.revoked = false
+    this.revoked = null
     for (const delivery of this.deliveries) delivery.currentAttempt = this
   }
 
-  /** Revokes only this attempt, even after an older attempt wrote. @returns {void} */
-  revoke() {
-    if (!this.written) this.revoked = true
+  /**
+   * Revokes this attempt and wakes its encoder, even if an older attempt wrote.
+   * @param {Error} [error]
+   * @returns {void}
+   */
+  revoke(error) {
+    if (this.written || this.revoked) return
+    this.revoked = error ?? new ProduceAttemptRefused('The Produce attempt was revoked')
+    this.cancelCodec?.(this.revoked)
+  }
+
+  /**
+   * Keeps a pending custom compressor from holding the request after revocation.
+   * @param {() => Promise<Buffer>} compress
+   * @returns {Promise<Buffer>}
+   */
+  async compress(compress) {
+    const refused = this.guard()
+    if (refused) throw refused
+    const revoked = new Promise((_, reject) => {
+      this.cancelCodec = reject
+    })
+    try {
+      return await Promise.race([compress(), revoked])
+    } finally {
+      this.cancelCodec = undefined
+    }
   }
 
   /**
@@ -337,8 +362,7 @@ class ProduceAttempt {
    * @returns {Error|null} refusal before any write, or null
    */
   guard = (frameLength) => {
-    if (this.revoked) return new ProduceAttemptRefused('The Produce attempt was revoked')
-    const closed = this.generation?.guard()
+    const closed = this.revoked ?? this.generation?.guard()
     if (closed) return closed
     const statusError = connectionStatusError(this.getConnectionStatus())
     if (statusError) return statusError
@@ -361,6 +385,30 @@ class ProduceAttempt {
       delivery.batch.child = null
     }
     return null
+  }
+}
+
+/**
+ * Keeps the pinned factory identity for batching and bounds. Only the actual encoder gets this
+ * wrapper, which gives caller factories and compressors their original receivers.
+ * @param {?Function} codec
+ * @param {number} compression
+ * @param {ProduceAttempt} attempt
+ * @param {import('./deliveryCallbacks')} [callbacks]
+ * @returns {?Function}
+ */
+const codecFor = (codec, compression, attempt, callbacks) => {
+  if (!callbacks || !codec || BUILT_IN[compression] === codec) return codec
+  return function guardedFactory() {
+    const refused = attempt.guard()
+    if (refused) throw refused
+    const implementation = callbacks.codec(codec, this)
+    return {
+      compress: async (...args) => {
+        const result = await attempt.compress(() => implementation.compress(...args))
+        return Buffer.isBuffer(result) ? ownedBuffer(result) : result
+      },
+    }
   }
 }
 
@@ -575,6 +623,7 @@ class DrainLoop {
   #getConnectionStatus
   #budget
   #generation
+  #callbacks
   /** @type {Set<Send>} */
   #sends = new Set()
   /** @type {Map<string, Map<number, Fifo<Delivery>>>} every partition's live batches, by enqueue order */
@@ -622,6 +671,7 @@ class DrainLoop {
     getConnectionStatus,
     budget = new RequestBudget(),
     generation,
+    callbacks,
   }) {
     this.#logger = logger
     this.#cluster = cluster
@@ -633,6 +683,7 @@ class DrainLoop {
     this.#getConnectionStatus = getConnectionStatus
     this.#budget = budget
     this.#generation = generation
+    this.#callbacks = callbacks
     this.#expiry = new ExpiryTimer(this.#expireDue)
   }
 
@@ -662,16 +713,49 @@ class DrainLoop {
   }
 
   /**
+   * Revokes the dispatched requests not yet written when their transaction aborts, waking a custom
+   * codec still compressing one, and settles their batches at once, as the abort settles its
+   * queued ones (`abortQueued`): their callers reject with `error` and the transaction is not
+   * armed, since the abort owns their outcome. The abort never waits for such a codec. A batch no
+   * attempt wrote gives its sequences back; one an earlier attempt wrote has spent them. The
+   * revoked attempt's own failure, when its encoder returns, only retires the batch and releases
+   * its debit.
+   * @param {Error} error
+   * @returns {import('./state/partitionSequencer').PartitionBatch[]} the settled batches whose
+   *   sequences an earlier attempt spent
+   */
+  abortUnwritten(error) {
+    const { sequencer } = this.#eosManager.stateManager
+    const spent = []
+    for (const send of [...this.#sends]) {
+      for (const delivery of [...send.deliveries]) {
+        const attempt = delivery.currentAttempt
+        if (!delivery.dispatched || delivery.settled || !attempt || attempt.written) continue
+        attempt.revoke(error)
+        if (delivery.everWritten) {
+          sequencer.fail(delivery.batch)
+          spent.push(delivery.batch)
+        } else {
+          sequencer.rebase(delivery.batch)
+        }
+        rejectBatch(delivery.batch, error)
+      }
+    }
+    return spent
+  }
+
+  /**
    * Queues one batch per entry and settles once all of them have. Every entry's `settlers` are
    * settled with its batch: resolved with the batch's `RecordMetadata`, or rejected with its error.
    * A transactional producer registers each partition with the transaction here, before anything
    * is drained.
-   * @param {{ acks: number, timeout: number, compression: number,
+   * @param {{ acks: number, timeout: number, compression: number, codec?: ?Function,
    *   batches: { topic: string, partition: number, messages: object[], settlers?: object[],
-   *   createdAt?: number }[] }} request
+   *   createdAt?: number }[] }} request `codec` is the send's pinned codec factory, which every
+   *   batch carries and every request built from it uses
    * @returns {Promise<object[]>}
    */
-  send({ acks, timeout, compression, batches }) {
+  send({ acks, timeout, compression, codec, batches }) {
     const manager = this.#eosManager.stateManager
     const send = new Send(batches.length, this.#settled)
     const now = Date.now()
@@ -703,6 +787,7 @@ class DrainLoop {
           acks,
           timeout,
           compression,
+          codec,
           firstSequence: null,
           producerId: null,
           producerEpoch: null,
@@ -1202,7 +1287,7 @@ class DrainLoop {
     })
     const refused = attempt.guard()
     if (refused) throw refused
-    const [{ acks, timeout, compression, producerId, producerEpoch }] = batches
+    const [{ acks, timeout, compression, codec, producerId, producerEpoch }] = batches
     const topicData = topicDataOf(batches)
     const transactional = this.#eosManager.isTransactional()
 
@@ -1213,6 +1298,7 @@ class DrainLoop {
       acks,
       timeout,
       compression,
+      compressionCodec: codecFor(codec, compression, attempt, this.#callbacks),
       compressionLevel:
         compression === Compression.GZIP
           ? this.#compressionLevels?.gzip
@@ -1690,11 +1776,14 @@ const createSendMessages = ({
   getConnectionStatus,
   budget = new RequestBudget(),
   getGeneration = () => undefined,
+  callbacks,
 }) => {
   const isIdempotent = () => idempotence !== undefined && idempotence.isEnabled()
   let loop = null
   let loopGeneration
   const plainForces = new Set()
+  const customPartitioner = callbacks && !isBuiltIn(partitioner)
+  const route = customPartitioner ? callbacks.partitioner(partitioner) : partitioner
 
   /**
    * The error a transactional send whose records could not be assigned to partitions rejects
@@ -1940,9 +2029,16 @@ const createSendMessages = ({
 
           const grouped = groupMessagesPerPartition({
             topic,
-            partitionMetadata,
+            partitionMetadata: customPartitioner
+              ? partitionMetadata.map(({ replicas, isr, offlineReplicas, ...partition }) => ({
+                  ...partition,
+                  replicas: replicas?.slice(),
+                  isr: isr?.slice(),
+                  offlineReplicas: offlineReplicas?.slice(),
+                }))
+              : partitionMetadata,
             messages,
-            partitioner,
+            partitioner: route,
             send,
           })
           for (const id of keys(grouped)) {
@@ -1994,17 +2090,18 @@ const createSendMessages = ({
    * @param {object} request
    * @param {number} request.acks
    * @param {number} request.timeout
-   * @param {number} request.compression
+   * @param {number} request.compression the batch attribute bits
+   * @param {?Function} [request.codec] the codec factory pinned at the call; absent, the registry's
    * @param {{ topic: string, partition: number, messages: object[], settlers?: object[],
    *   createdAt?: number }[]} request.batches `createdAt` starts the delivery deadline; now when
    *   absent
    * @returns {Promise<object[]>} the `RecordMetadata` of every batch
    * @throws {KafkaJSInvariantViolation} an idempotent send whose `acks` is not -1
    */
-  const sendPartitioned = async ({ acks, timeout, compression, batches }) =>
+  const sendPartitioned = async ({ acks, timeout, compression, codec, batches }) =>
     isIdempotent()
-      ? sendIdempotent({ acks, timeout, compression, batches })
-      : sendPartitionedPlain({ acks, timeout, compression, batches })
+      ? sendIdempotent({ acks, timeout, compression, codec, batches })
+      : sendPartitionedPlain({ acks, timeout, compression, codec, batches })
 
   /**
    * The idempotent half of `sendPartitioned`: the batches go through the drain loop, created on
@@ -2013,7 +2110,7 @@ const createSendMessages = ({
    * @returns {Promise<object[]>}
    * @throws {KafkaJSInvariantViolation} an `acks` other than -1
    */
-  const sendIdempotent = async ({ acks, timeout, compression, batches }) => {
+  const sendIdempotent = async ({ acks, timeout, compression, codec, batches }) => {
     if (batches.length === 0) {
       return []
     }
@@ -2036,9 +2133,10 @@ const createSendMessages = ({
         getConnectionStatus,
         budget,
         generation,
+        callbacks,
       })
     }
-    return loop.send({ acks, timeout, compression, batches })
+    return loop.send({ acks, timeout, compression, codec, batches })
   }
 
   /** ms from a send's start to its delivery deadline, the producer's */
@@ -2093,9 +2191,9 @@ const createSendMessages = ({
    * @returns {Promise<object[]>} the `RecordMetadata` of every batch, once all have settled;
    *   rejects with the first error a batch failed with
    */
-  const sendPartitionedPlain = ({ acks, timeout, compression, batches }) => {
+  const sendPartitionedPlain = ({ acks, timeout, compression, codec, batches }) => {
     const generation = getGeneration()
-    let callbacks = 0
+    let pendingCallbacks = 0
     let workEnded = false
     const unsettled = new Set(batches)
     /** Every batch of the call in partition order: a cut batch's first half goes before it. */
@@ -2117,7 +2215,7 @@ const createSendMessages = ({
     }
     /** Retires every batch of the call, once nothing of the call holds them. @returns {void} */
     const retireAll = () => {
-      if (!workEnded || callbacks !== 0) return
+      if (!workEnded || pendingCallbacks !== 0) return
       for (const batch of deliveries.keys()) batch.retire?.()
     }
     /**
@@ -2243,6 +2341,7 @@ const createSendMessages = ({
         acks,
         timeout,
         compression,
+        compressionCodec: codecFor(codec, compression, attempt, callbacks),
         compressionLevel:
           compression === Compression.GZIP
             ? compressionLevels?.gzip
@@ -2549,9 +2648,9 @@ const createSendMessages = ({
           }
         }
         await handOffRetrier((...args) => {
-          callbacks += 1
+          pendingCallbacks += 1
           return run(...args).finally(() => {
-            callbacks -= 1
+            pendingCallbacks -= 1
             retireAll()
           })
         })
@@ -2604,7 +2703,13 @@ const createSendMessages = ({
     for (const force of [...plainForces]) force(surfaced)
   }
 
-  return { sendPartitioned, partition, inTransaction, forceClose }
+  return {
+    sendPartitioned,
+    partition,
+    inTransaction,
+    forceClose,
+    abortUnwritten: (error) => loop?.abortUnwritten(error) ?? [],
+  }
 }
 
 createSendMessages.connectionStatusError = connectionStatusError

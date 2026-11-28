@@ -132,6 +132,7 @@ const restartedSinceSent = (entry) =>
  * @property {number} acks
  * @property {number} timeout
  * @property {number} compression
+ * @property {?Function} [codec] the codec factory its send pinned
  * @property {number|null} firstSequence assigned when the batch is first drained, kept across a
  *   retry, rewritten only by a restart or a rebase
  * @property {string|number|null} producerId the producer id the batch's sequence belongs to;
@@ -1049,8 +1050,8 @@ class PartitionSequencer {
 
 /**
  * Whether a batch can join a Produce request whose first batch is `first`: the same request-level
- * options, the same producer id and epoch (a batch never sent takes the gate's), and the same
- * part of a refused request, or none.
+ * options and the same pinned codec factory, the same producer id and epoch (a batch never sent
+ * takes the gate's), and the same part of a refused request, or none.
  * @param {PartitionBatch} first
  * @param {PartitionBatch} batch
  * @param {DrainGate} gate
@@ -1062,6 +1063,7 @@ const fitsRequest = (first, batch, gate) => {
     batch.acks === first.acks &&
     batch.timeout === first.timeout &&
     batch.compression === first.compression &&
+    batch.codec === first.codec &&
     stamp.producerId === first.producerId &&
     stamp.producerEpoch === first.producerEpoch &&
     (batch.child ?? null) === (first.child ?? null)

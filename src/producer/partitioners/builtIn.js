@@ -1,6 +1,9 @@
 /** Private identities of partitioners created by the built-in implementations. */
 const builtIns = new WeakSet()
 
+/** @param {Function} partitioner @returns {boolean} whether the library created it */
+const isBuiltIn = (partitioner) => builtIns.has(partitioner)
+
 /**
  * Registers one built-in instance or its internal instrumentation wrapper.
  * @param {Function} partitioner
@@ -41,4 +44,4 @@ const observe = (partitioner, called) => {
   return wrapper
 }
 
-module.exports = { register, attach, observe }
+module.exports = { register, attach, observe, isBuiltIn }

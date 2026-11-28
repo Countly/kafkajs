@@ -285,7 +285,7 @@ const encodeBlock = (input, output, at) => {
   return at
 }
 
-module.exports = {
+module.exports = Object.freeze({
   encodedBound,
   /**
    * Writes independent 32 KiB raw blocks inside xerial framing. Snappy has no level.
@@ -335,4 +335,4 @@ module.exports = {
     await drive(decodeBlocks(input, framed, output, budget), budget)
     return output
   },
-}
+})
