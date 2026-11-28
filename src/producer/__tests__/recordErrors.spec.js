@@ -108,8 +108,9 @@ const createFakeBroker = (answer) => {
       await connection.connect()
       return connection
     },
-    send: async (protocolRequest) => {
-      const promise = connection.send(protocolRequest)
+    send: async (protocolRequest, selected = connection, options) => {
+      const guard = options?.guard
+      const promise = selected.send(guard ? { ...protocolRequest, guard } : protocolRequest)
       await new Promise(setImmediate)
       await pump()
       return promise
@@ -862,11 +863,14 @@ describe('Producer > the record errors of a shared batch', () => {
         order.push('send')
         return error
       })
+      await flushAll()
+      expect(recordCounts(cluster)).toEqual([])
       const flushed = producer.flush().then(() => order.push('flush'))
       await flushAll()
       await flushed
 
       expect(order).toEqual(['batch', 'send', 'flush'])
+      expect(recordCounts(cluster)).toEqual([[1, 2]])
       const [a, b] = await Promise.all([batched, single])
       expectProtocolParity(a, first)
       expectProtocolParity(b, first)
@@ -1729,6 +1733,8 @@ describe('Producer > the record errors of a shared batch', () => {
     producers.push(producer)
     const answer = answerError(NOT_ENOUGH_REPLICAS, [0])
     const order = []
+    const arm = jest.spyOn(ProducerStateManager.prototype, 'arm')
+    countRecords(cluster)
     cluster.broker.produce.mockImplementation(async (request) => {
       const refusal = request.guard(128)
       if (refusal) throw refusal
@@ -1740,7 +1746,12 @@ describe('Producer > the record errors of a shared batch', () => {
         return error
       })
     )
+    await flushAll()
+    expect(recordCounts(cluster)).toEqual([])
     const flushed = producer.flush().then(() => order.push('flush'))
+    await flushAll()
+    expect(recordCounts(cluster)).toEqual([[2]])
+    expect(order).toEqual([])
     await jest.advanceTimersByTimeAsync(150)
     await flushed
 
@@ -1761,6 +1772,8 @@ describe('Producer > the record errors of a shared batch', () => {
     expect(armed).not.toBe(a)
     expect(armed).not.toBe(b)
     expect(armed.cause).toBe(answer)
+    const [original] = arm.mock.calls.find(([error]) => error instanceof KafkaJSDeliveryTimeout)
+    expect(armed).toBe(original)
     await transaction.abort()
   })
 })

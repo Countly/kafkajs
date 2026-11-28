@@ -778,7 +778,7 @@ class PendingSend {
     this.deadline = deadline
     this.settled = false
     this.pins = 0
-    /** @type {?((error: Error, joined?: boolean) => void)} rejects the send; set while held */
+    /** @type {?((error: Error) => void)} rejects the send; set while held */
     this.reject = null
     /** @type {?import('./admission').Reservation} the send's bytes in the buffer, once admitted */
     this.reservation = null
@@ -1382,15 +1382,11 @@ class Accumulator {
    * are dropped, and what the assignment does afterwards is ignored.
    * @param {PendingSend} send
    * @param {{ acks: number, timeout?: number, compression?: number }} options
-   * @returns {PromiseLike<object[]>} the send's outcome, as `append()` describes it
+   * @returns {Promise<object[]>} the send's outcome, as `append()` describes it
    */
   #hold(send, options) {
-    let joinedFailure = false
     const pending = new Promise((resolve, reject) => {
-      send.reject = (error, joined = false) => {
-        joinedFailure = joined
-        reject(error)
-      }
+      send.reject = reject
       send.resolve = resolve
       send.options = options
       this.#register(send)
@@ -1422,18 +1418,8 @@ class Accumulator {
         }
       )
     })
-    return {
-      then(resolve, reject) {
-        // A refusal before joining used to reach append in one job. A joined result took two
-        // through the adopted batch promise. Delivery replaces the first of those two jobs.
-        pending
-          .then(deliverRecords, (error) => {
-            if (joinedFailure) throw error
-            reject(error)
-          })
-          .then(resolve, reject)
-      },
-    }
+    // Delivery takes the hop previously used to adopt the separate batch promise.
+    return pending.then(deliverRecords)
   }
 
   /**
@@ -1445,13 +1431,7 @@ class Accumulator {
     const { entries, resolve, reject, options } = send
     this.#leave(send)
     try {
-      this.#join(
-        entries,
-        { ...options, createdAt: send.deadline.startedAt },
-        send,
-        resolve,
-        (error) => reject(error, true)
-      )
+      this.#join(entries, { ...options, createdAt: send.deadline.startedAt }, send, resolve, reject)
     } catch (error) {
       reject(error)
       send.untrack()
