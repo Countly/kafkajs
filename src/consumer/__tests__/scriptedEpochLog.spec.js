@@ -699,6 +699,115 @@ describe('Test harness > fake broker close', () => {
     }
   })
 
+  test('a frame whose size prefix disagrees with its length closes its connection without an answer and fails the request in flight on it', async () => {
+    const asked = []
+    const { broker, state, close } = createFakeBroker((header) => {
+      if (header.apiKey === apiKeys.ApiVersions) return apiVersionsBody(18)
+      asked.push(header.correlationId)
+      return new Promise(() => {})
+    })
+    await broker.connect()
+
+    try {
+      const outcome = jest.fn()
+      broker.offsetForLeaderEpoch(validationRequest(0, 4)).then(
+        () => outcome('answered'),
+        (error) => outcome(error.name, error.message)
+      )
+      while (asked.length === 0) await nextTurn()
+      const [socket] = state.sockets
+      const malformed = Buffer.from(socket.writes[socket.writes.length - 1])
+      malformed.writeInt32BE(0, 0)
+      // The header alone still reads: only the envelope is wrong.
+      expect(readRequestHeader(malformed).correlationId).toBe(asked[0])
+
+      socket.write(malformed)
+      await nextTurn()
+      await nextTurn()
+
+      expect(asked).toHaveLength(1)
+      expect(socket.destroyed).toBe(true)
+      expect(outcome.mock.calls).toEqual([
+        [
+          'KafkaJSConnectionError',
+          'Connection error: The fake broker could not read a request frame',
+        ],
+      ])
+    } finally {
+      await close()
+    }
+  })
+
+  /**
+   * A fake broker whose OffsetForLeaderEpoch playback closes it from the callback `closeIn` names,
+   * with the data its socket emits after connecting recorded.
+   * @param {'answer'|'answerThrows'|'chunks'|'chunkIterator'} closeIn
+   * @returns {Promise<{ broker: object, socket: object, data: Buffer[], closing: () => Promise<void>,
+   *   close: () => Promise<void> }>}
+   */
+  const closingFrom = async (closeIn) => {
+    let closing = null
+    const closeNow = () => {
+      closing = fake.close()
+    }
+    const fake = createFakeBroker(
+      (header) => {
+        if (header.apiKey === apiKeys.ApiVersions) return apiVersionsBody(18)
+        if (closeIn === 'answer') closeNow()
+        if (closeIn === 'answerThrows') {
+          closeNow()
+          throw new Error('the answer closed the fake broker, then threw')
+        }
+        return offsetForLeaderEpochResponse([{ partition: 0 }])
+      },
+      (frame, header) => {
+        if (header.apiKey !== apiKeys.OffsetForLeaderEpoch) return [frame]
+        if (closeIn === 'chunks') {
+          closeNow()
+          return [frame]
+        }
+        if (closeIn !== 'chunkIterator') return [frame]
+        return (function* () {
+          yield frame.subarray(0, 6)
+          closeNow()
+          yield frame.subarray(6)
+        })()
+      }
+    )
+    await fake.broker.connect()
+    const [socket] = fake.state.sockets
+    const data = []
+    socket.on('data', (chunk) => data.push(chunk))
+    return { broker: fake.broker, socket, data, closing: () => closing, close: fake.close }
+  }
+
+  test.each([
+    ['an answer that returns a body', 'answer', 0],
+    ['an answer that throws', 'answerThrows', 0],
+    ['the chunks callback', 'chunks', 0],
+    ['a chunk iterator between two chunks', 'chunkIterator', 1],
+  ])(
+    'close from %s rejects the request through the shutdown and emits nothing more',
+    async (_where, closeIn, chunksBeforeClose) => {
+      const { broker, socket, data, closing, close } = await closingFrom(closeIn)
+
+      try {
+        const outcome = jest.fn()
+        await broker.offsetForLeaderEpoch(validationRequest(0, 4)).then(
+          () => outcome('answered'),
+          (error) => outcome(error.name)
+        )
+        await closing()
+
+        expect(outcome.mock.calls).toEqual([['KafkaJSConnectionClosedError']])
+        expect(data).toHaveLength(chunksBeforeClose)
+        expect(socket.destroyed).toBe(true)
+      } finally {
+        await close()
+      }
+    }
+  )
+
   test('close aborts a connect still waiting for its socket and refuses the connect queued behind it, with the clock frozen', async () => {
     freezeClock()
     const answer = jest.fn(() => apiVersionsBody(18))

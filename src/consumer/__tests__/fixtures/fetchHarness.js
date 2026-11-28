@@ -607,6 +607,23 @@ const subscribe = (thenable, handlers) => {
 }
 
 /**
+ * Reads the request header of one written frame at the fake broker's frame boundary, after checking
+ * the whole envelope: the frame must be exactly as long as its INT32 size prefix declares, as a
+ * broker reads one request per declared size. `readRequestHeader` reads the header alone and keeps
+ * that contract for callers inspecting recorded writes.
+ * @param {Buffer} frame one recorded write
+ * @returns {{ apiKey: number, apiVersion: number, correlationId: number, clientId: string,
+ *   byteLength: number }}
+ * @throws {Error} when the size prefix disagrees with the frame's length or the header is unreadable
+ */
+const readFrameHeader = (frame) => {
+  if (frame.length < 4 || frame.readInt32BE(0) !== frame.length - 4) {
+    throw new Error(`A ${frame.length}-byte request frame does not match its size prefix`)
+  }
+  return readRequestHeader(frame)
+}
+
+/**
  * Builds a real `Broker` wired to a real `Connection` over the fake socket from `testHelpers`.
  * `answer` receives each outgoing request's header and the exact frame it answers, and returns the
  * response body to play back; each response carries that request's correlation id, is framed with
@@ -615,14 +632,18 @@ const subscribe = (thenable, handlers) => {
  *
  * Playback is driven by the writes themselves: each frame written to a socket is answered one
  * `setImmediate` later, in write order, whoever wrote it. A frame is owned by its socket and the
- * correlation id in its header, and nothing else. A frame whose header cannot be read has no
- * request to answer or fail, so the fake broker drops that socket, as a broker drops a connection
- * it cannot read, and the connection fails every request on it.
+ * correlation id in its header, and nothing else. A frame that is not exactly the size its prefix
+ * declares, or whose header cannot be read, has no request to answer or fail, so the fake broker
+ * drops that socket, as a broker drops a connection it cannot read, and the connection fails every
+ * request on it; `answer` never sees it.
  *
  * Each socket owns the work queued for it: the playback of every frame written to it and the
  * subscription to every withheld answer of those frames. When the socket is destroyed (an
  * ordinary disconnect, a failed generation, `close()`), that work is cancelled: nothing is
- * answered or failed on a dead socket, and nothing of it runs on a later turn.
+ * answered or failed on a dead socket, and nothing of it runs on a later turn. Ownership is the
+ * one authority for every effect of a playback: each data emission and each failure is applied
+ * only while the socket still owns its work, checked after `answer`, `chunks` or a chunk iterator
+ * ran, since any of them may close the fake broker before the connection destroys the socket.
  *
  * The fake broker is open until `close()`, then closed for good. `close()` is idempotent and
  * every caller gets the same promise. At once, it refuses every later connect, connection,
@@ -732,24 +753,24 @@ const createFakeBroker = (answer, chunks) => {
   })
 
   /**
-   * Plays one response back through `target.socket`, split by `chunks` when given.
-   * @param {{ socket: object }} target
+   * Plays one response back through `socket`, split by `chunks` when given. Each chunk is emitted
+   * only while `socket` still owns its work, checked again before every chunk, because `chunks`, a
+   * chunk iterator or the handling of an earlier chunk may close the fake broker; the rest is
+   * dropped and the close settles the request.
+   * @param {object} socket
    * @param {{ apiKey: number, apiVersion: number, correlationId: number }} header
    * @param {Buffer} body
    * @returns {void}
    */
-  const reply = (target, header, body) => {
-    const responseState = chunks
-      ? {
-          socket: {
-            emit: (_event, frame) => {
-              for (const chunk of chunks(frame, header)) target.socket.emit('data', chunk)
-            },
-          },
-        }
-      : target
+  const reply = (socket, header, body) => {
+    const emit = (_event, frame) => {
+      for (const chunk of chunks ? chunks(frame, header) : [frame]) {
+        if (!owned.has(socket)) return
+        socket.emit('data', chunk)
+      }
+    }
     respondWithFrame(
-      responseState,
+      { socket: { emit } },
       header.correlationId,
       responseHeaderVersion(header.apiKey, header.apiVersion),
       body
@@ -759,8 +780,9 @@ const createFakeBroker = (answer, chunks) => {
   /**
    * Fails one in-flight request with `error` the way the queue settles an answered one: the entry
    * leaves the in-flight set, pending requests may go out, the request settles, and the queue's
-   * observers (the drain of `disconnect()` among them) hear of it. A request no longer in flight on
-   * `socket`'s generation (answered, or failed by a close) is left alone.
+   * observers (the drain of `disconnect()` among them) hear of it. A request is left alone once
+   * `socket` no longer owns its work (destroyed, or released by `close()` before the connection
+   * destroys it), or once it is no longer in flight on `socket`'s generation: the close settles it.
    * @param {object} socket the socket the request's frame was written to
    * @param {number} correlationId
    * @param {Error} error
@@ -769,7 +791,7 @@ const createFakeBroker = (answer, chunks) => {
   const failRequest = (socket, correlationId, error) => {
     const queue = connection.requestQueue
     const request = queue.inflight.get(correlationId)
-    if (connection.socket !== socket || !request) return
+    if (!owned.has(socket) || connection.socket !== socket || !request) return
     queue.inflight.delete(correlationId)
     try {
       queue.checkPendingRequests()
@@ -789,16 +811,13 @@ const createFakeBroker = (answer, chunks) => {
   const playBack = (socket, frame, work) => {
     let header
     try {
-      header = readRequestHeader(frame)
+      header = readFrameHeader(frame)
     } catch (cause) {
       socket.destroy(new Error('The fake broker could not read a request frame', { cause }))
       return
     }
     const fail = (error) => failRequest(socket, header.correlationId, error)
-    const deliver = (body) => {
-      // `answer` may have closed the broker before returning.
-      if (!socket.destroyed) reply({ socket }, header, body)
-    }
+    const deliver = (body) => reply(socket, header, body)
     try {
       const body = answer(header, frame)
       if (typeof body?.then === 'function') {
