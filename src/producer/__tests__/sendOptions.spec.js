@@ -1969,6 +1969,8 @@ describe('Producer > send options', () => {
         jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
         const held = holdCodec()
         rig = await Rig.start({ transactionalId: 'external-end', linger: 0 }, { profile: 'tv2' })
+        // The default EndTxn vector throttles the next transaction on the frozen clock.
+        rig.cluster.answer('EndTxn', () => ({ throttleTime: 0 }))
         const { producer } = rig
         const transaction = await producer.transaction()
         const connected = jest.getTimerCount()
