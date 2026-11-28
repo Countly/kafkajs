@@ -2,12 +2,22 @@ const crypto = require('crypto')
 const { Kafka, CompressionTypes, CompressionCodecs } = require('../../../index')
 const {
   KafkaJSDeliveryTimeout,
+  KafkaJSNonRetriableError,
   KafkaJSProtocolError,
   KafkaJSRecordTooLargeError,
+  KafkaJSTransactionAbortableError,
 } = require('../../errors')
 const Broker = require('../../broker')
+const Connection = require('../../network/connection')
+const Decoder = require('../../protocol/decoder')
+const Encoder = require('../../protocol/encoder')
+const RecordBatchDecoder = require('../../protocol/recordBatch/v0/decoder')
+const createRequest = require('../../protocol/request')
+const { oracleRecordBatch } = require('../../protocol/requests/produce/fixtures/recordBatchOracle')
 const Accumulator = require('../state/accumulator')
+const { Admission } = require('../state/admission')
 const PartitionSequencer = require('../state/partitionSequencer')
+const { countersOf, quiescent, watch } = require('./fixtures/bufferHarness')
 const { RequestBudget } = require('../state/recordSize')
 const { owned, takeSent } = require('./fixtures/bufferHarness')
 const { Schedule } = require('../../../testHelpers/schedule')
@@ -17,6 +27,8 @@ const TOPIC = 'split-topic'
 const CAP = 1048576
 /** Short, fixed backoffs: a retried chunk waits 10 ms. */
 const RETRY = { retries: 10, initialRetryTime: 10, maxRetryTime: 10, factor: 0 }
+/** A `linger` no test waits out: the batches go on when the test calls `flush()`. */
+const LINGER_UNTIL_FLUSHED = 60000
 const PATHS = [
   ['the idempotent path', { idempotent: true }],
   ['the plain path', { idempotent: false }],
@@ -25,10 +37,69 @@ const PATHS = [
 const idOf = (index) => `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`
 const tick = () => new Promise((resolve) => setImmediate(resolve))
 
+/**
+ * The frame length of the Produce request `request` asked for, built independently by the record
+ * encoders: the request's own version codec over batches `oracleRecordBatch` builds, framed with
+ * the request header and its length prefix.
+ * @param {object} request the arguments `Broker#produce` was called with
+ * @param {{ apiVersion: number, clientId: string }} sent the version and client id it was sent with
+ * @returns {Promise<number>}
+ */
+const oracleFrameLength = async (request, { apiVersion, clientId }) => {
+  const batchBuilder = '../../protocol/requests/produce/buildRecordBatch'
+  let produce
+  jest.isolateModules(() => {
+    jest.doMock(
+      batchBuilder,
+      () => async (options) => new Encoder().writeBuffer(await oracleRecordBatch(options))
+    )
+    produce = require(`../../protocol/requests/produce/v${apiVersion}/request`)
+  })
+  jest.dontMock(batchBuilder)
+  const frame = await createRequest({ correlationId: 1, clientId, request: produce(request) })
+  return frame.size()
+}
+
+/** The fake clock of the tests that wait for a linger or a backoff: real turns still run. */
+const FAKE_TIME = { now: 0, doNotFake: ['nextTick', 'setImmediate'] }
+
+/**
+ * Awaits `promise` under fake time: while it is pending, the clock moves on by one retry backoff
+ * and a real turn passes, so no test waits out a linger or a backoff in real time.
+ * @param {Promise<unknown>} promise
+ * @returns {Promise<unknown>} `promise`, once settled
+ */
+const withTime = async (promise) => {
+  const watched = watch(promise)
+  for (let step = 0; step < 200 && watched.state === 'pending'; step += 1) {
+    await jest.advanceTimersByTimeAsync(RETRY.initialRetryTime)
+    await tick()
+  }
+  return promise
+}
+
 /** Waits, a turn at a time, for `predicate`, and fails the test when it never holds. */
 const until = async (predicate, turns = 2000) => {
   for (let i = 0; i < turns && !predicate(); i += 1) await tick()
   expect(predicate()).toBe(true)
+}
+
+/**
+ * The record values the batches the scripted broker received carried, decoded from the bytes of
+ * each batch as it was written, in the order the broker received them.
+ * @param {{ written: { partition: number, batch: { bytes: Buffer } }[] }} log the scripted broker's log
+ * @returns {Promise<Map<number, string[]>>} the values by partition
+ */
+const valuesWritten = async ({ written }) => {
+  const values = new Map()
+  for (const { partition, batch } of written) {
+    const { records } = await RecordBatchDecoder(new Decoder(batch.bytes))
+    values.set(partition, [
+      ...(values.get(partition) ?? []),
+      ...records.map(({ value }) => value.toString()),
+    ])
+  }
+  return values
 }
 
 /**
@@ -123,6 +194,7 @@ describe('Producer > a send larger than one request', () => {
   })
 
   afterEach(async () => {
+    jest.useRealTimers()
     if (producer) await producer.disconnect()
     if (cluster) cluster.assertClean()
     Object.assign(CompressionCodecs, saved)
@@ -372,6 +444,252 @@ describe('Producer > a send larger than one request', () => {
       expect(error).toMatchObject({ reason: 'maxRequestSize', scope: 'record', limit: CAP })
       expect(log.written.reduce((sum, { records: count }) => sum + count, 0)).toBe(4)
       expect(calls.length).toBeLessThanOrEqual(2 * 6 - 1)
+    }
+  )
+
+  test.each(PATHS)(
+    'one record an expanding codec takes past the cap fails with the size error, its size the frame the record encoders build for that request, and nothing is written, %s',
+    async (_, path) => {
+      const calls = attempts()
+      const sends = []
+      const send = Connection.prototype.send
+      jest.spyOn(Connection.prototype, 'send').mockImplementation(function (options) {
+        if (options.request.apiKey === 0) {
+          sends.push({ apiVersion: options.request.apiVersion, clientId: this.clientId })
+        }
+        return send.call(this, options)
+      })
+      CompressionCodecs[CompressionTypes.Snappy] = () => ({
+        compress: async ({ buffer }) => Buffer.concat([buffer, Buffer.alloc(buffer.length)]),
+        decompress: async (buffer) => buffer,
+      })
+      const { frames } = await start({ topics: [{ name: TOPIC, leaders: [0] }] }, path)
+
+      const error = await producer
+        .send({
+          topic: TOPIC,
+          compression: CompressionTypes.Snappy,
+          messages: [{ value: 'x'.repeat(600000), partition: 0, timestamp: 1700000000000 }],
+        })
+        .catch((failure) => failure)
+
+      expect(error).toBeInstanceOf(KafkaJSRecordTooLargeError)
+      expect(error).toMatchObject({ reason: 'maxRequestSize', scope: 'record', limit: CAP })
+      expect(error.size).toBe(await oracleFrameLength(calls[0], sends[0]))
+      expect(error.size).toBeGreaterThan(CAP)
+      expect(frames).toEqual([])
+    }
+  )
+
+  test.each(PATHS)(
+    'a batch of several never-written records an expanding codec takes past the cap is split, the oversized attempt is never written, and every record is delivered once, %s',
+    async (_, path) => {
+      const carried = []
+      const produce = Broker.prototype.produce
+      jest.spyOn(Broker.prototype, 'produce').mockImplementation(function (request) {
+        carried.push(
+          request.topicData.flatMap(({ partitions }) =>
+            partitions.map(({ messages }) => messages.length)
+          )
+        )
+        return produce.call(this, request)
+      })
+      CompressionCodecs[CompressionTypes.Snappy] = () => ({
+        compress: async ({ buffer }) => Buffer.concat([buffer, Buffer.alloc(buffer.length)]),
+        decompress: async (buffer) => buffer.subarray(0, buffer.length / 2),
+      })
+      const { frames, log } = await start(
+        { topics: [{ name: TOPIC, leaders: [0] }] },
+        {
+          ...path,
+          batchSize: 4 * CAP,
+        }
+      )
+      const messages = Array.from({ length: 4 }, (_, i) => ({
+        value: `${i}:`.padEnd(200000, 'x'),
+        partition: 0,
+      }))
+
+      const metadata = await producer.send({
+        topic: TOPIC,
+        compression: CompressionTypes.Snappy,
+        messages,
+      })
+
+      expect(carried[0]).toEqual([4])
+      expect(carried.length).toBeGreaterThan(frames.length)
+      expect(Math.max(...frames)).toBeLessThanOrEqual(CAP)
+      expect(log.written.map(({ records: count }) => count).reduce((a, b) => a + b, 0)).toBe(4)
+      expect(log.written.every(({ errorCode }) => errorCode === 0)).toBe(true)
+      expect(metadata).toEqual([expect.objectContaining({ partition: 0, baseOffset: '0' })])
+      expect(await valuesWritten(log)).toEqual(new Map([[0, messages.map(({ value }) => value)]]))
+    }
+  )
+
+  test.each(PATHS)(
+    'a send whose Buffer was transferred after the call fails alone: the send it was handed on with is written and acknowledged, the buffer is released, and the next send to its partition is accepted, %s',
+    async (_, path) => {
+      jest.useFakeTimers(FAKE_TIME)
+      const admissions = new Set()
+      const acquire = Admission.prototype.acquire
+      jest.spyOn(Admission.prototype, 'acquire').mockImplementation(function (...args) {
+        admissions.add(this)
+        return acquire.apply(this, args)
+      })
+      const calls = attempts()
+      const { log } = await withTime(
+        start(
+          { topics: [{ name: TOPIC, leaders: [0, 0] }] },
+          { ...path, linger: LINGER_UNTIL_FLUSHED }
+        )
+      )
+      const expected = new Map()
+      log.verdict = ({ topic, partition, batch }) => {
+        if (batch.producerId === '-1') return 0
+        const key = `${batch.producerId}/${batch.producerEpoch}/${topic}/${partition}`
+        const next = expected.get(key) ?? 0
+        if (batch.baseSequence !== next) return 45
+        expected.set(key, next + batch.recordCount)
+        return 0
+      }
+      const store = new ArrayBuffer(4)
+      const value = new Uint8Array(store)
+      value.set([1, 2, 3, 4])
+      Object.setPrototypeOf(value, Buffer.prototype)
+
+      const bystander = producer.send({
+        topic: TOPIC,
+        messages: [{ value: 'bystander', partition: 0 }],
+      })
+      const offender = producer.send({ topic: TOPIC, messages: [{ value, partition: 1 }] })
+      structuredClone(store, { transfer: [store] })
+      await tick()
+      const flushed = producer.flush()
+      const [kept, refused] = await withTime(Promise.allSettled([bystander, offender]))
+      await withTime(flushed)
+
+      expect(kept).toEqual({
+        status: 'fulfilled',
+        value: [expect.objectContaining({ partition: 0, errorCode: 0 })],
+      })
+      expect(refused.status).toBe('rejected')
+      expect(refused.reason).toBeInstanceOf(KafkaJSNonRetriableError)
+      expect(refused.reason.category).toBe('invalidConfiguration')
+      expect(refused.reason.message).toBe('A Buffer changed size while its send was being read')
+      expect(calls).toHaveLength(1)
+      expect(
+        log.written.map(({ partition, records: count, errorCode }) => [partition, count, errorCode])
+      ).toEqual([[0, 1, 0]])
+
+      const following = producer.send({
+        topic: TOPIC,
+        messages: [{ value: 'next', partition: 1 }],
+      })
+      await tick()
+      await withTime(producer.flush())
+      const next = await withTime(following)
+
+      expect(next).toEqual([expect.objectContaining({ partition: 1, errorCode: 0 })])
+      expect(
+        log.written.map(({ partition, records: count, errorCode }) => [partition, count, errorCode])
+      ).toEqual([
+        [0, 1, 0],
+        [1, 1, 0],
+      ])
+      if (path.idempotent) expect(log.written[1].batch.baseSequence).toBe(0)
+      const [admission] = admissions
+      expect(admissions.size).toBe(1)
+      await until(
+        () => JSON.stringify(countersOf(admission)) === JSON.stringify(quiescent(admission))
+      )
+      expect(countersOf(admission)).toEqual(quiescent(admission))
+    }
+  )
+
+  test.each([
+    ['tv1', 'a first attempt'],
+    ['tv2', 'a first attempt'],
+    ['tv1', 'a retry'],
+    ['tv2', 'a retry'],
+  ])(
+    'a transaction send whose Buffer was transferred fails alone and leaves the transaction abortable: commit rejects, abort succeeds and the next transaction commits, %s, %s',
+    async (profile, attempt) => {
+      jest.useFakeTimers(FAKE_TIME)
+      const { log } = await withTime(
+        start(
+          { topics: [{ name: TOPIC, leaders: [0, 0] }], profile },
+          { transactionalId: 'transferred-buffer', linger: LINGER_UNTIL_FLUSHED }
+        )
+      )
+      const store = new ArrayBuffer(4)
+      const value = new Uint8Array(store)
+      value.set([1, 2, 3, 4])
+      Object.setPrototypeOf(value, Buffer.prototype)
+      const transfer = () => structuredClone(store, { transfer: [store] })
+      if (attempt === 'a retry') {
+        let answered = false
+        log.verdict = ({ partition }) => {
+          if (partition !== 1 || answered) return 0
+          answered = true
+          transfer()
+          return 7
+        }
+      }
+
+      const transaction = await withTime(producer.transaction())
+      const sending = transaction.send({
+        topic: TOPIC,
+        messages: [
+          { value: 'kept', partition: 0 },
+          { value, partition: 1 },
+        ],
+      })
+      if (attempt === 'a first attempt') transfer()
+      await tick()
+      const flushed = producer.flush()
+      const refused = await withTime(sending.catch((error) => error))
+      await withTime(flushed)
+
+      expect(refused).toMatchObject({
+        name: 'KafkaJSInvalidConfigurationError',
+        category: 'invalidConfiguration',
+        message: 'A Buffer changed size while its send was being read',
+      })
+      const commit = await withTime(transaction.commit().catch((error) => error))
+      expect(commit).toBeInstanceOf(KafkaJSTransactionAbortableError)
+      expect(commit.cause).toBe(refused)
+      await withTime(transaction.abort())
+
+      const next = await withTime(producer.transaction())
+      const following = next.send({ topic: TOPIC, messages: [{ value: 'next', partition: 1 }] })
+      await tick()
+      await withTime(producer.flush())
+      await withTime(following)
+      await withTime(next.commit())
+
+      const writes = log.written.map(({ partition, records: count, errorCode }) => [
+        partition,
+        count,
+        errorCode,
+      ])
+      expect(writes).toEqual(
+        attempt === 'a retry'
+          ? [
+              [0, 1, 0],
+              [1, 1, 7],
+              [1, 1, 0],
+            ]
+          : [
+              [0, 1, 0],
+              [1, 1, 0],
+            ]
+      )
+      expect(
+        cluster
+          .requests()
+          .filter(({ api }) => api === 'EndTxn')
+          .map(({ fields }) => fields.transactionResult)
+      ).toEqual([false, true])
     }
   )
 

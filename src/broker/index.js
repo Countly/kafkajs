@@ -11,6 +11,7 @@ const { Types: Compression } = require('../protocol/message/compression')
 const Encoder = require('../protocol/encoder')
 const { requests, lookup, selectVersion } = require('../protocol/requests')
 const { partitionResults } = require('../protocol/requests/produce/partitionResults')
+const { captureEntries, RecordEntries, OWNED_RECORDS } = require('../protocol/recordBatch/entries')
 const { requireCoverage } = require('../protocol/requests/responseCoverage')
 const { validateTopics } = require('../protocol/requests/offsetFetch/responseIdentity')
 const { NO_TOPIC_ID, usableTopicIds } = require('../protocol/requests/topicIds')
@@ -167,6 +168,53 @@ const produceCeiling = ({ transactionalId, transactionVersion, topicIds }) => {
   }
 
   return topicIds == null ? PRODUCE_TOPIC_NAMES_MAX_VERSION : undefined
+}
+
+/**
+ * The library's own copy of a Produce request's `topicData`, read once by index: each topic's
+ * name and partitions, each partition's index and first sequence, and its records taken over as
+ * owned entries (`captureEntries`), the ones without a timestamp at `now`. A partition the
+ * producer already took over carries its entries under `OWNED_RECORDS`, and they are used as they
+ * are. Nothing the caller passed is read again.
+ * @param {{ topic: string, partitions: { partition: number, firstSequence?: number,
+ *   messages: object[] }[] }[]} topicData
+ * @param {number} now
+ * @returns {{ topic: string, partitions: { partition: number, firstSequence?: number,
+ *   messages: import('../protocol/recordBatch/entries').RecordEntries }[] }[]}
+ * @throws {import('../errors').KafkaJSInvalidConfigurationError} (a `KafkaJSNonRetriableError`) for
+ *   a partition's `messages` that is not an array, a record that is missing or not an object, a
+ *   record field that cannot be written, or a Buffer detached or out of bounds while it is read
+ */
+const captureTopicData = (topicData, now) => {
+  const topics = []
+  for (let t = 0, count = topicData.length; t < count; t++) {
+    const { topic, partitions: sent } = topicData[t]
+    const partitions = []
+    for (let p = 0, length = sent.length; p < length; p++) {
+      const { partition, firstSequence, messages, [OWNED_RECORDS]: owned } = sent[p]
+      partitions.push({
+        partition,
+        firstSequence,
+        messages: RecordEntries.is(owned) ? owned : captureEntries(messages, { now }),
+      })
+    }
+    topics.push({ topic, partitions })
+  }
+  return topics
+}
+
+/**
+ * Drops the records of a captured `topicData`, keeping each topic and partition its answer is
+ * checked against.
+ * @param {ReturnType<typeof captureTopicData>} topics
+ * @returns {void}
+ */
+const releaseRecords = (topics) => {
+  for (const { partitions } of topics) {
+    for (const partition of partitions) {
+      partition.messages = null
+    }
+  }
 }
 
 const PRIVATE = {
@@ -909,6 +957,9 @@ module.exports = class Broker {
   }
 
   /**
+   * Sends one Produce request. `topicData` is read once, during this call and before it first
+   * waits: each record becomes bytes the library owns, and a record without a timestamp takes the
+   * time of this call. Changing a record, a Buffer or the arrays afterwards changes nothing sent.
    * @public
    * @param {Object} request
    * @param {Array} request.topicData An array of messages per topic and per partition, example:
@@ -1043,18 +1094,29 @@ module.exports = class Broker {
       }
     }
 
+    // Taken over before the first await: what the caller changes later never reaches the wire.
+    const captured = captureTopicData(topicData, Date.now())
     const protocolRequest = produce({
       acks,
       timeout,
       compression,
       compressionLevel,
-      topicData,
+      topicData: captured,
       topicIds,
       topicNames,
       transactionalId,
       producerId,
       producerEpoch,
     })
+    // The request lives until its answer arrives; its records are not needed after the encoding.
+    const { encode } = protocolRequest.request
+    protocolRequest.request.encode = async () => {
+      try {
+        return await encode()
+      } finally {
+        releaseRecords(captured)
+      }
+    }
 
     if (!perPartitionResults) {
       return await this[PRIVATE.SEND_REQUEST](protocolRequest, guard)
@@ -1066,7 +1128,7 @@ module.exports = class Broker {
         response: {
           decode: protocolRequest.response.decode,
           parse: (data) => {
-            requireCoverage('Produce', topicData, data.topics, {
+            requireCoverage('Produce', captured, data.topics, {
               rowTopic: 'topicName',
               repeats: 'refuse',
               missing: 'allow',

@@ -79,6 +79,18 @@ module.exports = class Encoder {
   }
 
   /**
+   * An encoder over bytes already written, without a copy: its size is the buffer's length.
+   * @param {Buffer} buffer
+   * @returns {Encoder}
+   */
+  static wrap(buffer) {
+    const encoder = Object.create(Encoder.prototype)
+    encoder.buf = buffer
+    encoder.offset = buffer.length
+    return encoder
+  }
+
+  /**
    * Construct a new encoder with the given initial size
    *
    * @param {number} [initialSize] initial size

@@ -25,6 +25,7 @@ const { Deadline, ExpiryTimer, MAX_DELAY } = require('./deadline')
 const { Types: Compression } = require('../protocol/message/compression')
 const Accumulator = require('./state/accumulator')
 const { RequestBudget, recordsBytes } = require('./state/recordSize')
+const { captureEntries, OWNED_RECORDS } = require('../protocol/recordBatch/entries')
 
 const { keys } = Object
 
@@ -160,13 +161,16 @@ const leadersOfPartitions = (cluster, topic, partitions) => {
 
 /**
  * The topic data of one Produce request: the drained batches by topic, each partition carrying
- * the sequence its batch was numbered with.
+ * the sequence its batch was numbered with and, under `OWNED_RECORDS`, the entries the producer
+ * took its records over as.
  * @param {import('./state/partitionSequencer').PartitionBatch[]} batches
+ * @param {Map<object, import('../protocol/recordBatch/entries').RecordEntries>} [owned] by batch
  * @returns {{ topic: string, partitions: { partition: number, firstSequence: number, messages: object[] }[] }[]}
  */
-const topicDataOf = (batches) => {
+const topicDataOf = (batches, owned) => {
   const topicData = []
-  for (const { topic, partition, firstSequence, messages } of batches) {
+  for (const batch of batches) {
+    const { topic, partition, firstSequence, messages } = batch
     let entry = topicData.find((candidate) => candidate.topic === topic)
     if (entry === undefined) {
       entry = { topic, partitions: [] }
@@ -174,9 +178,36 @@ const topicDataOf = (batches) => {
     }
     const data = { partition, messages }
     if (firstSequence !== undefined) data.firstSequence = firstSequence
+    if (owned !== undefined) Object.defineProperty(data, OWNED_RECORDS, { value: owned.get(batch) })
     entry.partitions.push(data)
   }
   return topicData
+}
+
+/**
+ * Takes each batch's records over as owned entries for one request, the batches in order. A batch
+ * whose records cannot be read any more (a Buffer of one of its sends was transferred, or shrunk
+ * out of bounds, after the send's call) is handed to `refuse` with the capture's error and left
+ * out, so it fails alone and the batches it would have shared the request with are sent.
+ * @param {import('./state/partitionSequencer').PartitionBatch[]} batches
+ * @param {(batch: import('./state/partitionSequencer').PartitionBatch, error: Error) => void} refuse
+ * @returns {Map<import('./state/partitionSequencer').PartitionBatch, import('../protocol/recordBatch/entries').RecordEntries>}
+ *   the batches that go into the request, with their entries
+ */
+const ownedRecords = (batches, refuse) => {
+  const now = Date.now()
+  const owned = new Map()
+  for (const batch of batches) {
+    let entries
+    try {
+      entries = captureEntries(batch.messages, { now })
+    } catch (error) {
+      refuse(batch, error)
+      continue
+    }
+    owned.set(batch, entries)
+  }
+  return owned
 }
 
 /**
@@ -271,6 +302,18 @@ const rejectBatch = (batch, error) => {
 /** An internal, uncounted refusal of one request that has never been written. */
 class ProduceAttemptRefused extends Error {}
 
+/**
+ * The refusal of an attempt not yet written because the producer turned fatal. It carries the
+ * armed error, which the batches of the attempt fail with: they are neither requeued nor retried.
+ */
+class ProduceAttemptFatal extends ProduceAttemptRefused {
+  /** @param {Error} armed the error the producer was made fatal with */
+  constructor(armed) {
+    super('The producer turned fatal before the Produce attempt was written')
+    this.armed = armed
+  }
+}
+
 /** The refusal of a request whose encoded frame is above `maxRequestSize`; nothing was written. */
 class ProduceAttemptTooLarge extends ProduceAttemptRefused {
   /**
@@ -313,13 +356,24 @@ class ProduceAttempt {
    *   loop's also settles every other due delivery
    * @param {number} [maxRequestSize=Infinity] cap checked at transmission
    * @param {import('./generation')} [generation] captured lifecycle; never recaptured
+   * @param {() => (Error|null)} [getFatalError] the error the producer was made fatal with, or null
+   *   while it is not: nothing not yet written may then be written, whatever identity the attempt
+   *   was drained for
    */
-  constructor(deliveries, getConnectionStatus, expire, maxRequestSize = Infinity, generation) {
+  constructor(
+    deliveries,
+    getConnectionStatus,
+    expire,
+    maxRequestSize = Infinity,
+    generation,
+    getFatalError = () => null
+  ) {
     this.deliveries = deliveries.slice()
     this.getConnectionStatus = getConnectionStatus
     this.expire = expire
     this.maxRequestSize = maxRequestSize
     this.generation = generation
+    this.getFatalError = getFatalError
     this.written = false
     this.revoked = false
     for (const delivery of this.deliveries) delivery.currentAttempt = this
@@ -331,13 +385,22 @@ class ProduceAttempt {
   }
 
   /**
-   * At transmission a frame above `maxRequestSize` is refused, unwritten; a written attempt ends
-   * the size subdivision (`child`) of the batches it carries.
+   * The one decision whether this attempt may still be written, taken at every step before the
+   * frame leaves: a revoked attempt, or one drained before the producer turned fatal, is refused
+   * unwritten (`ProduceAttemptFatal` for the fatal producer, which says what to fail with). At
+   * transmission a frame above `maxRequestSize` is refused, unwritten; a written attempt ends the
+   * size subdivision (`child`) of the batches it carries.
    * @param {number} [frameLength] supplied only at transmission; includes the prefix and header
    * @returns {Error|null} refusal before any write, or null
    */
   guard = (frameLength) => {
-    if (this.revoked) return new ProduceAttemptRefused('The Produce attempt was revoked')
+    const fatal = this.getFatalError()
+    if (fatal !== null) this.revoke()
+    if (this.revoked) {
+      return fatal === null
+        ? new ProduceAttemptRefused('The Produce attempt was revoked')
+        : new ProduceAttemptFatal(fatal)
+    }
     const closed = this.generation?.guard()
     if (closed) return closed
     const statusError = connectionStatusError(this.getConnectionStatus())
@@ -573,6 +636,7 @@ class DrainLoop {
   #deadlineMs
   #compressionLevels
   #getConnectionStatus
+  #getFatalError
   #budget
   #generation
   /** @type {Set<Send>} */
@@ -608,6 +672,9 @@ class DrainLoop {
    * @param {number} [options.deliveryTimeout] ms from `send()` to a batch's last answer
    * @param {{ gzip?: number, zstd?: number }} [options.compressionLevels] per-codec levels
    * @param {() => string} options.getConnectionStatus
+   * @param {() => (Error|null)} options.getFatalError the producer's authority over whether it is
+   *   fatal, whichever identity turned it so: a request drained for any identity is refused its
+   *   write while it answers with an error
    * @param {RequestBudget} [options.budget] the request-size plan of each request it drains, and
    *   the `maxRequestSize` its frames are refused above
    * @param {import('./generation')} [options.generation] this loop's captured lifecycle
@@ -620,6 +687,7 @@ class DrainLoop {
     deliveryTimeout,
     compressionLevels,
     getConnectionStatus,
+    getFatalError,
     budget = new RequestBudget(),
     generation,
   }) {
@@ -631,6 +699,7 @@ class DrainLoop {
     this.#compressionLevels = compressionLevels
     this.#deadlineMs = deliveryTimeout ?? retry.maxTotalTime
     this.#getConnectionStatus = getConnectionStatus
+    this.#getFatalError = getFatalError
     this.#budget = budget
     this.#generation = generation
     this.#expiry = new ExpiryTimer(this.#expireDue)
@@ -1148,18 +1217,27 @@ class DrainLoop {
 
   /**
    * Hands one drained set of batches to its broker - after the requests drained before it, so the
-   * broker receives them in drain order - and settles them on the answer.
+   * broker receives them in drain order - and settles them on the answer. Each batch's records are
+   * taken over first; a batch whose records cannot be read any more fails alone, before it is
+   * written (`#refuseUnwritten`), and the request carries the others.
    * @param {string} nodeId
-   * @param {import('./state/partitionSequencer').PartitionBatch[]} batches
+   * @param {import('./state/partitionSequencer').PartitionBatch[]} drained
    * @returns {void}
    */
-  #dispatch(nodeId, batches) {
+  #dispatch(nodeId, drained) {
+    const manager = this.#eosManager.stateManager
+    const owned = ownedRecords(drained, (batch, error) =>
+      this.#refuseUnwritten(manager, batch, error)
+    )
+    const batches = [...owned.keys()]
+    if (batches.length === 0) return
     const attempt = new ProduceAttempt(
       batches.map(deliveryOf),
       this.#getConnectionStatus,
       () => this.#expireDue(Date.now()),
       this.#budget.maxRequestSize,
-      this.#generation
+      this.#generation,
+      this.#getFatalError
     )
     for (const batch of batches) {
       deliveryOf(batch).dispatched = true
@@ -1167,7 +1245,7 @@ class DrainLoop {
     this.#outstanding.set(nodeId, (this.#outstanding.get(nodeId) ?? 0) + 1)
 
     const handed = (this.#handoffs.get(nodeId) ?? RESOLVED).then(() =>
-      this.#handOff(nodeId, batches, attempt)
+      this.#handOff(nodeId, batches, attempt, owned)
     )
     const tail = handed.then(ignore, ignore)
     this.#handoffs.set(nodeId, tail)
@@ -1189,11 +1267,13 @@ class DrainLoop {
    * @param {string} nodeId
    * @param {import('./state/partitionSequencer').PartitionBatch[]} batches
    * @param {ProduceAttempt} attempt fixed request membership and transmission right
+   * @param {Map<object, import('../protocol/recordBatch/entries').RecordEntries>} owned the
+   *   batches' records, taken over
    * @returns {Promise<{ answer: Promise<import('../protocol/requests/produce/partitionResults').PartitionResult[]|undefined> }>}
    *   once the request is handed to the broker; `answer` settles with its answer, and is wrapped so
    *   that waiting for the hand-off does not wait for the answer
    */
-  async #handOff(nodeId, batches, attempt) {
+  async #handOff(nodeId, batches, attempt, owned) {
     const refusal = attempt.guard()
     if (refusal) throw refusal
     const broker = await this.#cluster.findBroker({
@@ -1203,7 +1283,7 @@ class DrainLoop {
     const refused = attempt.guard()
     if (refused) throw refused
     const [{ acks, timeout, compression, producerId, producerEpoch }] = batches
-    const topicData = topicDataOf(batches)
+    const topicData = topicDataOf(batches, owned)
     const transactional = this.#eosManager.isTransactional()
 
     const answer = broker.produce({
@@ -1301,7 +1381,9 @@ class DrainLoop {
   }
 
   /**
-   * Settles each batch of a request that failed as a whole.
+   * Settles each batch of a request that failed as a whole. A request refused unwritten because the
+   * producer turned fatal fails its batches with the armed error at once (`#refuseUnwritten`):
+   * nothing is requeued, so no routing, backoff or deadline stands between them and that error.
    * @param {string} nodeId
    * @param {import('./state/partitionSequencer').PartitionBatch[]} batches
    * @param {Error} error
@@ -1331,7 +1413,9 @@ class DrainLoop {
         delivery.retire()
         continue
       }
-      if (error instanceof ProduceAttemptTooLarge) {
+      if (error instanceof ProduceAttemptFatal) {
+        this.#refuseUnwritten(manager, batch, error.armed)
+      } else if (error instanceof ProduceAttemptTooLarge) {
         refused.push(batch)
       } else if (error instanceof ProduceAttemptRefused) {
         manager.sequencer.requeue(batch, 0, { counted: false })
@@ -1405,20 +1489,32 @@ class DrainLoop {
   }
 
   /**
-   * Fails a batch no request under `maxRequestSize` can carry. A batch never written gives its
-   * sequences back; one with a written attempt leaves its partition's sequence unresolved before it
-   * leaves, its range never given back. The error carries no `outcome`. Inside a transaction it
-   * arms the abortable state, and the batch's sends keep the error.
+   * Fails a batch no request under `maxRequestSize` can carry (see `#refuseUnwritten`). The error
+   * carries no `outcome`.
    * @param {import('./state')} manager
    * @param {import('./state/partitionSequencer').PartitionBatch} batch
    * @param {ProduceAttemptTooLarge} refusal
    * @returns {void}
    */
   #tooLarge(manager, batch, refusal) {
+    this.#refuseUnwritten(manager, batch, tooLarge(batch, refusal))
+  }
+
+  /**
+   * Fails a batch for good before its current attempt is written. A batch never written gives its
+   * sequences back, so the batches after it on its partition are numbered as if it had never been;
+   * one with a written attempt leaves its partition's sequence unresolved before it leaves (the
+   * earlier attempt may have reached the broker), its range never given back. Inside a transaction
+   * the error arms the state its category calls for, and the batch's sends keep the error.
+   * @param {import('./state')} manager
+   * @param {import('./state/partitionSequencer').PartitionBatch} batch
+   * @param {Error} error
+   * @returns {void}
+   */
+  #refuseUnwritten(manager, batch, error) {
     if (deliveryOf(batch).everWritten) manager.sequencer.markUnresolved(batch)
     else if (batch.firstSequence !== null) manager.sequencer.rebase(batch)
     manager.sequencer.fail(batch)
-    const error = tooLarge(batch, refusal)
     rejectBatch(batch, error)
     this.#inTransaction(manager, error)
   }
@@ -1671,6 +1767,10 @@ class DrainLoop {
  * @param {{ gzip?: number, zstd?: number }} [options.compressionLevels] validated producer
  *   snapshot, selected by codec on both send paths and retained for retries
  * @param {() => string} [options.getConnectionStatus] the producer's connection status
+ * @param {() => (Error|null)} [options.getFatalError] the producer's authority over whether it is
+ *   fatal, the same one its public calls refuse by: both send paths refuse every request not yet
+ *   written once it answers with an error, whichever identity turned the producer fatal. Absent:
+ *   the idempotent path reads its `eosManager`'s own state and the plain path is never fatal
  * @param {RequestBudget} [options.budget] the producer's request-size plan: both send paths keep
  *   each request within it, and refuse a frame above its `maxRequestSize` before writing it
  * @param {() => import('./generation')|undefined} [options.getGeneration] current lifecycle
@@ -1688,6 +1788,7 @@ const createSendMessages = ({
   deliveryTimeout,
   compressionLevels,
   getConnectionStatus,
+  getFatalError,
   budget = new RequestBudget(),
   getGeneration = () => undefined,
 }) => {
@@ -2034,6 +2135,7 @@ const createSendMessages = ({
         deliveryTimeout,
         compressionLevels,
         getConnectionStatus,
+        getFatalError: getFatalError ?? (() => eosManager.stateManager.fatalError()),
         budget,
         generation,
       })
@@ -2234,10 +2336,12 @@ const createSendMessages = ({
      * ended nothing of this call holds its topic data, which lists the batches' records.
      * @param {object[]} sent
      * @param {ProduceAttempt} attempt
+     * @param {Map<object, import('../protocol/recordBatch/entries').RecordEntries>} owned the
+     *   batches' records, taken over
      * @returns {object}
      */
-    const requestOf = (sent, attempt) => {
-      const topicData = topicDataOf(sent)
+    const requestOf = (sent, attempt, owned) => {
+      const topicData = topicDataOf(sent, owned)
       return {
         ...plainRequestOf(topicData.map(({ topic }) => topic)),
         acks,
@@ -2359,13 +2463,19 @@ const createSendMessages = ({
     }
 
     /**
-     * Builds one request with fixed membership after filtering all prior awaits.
+     * Builds one request with fixed membership after filtering all prior awaits. Each batch's
+     * records are taken over first; a batch whose records cannot be read any more fails alone,
+     * unwritten, and the request carries the others.
      * @param {object} broker the broker already looked up
      * @param {object[]} candidates batches proposed for this broker
      * @returns {Promise<Error|null>} a genuine retriable failure, a private refusal, or no failure
      */
     const produceTo = async (broker, candidates) => {
-      const sent = candidates.filter((batch) => unsettled.has(batch))
+      let owned = ownedRecords(
+        candidates.filter((batch) => unsettled.has(batch)),
+        (batch, error) => settle(batch, undefined, error)
+      )
+      const sent = [...owned.keys()]
       if (sent.length === 0) return null
       const carried = sent.map((batch) => deliveries.get(batch))
       const attempt = new ProduceAttempt(
@@ -2373,7 +2483,8 @@ const createSendMessages = ({
         getConnectionStatus || (() => CONNECTION_STATUS.CONNECTED),
         expire,
         budget.maxRequestSize,
-        generation
+        generation,
+        getFatalError
       )
       /** The request ended: a batch that settled meanwhile detaches now. @returns {void} */
       const ended = () => {
@@ -2387,12 +2498,18 @@ const createSendMessages = ({
       })
       let results
       try {
-        results = await broker.produce(requestOf(sent, attempt))
+        const answer = broker.produce(requestOf(sent, attempt, owned))
+        owned = null
+        results = await answer
       } catch (error) {
         const refused = error instanceof ProduceAttemptRefused
         if (!refused) attachFailingRecords(error, topicDataOf(sent))
         ended()
         if (generation?.closed) return null
+        if (error instanceof ProduceAttemptFatal) {
+          sent.forEach((batch) => settle(batch, undefined, error.armed))
+          return null
+        }
         if (error instanceof ProduceAttemptTooLarge) repartition(sent, error)
         if (refused) return error
         for (const delivery of carried) delivery.lastError = error

@@ -191,6 +191,13 @@ class ProducerStateManager {
     return this.transaction.state()
   }
 
+  /**
+   * @returns {Error|null} the error `FATAL_ERROR` was armed with; null in any other state
+   */
+  fatalError() {
+    return this.transaction.state() === FATAL_ERROR ? this.transaction.armedError() : null
+  }
+
   /** @returns {1|2} the transaction version in force for the current transaction */
   transactionVersion() {
     return this.version.current()

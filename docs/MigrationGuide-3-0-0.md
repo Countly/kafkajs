@@ -260,7 +260,14 @@ notice and what, if anything, to do.
   every send of its request. A key, value or header value must be a string, a `Buffer` or `null`
   (header values: not `null`), and a timestamp must hold an integer — a number, a numeric string,
   a `Date`, a `BigInt` or a `Long`. Inside a transaction such a send leaves the transaction as it
-  was.
+  was. A `Buffer` whose memory the application transferred, or shrank out of bounds, after `send()`
+  returned fails the same way but later, when its batch is encoded: only that batch fails, before it
+  is written, the send that owns it rejects with the same `KafkaJSInvalidConfigurationError`, and
+  the sends sharing its request are written. Inside a transaction its `commit()` then rejects with a
+  `KafkaJSTransactionAbortableError` whose `cause` is that error, and `abort()` succeeds. kafkajs
+  2.2.4 sent such a `Buffer` as an empty value. A direct `Broker#produce()` call applies the same
+  rules and rejects as a whole, before writing anything, for such a `Buffer`, a partition's
+  `messages` that is not an array, or a record that is missing or not an object.
   *What to do:* code that caught a `TypeError` from `send()` catches
   `KafkaJSInvalidConfigurationError` instead, and fixes the record.
 
@@ -403,7 +410,11 @@ transaction in a way its error decides.
   `KafkaJSApplicationRecoverableError`, and that is when to create a new producer; otherwise keep
   it, and for `invalidConfiguration` also fix the record, config or ACL. A send rejected inside a
   transaction after its records were queued always ends that transaction, so `commit()` after one
-  will not silently publish a partial transaction.
+  will not silently publish a partial transaction. Once the producer is fatal, a Produce request it
+  had drained but not yet written is never written, whichever identity or send path drained it and
+  whichever send's failure made the producer fatal: its batches reject with the armed error at
+  once, without a retry or a wait for a partition leader. A request already written answers as
+  before.
 
 - **An initial `InitProducerId` answered `INVALID_PRODUCER_EPOCH` (47) or `PRODUCER_FENCED` (90) now
   makes the producer permanently unusable.** The call rejects with a
