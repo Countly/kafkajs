@@ -71,6 +71,17 @@
         { "key": "cpuMicrosPerMessage", "unit": "us" },
         { "key": "elapsedMs", "unit": "ms" }
       ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
       "arms": ["fork", "kafkajs@2.2.4"]
     },
     {
@@ -95,6 +106,17 @@
         { "key": "cpuMicrosPerMessage", "unit": "us" },
         { "key": "elapsedMs", "unit": "ms" }
       ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
       "arms": ["fork", "kafkajs@2.2.4"],
       "profile": true
     },
@@ -120,6 +142,17 @@
         { "key": "cpuMicrosPerMessage", "unit": "us" },
         { "key": "elapsedMs", "unit": "ms" }
       ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
       "arms": ["fork", "kafkajs@2.2.4"]
     },
     {
@@ -144,6 +177,17 @@
         { "key": "cpuMicrosPerMessage", "unit": "us" },
         { "key": "elapsedMs", "unit": "ms" }
       ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
       "arms": ["fork", "kafkajs@2.2.4"]
     },
     {
@@ -168,7 +212,514 @@
         { "key": "cpuMicrosPerMessage", "unit": "us" },
         { "key": "elapsedMs", "unit": "ms" }
       ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
       "arms": ["fork", "kafkajs@2.2.4"]
+    },
+    {
+      "name": "compare-produce-throughput-100k",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--size",
+        "102400",
+        "--batch",
+        "8"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-1m",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--size",
+        "1000000",
+        "--batch",
+        "1"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-15k",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--size",
+        "15360",
+        "--batch",
+        "32"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-17k",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--size",
+        "17408",
+        "--batch",
+        "32"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-12p-keyed",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--partitions",
+        "12",
+        "--keys",
+        "index"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-string-200",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--value-type",
+        "string"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-string-1k",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--size",
+        "1024",
+        "--value-type",
+        "string"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-100k-gzip",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--size",
+        "102400",
+        "--batch",
+        "8",
+        "--compression",
+        "gzip"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-100k-lz4",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--size",
+        "102400",
+        "--batch",
+        "8",
+        "--compression",
+        "lz4"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-coalesced",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--partitions",
+        "1",
+        "--unawaited",
+        "100"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-fanout-100p",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--size",
+        "50",
+        "--partitions",
+        "100",
+        "--keys",
+        "index"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-custom",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--partitions",
+        "12",
+        "--partitioner",
+        "custom"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
+    },
+    {
+      "name": "compare-produce-throughput-headers",
+      "adapter": "clientCompare",
+      "command": [
+        "scripts/benchmarks/clientCompare.js",
+        "--client",
+        "{client}",
+        "--package",
+        "{package}",
+        "--workload",
+        "produce-throughput",
+        "--duration-ms",
+        "30000",
+        "--headers",
+        "20"
+      ],
+      "broker": true,
+      "metrics": [
+        { "key": "messagesPerSecond", "unit": "msg/s" },
+        { "key": "cpuMicrosPerMessage", "unit": "us" },
+        { "key": "elapsedMs", "unit": "ms" }
+      ],
+      "diagnostic": {
+        "args": ["--probe", "on"],
+        "metrics": [
+          { "key": "sendCallMicrosP50", "unit": "us" },
+          { "key": "sendCallMicrosP99", "unit": "us" },
+          { "key": "peakRssBytes", "unit": "bytes" },
+          { "key": "peakArrayBuffers", "unit": "bytes" },
+          { "key": "gcCountPer10kMessages", "unit": "collections" },
+          { "key": "gcPauseMsPer10kMessages", "unit": "ms" }
+        ]
+      },
+      "arms": ["fork", "kafkajs@2.2.4"],
+      "namedOnly": true
     },
     {
       "name": "compare-consume-throughput",

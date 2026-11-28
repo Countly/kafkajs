@@ -1,5 +1,6 @@
 /**
- * Benchmark report: runs every entry of `manifest.json` once per arm and per run, takes the median
+ * Benchmark report: runs every entry of `manifest.json` that is selected (all but those marked
+ * `namedOnly` unless `--only` names them) once per arm and per run, takes the median
  * and the range of each metric, and writes `bench-report.md` and `bench-report.json`. Benchmarks are
  * reported and never judged: a crash, a non-zero exit, bad output or a bad metric is an `error` row,
  * a report is always written, and the exit code stays 0.
@@ -15,7 +16,8 @@
  * Usage: node scripts/benchmarks/report.js --runs 3 --fork-dir <dir> --baseline-dir <dir> --out <dir>
  *          [--only <name>[,<name>...]]
  * `--fork-dir` and `--baseline-dir` are npm install prefixes: the fork's packed tarball and
- * kafkajs@2.2.4. `--only` runs just the named manifest entries; an empty value runs them all.
+ * kafkajs@2.2.4. `--only` runs just the named manifest entries; an empty value runs them all
+ * except those marked `namedOnly`, which run only when named.
  * Exit codes: 0 a report was written, 2 a bad argument (an unknown `--only` name included).
  */
 const fs = require('node:fs')
@@ -48,8 +50,10 @@ const USAGE =
  *   notes: string[], table?: { caption: string, header: string[], rows: string[][] } }} Detail
  *   what an adapter shows beside its rows: controls, notes and an optional table of text cells,
  *   shown whatever the row's status
- * @typedef {{ outputs: object[], error?: string, profile?: string }} Outcome what the runs of
- *   one arm gave; `profile` is where its CPU profile is, or why it failed
+ * @typedef {{ outputs: object[], error?: string, profile?: string,
+ *   diagnostic?: { output?: object, error?: string } }} Outcome what the runs of one arm gave;
+ *   `profile` is where its CPU profile is, or why it failed; `diagnostic` is the output of its one
+ *   diagnostic run, or why that run failed
  * @typedef {{ runs?: number, timeoutMs?: number, interleave?: boolean,
  *   read: (result: object, entry: ManifestEntry, arm: string) => object,
  *   rows: (entry: ManifestEntry, arm: string, outcome: Outcome, runs: number) =>
@@ -58,9 +62,11 @@ const USAGE =
  *   report's for every arm; `interleave` alternates the arms run by run
  * @typedef {{ name: string, command: string[], broker: boolean,
  *   metrics: { key: string, unit: string }[], arms: ('fork'|'kafkajs@2.2.4')[],
- *   adapter?: string, profile?: boolean,
+ *   adapter?: string, profile?: boolean, namedOnly?: boolean,
+ *   diagnostic?: { args: string[], metrics: { key: string, unit: string }[] },
  *   omitted?: { reason: string, decision: string, evidenceRun: string } }} ManifestEntry
- *   `profile` adds one CPU-profiled run per arm
+ *   `profile` adds one CPU-profiled run per arm; `diagnostic` adds one run per arm with `args`
+ *   appended to the command, whose `metrics` are reported from that run alone
  */
 
 /**
@@ -165,7 +171,10 @@ const readRun = (result, entry, arm) => {
  * After each run, every run of that arm so far (arguments, exit, stdout, stderr) is rewritten to
  * `<rawDir>/<arm>.json`. An entry with `profile` then runs each arm that did not fail once more
  * under `node --cpu-prof`, writing the profile to `<rawDir>/<arm>-cpu-profile/`; that run's
- * output is checked but never joins the outputs, since profiling changes the timing.
+ * output is checked but never joins the outputs, since profiling changes the timing. An entry with
+ * `diagnostic` then runs each arm that did not fail once more with the arguments `diagnostic.args`
+ * added; that run's output is kept apart as the arm's `diagnostic`, since what it measures
+ * changes the timing too, and a failed diagnostic run leaves the measured outputs as they are.
  * @param {ManifestEntry} entry
  * @param {Adapter} adapter reads each run's result
  * @param {{ runs: number, forkDir: string, baselineDir: string, spawn: Function,
@@ -182,13 +191,16 @@ const runArms = (entry, adapter, { runs, forkDir, baselineDir, spawn, rawDir }) 
     : entry.arms.flatMap((arm) => numbers.map((n) => [arm, n]))
   const timeout = adapter.timeoutMs ?? RUN_TIMEOUT_MS
   const options = { cwd: ROOT, encoding: 'utf8', timeout, maxBuffer: MAX_BUFFER }
-  const run = (arm, n, nodeArgs = []) => {
-    const args = fill(entry.command, {
-      client: arm === 'fork' ? forkDir : baselineDir,
-      package: PACKAGES[arm],
-      baselinePackageDir: path.join(baselineDir, 'node_modules', 'kafkajs'),
-      raw: path.join(rawDir, `${arm}-run-${n}.jsonl`),
-    })
+  const run = (arm, n, nodeArgs = [], extraArgs = []) => {
+    const args = [
+      ...fill(entry.command, {
+        client: arm === 'fork' ? forkDir : baselineDir,
+        package: PACKAGES[arm],
+        baselinePackageDir: path.join(baselineDir, 'node_modules', 'kafkajs'),
+        raw: path.join(rawDir, `${arm}-run-${n}.jsonl`),
+      }),
+      ...extraArgs,
+    ]
     const result = spawn(process.execPath, [...nodeArgs, ...args], options)
     const { evidence } = state.get(arm)
     evidence.runs.push({
@@ -222,10 +234,23 @@ const runArms = (entry, adapter, { runs, forkDir, baselineDir, spawn, rawDir }) 
       arms.profile = `failed: ${err.message}`
     }
   }
+  for (const [arm, arms] of entry.diagnostic ? state : []) {
+    if (arms.error) continue
+    try {
+      arms.diagnostic = { output: run(arm, 'diagnostic', [], entry.diagnostic.args) }
+    } catch (err) {
+      arms.diagnostic = { error: `diagnostic run: ${err.message}` }
+    }
+  }
   return new Map(
-    [...state].map(([arm, { outputs, error, profile }]) => [
+    [...state].map(([arm, { outputs, error, profile, diagnostic }]) => [
       arm,
-      { outputs, ...(error && { error }), ...(profile && { profile }) },
+      {
+        outputs,
+        ...(error && { error }),
+        ...(profile && { profile }),
+        ...(diagnostic && { diagnostic }),
+      },
     ])
   )
 }
@@ -544,8 +569,9 @@ const main = (
   fs.mkdirSync(rawDir, { recursive: true })
   const setup = setupFailure(env.BENCH_SETUP)
   const results = manifest.entries.map((entry) => {
-    if (args.only && !args.only.includes(entry.name)) {
-      return { rows: [entryRow(entry, 'not selected', 'left out by --only')], details: [] }
+    if (args.only ? !args.only.includes(entry.name) : entry.namedOnly) {
+      const reason = args.only ? 'left out by --only' : 'runs only when named with --only'
+      return { rows: [entryRow(entry, 'not selected', reason)], details: [] }
     }
     log(entry.name)
     if (setup) return setupRow(entry, setup, env.BENCH_SETUP, rawDir)
