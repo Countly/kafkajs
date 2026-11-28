@@ -82,6 +82,7 @@ const begin = async ({
   const run = await startClassic('classic', {
     autoCommitThreshold: 100,
     records: { 'topic-a|0': [40, 41] },
+    trace: true,
     ...options,
     config: { ...(instance && { groupInstanceId: INSTANCE }), ...(retry && { retry }), ...config },
     eachMessage: async (payload, held) => {
@@ -111,10 +112,6 @@ const begin = async ({
   consumer.on(consumer.events.POLL_INTERVAL_EXCEEDED, ({ payload }) =>
     log.push({ kind: 'POLL', isStatic: payload.isStatic })
   )
-  consumer.on(consumer.events.DISCONNECT, () => log.push({ kind: 'DISCONNECT' }))
-  consumer.on(consumer.events.CRASH, ({ payload }) =>
-    log.push({ kind: 'CRASH', restart: payload.restart, at: Date.now() })
-  )
   return Object.assign(run, { delivered })
 }
 
@@ -122,16 +119,65 @@ const begin = async ({
 const crashedAt = (run) => run.log.find(({ kind }) => kind === 'CRASH').at
 
 /**
- * Checks that no restart starts in the 299 ms after CRASH, then whether one starts by 1 s.
+ * Checks the restart delay to the millisecond: the cluster is not connected again one millisecond
+ * before `delay` has passed since CRASH, and is connected at exactly `delay` when the run
+ * restarts; a run that does not restart makes no connect within a further second. Call it within
+ * `delay` ms of CRASH.
+ * @param {object} run
+ * @param {boolean} restart whether CRASH reported a restart
+ * @param {number} [delay=300] the configured restart delay, in ms
  * @returns {Promise<void>}
  */
 const expectRestart = async (run, restart, delay = 300) => {
-  const waited = Date.now() - crashedAt(run)
-  expect(waited).toBeLessThan(delay - 1)
+  const connects = () => run.log.filter(({ kind }) => kind === 'connect')
+  const before = connects().length
+  const crashAt = crashedAt(run)
+  const waited = Date.now() - crashAt
+  expect(waited).toBeLessThan(delay)
   await jest.advanceTimersByTimeAsync(delay - 1 - waited)
-  expect(run.cluster.connect).toHaveBeenCalledTimes(1)
-  await advanceUntil(() => run.cluster.connect.mock.calls.length > 1, 1000)
-  expect(run.cluster.connect).toHaveBeenCalledTimes(restart ? 2 : 1)
+  expect(connects()).toHaveLength(before)
+  await jest.advanceTimersByTimeAsync(1)
+  if (!restart) {
+    await jest.advanceTimersByTimeAsync(1000)
+    expect(connects()).toHaveLength(before)
+    return
+  }
+  for (let turn = 0; turn < 20 && connects().length === before; turn++) {
+    await jest.advanceTimersByTimeAsync(0)
+  }
+  expect(connects()).toHaveLength(before + 1)
+  expect(connects()[before].at - crashAt).toBe(delay)
+}
+
+/** How each step of a crash during start reads in its trace, `run()` settlement included. */
+const START_STEPS = {
+  commit: () => 'commit',
+  STOP: () => 'STOP',
+  disconnect: () => 'transport disconnect',
+  DISCONNECT: () => 'DISCONNECT',
+  CRASH: ({ restart }) => `CRASH restart ${restart}`,
+  RUN: () => 'run() settled',
+}
+
+/** @returns {string[]} what the run's single trace holds of a crash during start, in order */
+const startupTrail = (run) =>
+  run.log.filter(({ kind }) => START_STEPS[kind]).map((entry) => START_STEPS[entry.kind](entry))
+
+/**
+ * Parks the transport disconnect of the run's cleanup, so `run()` and the crash report are still
+ * pending behind it.
+ * @returns {{ prepare: Function, parked: Function, release: () => void }} the `startClassic`
+ *   options that park it and wait until it is parked, and the release
+ */
+const parkTransport = () => {
+  const gate = deferred()
+  return {
+    prepare: ({ state }) => {
+      state.disconnecting = gate.promise
+    },
+    parked: ({ log }) => log.some(({ kind }) => kind === 'disconnect'),
+    release: gate.resolve,
+  }
 }
 
 /**
@@ -252,21 +298,39 @@ describe('Consumer > how a classic run ends', () => {
     it('a start failure before the run is running commits and leaves nothing, emits STOP and then DISCONNECT before CRASH, and restarts by the crash rules', async () => {
       const error = new KafkaJSError('the connection failed', { retriable: true })
       const connect = jest.spyOn(ConsumerGroup.prototype, 'connect').mockRejectedValueOnce(error)
-      const run = await startClassic('classic', { config: { retry: RETRY } })
+      const transport = parkTransport()
+      const run = await startClassic('classic', {
+        config: { retry: RETRY },
+        trace: true,
+        prepare: transport.prepare,
+        until: transport.parked,
+      })
 
+      await jest.advanceTimersByTimeAsync(1000)
+      expect(startupTrail(run)).toEqual(['STOP', 'transport disconnect'])
+      expect(run.started.done).toBe(false)
+      expect(run.crashes).toEqual([])
+
+      transport.release()
+      await advanceUntil(() => run.started.done, 2000)
+
+      expect(run.started).toMatchObject({ done: true, value: undefined })
+      expect(startupTrail(run)).toEqual([
+        'STOP',
+        'transport disconnect',
+        'DISCONNECT',
+        'CRASH restart true',
+        'run() settled',
+      ])
       expect(run.crashes.map((crash) => [crash.error, crash.restart])).toEqual([[error, true]])
-      expect(
-        run.log.filter(({ kind }) => ['STOP', 'disconnect', 'commit'].includes(kind))
-      ).toMatchObject([{ kind: 'STOP' }, { kind: 'disconnect' }])
       expect(run.cluster.disconnect.mock.calls).toEqual([[{ preserveSetupState: true }]])
       expect(run.coordinator.joinGroup).not.toHaveBeenCalled()
       expect(run.coordinator.offsetCommit).not.toHaveBeenCalled()
       expect(run.coordinator.leaveGroup).not.toHaveBeenCalled()
 
-      await jest.advanceTimersByTimeAsync(250)
-      expect(connect).toHaveBeenCalledTimes(1)
-      await advanceUntil(() => run.coordinator.joinGroup.mock.calls.length > 0, 1000)
+      await expectRestart(run, true)
       expect(connect).toHaveBeenCalledTimes(2)
+      await advanceUntil(() => run.coordinator.joinGroup.mock.calls.length > 0, 1000)
       expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(1)
     }, 30000)
   })
@@ -796,6 +860,39 @@ describe('Consumer > how a classic run ends', () => {
       },
       30000
     )
+
+    it('then disconnect({ timeout: 500 }) with the expiry LeaveGroup written and its reply still held settles at once, and the late reply changes nothing', async () => {
+      const reply = deferred()
+      const holdReply = ({ coordinator, log }) =>
+        coordinator.leaveGroup.mockImplementation(async ({ memberId, groupInstanceId }) => {
+          log.push({ kind: 'leave', memberId, groupInstanceId })
+          await reply.promise
+        })
+      const run = await expire({ beforeExpiry: holdReply })
+      await jest.advanceTimersByTimeAsync(200)
+      expect(trail(run)).toEqual(['POLL_INTERVAL_EXCEEDED', 'leave member-1 null'])
+      expect(run.coordinator.leaveGroup).toHaveBeenCalledTimes(1)
+
+      const ending = settled(run.consumer.disconnect({ timeout: 500 }))
+      await jest.advanceTimersByTimeAsync(1000)
+
+      const ended = ['POLL_INTERVAL_EXCEEDED', 'leave member-1 null', 'STOP', 'DISCONNECT']
+      expect(ending).toMatchObject({ done: true, value: undefined })
+      expect(trail(run)).toEqual(ended)
+      expect(run.cluster.disconnect.mock.calls).toEqual([[{ drainTimeout: 0 }]])
+
+      reply.resolve()
+      run.held.resolve()
+      await jest.advanceTimersByTimeAsync(2000)
+
+      expect(trail(run)).toEqual(ended)
+      expect(run.coordinator.leaveGroup).toHaveBeenCalledTimes(1)
+      expect(run.coordinator.leaveGroup.mock.calls[0][0]).toMatchObject({ memberId: 'member-1' })
+      expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(1)
+      expect(run.log.filter(({ kind }) => kind === 'commit')).toEqual([])
+      expect(run.crashes).toEqual([])
+      expect(jest.getTimerCount()).toBe(0)
+    }, 30000)
   })
 
   describe('a FENCED_INSTANCE_ID heartbeat answer to a static member', () => {
@@ -1001,25 +1098,41 @@ describe('Consumer > how a classic run ends', () => {
       const error = failure(false)
       let refuse = null
       const joined = { promise: new Promise((_resolve, reject) => (refuse = reject)) }
-      const run = await startClassic('classic', { joined, config: { retry: RETRY } })
+      const transport = parkTransport()
+      const run = await startClassic('classic', {
+        joined,
+        config: { retry: RETRY },
+        trace: true,
+        prepare: transport.prepare,
+      })
       expect(run.runner.running).toBe(true)
 
       refuse(error)
+      await advanceUntil(() => transport.parked(run), 2000)
+      await jest.advanceTimersByTimeAsync(1000)
+
+      expect(startupTrail(run)).toEqual(['STOP', 'transport disconnect'])
+      expect(run.started.done).toBe(false)
+      expect(run.crashes).toEqual([])
+
+      transport.release()
       await advanceUntil(() => run.started.done, 2000)
 
       expect(run.started).toMatchObject({ done: true, value: undefined })
+      expect(startupTrail(run)).toEqual([
+        'STOP',
+        'transport disconnect',
+        'DISCONNECT',
+        'CRASH restart false',
+        'run() settled',
+      ])
       expect(run.crashes).toHaveLength(1)
       expect(inCauseChain(run.crashes[0].error, error)).toBe(true)
-      expect(run.crashes[0].restart).toBe(false)
-      expect(
-        run.log.filter(({ kind }) => ['STOP', 'disconnect', 'commit'].includes(kind))
-      ).toMatchObject([{ kind: 'STOP' }, { kind: 'disconnect' }])
       expect(run.cluster.disconnect.mock.calls).toEqual([[{ preserveSetupState: true }]])
       expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(1)
       expect(run.coordinator.syncGroup).not.toHaveBeenCalled()
       expect(run.coordinator.leaveGroup).not.toHaveBeenCalled()
-      await jest.advanceTimersByTimeAsync(1000)
-      expect(run.cluster.connect).toHaveBeenCalledTimes(1)
+      await expectRestart(run, false)
       expect(jest.getTimerCount()).toBe(0)
     }, 30000)
 

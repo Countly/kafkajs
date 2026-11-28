@@ -331,13 +331,30 @@ const eager = () => ({
  * Starts a run of topic-a over the scripted cluster under the classic protocol, as a follower
  * that joins with JoinGroup and SyncGroup, or under manual assignment. Waits until `run()` settled,
  * or, when `joined` holds the first JoinGroup answer, until that JoinGroup was sent. A handler
- * receives the payload and `held`, which the run's teardown resolves.
+ * receives the payload and `held`, which the run's teardown resolves. With `prepare` or a parked
+ * `run()` the caller owns the wait: `until` names the point to wait for.
  * @param {'classic'|'manual'} kind
  * @param {object} [options]
+ * @param {(payload: object, held: object) => Promise<void>} [options.eachMessage] the `eachMessage`
+ *   handler; `held` resolves in the run's teardown
+ * @param {(payload: object, held: object) => Promise<void>} [options.eachBatch] the `eachBatch`
+ *   handler, with the same `held`
+ * @param {object} [options.hook] the `rebalanceListener` of the run
+ * @param {{ promise: Promise<void> }} [options.joined] holds the first JoinGroup answer: the
+ *   start waits until that JoinGroup was sent, and `run()` is still pending then
+ * @param {object} [options.config] consumer options replacing the fixture's defaults
+ * @param {number} [options.autoCommitThreshold] the run's `autoCommitThreshold`
  * @param {Record<string, number[]>} [options.records] the offsets served by `topic|partition`;
  *   `topic-a|0` serves 40 when a handler is given and this is omitted
  * @param {number[]} [options.partitions=[0]] the partitions of topic-a SyncGroup assigns
  * @param {object} [options.run] further `run()` options
+ * @param {boolean} [options.trace] records DISCONNECT, CRASH (with `restart` and the fake-clock
+ *   `at`) and the settlement of `run()` in `log`, so one trace orders them with STOP and the
+ *   transport disconnect; every listener is attached before `run()` starts
+ * @param {(built: object) => void} [options.prepare] runs on the built consumer before `run()`,
+ *   to park a step of the start (for instance `built.state.disconnecting`)
+ * @param {(built: object) => boolean} [options.until] waits, instead of for `run()` to settle,
+ *   until this holds; `run()` may then still be pending
  * @returns {Promise<object>} the run, its runner and its group
  */
 const startClassic = async (
@@ -352,11 +369,21 @@ const startClassic = async (
     records,
     partitions = [0],
     run: runOptions,
+    trace,
+    prepare,
+    until,
   } = {}
 ) => {
   const runs = jest.spyOn(Runner.prototype, 'start')
   const built = buildConsumer({ groupProtocol: 'classic', partitionAssigners: [eager], ...config })
-  const { consumer, coordinator, cluster, state } = built
+  const { consumer, coordinator, cluster, state, log } = built
+  if (trace) {
+    consumer.on(consumer.events.DISCONNECT, () => log.push({ kind: 'DISCONNECT' }))
+    consumer.on(consumer.events.CRASH, ({ payload }) =>
+      log.push({ kind: 'CRASH', restart: payload.restart, at: Date.now() })
+    )
+  }
+  prepare?.(built)
   Object.assign(coordinator, {
     joinGroup: jest.fn(async () => {
       await joined?.promise
@@ -393,22 +420,26 @@ const startClassic = async (
     await consumer.subscribe({ topic: 'topic-a' })
   }
   const held = deferred()
-  const started = settled(
-    consumer.run({
-      eachMessage: eachMessage && ((payload) => eachMessage(payload, held)),
-      eachBatch: eachBatch && ((payload) => eachBatch(payload, held)),
-      ...(hook && { rebalanceListener: hook }),
-      ...(autoCommitThreshold && { autoCommitThreshold }),
-      ...runOptions,
-    })
-  )
+  const running = consumer.run({
+    eachMessage: eachMessage && ((payload) => eachMessage(payload, held)),
+    eachBatch: eachBatch && ((payload) => eachBatch(payload, held)),
+    ...(hook && { rebalanceListener: hook }),
+    ...(autoCommitThreshold && { autoCommitThreshold }),
+    ...runOptions,
+  })
+  const runSettled = () => log.push({ kind: 'RUN' })
+  if (trace) running.then(runSettled, runSettled)
+  const started = settled(running)
   cleanup = async () => {
     held.resolve()
     const end = settled(consumer.disconnect({ timeout: 0 }))
     await jest.advanceTimersByTimeAsync(10)
     expect(end.done).toBe(true)
   }
-  if (joined) {
+  if (until) {
+    await advanceUntil(() => until(built))
+    expect(until(built)).toBe(true)
+  } else if (joined) {
     await advanceUntil(() => coordinator.joinGroup.mock.calls.length > 0)
     expect(started.done).toBe(false)
   } else {
