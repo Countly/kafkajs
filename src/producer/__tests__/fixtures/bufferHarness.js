@@ -4,6 +4,229 @@ const createProducer = require('../../index')
 const { Admission } = require('../../state/admission')
 const { createFakeCluster } = require('./fakeCluster')
 const { createLogger, LEVELS } = require('../../../loggers')
+const Decoder = require('../../../protocol/decoder')
+const decodeRecordBatch = require('../../../protocol/recordBatch/v0/decoder')
+const buildRecordBatch = require('../../../protocol/requests/produce/buildRecordBatch')
+const { Types: Compression } = require('../../../protocol/message/compression')
+const Long = require('../../../utils/long')
+
+/**
+ * A batch's records, for a test that builds a batch itself, in the form batches hold them.
+ * @param {object[]} messages the records as a caller passes them to `send()`
+ * @returns {object[]} the records a batch's `messages` field holds
+ */
+const owned = (messages) => messages
+
+/**
+ * @typedef {{ topicData?: { topic: string, partitions: { partition: number,
+ *   firstSequence?: number, messages: object[] }[] }[], batches?: { topic: string,
+ *   partition: number, firstSequence?: number, messages: object[] }[] }} SentRequest a Produce
+ *   request (`topicData`) or an accumulator hand-off (`batches`)
+ */
+
+/**
+ * @typedef {{ topic: string, partition: number, firstSequence: number, records: {
+ *   key: Buffer|null, value: Buffer|null, headers: object, timestamp: string, offset: string }[]
+ *   }} ReadBatch a batch as a broker reads it; `offset` is the record's position in its batch
+ */
+
+/**
+ * A batch's place and its own copy of its record list.
+ * @param {string} topic
+ * @param {{ partition: number, firstSequence?: number, messages: object[] }} batch
+ * @returns {{ topic: string, partition: number, firstSequence: number|undefined,
+ *   messages: object[] }}
+ */
+const placed = (topic, { partition, firstSequence, messages }) => {
+  const copy = new Array(messages.length)
+  for (let at = 0; at < messages.length; at++) copy[at] = messages[at]
+  return { topic, partition, firstSequence, messages: copy }
+}
+
+/**
+ * The batches a request carries, read synchronously, in request order, each with its own copy of
+ * its record list. The one place a fixture reads a request's records, for a fake broker or probe
+ * that decides or labels by them at the instant the request arrives. It is plain loops and
+ * property reads, no built-in method, so a spec that spies on one sees only the producer's calls.
+ * @param {SentRequest} request
+ * @returns {{ topic: string, partition: number, firstSequence: number|undefined,
+ *   messages: object[] }[]}
+ */
+const batchesOf = (request) => {
+  const taken = []
+  if (request.batches) {
+    for (let at = 0; at < request.batches.length; at++) {
+      taken[taken.length] = placed(request.batches[at].topic, request.batches[at])
+    }
+    return taken
+  }
+  for (let at = 0; at < request.topicData.length; at++) {
+    const { topic, partitions } = request.topicData[at]
+    for (let index = 0; index < partitions.length; index++) {
+      taken[taken.length] = placed(topic, partitions[index])
+    }
+  }
+  return taken
+}
+
+/**
+ * A copy of a record field as it is now: a Buffer's bytes are copied with indexed writes, any
+ * other value is kept as it is.
+ * @param {*} field
+ * @returns {*}
+ */
+const fieldOf = (field) => {
+  if (!Buffer.isBuffer(field)) return field
+  const copy = Buffer.alloc(field.length)
+  for (let at = 0; at < field.length; at++) copy[at] = field[at]
+  return copy
+}
+
+/**
+ * A copy of a record's headers as they are now, header-value arrays included. The copy has no
+ * prototype, so a header named `__proto__` is stored as an own property like any other instead of
+ * reaching the inherited setter, and a repeated header's array keeps its holes, since the batch
+ * writer skips them: only the indices present in the original are copied.
+ * @param {object|null|undefined} headers
+ * @returns {object|null|undefined}
+ */
+const headersOf = (headers) => {
+  if (headers === null || typeof headers !== 'object') return headers
+  const copy = Object.create(null)
+  for (const name in headers) {
+    if (!Object.hasOwn(headers, name)) continue
+    const entry = headers[name]
+    if (Array.isArray(entry)) {
+      const list = new Array(entry.length)
+      for (let at = 0; at < entry.length; at++) {
+        if (at in entry) list[at] = fieldOf(entry[at])
+      }
+      copy[name] = list
+    } else {
+      copy[name] = fieldOf(entry)
+    }
+  }
+  return copy
+}
+
+/**
+ * A timestamp as it is now, in the same form: a `Date` as a new `Date` of its time and a `Long` as
+ * a new `Long` of its value, both still objects, so the batch writer's "falsy is the send time"
+ * rule sees what it would see in the original (a `Date` of the epoch stays the literal epoch).
+ * @param {*} timestamp
+ * @returns {*}
+ */
+const timestampOf = (timestamp) => {
+  if (timestamp instanceof Date) return new Date(timestamp.getTime())
+  if (timestamp instanceof Long) return new Long(timestamp.value)
+  return timestamp
+}
+
+/**
+ * A record's encoded fields as they are now: key, value, headers and timestamp.
+ * @param {object} message
+ * @returns {{ key: *, value: *, headers: *, timestamp: * }}
+ */
+const recordOf = (message) => ({
+  key: fieldOf(message.key),
+  value: fieldOf(message.value),
+  headers: headersOf(message.headers),
+  timestamp: timestampOf(message.timestamp),
+})
+
+/**
+ * Reads one record batch with the consumer's batch decoder, CRC included.
+ * @param {Buffer} buffer the batch's bytes
+ * @returns {Promise<{ firstSequence: number, records: ReadBatch['records'] }>}
+ * @throws {import('../../../errors').KafkaJSCorruptRecordError} for bytes that are not a valid
+ *   batch, such as a payload byte changed under its CRC
+ */
+const readBatch = async (buffer) => {
+  const { firstSequence, records } = await decodeRecordBatch(new Decoder(buffer), {
+    maxDecompressedBatchBytes: Number.MAX_SAFE_INTEGER,
+  })
+  return {
+    firstSequence,
+    records: records.map(({ key, value, headers, timestamp, offset }) => ({
+      key,
+      value,
+      headers,
+      timestamp,
+      offset,
+    })),
+  }
+}
+
+/**
+ * Takes what a request carries at this instant without waiting. Three things differ in when they
+ * happen:
+ * - observation, at the call: each batch's place, the request's first sequence, its record count
+ *   and every record's key, value, headers and timestamp as they are now (strings and numbers as
+ *   they are, Buffer bytes copied, a `Date` or `Long` timestamp as a new one of the same value),
+ *   so a later change to a record list, a record field or a Buffer byte is not seen;
+ * - encoding, deferred to `read()`: the producer's batch writer writes the observed records and the
+ *   consumer's decoder reads them back, CRC checked. The writer takes the send time for a falsy
+ *   timestamp (absent, `null`, `0`, `0n`) when it runs, so that time is the clock at the `read()`
+ *   call, not at the observation. A test whose assertion depends on that time fixes the clock for
+ *   both calls or reads the write where the producer made it;
+ * - bytes captured at a real write are not this helper's: a test that needs the bytes the producer
+ *   itself put on the wire reads them where it captures that write.
+ * The call is plain loops, indexed reads and writes, `Buffer.alloc`, `Buffer.isBuffer`,
+ * `Array.isArray`, `Object.hasOwn`, `Object.create(null)`, `Date#getTime`, `new Date(time)` and
+ * `new Long`, so a fake
+ * broker or probe that takes a request decides, records and answers at the same instant as one
+ * that reads nothing, and a spec spying on another built-in or on the clock sees only the
+ * producer's calls.
+ *
+ * What a read checks is the record content: keys, values, headers, timestamps, order and offsets,
+ * and that the bytes hold `count` records. The batch is written uncompressed with the default
+ * producer id and epoch and no transaction flag, so it says nothing of the request's envelope,
+ * compression, producer identity or transaction attribute; tests check those on the request or
+ * the wire.
+ * @param {SentRequest} request
+ * @returns {{ batches: { topic: string, partition: number, firstSequence: number|undefined,
+ *   count: number }[], read: () => Promise<ReadBatch[]> }} `read` settles once and rejects with
+ *   what writing or decoding threw
+ */
+const takeSent = (request) => {
+  const taken = batchesOf(request)
+  const batches = new Array(taken.length)
+  const observed = new Array(taken.length)
+  for (let at = 0; at < taken.length; at++) {
+    const { topic, partition, firstSequence, messages } = taken[at]
+    batches[at] = { topic, partition, firstSequence, count: messages.length }
+    observed[at] = new Array(messages.length)
+    for (let index = 0; index < messages.length; index++) {
+      observed[at][index] = recordOf(messages[index])
+    }
+  }
+  let reading = null
+  const read = () =>
+    (reading ??= Promise.all(
+      batches.map(async ({ topic, partition, firstSequence, count }, at) => {
+        const { buffer } = await buildRecordBatch({
+          compression: Compression.None,
+          messages: observed[at],
+          firstSequence,
+        })
+        const { firstSequence: written, records } = await readBatch(buffer)
+        if (records.length !== count) {
+          throw new Error(
+            `${topic}/${partition} held ${count} records, its bytes ${records.length}`
+          )
+        }
+        return { topic, partition, firstSequence: written, records }
+      })
+    ))
+  return { batches, read }
+}
+
+/**
+ * The records a broker reads from a request, taken now (`takeSent`) and decoded.
+ * @param {SentRequest} request
+ * @returns {Promise<ReadBatch[]>} one entry per batch, in request order
+ */
+const sentRecords = (request) => takeSent(request).read()
 
 /**
  * Creates a promise whose owner can resolve or reject it explicitly.
@@ -180,6 +403,11 @@ const transactionalProducer = async (options = {}) => {
 }
 
 module.exports = {
+  owned,
+  batchesOf,
+  readBatch,
+  takeSent,
+  sentRecords,
   succeeded,
   transactionalProducer,
   deferred,

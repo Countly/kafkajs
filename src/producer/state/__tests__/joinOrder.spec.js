@@ -9,6 +9,7 @@ const {
   KafkaJSDeliveryTimeout,
   KafkaJSProducerClosedError,
 } = require('../../../errors')
+const { takeSent } = require('../../__tests__/fixtures/bufferHarness')
 
 const TOPIC = 'topic-a'
 const OTHER_TOPIC = 'topic-b'
@@ -23,6 +24,9 @@ const deferred = () => {
   })
   return { promise, resolve, reject }
 }
+
+/** A record's value as a broker reads it, as text. */
+const textOf = ({ value }) => value.toString()
 
 /** Every record goes to the partition it names. */
 const byMessage = ({ records }) =>
@@ -57,7 +61,7 @@ const createGated = ({ deadline, linger = 0, admission } = {}) => {
       return byMessage(send)
     },
     sendPartitioned: async (request) => {
-      calls.push(request)
+      calls.push(takeSent(request))
       return request.batches.map(({ topic, partition, settlers }) => {
         const metadata = { topicName: topic, partition, errorCode: 0, baseOffset: '0' }
         settlers.forEach((settler) => settler.resolve(metadata))
@@ -65,11 +69,16 @@ const createGated = ({ deadline, linger = 0, admission } = {}) => {
       })
     },
   })
-  const written = () =>
-    calls.flatMap(({ batches }) => batches.flatMap(({ messages }) => messages.map((m) => m.value)))
+  const written = async () =>
+    (await Promise.all(calls.map(({ read }) => read()))).flatMap((batches) =>
+      batches.flatMap(({ records }) => records.map(textOf))
+    )
+  const writtenCount = () =>
+    calls.reduce((sum, { batches }) => batches.reduce((total, { count }) => total + count, sum), 0)
   return {
     accumulator,
     written,
+    writtenCount,
     assign: (value) => gateOf(value).resolve(),
     fail: (value, error) => gateOf(value).reject(error),
   }
@@ -84,21 +93,21 @@ const flushJobs = () => new Promise((resolve) => setImmediate(resolve))
 
 describe('Producer > the accumulator joins sends to their batches in call order', () => {
   test('a send partitioned before an earlier send of its topic waits for it, then both join in call order', async () => {
-    const { accumulator, written, assign } = createGated()
+    const { accumulator, written, writtenCount, assign } = createGated()
     const first = sendOne(accumulator, 'first')
     const second = sendOne(accumulator, 'second')
 
     assign('second')
     await flushJobs()
-    expect(written()).toEqual([])
+    expect(writtenCount()).toBe(0)
 
     assign('first')
     await Promise.all([first, second])
-    expect(written()).toEqual(['first', 'second'])
+    expect(await written()).toEqual(['first', 'second'])
   })
 
   test('an earlier send whose partitioning fails for good leaves the order, and the later ones join', async () => {
-    const { accumulator, written, assign, fail } = createGated()
+    const { accumulator, written, writtenCount, assign, fail } = createGated()
     const first = sendOne(accumulator, 'first')
     const second = sendOne(accumulator, 'second')
     const third = sendOne(accumulator, 'third')
@@ -106,13 +115,13 @@ describe('Producer > the accumulator joins sends to their batches in call order'
     assign('third')
     assign('second')
     await flushJobs()
-    expect(written()).toEqual([])
+    expect(writtenCount()).toBe(0)
 
     const refused = new Error('no metadata, for good')
     fail('first', refused)
     await expect(first).rejects.toBe(refused)
     await Promise.all([second, third])
-    expect(written()).toEqual(['second', 'third'])
+    expect(await written()).toEqual(['second', 'third'])
   })
 
   test('a send of another topic is not delayed by an earlier send still waiting for its partitions', async () => {
@@ -122,15 +131,15 @@ describe('Producer > the accumulator joins sends to their batches in call order'
 
     assign('other')
     await other
-    expect(written()).toEqual(['other'])
+    expect(await written()).toEqual(['other'])
 
     assign('stuck')
     await stuck
-    expect(written()).toEqual(['other', 'stuck'])
+    expect(await written()).toEqual(['other', 'stuck'])
   })
 
   test('a send of two topics waits for the earlier sends of each, and holds the later sends of each', async () => {
-    const { accumulator, written, assign } = createGated()
+    const { accumulator, written, writtenCount, assign } = createGated()
     const a = sendOne(accumulator, 'a', TOPIC)
     const both = accumulator.append({
       acks: -1,
@@ -144,15 +153,15 @@ describe('Producer > the accumulator joins sends to their batches in call order'
     assign('b')
     assign('both')
     await flushJobs()
-    expect(written()).toEqual([])
+    expect(writtenCount()).toBe(0)
 
     assign('a')
     await Promise.all([a, both, b])
-    expect(written()).toEqual(['a', 'both', 'both-b', 'b'])
+    expect(await written()).toEqual(['a', 'both', 'both-b', 'b'])
   })
 
   test('a forced close rejects the sends waiting for an earlier one with the existing error and joins none of them', async () => {
-    const { accumulator, written, assign } = createGated()
+    const { accumulator, writtenCount, assign } = createGated()
     const first = sendOne(accumulator, 'first')
     const second = sendOne(accumulator, 'second')
     assign('second')
@@ -170,27 +179,27 @@ describe('Producer > the accumulator joins sends to their batches in call order'
     }
     assign('first')
     await flushJobs()
-    expect(written()).toEqual([])
+    expect(writtenCount()).toBe(0)
   })
 
   test('a send waiting for an earlier one still ends at its own delivery deadline, and the later ones then join', async () => {
     jest.useFakeTimers({ now: 0 })
     try {
-      const { accumulator, written, assign } = createGated({ deadline: 100 })
+      const { accumulator, written, writtenCount, assign } = createGated({ deadline: 100 })
       const first = sendOne(accumulator, 'first')
       first.catch(() => {})
       await jest.advanceTimersByTimeAsync(50)
       const second = sendOne(accumulator, 'second')
       assign('second')
       await jest.advanceTimersByTimeAsync(49)
-      expect(written()).toEqual([])
+      expect(writtenCount()).toBe(0)
 
       await jest.advanceTimersByTimeAsync(1)
       const error = await first.catch((e) => e)
       expect(error).toBeInstanceOf(KafkaJSDeliveryTimeout)
       expect(error.outcome).toBe('unsent')
       await second
-      expect(written()).toEqual(['second'])
+      expect(await written()).toEqual(['second'])
     } finally {
       jest.useRealTimers()
     }
@@ -199,7 +208,7 @@ describe('Producer > the accumulator joins sends to their batches in call order'
   test('a waiting send that reaches its deadline first ends alone, and the earlier one still joins', async () => {
     jest.useFakeTimers({ now: 0 })
     try {
-      const { accumulator, written, assign } = createGated({ deadline: 100 })
+      const { accumulator, written, writtenCount, assign } = createGated({ deadline: 100 })
       const first = sendOne(accumulator, 'first', TOPIC)
       const second = accumulator.append({
         acks: -1,
@@ -211,12 +220,12 @@ describe('Producer > the accumulator joins sends to their batches in call order'
 
       const error = await second.catch((e) => e)
       expect(error).toBeInstanceOf(KafkaJSDeliveryTimeout)
-      expect(written()).toEqual([])
+      expect(writtenCount()).toBe(0)
 
       assign('first')
       await jest.advanceTimersByTimeAsync(0)
       await first
-      expect(written()).toEqual(['first'])
+      expect(await written()).toEqual(['first'])
     } finally {
       jest.useRealTimers()
     }
@@ -241,7 +250,7 @@ describe('Producer > the accumulator joins sends to their batches in call order'
       assign('second')
       assign('first')
       await Promise.all([first, second])
-      expect(written()).toEqual(['first', 'second'])
+      expect(await written()).toEqual(['first', 'second'])
     })
 
     test('refused at once, leaves the order and the later sends of its topic join', async () => {
@@ -255,7 +264,7 @@ describe('Producer > the accumulator joins sends to their batches in call order'
       const later = sendOne(accumulator, 'later')
       assign('later')
       await later
-      expect(written()).toEqual(['later'])
+      expect(await written()).toEqual(['later'])
     })
 
     test('refused when its wait runs out, leaves the order and the later sends of its topic join', async () => {
@@ -274,7 +283,7 @@ describe('Producer > the accumulator joins sends to their batches in call order'
         assign('later')
         await jest.advanceTimersByTimeAsync(0)
         await later
-        expect(written()).toEqual(['later'])
+        expect(await written()).toEqual(['later'])
       } finally {
         jest.useRealTimers()
       }
@@ -365,13 +374,11 @@ describe('Producer > the accumulator joins sends to their batches in call order'
           return byMessage(send)
         },
         sendPartitioned: async (request) => {
-          calls.push(
-            request.batches.map(({ topic, partition, acks, messages }) => ({
-              key: `${topic}/${partition}`,
-              acks,
-              values: messages.map(({ value }) => value),
-            }))
-          )
+          const shapes = request.batches.map(({ topic, partition, acks }) => ({
+            key: `${topic}/${partition}`,
+            acks,
+          }))
+          calls.push({ shapes, sent: takeSent(request) })
           return request.batches.map(({ topic, partition, settlers }) => {
             const metadata = { topicName: topic, partition, errorCode: 0, baseOffset: '10' }
             settlers.forEach((settler) => settler.resolve(metadata))
@@ -404,7 +411,13 @@ describe('Producer > the accumulator joins sends to their batches in call order'
         outcomes.push(await Promise.all(sends))
         gate = deferred()
       }
-      return { calls, outcomes }
+      const read = await Promise.all(calls.map(({ sent }) => sent.read()))
+      return {
+        calls: calls.map(({ shapes }, index) =>
+          shapes.map((shape, at) => ({ ...shape, values: read[index][at].records.map(textOf) }))
+        ),
+        outcomes,
+      }
     }
 
     const WORKLOADS = [1, 7, 42].flatMap((seed) => [
