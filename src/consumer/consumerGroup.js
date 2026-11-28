@@ -3659,7 +3659,7 @@ module.exports = class ConsumerGroup {
       })
 
       const caller = fence ? { guard: fence.guard, fence } : undefined
-      const reset = await this.offsetManager.setDefaultOffset(
+      await this.offsetManager.setDefaultOffset(
         { topic: e.topic, partition: e.partition },
         ...(context
           ? [this.boundToRequest(e.topic, e.partition, context.requestClock, caller)]
@@ -3668,7 +3668,7 @@ module.exports = class ConsumerGroup {
             : [])
       )
       fence?.check()
-      if (reset === false || stale()) return
+      if (stale()) return
       this.markChanged(e.topic, e.partition)
     }
   }
@@ -4504,9 +4504,9 @@ module.exports = class ConsumerGroup {
           preparation && this.fetchedResetContext(preparation, requestClock)
         )
       } else {
-        const reset = await manager.setDefaultOffset({ topic, partition }, bound)
+        await manager.setDefaultOffset({ topic, partition }, bound)
         preparation?.check()
-        if (reset === false || stale()) return
+        if (stale()) return
         this.markChanged(topic, partition)
       }
     } else {

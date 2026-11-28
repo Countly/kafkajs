@@ -734,17 +734,25 @@ describe('Consumer > partition handler retry state', () => {
     }
   )
 
-  it.each(['seek', 'recreate', 'truncate'])(
+  /**
+   * Starts an eager run whose handler pauses topic-a/0 and fails, and waits for the failure record.
+   * @returns {Promise<{ run: object, token: symbol }>} the run and the failed assignment's token
+   */
+  const pausedFailure = async () => {
+    const run = await startRetryRun('eager', 'eachMessage', ({ pause }) => {
+      pause()
+      throw failure(true)
+    })
+    await advanceUntil(() => run.runner.partitionRetries.size === 1)
+    expect(run.consumer.paused()).toEqual([{ topic: 'topic-a', partitions: [0] }])
+    return { run, token: run.group.acquired.get('topic-a|0').assignmentToken }
+  }
+
+  it.each(['seek', 'truncate'])(
     '%s clears a failed partition while it stays paused',
     async (change) => {
-      const run = await startRetryRun('eager', 'eachMessage', ({ pause }) => {
-        pause()
-        throw failure(true)
-      })
-      await advanceUntil(() => run.runner.partitionRetries.size === 1)
-      const token = run.group.acquired.get('topic-a|0').assignmentToken
+      const { run, token } = await pausedFailure()
       if (change === 'seek') run.consumer.seek({ topic: 'topic-a', partition: 0, offset: '40' })
-      if (change === 'recreate') run.group.invalidateTopic('topic-a')
       if (change === 'truncate') {
         await run.group.applyValidationOutcome('topic-a', 0, '40', {
           action: 'truncated',
@@ -757,6 +765,15 @@ describe('Consumer > partition handler retry state', () => {
       await closeClean(run)
     }
   )
+
+  it('recreate clears the record of a paused failed partition, and the pause goes with the old topic', async () => {
+    const { run, token } = await pausedFailure()
+    run.group.invalidateTopic('topic-a')
+    expect(run.runner.partitionRetries.size).toBe(0)
+    expect(run.group.acquired.get('topic-a|0').assignmentToken).not.toBe(token)
+    expect(run.consumer.paused()).toEqual([])
+    await closeClean(run)
+  })
 })
 
 describe('Consumer > how a classic run ends', () => {
@@ -2749,8 +2766,26 @@ describe('Consumer > how a consumer-protocol run ends', () => {
       expect(joined).toHaveBeenCalledTimes(Number(replace))
       expect(run.crashes).toHaveLength(Number(!replace))
       expect(policy).toHaveBeenCalledTimes(Number(!replace))
-      expect(published).not.toHaveBeenCalled()
-      expect(run.coordinator.offsetCommit).toHaveBeenCalledTimes(1)
+      // The refused epoch-1 commit is never sent again; the redelivered record commits under epoch 2.
+      expect(
+        run.coordinator.offsetCommit.mock.calls.map(([{ groupGenerationId, topics }]) => [
+          groupGenerationId,
+          topics[0].partitions[0].offset,
+        ])
+      ).toEqual(
+        replace
+          ? [
+              [1, '41'],
+              [2, '41'],
+            ]
+          : [[1, '41']]
+      )
+      expect(
+        published.mock.calls.map(([{ payload }]) => [
+          payload.groupGenerationId,
+          payload.topics[0].partitions[0].offset,
+        ])
+      ).toEqual(replace ? [[2, '41']] : [])
       if (replace) {
         await closeClean(run)
       } else {

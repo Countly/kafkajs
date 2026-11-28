@@ -108,7 +108,6 @@ module.exports = class RebalanceCoordinator {
    *   before `GROUP_JOIN` is delivered, so state it records is visible to every observer of that
    *   event whatever the order public instrumentation reaches them in
    * @param {import('../retry').Retrier} [options.retryJoin] retries for foreground recovery
-   * @param {() => void} [options.onFatalVerdict] ends any handler retry wait
    */
   constructor({
     runner,
@@ -121,7 +120,6 @@ module.exports = class RebalanceCoordinator {
     groupId,
     onJoinComplete = () => {},
     retryJoin,
-    onFatalVerdict = () => {},
   }) {
     this.runner = runner
     this.consumerGroup = consumerGroup
@@ -133,7 +131,6 @@ module.exports = class RebalanceCoordinator {
     this.groupId = groupId
     this.onJoinComplete = onJoinComplete
     this.retryJoin = retryJoin
-    this.onFatalVerdict = onFatalVerdict
 
     /** @type {Promise<void>|null} the running chain; also the single-flight marker */
     this.inFlight = null
@@ -727,7 +724,6 @@ module.exports = class RebalanceCoordinator {
 
     if (aborting) {
       this.verdict = this.mergeVerdict(this.verdict, verdict)
-      if (this.hasFatalVerdict()) this.onFatalVerdict()
       if (verdict.kind === 'lost' && this.consumerGroup.kind === 'consumer') {
         this.consumerGroup.roundContext?.retire(verdict.error)
       }
@@ -757,11 +753,8 @@ module.exports = class RebalanceCoordinator {
     // `start()` - the round has to be driven from here, in the background.
     // Created outside any handler or callback store, with its catch inside it: the internal chain
     // and its observers must not inherit the triggering callback's authority.
-    this.runInternal(() => {
-      const chain = this.runRound(verdict.reason, verdict.kind)
-      const recovery = this.recovery
-      return chain.catch(async (error) => {
-        if (recovery?.step) return
+    this.runInternal(() =>
+      this.runRound(verdict.reason, verdict.kind).catch(async (error) => {
         try {
           // `onCrash` owns the CRASH event; if it throws there is nothing left to notify with, and
           // this chain is nobody's `await`, so the rejection would be unobserved.
@@ -775,7 +768,7 @@ module.exports = class RebalanceCoordinator {
           })
         }
       })
-    })
+    )
   }
 
   /**
