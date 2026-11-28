@@ -2170,9 +2170,10 @@ const createSendMessages = ({
      * @param {object} batch
      * @param {object|undefined} value acknowledgement metadata
      * @param {Error} [error] a terminal failure
-     * @param {Map<object, Error>|null} [projected] each accumulator send's own error, made from
-     *   the answer `error` is (see `Accumulator.projectionsFor`) before the batch detaches here;
-     *   given only by the result loop's terminal answer
+     * @param {Map<object, object>|null} [projected] each accumulator send's detached failure data
+     *   (see `Accumulator.projectionsFor`), made from the answer `error` is before the batch
+     *   detaches here; the send's own error is built from it when its append promise settles.
+     *   Given only by the result loop's terminal answer
      * @returns {void}
      */
     const settle = (batch, value, error, projected) => {

@@ -327,6 +327,17 @@ const ownerOf = (owners, index) => {
 }
 
 /**
+ * @param {object} entry
+ * @param {string} key
+ * @returns {PropertyDescriptor|undefined} the descriptor of an own, enumerable data property: the
+ *   only kind an entry copy (`{ ...entry }`) and a plain read both carry faithfully
+ */
+const enumerableData = (entry, key) => {
+  const descriptor = Object.getOwnPropertyDescriptor(entry, key)
+  return descriptor?.enumerable && Object.hasOwn(descriptor, 'value') ? descriptor : undefined
+}
+
+/**
  * Builds only the caller-specific data needed at the send's delivery boundary.
  * @param {object[]} messages
  * @param {{ protocol: object, timeout: object|null }} fields
@@ -349,13 +360,20 @@ const projectEntries = (messages, fields, entries, owners) => {
     ) {
       return null
     }
-    const index = Object.getOwnPropertyDescriptor(entry, 'batchIndex')?.value
-    const message = Object.getOwnPropertyDescriptor(entry, 'errorMessage')?.value
-    if (typeof index !== 'number' || (message !== null && typeof message !== 'string')) return null
-    if (!resolves(index, messages.length)) continue
-    const owner = ownerOf(owners, index)
+    const index = enumerableData(entry, 'batchIndex')
+    const message = enumerableData(entry, 'errorMessage')
+    if (
+      index === undefined ||
+      message === undefined ||
+      typeof index.value !== 'number' ||
+      (message.value !== null && typeof message.value !== 'string')
+    ) {
+      return null
+    }
+    if (!resolves(index.value, messages.length)) continue
+    const owner = ownerOf(owners, index.value)
     if (!owned.has(owner)) owned.set(owner, new Set())
-    owned.get(owner).add(index)
+    owned.get(owner).add(index.value)
   }
   if (owned.size === 0) return null
 

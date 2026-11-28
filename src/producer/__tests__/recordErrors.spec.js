@@ -45,6 +45,9 @@ const NODE_ID = 0
 const NOT_ENOUGH_REPLICAS = 19
 const INVALID_RECORD = 87
 
+/** The wall clock as it was before any test fakes timers. */
+const realNow = performance.now.bind(performance)
+
 /** A v3/v4-shaped ApiVersions body advertising the given Produce maxVersion. */
 const apiVersionsBody = (produceMaxVersion) =>
   new Encoder()
@@ -344,7 +347,6 @@ const chainOf = (error) => {
   return chain
 }
 
-/** @type {WeakMap<object, number[][]>} per fake cluster, what `countRecords` noted */
 /**
  * Compares the producer's native protocol error with the decoder's public own fields, including
  * their presence. Routing hints are tested separately.
@@ -364,6 +366,7 @@ const expectProtocolParity = (error, answer) => {
   expect(error.cause).toBeUndefined()
 }
 
+/** @type {WeakMap<object, number[][]>} per fake cluster, what `countRecords` noted */
 const noted = new WeakMap()
 
 /**
@@ -916,7 +919,7 @@ describe('Producer > the record errors of a shared batch', () => {
   test('a projected record carries its fields as Buffers of one exact store, its timestamp as a string, and no custom timestamp', async () => {
     const { producer, cluster } = await start({ idempotent: false })
     const valueOf = jest.fn(() => 1700000000002)
-    const answer = answerError(INVALID_RECORD, [0, 1, 2, 3, 4, 5, 6, 7])
+    const answer = answerError(INVALID_RECORD, [0, 1, 2, 3, 4, 5, 6])
     let readsAtAnswer
     cluster.broker.produce.mockImplementation(async (request) => {
       readsAtAnswer = valueOf.mock.calls.length
@@ -937,7 +940,6 @@ describe('Producer > the record errors of a shared batch', () => {
           },
           { value: null, timestamp: 0 },
           { value: null, timestamp: 0n },
-          { value: null, timestamp: '' },
           { value: null, timestamp: new Date(0) },
           { value: null, timestamp: { value: 7n } },
         ],
@@ -946,7 +948,12 @@ describe('Producer > the record errors of a shared batch', () => {
     await jest.advanceTimersByTimeAsync(20)
     await flushAll()
 
+    expect(readsAtAnswer).toBeDefined()
+    expect(sent.state).toBe('rejected')
+    expect(sent.value).toBeInstanceOf(KafkaJSProtocolError)
+    expect(sent.value.code).toBe(INVALID_RECORD)
     const records = sent.value.recordErrors.map(({ record }) => record)
+    expect(records).toHaveLength(7)
     expect(records).toEqual([
       { key: null, value: Buffer.from('v0'), headers: {}, timestamp: '1700000000000' },
       { key: Buffer.from('k1'), value: null, headers: {}, timestamp: '1700000000001' },
@@ -955,7 +962,6 @@ describe('Producer > the record errors of a shared batch', () => {
         value: Buffer.from('v2'),
         headers: { a: Buffer.from('x'), b: [Buffer.from('y'), Buffer.from('z')] },
       },
-      { key: null, value: null, headers: {} },
       { key: null, value: null, headers: {} },
       { key: null, value: null, headers: {} },
       { key: null, value: null, headers: {}, timestamp: '0' },
@@ -1086,6 +1092,57 @@ describe('Producer > the record errors of a shared batch', () => {
       )
     }
     expectRaw(answer)
+  })
+
+  // Measurement, not a threshold: the printed line is the evidence, so its format stays stable.
+  // Peak heap is the highest `heapUsed` seen, above its value after a full collection before the
+  // burst, sampled on every event-loop turn while the burst settles and once after each phase.
+  test('a large failure burst reports its latency and peak heap with and without reading recordErrors', async () => {
+    const count = 1000
+    const indices = Array.from({ length: count }, (_, i) => i)
+    for (const read of [false, true]) {
+      const { producer, cluster } = await start({ idempotent: false, batchSize: 1 << 20 })
+      cluster.broker.produce.mockImplementation(async (request) =>
+        resultsOf(request, { 0: answerError(INVALID_RECORD, indices) })
+      )
+      await collect()
+      const baseline = process.memoryUsage().heapUsed
+      let peak = baseline
+      const sample = () => {
+        peak = Math.max(peak, process.memoryUsage().heapUsed)
+      }
+      const sampling = { on: true }
+      const sampler = (async () => {
+        while (sampling.on) {
+          sample()
+          await new Promise(setImmediate)
+        }
+      })()
+
+      const failureStartedAt = realNow()
+      const sends = await sendAll(
+        producer,
+        indices.map((i) => message(i))
+      )
+      const failureMs = realNow() - failureStartedAt
+      sample()
+      let entries = 0
+      const readStartedAt = realNow()
+      if (read) for (const { value } of sends) entries += value.recordErrors.length
+      const readMs = realNow() - readStartedAt
+      sample()
+      sampling.on = false
+      await sampler
+
+      expect(recordCounts(cluster)).toEqual([[count]])
+      expect(sends.map(({ state }) => state)).toEqual(Array(count).fill('rejected'))
+      expect(entries).toBe(read ? count * count : 0)
+      process.stdout.write(
+        `recordErrors burst node=${process.version} records=${count} read=${read} ` +
+          `failureMs=${failureMs.toFixed(1)} readMs=${readMs.toFixed(1)} ` +
+          `peakHeapMiB=${((peak - baseline) / 2 ** 20).toFixed(1)}\n`
+      )
+    }
   })
 
   test.each([[-1], [2], [1.5]])(
@@ -1835,6 +1892,52 @@ describe('Accumulator.projectionsFor', () => {
     expect(projected).toBeNull()
     expect(sends.map(({ value }) => value)).toEqual([delivered, delivered])
     for (const { value } of sends) expect(value).toBe(delivered)
+  })
+
+  test.each([
+    [
+      'a record error with a non-enumerable batchIndex',
+      () => ({ batchIndex: { value: 0 }, errorMessage: { value: 'bad', enumerable: true } }),
+    ],
+    [
+      'a record error with a non-enumerable errorMessage',
+      () => ({ batchIndex: { value: 0, enumerable: true }, errorMessage: { value: 'bad' } }),
+    ],
+    [
+      'a record error with a getter for batchIndex',
+      (getter) => ({
+        batchIndex: { get: getter, enumerable: true },
+        errorMessage: { value: 'bad', enumerable: true },
+      }),
+    ],
+    [
+      'a record error with a getter for errorMessage',
+      (getter) => ({
+        batchIndex: { value: 0, enumerable: true },
+        errorMessage: { get: getter, enumerable: true },
+      }),
+    ],
+    [
+      'a record error with no errorMessage field',
+      () => ({
+        batchIndex: { value: 0, enumerable: true },
+        other: { value: 'bad', enumerable: true },
+      }),
+    ],
+  ])('%s is delivered unchanged', async (_, descriptors) => {
+    const { batch, sends } = await sharedBatch()
+    const answer = answerError(INVALID_RECORD, [0])
+    const getter = jest.fn(() => 0)
+    const entries = Object.freeze([Object.freeze(Object.defineProperties({}, descriptors(getter)))])
+    answer.recordErrors = entries
+
+    const projected = await settleWith(batch, answer, occurrenceFor(answer, batch))
+
+    expect(projected).toBeNull()
+    expect(getter).not.toHaveBeenCalled()
+    expect(sends[0].value).toBe(answer)
+    expect(sends[1].value).toBe(answer)
+    expect(answer.recordErrors).toBe(entries)
   })
 
   test('a timeout and its cause format their own stacks on demand and propagate formatter exceptions', async () => {

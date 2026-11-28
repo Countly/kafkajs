@@ -112,8 +112,9 @@ notice and what, if anything, to do.
   `record`, with detached key, value and header bytes as `Buffer`s. The other entries are shared
   and frozen. `record.timestamp` is the decimal string of a truthy supported snapshot timestamp.
   The snapshot normalizes a `Date` or an object with a bigint `value` to a string, so epoch zero
-  in either form is `'0'`. Numeric zero, `0n`, an empty string, an omitted timestamp and other
-  timestamp objects omit `record.timestamp`.
+  in either form is `'0'`. Numeric zero, `0n`, a `null` or omitted timestamp and other timestamp
+  objects omit `record.timestamp`. An empty string is not a timestamp: `send` refuses it with a
+  `KafkaJSInvalidConfigurationError` before the record joins a batch, so no record carries one.
 
   Whole-request failures, exhausted retries, plain-producer delivery timeouts, ambiguous answers
   and other failures that cannot be attributed keep the existing error or retry/deadline wrapper

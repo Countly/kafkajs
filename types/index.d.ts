@@ -2973,8 +2973,8 @@ export type ProduceRecordError = {
    * A copy of the record as the producer wrote it, in a store of its own: `key`, `value` and the
    * header values as `Buffer`s (strings UTF-8 encoded). A truthy supported snapshot timestamp is
    * reported as a decimal string. Dates and objects with a bigint `value` are normalized to
-   * strings in the snapshot, including `'0'`. Numeric zero, `0n`, an empty string, omission and
-   * other timestamp objects omit `timestamp`.
+   * strings in the snapshot, including `'0'`. Numeric zero, `0n`, `null`, omission and other
+   * timestamp objects omit `timestamp`. An empty string is refused when the record is sent.
    */
   readonly record?: {
     readonly key: Buffer | null
