@@ -735,6 +735,27 @@ describe('ClassicGroupCoordinator', () => {
       const again = await coordinator.whenAccepted('JoinGroup')
       expect(again.groupProtocols[0]).toEqual({ name: PROTOCOL, metadata: METADATA })
     })
+
+    test('the accepted history edited in place leaves what whenAccepted later matches and returns alone', async () => {
+      await join(client(), { groupInstanceId: 'a' })
+      const recorded = coordinator.accepted.length
+      const [record] = coordinator.accepted
+      record.api = 'LeaveGroup'
+      record.request.groupInstanceId = 'z'
+      record.request.groupProtocols[0].metadata.fill(0)
+      coordinator.accepted.push({ api: 'JoinGroup', request: { groupInstanceId: 'z' } })
+
+      const original = await coordinator.whenAccepted(
+        'JoinGroup',
+        ({ groupInstanceId }) => groupInstanceId === 'a'
+      )
+      expect(original.groupProtocols[0]).toEqual({ name: PROTOCOL, metadata: METADATA })
+      expect(coordinator.accepted).toHaveLength(recorded)
+      expect(coordinator.accepted[0]).toMatchObject({
+        api: 'JoinGroup',
+        request: { groupInstanceId: 'a' },
+      })
+    })
   })
 
   describe('unload, as GroupMetadataManager 4.4.0 onUnloaded', () => {

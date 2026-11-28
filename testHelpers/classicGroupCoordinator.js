@@ -175,6 +175,9 @@ const readRequest = (apiKey, body) => {
  * @see https://github.com/apache/kafka/blob/4.4.0/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/classic/ClassicGroup.java
  */
 class ClassicGroupCoordinator {
+  /** @type {{ api: string, request: object }[]} every request accepted, held privately */
+  #accepted = []
+
   /**
    * @param {object} [options]
    * @param {string} [options.groupId='classic-group']
@@ -207,8 +210,6 @@ class ClassicGroupCoordinator {
     this.nextId = 0
     /** @type {{ api: string, connection: number, request: object }[]} */
     this.requests = []
-    /** @type {{ api: string, request: object }[]} every request the coordinator accepted */
-    this.accepted = []
     /** @type {{ api: string, match: Function, resolve: Function }[]} */
     this.acceptWaiters = []
     /** @type {Error[]} */
@@ -328,6 +329,15 @@ class ClassicGroupCoordinator {
   }
 
   /**
+   * Every request the coordinator accepted, in order, as a fresh deep copy on each read: editing
+   * it changes nothing the coordinator or {@link ClassicGroupCoordinator#whenAccepted} reads.
+   * @returns {{ api: string, request: object }[]}
+   */
+  get accepted() {
+    return this.#accepted.map(({ api, request }) => ({ api, request: copyOf(request) }))
+  }
+
+  /**
    * Resolves once the coordinator has accepted a request of `api` that `match` selects (at once
    * when it already has), so the group already shows its effect.
    * @param {'JoinGroup'|'SyncGroup'|'Heartbeat'|'LeaveGroup'} api
@@ -335,7 +345,7 @@ class ClassicGroupCoordinator {
    * @returns {Promise<object>} the decoded request
    */
   whenAccepted(api, match = () => true) {
-    const done = this.accepted.find((each) => each.api === api && match(copyOf(each.request)))
+    const done = this.#accepted.find((each) => each.api === api && match(copyOf(each.request)))
     if (done) return Promise.resolve(copyOf(done.request))
     return new Promise((resolve) => this.acceptWaiters.push({ api, match, resolve }))
   }
@@ -451,7 +461,7 @@ class ClassicGroupCoordinator {
     if (socket.destroyed) return
 
     const answered = this.accept(header.apiKey, request)
-    this.accepted.push({ api: wire.api, request: copyOf(request) })
+    this.#accepted.push({ api: wire.api, request: copyOf(request) })
     this.acceptWaiters = this.acceptWaiters.filter((waiter) => {
       if (waiter.api !== wire.api || !waiter.match(copyOf(request))) return true
       waiter.resolve(copyOf(request))

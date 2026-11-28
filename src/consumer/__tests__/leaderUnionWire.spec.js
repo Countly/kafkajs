@@ -1,7 +1,6 @@
 const Cluster = require('../../cluster')
 const Connection = require('../../network/connection')
 const ClassicGroupProtocol = require('../groupProtocol/classic')
-const AssignerOffers = require('../groupProtocol/assignerOffers')
 const ConsumerGroup = require('../consumerGroup')
 const IdleWait = require('../idleWait')
 const RoundRobinAssigner = require('../assigners/roundRobinAssigner')
@@ -336,7 +335,7 @@ const leader = async (env, assigner, members) => {
     leaderId: 'a',
     generationId: 1,
     groupProtocol: assigner.name,
-    offers: AssignerOffers.declared(protocol.assigners),
+    selectedAssigner: protocol.assigners[0],
     protocolType: 'consumer',
     members: members.map(([memberId, memberMetadata]) => ({ memberId, memberMetadata })),
     coordinator: await env.cluster.findGroupCoordinator({ groupId: 'group' }),
@@ -395,7 +394,7 @@ const assigned = async (env, members) => {
     leaderId: 'a',
     generationId: 1,
     groupProtocol: protocol.assigners[0].name,
-    offers: AssignerOffers.declared(protocol.assigners),
+    selectedAssigner: protocol.assigners[0],
     protocolType: 'consumer',
     members: members.map(([memberId, memberMetadata]) => ({ memberId, memberMetadata })),
     coordinator: await env.cluster.findGroupCoordinator({ groupId: 'group' }),

@@ -4,7 +4,6 @@ const Cluster = require('../../cluster')
 const Runner = require('../runner')
 const Batch = require('../batch')
 const ClassicGroupProtocol = require('../groupProtocol/classic')
-const AssignerOffers = require('../groupProtocol/assignerOffers')
 const cooperativeSticky = require('../assigners/cooperativeStickyAssigner')
 const RebalanceCoordinator = require('../rebalanceCoordinator')
 const IdleWait = require('../idleWait')
@@ -13,7 +12,8 @@ const { MemberMetadata, MemberAssignment } = require('../assignerProtocol')
 const { COOPERATIVE, EAGER } = require('../groupProtocol/interface')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const { events } = require('../instrumentationEvents')
-const { KafkaJSProtocolError } = require('../../errors')
+const { KafkaJSProtocolError, KafkaJSNonRetriableError } = require('../../errors')
+const Encoder = require('../../protocol/encoder')
 const { createErrorFromCode } = require('../../protocol/error')
 const {
   REBALANCE_PATHS,
@@ -1262,11 +1262,12 @@ describe('Consumer > cooperative rebalance apply', () => {
       groupProtocol,
       assignment,
       assigner = { name: groupProtocol, assign: jest.fn(async () => assignment) },
+      partitions = 0,
     }) => {
       const protocol = new ClassicGroupProtocol({
         cluster: {
           refreshMetadata: jest.fn(async () => {}),
-          findTopicPartitionMetadata: () => [],
+          findTopicPartitionMetadata: () => partitionMetadata(partitions),
         },
         groupId: 'cooperative-group',
         sessionTimeout: 30000,
@@ -1281,7 +1282,7 @@ describe('Consumer > cooperative rebalance apply', () => {
       protocol.leaderId = 'member-1'
       protocol.generationId = 1
       protocol.groupProtocol = groupProtocol
-      protocol.offers = AssignerOffers.declared(protocol.assigners)
+      protocol.selectedAssigner = assigner
       protocol.members = [
         {
           memberId: 'member-1',
@@ -1346,24 +1347,245 @@ describe('Consumer > cooperative rebalance apply', () => {
       expect(error.message).toContain('member-2')
     })
 
-    it('exempts the built-in cooperative-sticky assigner, whose own withhold rule guarantees it', async () => {
-      const builtIn = cooperativeSticky({ cluster: {} })
-      builtIn.assign = jest.fn(async () => movesAnOwnedPartition)
-      const protocol = buildProtocol({
-        mode: COOPERATIVE,
-        groupProtocol: 'cooperative-sticky',
-        assigner: builtIn,
-      })
+    describe('one ownership rule for every plan, in either member order', () => {
+      const A = 'member-a'
+      const B = 'member-b'
+      const ORDERS = { 'a first': [A, B], 'b first': [B, A] }
 
-      await expect(
-        protocol.sync({
+      /**
+       * One member's subscription to `TOPIC_A`, claiming `owned`.
+       * @param {{ owned: number[], generation?: number, userData?: number, version?: number }} claim
+       *   `generation` is the `GenerationId` (version 2 and up), `userData` the four-byte generation
+       * @returns {Buffer}
+       */
+      const subscription = ({ owned, generation, userData, version = 3 }) =>
+        MemberMetadata.encode({
+          version,
+          topics: [TOPIC_A],
+          userData: userData == null ? Buffer.alloc(0) : new Encoder().writeInt32(userData).buffer,
+          ownedPartitions: [{ topic: TOPIC_A, partitions: owned }],
+          generationId: generation,
+        })
+
+      /** @param {{[memberId: string]: number[]}} byMember @returns {object[]} the plan rows */
+      const planOf = (byMember) =>
+        Object.entries(byMember).map(([memberId, partitions]) => ({
+          memberId,
+          memberAssignment: encodeAssignment({ [TOPIC_A]: partitions }),
+        }))
+
+      /**
+       * Starts the leader's sync with the members listed in `order`.
+       * @returns {{ protocol: ClassicGroupProtocol, outcome: Promise<object> }}
+       */
+      const leaderSync = ({ claims, order, groupProtocol, assigner, partitions = 2 }) => {
+        const protocol = buildProtocol({ mode: COOPERATIVE, groupProtocol, assigner, partitions })
+        protocol.members = ORDERS[order].map((memberId) => ({
+          memberId,
+          memberMetadata: subscription(claims[memberId]),
+        }))
+        const outcome = protocol.sync({
           topics: [TOPIC_A],
           topicsSubscribed: [TOPIC_A],
           beforeSync: () => {},
           round: realRound(),
         })
-      ).resolves.toMatchObject({ assignment: {} })
-      expect(protocol.coordinator.syncGroup).toHaveBeenCalledTimes(1)
+        outcome.catch(() => {})
+        return { protocol, outcome }
+      }
+
+      /** @returns {{[memberId: string]: object}} each member's assignment in the SyncGroup sent */
+      const sentPlan = (protocol) => {
+        const [[{ groupAssignment }]] = protocol.coordinator.syncGroup.mock.calls
+        return Object.fromEntries(
+          groupAssignment.map(({ memberId, memberAssignment }) => [
+            memberId,
+            MemberAssignment.decode(memberAssignment).assignment,
+          ])
+        )
+      }
+
+      const owns = (owned, generation) => ({ owned, generation })
+      const CUSTOM = 'custom'
+      const STICKY = 'cooperative-sticky'
+
+      // One row per line of the rule's table, then the generation each kind of subscription
+      // claims in. A null `refusal` means the plan is written; otherwise no SyncGroup is.
+      const RULE = [
+        {
+          title: 'nobody claims the partition',
+          claims: { [A]: owns([], 3), [B]: owns([], 3) },
+          plan: { [A]: [0], [B]: [1] },
+          refusal: null,
+        },
+        {
+          title: 'the one owner keeps it',
+          claims: { [A]: owns([0], 3), [B]: owns([], 3) },
+          plan: { [A]: [0], [B]: [1] },
+          refusal: null,
+        },
+        {
+          title: 'the one owner would hand it to another member',
+          claims: { [A]: owns([0], 3), [B]: owns([], 3) },
+          plan: { [B]: [0] },
+          refusal: `${TOPIC_A}-0 to ${B} while ${A} still owns it`,
+        },
+        {
+          title: 'the newer of two claims keeps it',
+          claims: { [A]: owns([0], 9), [B]: owns([0], 2) },
+          plan: { [A]: [0], [B]: [1] },
+          refusal: null,
+        },
+        {
+          title: 'the stale claim would take it from the newer one',
+          claims: { [A]: owns([0], 9), [B]: owns([0], 2) },
+          plan: { [B]: [0] },
+          refusal: `${TOPIC_A}-0 to ${B} while ${A} still owns it`,
+        },
+        {
+          title: 'one of two equal-generation claims would keep it',
+          claims: { [A]: owns([0], 5), [B]: owns([0], 5) },
+          plan: { [A]: [0] },
+          refusal: `${TOPIC_A}-0 to ${A} while ${A} and ${B} claim it in the same generation 5`,
+        },
+        {
+          title: 'two equal-generation claims both wait',
+          claims: { [A]: owns([0], 5), [B]: owns([0], 5) },
+          plan: { [A]: [1], [B]: [] },
+          refusal: null,
+        },
+        {
+          title: 'two members would be assigned one partition',
+          claims: { [A]: owns([], 3), [B]: owns([], 3) },
+          plan: { [A]: [0], [B]: [0] },
+          refusal: `${TOPIC_A}-0 to ${B} while ${A} is assigned it too`,
+        },
+        {
+          title: 'cooperative-sticky reads the generation in version-1 userData',
+          claims: { [A]: { owned: [0], userData: 9, version: 1 }, [B]: owns([0], 5) },
+          plan: { [A]: [0] },
+          groupProtocol: STICKY,
+          refusal: null,
+        },
+        {
+          title: 'cooperative-sticky reads the userData generation behind GenerationId -1',
+          claims: { [A]: { owned: [0], generation: -1, userData: 9 }, [B]: owns([0], 5) },
+          plan: { [A]: [0] },
+          groupProtocol: STICKY,
+          refusal: null,
+        },
+        {
+          title: 'another protocol never reads userData as a generation',
+          claims: { [A]: { owned: [0], userData: 9, version: 1 }, [B]: owns([0], 5) },
+          plan: { [A]: [0] },
+          refusal: `${TOPIC_A}-0 to ${A} while ${B} still owns it`,
+        },
+      ].flatMap((row) => Object.keys(ORDERS).map((order) => [row.title, order, row]))
+
+      test.each(RULE)('%s, members listed %s', async (_title, order, row) => {
+        const { claims, plan, groupProtocol = CUSTOM, refusal } = row
+        const assigner = { name: groupProtocol, assign: jest.fn(async () => planOf(plan)) }
+        const { protocol, outcome } = leaderSync({ claims, order, groupProtocol, assigner })
+
+        if (refusal === null) {
+          await outcome
+          expect(sentPlan(protocol)).toEqual(
+            Object.fromEntries(Object.entries(plan).map(([id, ps]) => [id, { [TOPIC_A]: ps }]))
+          )
+        } else {
+          await expect(outcome).rejects.toThrow(refusal)
+          await expect(outcome).rejects.toBeInstanceOf(KafkaJSNonRetriableError)
+          expect(protocol.coordinator.syncGroup).not.toHaveBeenCalled()
+        }
+      })
+
+      /** @returns {object} an assigner that delegates every call to a built-in it holds */
+      const delegating = (inner) => ({
+        name: inner.name,
+        supportedProtocols: () => inner.supportedProtocols(),
+        protocol: (subscription) => inner.protocol(subscription),
+        assign: (group) => inner.assign(group),
+        onAssignment: (assignment, metadata) => inner.onAssignment(assignment, metadata),
+      })
+
+      const ASSIGNERS = {
+        'the built-in': () => cooperativeSticky({ cluster: {} }),
+        'a wrapper delegating to the built-in': () =>
+          delegating(cooperativeSticky({ cluster: {} })),
+        'the built-in with its withhold step replaced': () =>
+          Object.assign(cooperativeSticky({ cluster: {} }), {
+            withholdTransferringPartitions: () => {},
+          }),
+      }
+
+      // What the built-in sends, and what it would hand out without its withhold step.
+      const SHAPES = {
+        'a partition moving to a joiner': {
+          claims: { [A]: owns([0, 1], 4), [B]: owns([], 4) },
+          partitions: 2,
+          sent: { [A]: { [TOPIC_A]: [0] }, [B]: {} },
+          unwithheld: new RegExp(`${TOPIC_A}-1 to ${B} while ${A} still owns it`),
+        },
+        'a newer claim beside a stale one': {
+          claims: { [A]: owns([0], 9), [B]: owns([0], 2) },
+          partitions: 1,
+          sent: { [A]: { [TOPIC_A]: [0] }, [B]: {} },
+          unwithheld: null,
+        },
+        'two equal-generation claims': {
+          claims: { [A]: owns([0], 5), [B]: owns([0], 5) },
+          partitions: 1,
+          sent: { [A]: {}, [B]: {} },
+          unwithheld: new RegExp(
+            `${TOPIC_A}-0 to member-[ab] while ${A} and ${B} claim it in the same generation 5`
+          ),
+        },
+      }
+
+      const BUILT_IN = Object.keys(SHAPES).flatMap((shape) =>
+        Object.keys(ASSIGNERS).flatMap((assigner) =>
+          Object.keys(ORDERS).map((order) => [assigner, shape, order])
+        )
+      )
+
+      test.each(BUILT_IN)('%s on %s, members listed %s', async (name, shape, order) => {
+        const { claims, partitions, sent, unwithheld } = SHAPES[shape]
+        const tampered = name === 'the built-in with its withhold step replaced'
+        const { protocol, outcome } = leaderSync({
+          claims,
+          order,
+          groupProtocol: 'cooperative-sticky',
+          assigner: ASSIGNERS[name](),
+          partitions,
+        })
+
+        if (tampered && unwithheld) {
+          await expect(outcome).rejects.toThrow(unwithheld)
+          expect(protocol.coordinator.syncGroup).not.toHaveBeenCalled()
+        } else {
+          await outcome
+          expect(sentPlan(protocol)).toEqual(sent)
+        }
+      })
+
+      test.each(Object.keys(ORDERS))(
+        'refuses the built-in whose assign was replaced by one returning a conflicting plan, members listed %s',
+        async (order) => {
+          const builtIn = cooperativeSticky({ cluster: {} })
+          builtIn.assign = jest.fn(async () => planOf({ [A]: [0, 1], [B]: [] }))
+
+          const { protocol, outcome } = leaderSync({
+            claims: { [A]: owns([0], 4), [B]: owns([1], 4) },
+            order,
+            groupProtocol: 'cooperative-sticky',
+            assigner: builtIn,
+          })
+
+          await expect(outcome).rejects.toThrow(`${TOPIC_A}-1 to ${A} while ${B} still owns it`)
+          expect(builtIn.assign).toHaveBeenCalledTimes(1)
+          expect(protocol.coordinator.syncGroup).not.toHaveBeenCalled()
+        }
+      )
     })
 
     it('checks a custom assigner that offers the name cooperative-sticky', async () => {
@@ -1381,6 +1603,26 @@ describe('Consumer > cooperative rebalance apply', () => {
           round: realRound(),
         })
       ).rejects.toThrow(/topic-a-1.*member-1/)
+      expect(protocol.coordinator.syncGroup).not.toHaveBeenCalled()
+    })
+
+    it('checks an assignment returned as a string by the bytes the encoder writes for it', async () => {
+      // Every byte of this assignment is ASCII, so the string's UTF-8 is the assignment itself.
+      const asString = encodeAssignment({ [TOPIC_A]: [0, 1] }).toString('latin1')
+      const protocol = buildProtocol({
+        mode: COOPERATIVE,
+        groupProtocol: 'range',
+        assignment: [{ memberId: 'member-1', memberAssignment: asString }],
+      })
+
+      await expect(
+        protocol.sync({
+          topics: [TOPIC_A],
+          topicsSubscribed: [TOPIC_A],
+          beforeSync: () => {},
+          round: realRound(),
+        })
+      ).rejects.toThrow(`${TOPIC_A}-1 to member-1 while member-2 still owns it`)
       expect(protocol.coordinator.syncGroup).not.toHaveBeenCalled()
     })
 

@@ -1,76 +1,36 @@
 const Encoder = require('../../../protocol/encoder')
-const Decoder = require('../../../protocol/decoder')
 const { MemberMetadata, MemberAssignment } = require('../../assignerProtocol')
 const partitionMetadata = require('../partitionMetadata')
-const {
-  assignSticky,
-  DEFAULT_GENERATION,
-  keyOf,
-  topicOf,
-  partitionOf,
-} = require('../stickyAssigner/stickyCore')
+const { assignSticky, DEFAULT_GENERATION } = require('../stickyAssigner/stickyCore')
 const dictionary = require('../../../utils/dictionary')
-const { guaranteeCooperativeOwnership } = require('../cooperativeGuarantee')
-
-/**
- * @param {Buffer|null} userData
- * @returns {number} the generation a peer encoded in its four-byte userData, or the default when
- *   there is nothing readable there
- */
-const decodeGeneration = (userData) => {
-  if (userData == null || userData.length < 4) {
-    return DEFAULT_GENERATION
-  }
-
-  return new Decoder(userData).readInt32()
-}
-
-/**
- * The generation a member is claiming its partitions in.
- *
- * A subscription's `GenerationId` counts only when it is non-negative: the field's wire default is
- * `-1`, and a member that lost its generation sends that while its userData still carries the last
- * generation it was actually assigned. Java draws the same line by turning any negative value into
- * an absent `Optional` before the assignor ever sees it.
- *
- * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/ConsumerPartitionAssignor.java
- * @param {{ generationId?: number, userData?: Buffer|null }} metadata decoded subscription
- * @returns {number}
- */
-const generationOf = (metadata) =>
-  metadata.generationId == null || metadata.generationId < 0
-    ? decodeGeneration(metadata.userData)
-    : metadata.generationId
-
-/**
- * @param {Array<{topic: string, partitions: number[]}>} byTopic
- * @returns {string[]} flat partition keys, for set arithmetic
- */
-const flatten = (byTopic) =>
-  byTopic.flatMap(({ topic, partitions }) => partitions.map((partition) => keyOf(topic, partition)))
+const {
+  CooperativeOwnership,
+  claimGeneration,
+  COOPERATIVE_STICKY,
+} = require('../cooperativeOwnership')
 
 /**
  * Java's `CooperativeStickyAssignor`, under its wire name.
  *
  * The assignment itself is the sticky one; what makes it cooperative is a single subtraction
- * afterwards. A partition that is being added to one member *and* revoked from another is
- * withheld this round: the member losing it revokes it and triggers a follow-up round, and only
- * then does the new owner get it. So is a partition two members of the same generation both
- * claim - one of them is working from a membership it has already lost, and neither may fetch it
- * until the next round says who owns it. Nothing else is withheld - a brand-new partition, or one
- * whose previous owner has left, is handed over immediately.
+ * afterwards, by the rule of {@link CooperativeOwnership}: a partition is withheld this round from
+ * any member other than its one live owner, the member claiming it at the highest generation. The
+ * owner losing it revokes it and triggers a follow-up round, and only then does the new owner get
+ * it. A partition two members claim at the highest generation is withheld from everyone until the
+ * next round says who owns it. A brand-new partition, or one whose previous owner has left, is
+ * handed over immediately. The group leader checks every plan by the same rule.
  *
  * Ownership comes from the subscription's `OwnedPartitions`, not from userData: under the
  * cooperative protocol a member still holds its partitions while it rejoins, so the protocol
  * field is the live truth. The four-byte userData carries only the generation, and is read only
- * when the peer is too old to send a `GenerationId`.
+ * when the subscription carries no `GenerationId` (see {@link claimGeneration}).
  *
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/CooperativeStickyAssignor.java
  * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-429%3A+Kafka+Consumer+Incremental+Rebalance+Protocol
  * @type {import('types').PartitionAssigner}
  */
-const createCooperativeSticky = ({ cluster }) => ({
-  name: 'cooperative-sticky',
+module.exports = ({ cluster }) => ({
+  name: COOPERATIVE_STICKY,
   version: 3,
 
   /** Set by `onAssignment`; the only state this assigner retains. */
@@ -97,7 +57,7 @@ const createCooperativeSticky = ({ cluster }) => ({
         groupInstanceId: member.groupInstanceId == null ? null : member.groupInstanceId,
         topics: metadata.topics,
         ownedPartitions,
-        generationId: generationOf(metadata),
+        generationId: claimGeneration(metadata, { userDataGeneration: true }),
       }
     })
 
@@ -108,13 +68,8 @@ const createCooperativeSticky = ({ cluster }) => ({
       )
     }
 
-    const contested = new Set()
-    const assignment = assignSticky({
-      partitionsPerTopic,
-      members: decoded,
-      contested,
-    })
-    this.withholdTransferringPartitions(decoded, assignment, contested)
+    const assignment = assignSticky({ partitionsPerTopic, members: decoded })
+    this.withholdTransferringPartitions(decoded, assignment)
 
     return [...assignment].map(([memberId, byTopic]) => ({
       memberId,
@@ -126,58 +81,26 @@ const createCooperativeSticky = ({ cluster }) => ({
   },
 
   /**
-   * Removes every partition that is simultaneously added to one member and revoked from another,
-   * and every partition two members of the same generation both claimed.
+   * Removes every partition the {@link CooperativeOwnership} rule does not let its member hold
+   * this round: one another member owns, or one two members claim at the highest generation.
    * @private
-   * @param {Array<{memberId: string, ownedPartitions: Array<{topic: string, partitions: number[]}>}>} members
+   * @param {Array<{memberId: string, generationId: number,
+   *   ownedPartitions: Array<{topic: string, partitions: number[]}>}>} members
    * @param {Map<string, {[topic: string]: number[]}>} assignment mutated in place
-   * @param {Set<string>} contested flat keys claimed twice in one generation
    * @returns {void}
    */
-  withholdTransferringPartitions(members, assignment, contested) {
-    const holderOf = new Map()
-    const added = new Set()
-    const revoked = new Set()
+  withholdTransferringPartitions(members, assignment) {
+    const ownership = new CooperativeOwnership(members)
 
-    for (const { memberId, ownedPartitions } of members) {
-      const owned = new Set(flatten(ownedPartitions))
-      const byTopic = assignment.get(memberId)
-      const assigned = new Set(
-        flatten(
-          Object.keys(byTopic).map((topic) => ({
-            topic,
-            partitions: byTopic[topic],
-          }))
-        )
-      )
+    for (const [memberId, byTopic] of assignment) {
+      for (const topic of Object.keys(byTopic)) {
+        const kept = byTopic[topic].filter((p) => ownership.mayHold(memberId, topic, p))
 
-      for (const key of assigned) {
-        holderOf.set(key, memberId)
-
-        if (!owned.has(key)) {
-          added.add(key)
+        if (kept.length === 0) {
+          delete byTopic[topic]
+        } else {
+          byTopic[topic] = kept
         }
-      }
-
-      for (const key of owned) {
-        if (!assigned.has(key)) {
-          revoked.add(key)
-        }
-      }
-    }
-
-    for (const [key, memberId] of holderOf) {
-      if (!contested.has(key) && !(added.has(key) && revoked.has(key))) {
-        continue
-      }
-
-      const topic = topicOf(key)
-      const partition = partitionOf(key)
-      const byTopic = assignment.get(memberId)
-      byTopic[topic] = byTopic[topic].filter((p) => p !== partition)
-
-      if (byTopic[topic].length === 0) {
-        delete byTopic[topic]
       }
     }
   },
@@ -220,11 +143,3 @@ const createCooperativeSticky = ({ cluster }) => ({
     this.generationId = assignment == null ? DEFAULT_GENERATION : generationId
   },
 })
-
-/**
- * The built-in assigner, recorded as one whose plans keep the cooperative ownership rule, so the
- * leader does not check them again.
- * @param {{ cluster: object }} options
- * @returns {import('types').PartitionAssigner}
- */
-module.exports = (options) => guaranteeCooperativeOwnership(createCooperativeSticky(options))

@@ -14,7 +14,11 @@ const {
 } = require('../instrumentationEvents')
 const { EAGER, COOPERATIVE } = require('./interface')
 const AssignerOffers = require('./assignerOffers')
-const { guaranteesCooperativeOwnership } = require('../assigners/cooperativeGuarantee')
+const {
+  CooperativeOwnership,
+  claimGeneration,
+  COOPERATIVE_STICKY,
+} = require('../assigners/cooperativeOwnership')
 const LeaderUnionWatch = require('../leaderUnionWatch')
 const CoordinatorLookup = require('../coordinatorLookup')
 const {
@@ -45,6 +49,24 @@ const losesCoordinator = (error) =>
   error instanceof KafkaJSConnectionError ||
   error instanceof KafkaJSRequestTimeoutError ||
   isStaleCoordinator(error)
+
+/**
+ * The leader's own copy of the plan an assigner returned: new rows, each assignment `Buffer`
+ * copied, so the plan that is checked and written cannot change after `assign` returns. Any other
+ * non-null assignment becomes the bytes the encoder writes for it, its string in UTF-8, so every
+ * byte that is sent is checked.
+ * @param {Array<{ memberId: string, memberAssignment: Buffer|string|null }>} rows as returned
+ * @returns {Array<{ memberId: string, memberAssignment: Buffer|null }>}
+ */
+const ownPlan = (rows) =>
+  rows.map(({ memberId, memberAssignment }) => ({
+    memberId,
+    memberAssignment: Buffer.isBuffer(memberAssignment)
+      ? Buffer.from(memberAssignment)
+      : memberAssignment == null
+        ? memberAssignment
+        : Buffer.from(String(memberAssignment), 'utf8'),
+  }))
 
 /**
  * Membership over the classic JoinGroup/SyncGroup protocol.
@@ -135,8 +157,11 @@ module.exports = class ClassicGroupProtocol {
     this.membershipRevision = 0
     this.members = null
     this.groupProtocol = null
-    /** @type {AssignerOffers|null} the offers of the JoinGroup that joined the current membership */
-    this.offers = null
+    /**
+     * @type {import('../../../types').Assigner|null} the assigner whose offer the coordinator
+     *   selected in the JoinGroup that joined the current membership
+     */
+    this.selectedAssigner = null
     this.protocolType = null
     this.lastRequest = Date.now()
     this.staticMembershipInactiveWarned = false
@@ -518,9 +543,10 @@ module.exports = class ClassicGroupProtocol {
 
   /**
    * Keeps what a JoinGroup answer decided about the joined membership: who leads, the members the
-   * leader will assign, the protocol the coordinator selected and the offers that selection is
-   * resolved against. They are set together so a leader's SyncGroup never reads a selection
-   * without the offers that were sent.
+   * leader will assign, the protocol the coordinator selected and the assigner that offered it,
+   * resolved against the offers this JoinGroup sent. They are set together so a leader's SyncGroup
+   * never reads a selection resolved against another join. The offers themselves, with their
+   * metadata bytes, are not kept.
    * @param {{ leaderId: string, members: object[], groupProtocol: string, protocolType: string }} groupData
    * @param {AssignerOffers} offers the offers the JoinGroup sent
    * @returns {void}
@@ -529,7 +555,7 @@ module.exports = class ClassicGroupProtocol {
     this.leaderId = groupData.leaderId
     this.members = groupData.members
     this.groupProtocol = groupData.groupProtocol
-    this.offers = offers
+    this.selectedAssigner = offers.assignerFor(groupData.groupProtocol) ?? null
     this.protocolType = groupData.protocolType
   }
 
@@ -638,7 +664,8 @@ module.exports = class ClassicGroupProtocol {
    *   of the topics only other members subscribe to, for `LeaderUnionWatch`; null for a follower
    *   or when every member shares the leader's subscription
    * @throws {KafkaJSNonRetriableError} when the coordinator picked an assignor this member does
-   *   not have
+   *   not have, and, under the cooperative protocol, when the plan breaks the
+   *   {@link CooperativeOwnership} rule; no SyncGroup is written then
    */
   async sync({ topics, topicsSubscribed, beforeSync, round }) {
     let assignment = []
@@ -663,7 +690,7 @@ module.exports = class ClassicGroupProtocol {
         memberId,
         topics,
       })
-      const assigner = this.offers?.assignerFor(groupProtocol)
+      const assigner = this.selectedAssigner
 
       if (!assigner) {
         throw new KafkaJSNonRetriableError(
@@ -682,7 +709,12 @@ module.exports = class ClassicGroupProtocol {
         groupTopics.filter((topic) => !own.has(topic)),
         groupTopicMetadata
       )
-      assignment = await round.wait(() =>
+      // An incremental rebalance must never hand a partition to a member while another member
+      // still owns it: the new owner would fetch it while the old one is still delivering. Every
+      // plan is checked, the built-in assigner's included, against claims read before `assign`
+      // runs, and the plan checked is the copy that is sent.
+      const ownership = this.mode === COOPERATIVE ? this.ownershipOf(members, groupProtocol) : null
+      const returned = await round.wait(() =>
         assigner.assign({
           members,
           topics: topicsSubscribed,
@@ -690,22 +722,14 @@ module.exports = class ClassicGroupProtocol {
           groupTopicMetadata,
         })
       )
-
-      // An incremental rebalance must never hand a partition to a member while another member
-      // still owns it: the new owner would fetch it while the old one is still delivering.
-      // The built-in `cooperative-sticky` assigner guarantees this through its own withhold rule,
-      // so that object is exempt; any other assigner under this mode, whatever name it offers,
-      // has to be checked.
-      // @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-429%3A+Kafka+Consumer+Incremental+Rebalance+Protocol
-      if (this.mode === COOPERATIVE && !guaranteesCooperativeOwnership(assigner)) {
-        this.assertNoDoubleAssignment({ members, assignment })
-      }
+      assignment = ownPlan(returned)
+      if (ownership) ownership.assertPlan(assignment)
 
       this.logger.debug('Group assignment', {
         groupId,
         generationId,
         groupProtocol,
-        assignment,
+        assignment: returned,
         topics: topicsSubscribed,
       })
     }
@@ -740,44 +764,34 @@ module.exports = class ClassicGroupProtocol {
   }
 
   /**
-   * Throws when a leader-computed assignment hands a partition to one member while another still
-   * owns it, which an incremental rebalance must never do.
+   * The leader's own reading of what each joined member claims to own, taken before any assigner
+   * sees the members, so an assigner that edits its input cannot change what its plan is checked
+   * against.
    *
    * A member whose subscription carries no owned partitions - a v0 subscription, or one this
-   * member cannot decode - contributes nothing to the ownership set, so an unknown owner is never
-   * treated as a conflict.
+   * member cannot decode - claims nothing. The generation of a claim follows
+   * {@link claimGeneration}: the subscription's `GenerationId`, or, under the `cooperative-sticky`
+   * protocol only, the generation in its four-byte userData. Another protocol's userData is its
+   * assigner's own and is never read, so a claim without a `GenerationId` there is of unknown
+   * generation, older than any known one.
    *
-   * @param {{ members: Array<{memberId: string, memberMetadata: Buffer}>,
-   *   assignment: Array<{memberId: string, memberAssignment: Buffer}> }} round
-   * @returns {void}
-   * @throws {KafkaJSNonRetriableError} naming the topic, the partition and both member ids
+   * @private
+   * @param {Array<{memberId: string, memberMetadata: Buffer}>} members the JoinGroup members
+   * @param {string} groupProtocol the protocol the coordinator selected
+   * @returns {CooperativeOwnership}
    */
-  assertNoDoubleAssignment({ members, assignment }) {
-    const ownerOf = new Map()
-
-    for (const { memberId, memberMetadata } of members) {
-      const decoded = this.decodeSubscription(memberMetadata)
-      for (const { topic, partitions } of (decoded && decoded.ownedPartitions) || []) {
-        for (const partition of partitions) {
-          ownerOf.set(`${topic}|${partition}`, memberId)
+  ownershipOf(members, groupProtocol) {
+    const userDataGeneration = groupProtocol === COOPERATIVE_STICKY
+    return new CooperativeOwnership(
+      members.map(({ memberId, memberMetadata }) => {
+        const subscription = this.decodeSubscription(memberMetadata)
+        return {
+          memberId,
+          ownedPartitions: subscription && subscription.ownedPartitions,
+          generationId: subscription && claimGeneration(subscription, { userDataGeneration }),
         }
-      }
-    }
-
-    for (const { memberId, memberAssignment } of assignment) {
-      const decoded = MemberAssignment.decode(memberAssignment)
-      for (const [topic, partitions] of Object.entries(decoded ? decoded.assignment : {})) {
-        for (const partition of partitions) {
-          const owner = ownerOf.get(`${topic}|${partition}`)
-
-          if (owner !== undefined && owner !== memberId) {
-            throw new KafkaJSNonRetriableError(
-              `Cooperative rebalance would assign ${topic}-${partition} to ${memberId} while ${owner} still owns it; use the cooperative-sticky assigner or an assignor that withholds moved partitions`
-            )
-          }
-        }
-      }
-    }
+      })
+    )
   }
 
   /**
@@ -940,7 +954,7 @@ module.exports = class ClassicGroupProtocol {
     this.leaderId = null
     this.members = null
     this.groupProtocol = null
-    this.offers = null
+    this.selectedAssigner = null
     this.protocolType = null
     this.ownedPartitions = []
 

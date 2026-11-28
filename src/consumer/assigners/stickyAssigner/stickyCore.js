@@ -959,14 +959,11 @@ class PartitionMovements {
  * @param {{[topic: string]: number[]}} input.partitionsPerTopic every partition of every topic
  *   any member subscribes to
  * @param {StickyMember[]} input.members
- * @param {Set<string>} [input.contested] filled with the flat keys of the partitions two members
- *   of the same generation both claimed. They belong to nobody: the cooperative caller withholds
- *   them for a round, the eager one has no use for them and passes nothing.
  * @returns {Map<string, {[topic: string]: number[]}>} one entry per member, including members
  *   that end up with nothing
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractStickyAssignor.java
  */
-const assignSticky = ({ partitionsPerTopic, members, contested }) => {
+const assignSticky = ({ partitionsPerTopic, members }) => {
   const ordered = [...members].sort(compareMembers)
   const subscribed = new Set(ordered.flatMap(({ topics }) => topics))
   const partitions = dictionary()
@@ -984,12 +981,6 @@ const assignSticky = ({ partitionsPerTopic, members, contested }) => {
     members: ordered,
     partitionsPerTopic: partitions,
   })
-
-  if (contested) {
-    for (const key of doublyClaimed) {
-      contested.add(key)
-    }
-  }
 
   const assigned = subscriptionsEqual
     ? new ConstrainedAssignmentBuilder({

@@ -474,7 +474,7 @@ describe('Consumer > classic group protocol > the leader round guards', () => {
       leaderId: 'm1',
       memberId: 'm1',
       groupProtocol: 'custom',
-      offers: AssignerOffers.declared(protocol.assigners),
+      selectedAssigner: protocol.assigners[0] ?? null,
       members: [],
     })
     return protocol
@@ -546,15 +546,15 @@ describe('Consumer > classic group protocol > the leader round guards', () => {
     ).rejects.toThrow('Unsupported partition assigner "custom"')
   })
 
-  it('drops the offers of the joined membership with its leader and selected protocol when the generation is reset', () => {
+  it('drops the selected assigner of the joined membership with its leader and selected protocol when the generation is reset', () => {
     const protocol = leader({ assigners: [{ name: 'custom', assign: async () => [] }] })
-    expect(protocol.offers.assignerFor('custom')).toBe(protocol.assigners[0])
+    expect(protocol.selectedAssigner).toBe(protocol.assigners[0])
 
     protocol.resetGeneration()
 
     expect(protocol.leaderId).toBeNull()
     expect(protocol.groupProtocol).toBeNull()
-    expect(protocol.offers).toBeNull()
+    expect(protocol.selectedAssigner).toBeNull()
   })
 
   it('does not upload an assignment once the round retired during the assign window', async () => {
@@ -587,7 +587,7 @@ describe('Consumer > classic group protocol > the leader round guards', () => {
       { memberId: 'm3', memberAssignment: Buffer.alloc(0) },
       { memberId: 'm2', memberAssignment: taken },
     ]
-    expect(() => protocol.assertNoDoubleAssignment({ members, assignment })).toThrow(
+    expect(() => protocol.ownershipOf(members, 'custom').assertPlan(assignment)).toThrow(
       'a-0 to m2 while m1 still owns it'
     )
   })
@@ -973,18 +973,20 @@ describe('Consumer > classic group protocol > the protocols a join offers', () =
    * @param {string} [options.mode] the rebalance protocol of the member
    * @param {(joinNumber: number) => Buffer} [options.joinAnswers] the answer to the nth JoinGroup,
    *   counted from 1; the plain selection of `selected` when absent
-   * @returns {Promise<{ outcome: Promise<object>, bodyOf: Function }>} the round's result and the
-   *   reader of the frames written
+   * @param {(broker: object) => void} [options.prepare] called with the real broker before the round
+   * @returns {Promise<{ outcome: Promise<object>, bodyOf: Function, protocol: ClassicGroupProtocol }>}
+   *   the round's result, the reader of the frames written and the member
    */
   const roundSelecting = async (
     assigners,
     selected,
-    { mode, joinAnswers = () => joinGroupResponse(selected) } = {}
+    { mode, joinAnswers = () => joinGroupResponse(selected), prepare = () => {} } = {}
   ) => {
     let joins = 0
     const { broker, bodyOf } = await createFakeCoordinator((header) =>
       header.apiKey === apiKeys.JoinGroup ? joinAnswers((joins += 1)) : answer(header)
     )
+    prepare(broker)
     const protocol = new ClassicGroupProtocol({
       cluster: {
         findGroupCoordinator: async () => broker,
@@ -1007,8 +1009,18 @@ describe('Consumer > classic group protocol > the protocols a join offers', () =
       round: realRound(),
     })
     outcome.catch(() => {})
-    return { outcome, bodyOf }
+    return { outcome, bodyOf, protocol }
   }
+
+  it('keeps only the selected assigner once the join is installed, not the offers and the metadata they copied', async () => {
+    const chosen = assigner('declared-name', 'offered-name')
+
+    const { outcome, protocol } = await roundSelecting([chosen], 'offered-name')
+
+    await outcome
+    expect(protocol.selectedAssigner).toBe(chosen)
+    expect(Object.values(protocol).filter((value) => value instanceof AssignerOffers)).toEqual([])
+  })
 
   it('refuses two assigners whose offered names, not their declared ones, are written as the same bytes, and writes no JoinGroup', async () => {
     const first = assigner('first', 'planner-\uD800')
@@ -1140,7 +1152,7 @@ describe('Consumer > classic group protocol > the protocols a join offers', () =
       expect(() => bodyOf(apiKeys.SyncGroup)).toThrow('no request written')
     })
 
-    it('does not check the plan of the built-in cooperative-sticky assigner, which withholds moved partitions itself', async () => {
+    it('refuses a conflicting plan from the built-in cooperative-sticky assigner whose assign was replaced, and writes no SyncGroup', async () => {
       const builtIn = cooperativeSticky({ cluster: {} })
       builtIn.assign = jest.fn(async () => conflicting())
 
@@ -1150,9 +1162,79 @@ describe('Consumer > classic group protocol > the protocols a join offers', () =
         selecting('cooperative-sticky')
       )
 
-      await expect(outcome).resolves.toMatchObject({ assignment: expect.any(Object) })
+      await expect(outcome).rejects.toThrow(
+        `Cooperative rebalance would assign ${TOPICS[0]}-1 to ${MEMBER_ID} while ${OTHER_ID} still owns it`
+      )
       expect(builtIn.assign).toHaveBeenCalledTimes(1)
-      expect(bodyOf(apiKeys.SyncGroup).body.includes(OTHER_ID)).toBe(true)
+      expect(() => bodyOf(apiKeys.SyncGroup)).toThrow('no request written')
+    })
+
+    it('checks the plan against the claims the members sent, not a subscription the assigner edited in its input, and writes no SyncGroup', async () => {
+      const editing = {
+        name: 'custom',
+        protocol: () => ({ name: 'custom', metadata: PROTOCOL_METADATA }),
+        supportedProtocols: () => ['cooperative'],
+        assign: jest.fn(async ({ members }) => {
+          const other = members.find(({ memberId }) => memberId === OTHER_ID)
+          other.memberMetadata = owning([])
+          return conflicting()
+        }),
+      }
+
+      const { outcome, bodyOf } = await roundSelecting([editing], 'custom', selecting('custom'))
+
+      await expect(outcome).rejects.toThrow(
+        `Cooperative rebalance would assign ${TOPICS[0]}-1 to ${MEMBER_ID} while ${OTHER_ID} still owns it`
+      )
+      expect(editing.assign).toHaveBeenCalledTimes(1)
+      expect(() => bodyOf(apiKeys.SyncGroup)).toThrow('no request written')
+    })
+
+    it('writes the plan it checked when the assigner changes the rows it returned while the SyncGroup send is held', async () => {
+      const rows = planFor({ [MEMBER_ID]: [0], [OTHER_ID]: [1] })
+      const kept = rows.map(({ memberAssignment }) => Buffer.from(memberAssignment))
+      const takeover = planFor({ [OTHER_ID]: [0, 1] })[0].memberAssignment
+      const retaining = {
+        name: 'custom',
+        protocol: () => ({ name: 'custom', metadata: PROTOCOL_METADATA }),
+        supportedProtocols: () => ['cooperative'],
+        assign: jest.fn(async () => rows),
+      }
+
+      let release
+      const held = new Promise((resolve) => (release = resolve))
+      let reached
+      const reachedSync = new Promise((resolve) => (reached = resolve))
+      const holdSync = (broker) => {
+        const pool = broker.connectionPool
+        const getConnectionByRequest = pool.getConnectionByRequest
+        pool.getConnectionByRequest = async (protocolRequest, ...rest) => {
+          if (protocolRequest.request.apiKey === apiKeys.SyncGroup) {
+            reached()
+            await held
+          }
+          return getConnectionByRequest.call(pool, protocolRequest, ...rest)
+        }
+      }
+
+      const { outcome, bodyOf } = await roundSelecting([retaining], 'custom', {
+        ...selecting('custom'),
+        prepare: holdSync,
+      })
+
+      await reachedSync
+      expect(() => bodyOf(apiKeys.SyncGroup)).toThrow('no request written')
+      rows[0].memberAssignment.fill(0)
+      rows[1].memberAssignment = takeover
+      rows.push({ memberId: 'golden-member-3', memberAssignment: takeover })
+      release()
+
+      await expect(outcome).resolves.toMatchObject({ assignment: expect.any(Object) })
+      const { body } = bodyOf(apiKeys.SyncGroup)
+      expect(body.includes(kept[0])).toBe(true)
+      expect(body.includes(kept[1])).toBe(true)
+      expect(body.includes(takeover)).toBe(false)
+      expect(body.includes('golden-member-3')).toBe(false)
     })
   })
 })

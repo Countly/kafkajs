@@ -1,5 +1,4 @@
 const ClassicGroupProtocol = require('../groupProtocol/classic')
-const AssignerOffers = require('../groupProtocol/assignerOffers')
 const ConsumerGroup = require('../consumerGroup')
 const { MemberMetadata } = require('../assignerProtocol')
 
@@ -173,7 +172,7 @@ const leader = (assign) => {
     leaderId: 'a',
     generationId: 1,
     groupProtocol: 'custom',
-    offers: AssignerOffers.declared(assigners),
+    selectedAssigner: assigners[0],
     protocolType: 'consumer',
     mode: 'eager',
     members: [

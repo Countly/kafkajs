@@ -610,12 +610,12 @@ const assignCooperative = async (factory, shape, members) => {
   const capturing = (deps) => {
     const assigner = factory(deps)
     const withhold = assigner.withholdTransferringPartitions
-    assigner.withholdTransferringPartitions = function (group, assignment, contested) {
+    assigner.withholdTransferringPartitions = function (group, assignment, ...rest) {
       cooperativeCore = [...assignment].map(([memberId, byTopic]) => ({
         memberId,
         memberAssignment: MemberAssignment.encode({ version: this.version, assignment: byTopic }),
       }))
-      return withhold.call(this, group, assignment, contested)
+      return withhold.call(this, group, assignment, ...rest)
     }
     return assigner
   }
