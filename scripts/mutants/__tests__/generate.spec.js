@@ -1049,10 +1049,10 @@ describe('scripts/mutants/generate.js', () => {
         ],
       ],
       [
-        'producer send: record errors pick the failing records',
+        'producer send: a request keyed by topic id only when every id is known',
         'src/producer/sendMessages.js',
-        'const resolveFailingRecords',
-        '  if (!Array.isArray(e.recordErrors) || e.recordErrors.length === 0) {',
+        'const topicIdsOf',
+        '    if (topicId === undefined) {',
         'negated-condition',
         [
           `${PRODUCER}/sendMessages.spec.js`,

@@ -1388,5 +1388,14 @@ const createEosManager = ({
 }
 
 createEosManager.surfaceInTransaction = surfaceInTransaction
+createEosManager.markLookupFailure = markLookupFailure
+createEosManager.isDiscoveryExhausted = isDiscoveryExhausted
+
+/**
+ * @param {Error} error
+ * @returns {boolean} whether `error` itself is a lookup link whose identity decides discovery
+ *   exhaustion: a copy of it would not be recognised
+ */
+createEosManager.isExhaustedLookup = (error) => exhaustedLookups.has(error)
 
 module.exports = createEosManager
