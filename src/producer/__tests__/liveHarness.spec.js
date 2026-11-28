@@ -59,7 +59,7 @@ const {
   pollTolerating,
   pollUntil,
 } = require('./fixtures/bounded')
-const { bufferedProducer, deferred, watch } = require('./fixtures/bufferHarness')
+const { bufferedProducer, deferred, owned, watch } = require('./fixtures/bufferHarness')
 const { createFakeCluster } = require('./fixtures/fakeCluster')
 const { heartbeatInBatch } = require('./fixtures/memberHeartbeat')
 const { droppedFrom } = require('./fixtures/liveTransactions')
@@ -706,7 +706,7 @@ describe('Producer > the live scenarios harness', () => {
           payload: 0,
           pinner: cluster,
         }
-        const chunk = { messages: [{}], owners: [] }
+        const chunk = { messages: owned([{}]), owners: [] }
         Cluster.prototype.holdTopic.call(cluster, topic)
         accumulator.track(send)
         chunk.ownership = new BatchOwnership(admission, chunk, false)
@@ -1512,19 +1512,32 @@ describe('Producer > the live scenarios harness', () => {
   describe('ProduceLedger and traceCalls', () => {
     test('records what a Produce call carried and what the broker answered', async () => {
       const original = Broker.prototype.produce
+      const lost = new Error('lost')
+      const answered = [
+        { topicName: 't', partition: 0, errorCode: 0, baseOffset: '4', error: null },
+      ]
       Broker.prototype.produce = async function (request) {
-        if (request.fail) throw new Error('lost')
-        return [{ topicName: 't', partition: 0, errorCode: 0, baseOffset: '4', error: null }]
+        if (request.fail) throw lost
+        return answered
       }
       const ledger = new ProduceLedger().install()
       try {
         const topicData = [
           {
             topic: 't',
-            partitions: [{ partition: 0, firstSequence: 3, messages: [{ value: 'x' }] }],
+            partitions: [{ partition: 0, firstSequence: 3, messages: owned([{ value: 'x' }]) }],
           },
         ]
-        await Broker.prototype.produce({ producerId: 9n, producerEpoch: 1, acks: -1, topicData })
+        const first = Broker.prototype.produce({
+          producerId: 9n,
+          producerEpoch: 1,
+          acks: -1,
+          topicData,
+        })
+        expect(ledger.calls[0].partitions).toEqual([
+          { topic: 't', partition: 0, firstSequence: 3, records: 1, first: 'x' },
+        ])
+        await expect(first).resolves.toBe(answered)
         await expect(
           Broker.prototype.produce({
             producerId: 9n,
@@ -1533,7 +1546,7 @@ describe('Producer > the live scenarios harness', () => {
             topicData,
             fail: true,
           })
-        ).rejects.toThrow('lost')
+        ).rejects.toBe(lost)
       } finally {
         ledger.restore()
         Broker.prototype.produce = original
@@ -1550,6 +1563,43 @@ describe('Producer > the live scenarios harness', () => {
         error: null,
       })
       expect(ledger.calls[1].error.message).toBe('lost')
+    })
+
+    test('a Produce call its guard refuses at the broker is recorded at once and rejects with the refusal itself', async () => {
+      const original = Broker.prototype.produce
+      const refusal = new Error('refused by the guard')
+      const guard = jest.fn(() => refusal)
+      Broker.prototype.produce = async function ({ guard: check }) {
+        this.throwIfRefused(check)
+        return []
+      }
+      const ledger = new ProduceLedger().install()
+      try {
+        const refused = Broker.prototype.produce({
+          producerId: 9n,
+          producerEpoch: 1,
+          acks: -1,
+          guard,
+          topicData: [
+            {
+              topic: 't',
+              partitions: [{ partition: 0, firstSequence: 3, messages: owned([{ value: 'x' }]) }],
+            },
+          ],
+        })
+        expect(ledger.calls).toHaveLength(1)
+        expect(ledger.calls[0].partitions).toEqual([
+          { topic: 't', partition: 0, firstSequence: 3, records: 1, first: 'x' },
+        ])
+        await expect(refused).rejects.toBe(refusal)
+      } finally {
+        ledger.restore()
+        Broker.prototype.produce = original
+      }
+
+      expect(guard).toHaveBeenCalledTimes(1)
+      expect(ledger.calls[0].results).toBeNull()
+      expect(ledger.calls[0].error).toBe(refusal)
     })
 
     test('traceCalls keeps the calls describe selects and the error each one ended with', async () => {
