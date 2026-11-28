@@ -1,3 +1,4 @@
+const { types } = require('node:util')
 const Broker = require('../../../broker')
 const setupPool = require('../../../../testHelpers/setupPool')
 const Connection = require('../../../network/connection')
@@ -14,12 +15,8 @@ const { errorCodes } = require('../../../protocol/error')
 const { responseHeaderVersion } = require('../../../protocol/headers')
 const { RecordBatch } = require('../../../protocol/recordBatch/v0')
 const RecordEncoder = require('../../../protocol/recordBatch/record/v0')
-const {
-  newLogger,
-  createFakeSocketFactory,
-  respondWithFrame,
-  readRequestHeader,
-} = require('testHelpers')
+const { newLogger, createFakeSocketFactory, readRequestHeader } = require('testHelpers')
+const { encodeResponseFrame } = require('../../../../testHelpers/fakeSocket')
 
 const NODE_ID = 0
 const TOPIC = 'test-topic'
@@ -799,9 +796,9 @@ const readFrameHeader = (frame) => {
  * Each socket owns the work queued for it: the playback of every frame written to it and the
  * subscription to every withheld answer of those frames. When the socket is destroyed (an
  * ordinary disconnect, a failed generation, `close()`), that work is cancelled: nothing is
- * answered or failed on a dead socket. The playback checks ownership before and after calling
- * fixture code or emitting data, since those calls may close the broker before the connection
- * destroys the socket. Cancellation stops the playback and closes any open chunk iterator.
+ * answered or failed on a dead socket. Playback checks liveness at the answer, chunk and
+ * failure boundaries. Each data emit finishes dispatching to its listeners. Cancellation
+ * stops further chunks and closes the iterator once playback has started iterating.
  *
  * The fake broker is open until `close()`, then closed for good. `close()` is idempotent and
  * every caller gets the same promise. At once, it refuses every later connect, connection,
@@ -861,7 +858,7 @@ const buildFakeBroker = (answer, chunks) => {
    * @param {object} socket
    * @returns {void}
    */
-  const release = (socket) => {
+  const cancelSocket = (socket) => {
     const work = owned.get(socket)
     if (!work) return
     owned.delete(socket)
@@ -883,14 +880,11 @@ const buildFakeBroker = (answer, chunks) => {
     const socket = socketFactory(options)
     const work = { playbacks: new Set(), detaches: new Set() }
     owned.set(socket, work)
-    const { write, destroy } = socket
-    socket.destroy = (error) => {
-      release(socket)
-      return destroy(error)
-    }
+    socket.onDestroy(() => cancelSocket(socket))
+    const { write } = socket
     socket.write = (...args) => {
       const written = write(...args)
-      if (owned.has(socket)) {
+      if (!closed && !socket.destroyed) {
         const frame = socket.writes[socket.writes.length - 1]
         const playback = setImmediate(() => {
           work.playbacks.delete(playback)
@@ -920,40 +914,22 @@ const buildFakeBroker = (answer, chunks) => {
    * @param {object} socket
    * @param {{ apiKey: number, apiVersion: number, correlationId: number }} header
    * @param {Buffer} body
-   * @param {<T>(effect: () => T) => T} run the playback's ownership guard
+   * @param {() => boolean} isLive whether playback may continue on this socket
    * @returns {void}
    */
-  const reply = (socket, header, body, run) => {
-    const emit = (_event, frame) => {
-      const parts = run(() => (chunks ? chunks(frame, header) : [frame]))
-      let iterator
-      try {
-        const iterate = run(() => parts[Symbol.iterator])
-        run(() => {
-          iterator = Reflect.apply(iterate, parts, [])
-        })
-        const next = run(() => iterator.next)
-        while (true) {
-          const result = run(() => Reflect.apply(next, iterator, []))
-          if (run(() => result.done)) return
-          const chunk = run(() => result.value)
-          run(() => socket.emit('data', chunk))
-        }
-      } catch (error) {
-        try {
-          iterator?.return?.()
-        } catch {
-          // Keep the playback error, as for an abrupt exit from a for-of loop.
-        }
-        throw error
-      }
-    }
-    respondWithFrame(
-      { socket: { emit } },
+  const reply = (socket, header, body, isLive) => {
+    const frame = encodeResponseFrame(
       header.correlationId,
       responseHeaderVersion(header.apiKey, header.apiVersion),
       body
     )
+    const parts = chunks ? chunks(frame, header) : [frame]
+    if (!isLive()) return
+    for (const chunk of parts) {
+      if (!isLive()) break
+      socket.deliver(chunk)
+      if (!isLive()) break
+    }
   }
 
   /**
@@ -988,42 +964,39 @@ const buildFakeBroker = (answer, chunks) => {
    * @returns {void}
    */
   const playBack = (socket, frame, work) => {
-    const cancelled = Symbol('playback cancelled')
-    const isOwned = () => owned.get(socket) === work
-    /**
-     * Runs one playback operation and unwinds the frame if ownership has been revoked.
-     * @template T
-     * @param {() => T} effect
-     * @returns {T}
-     */
-    const run = (effect) => {
-      if (!isOwned()) throw cancelled
-      const value = effect()
-      if (!isOwned()) throw cancelled
-      return value
-    }
+    const isLive = () => !closed && !socket.destroyed
+    if (!isLive()) return
 
     let header
     try {
-      header = run(() => readFrameHeader(frame))
+      header = readFrameHeader(frame)
     } catch (cause) {
-      if (isOwned()) {
-        socket.destroy(new Error('The fake broker could not read a request frame', { cause }))
-      }
+      socket.destroy(new Error('The fake broker could not read a request frame', { cause }))
       return
     }
     const fail = (error) => {
-      if (isOwned()) failRequest(socket, header.correlationId, error)
+      if (isLive()) failRequest(socket, header.correlationId, error)
     }
-    const deliver = (body) => run(() => reply(socket, header, body, run))
+    const deliver = (body) => {
+      if (isLive()) reply(socket, header, body, isLive)
+    }
     try {
-      const body = run(() => answer(header, frame))
-      const then = run(() => body?.then)
-      if (typeof then === 'function') {
+      const body = answer(header, frame)
+      const isPromise = types.isPromise(body)
+      if (!isLive()) {
+        if (isPromise) Promise.prototype.then.call(body, undefined, () => {})
+        return
+      }
+      const then = isPromise ? undefined : body?.then
+      if (isPromise || typeof then === 'function') {
         const detach = subscribe(
-          {
-            then: (resolve, reject) => run(() => Reflect.apply(then, body, [resolve, reject])),
-          },
+          isPromise
+            ? body
+            : {
+                then: (resolve, reject) => {
+                  if (isLive()) then.call(body, resolve, reject)
+                },
+              },
           {
             deliver: (value) => {
               work.detaches.delete(detach)
@@ -1111,7 +1084,7 @@ const buildFakeBroker = (answer, chunks) => {
   const close = () =>
     (closing ??= (async () => {
       closed = true
-      for (const socket of [...owned.keys()]) release(socket)
+      for (const socket of owned.keys()) cancelSocket(socket)
       await broker.disconnect({ drainTimeout: 0 })
       while (connects.size > 0) await Promise.all(connects)
     })())

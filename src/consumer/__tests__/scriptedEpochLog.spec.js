@@ -1,3 +1,5 @@
+const { execFileSync } = require('node:child_process')
+const { resolve } = require('node:path')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { decode } = require('../../protocol/requests/offsetForLeaderEpoch/v4/response')
 const { readRequestHeader } = require('testHelpers')
@@ -674,6 +676,7 @@ describe('Test harness > fake broker close', () => {
       await nextTurn()
       await nextTurn()
 
+      expect(asked).toHaveLength(1)
       expect(socket.destroyed).toBe(true)
       expect(outcome.mock.calls).toEqual([
         [
@@ -728,7 +731,7 @@ describe('Test harness > fake broker close', () => {
   /**
    * A fake broker whose OffsetForLeaderEpoch playback closes it from the callback `closeIn` names,
    * with its splitter, iterator and data events recorded after connecting.
-   * @param {'answer'|'answerThrows'|'destroy'|'chunks'|'chunkIterator'|'data'} closeIn
+   * @param {'answer'|'answerThrows'|'thenable'|'destroy'|'chunks'|'chunkIterator'|'data'} closeIn
    * @returns {Promise<{ broker: object, socket: object, data: Buffer[], closing: () => Promise<void>,
    *   close: () => Promise<void>, playback: string[] }>}
    */
@@ -746,6 +749,15 @@ describe('Test harness > fake broker close', () => {
         if (closeIn === 'answerThrows') {
           closeNow()
           throw new Error('the answer closed the fake broker, then threw')
+        }
+        if (closeIn === 'thenable') {
+          closeNow()
+          return {
+            get then() {
+              playback.push('thenable inspected')
+              return () => playback.push('thenable called')
+            },
+          }
         }
         return offsetForLeaderEpochResponse([{ partition: 0 }])
       },
@@ -788,6 +800,7 @@ describe('Test harness > fake broker close', () => {
   test.each([
     ['an answer that returns a body', 'answer', 0, []],
     ['an answer that throws', 'answerThrows', 0, []],
+    ['an answer that returns a thenable', 'thenable', 0, []],
     ['an answer that destroys the socket', 'destroy', 0, []],
     ['the chunks callback', 'chunks', 0, ['split']],
     [
@@ -819,6 +832,42 @@ describe('Test harness > fake broker close', () => {
       }
     }
   )
+
+  test('an async answer that closes and rejects leaves no unhandled rejection', () => {
+    // Observe Node's unhandled-rejection events outside the Jest worker.
+    const script = `
+      const { apiVersionsBody, createFakeBroker, TOPIC } = require(process.argv[1])
+      const unhandled = []
+      process.on('unhandledRejection', (error) => unhandled.push(error.message))
+      async function main() {
+        const fake = createFakeBroker(async ({ apiKey }) => {
+          if (apiKey === ${apiKeys.ApiVersions}) return apiVersionsBody(18)
+          fake.close()
+          throw new Error('the async answer rejected')
+        })
+        await fake.broker.connect()
+        const outcome = await fake.broker.offsetForLeaderEpoch({
+          topics: [{
+            topic: TOPIC,
+            partitions: [{ partition: 0, currentLeaderEpoch: 9, leaderEpoch: 4 }],
+          }],
+        }).then(() => 'answered', (error) => error.name)
+        await fake.close()
+        await new Promise(setImmediate)
+        process.stdout.write(JSON.stringify({ outcome, unhandled }))
+      }
+      main().catch((error) => {
+        process.stderr.write(error.stack)
+        process.exitCode = 1
+      })
+    `
+    const report = execFileSync(
+      process.execPath,
+      ['--unhandled-rejections=throw', '-e', script, require.resolve('./fixtures/fetchHarness')],
+      { env: { NODE_PATH: resolve(__dirname, '../../..') }, encoding: 'utf8', timeout: 10000 }
+    )
+    expect(JSON.parse(report)).toEqual({ outcome: 'KafkaJSConnectionClosedError', unhandled: [] })
+  })
 
   test('close aborts a connect still waiting for its socket and refuses the connect queued behind it, with the clock frozen', async () => {
     freezeClock()
