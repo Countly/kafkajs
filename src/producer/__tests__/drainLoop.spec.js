@@ -20,7 +20,13 @@ const Encoder = require('../../protocol/encoder')
 const { INT_32_MAX_VALUE } = require('../../constants')
 const { createGroupApiBroker } = require('../../broker/__tests__/fixtures/groupApiHarness')
 const { createFakeCluster } = require('./fixtures/fakeCluster')
-const { bufferedProducer, transactionalProducer } = require('./fixtures/bufferHarness')
+const {
+  bufferedProducer,
+  owned,
+  sentRecords,
+  takeSent,
+  transactionalProducer,
+} = require('./fixtures/bufferHarness')
 const {
   KafkaJSConnectionClosedError,
   KafkaJSDeliveryTimeout,
@@ -682,13 +688,13 @@ describe('Producer > the idempotent drain loop', () => {
           acks: -1,
           timeout: 30000,
           compression: 0,
-          batches: [{ topic: TOPIC, partition: 0, messages: records(0) }],
+          batches: [{ topic: TOPIC, partition: 0, messages: owned(records(0)) }],
         }),
         harness.sendMessages.sendPartitioned({
           acks: -1,
           timeout: 30000,
           compression: 1,
-          batches: [{ topic: TOPIC, partition: 1, messages: records(1) }],
+          batches: [{ topic: TOPIC, partition: 1, messages: owned(records(1)) }],
         }),
       ])
 
@@ -851,9 +857,10 @@ describe('Producer > the idempotent drain loop', () => {
       partitioned.resolve()
       await Promise.all([pending, third])
 
-      const second = cluster.broker.produce.mock.calls
-        .map(([request]) => request)
-        .find(({ topicData }) => topicData[0].partitions[0].messages[0].value === 'second')
+      const requests = cluster.broker.produce.mock.calls.map(([request]) => request)
+      const read = await Promise.all(requests.map(sentRecords))
+      const second =
+        requests[read.findIndex(([batch]) => String(batch.records[0].value) === 'second')]
       expect(producer.isIdempotent()).toBe(false)
       expect(second).toMatchObject({ acks: -1, producerId: -1, producerEpoch: 0 })
       expect(second.topicData[0].partitions[0].firstSequence).toBeUndefined()
@@ -1098,14 +1105,14 @@ describe('Producer > the idempotent drain loop', () => {
         acks: -1,
         timeout: 30000,
         compression: 0,
-        batches: [{ topic: TOPIC, partition: 0, messages: records(0) }],
+        batches: [{ topic: TOPIC, partition: 0, messages: owned(records(0)) }],
       })
       await settle()
       const second = harness.sendMessages.sendPartitioned({
         acks: -1,
         timeout: 30000,
         compression: 0,
-        batches: [{ topic: TOPIC, partition: 1, messages: records(1) }],
+        batches: [{ topic: TOPIC, partition: 1, messages: owned(records(1)) }],
       })
       await settle()
 
@@ -1286,7 +1293,7 @@ describe('Producer > the idempotent drain loop', () => {
         acks: -1,
         timeout: 30000,
         compression: 0,
-        batches: [{ topic: TOPIC, partition, messages: records(partition) }],
+        batches: [{ topic: TOPIC, partition, messages: owned(records(partition)) }],
       })
 
       const abandoned = harness.sendMessages.sendPartitioned(request(0)).catch((e) => e)
@@ -1455,7 +1462,7 @@ describe('Producer > the idempotent drain loop', () => {
               acks: -1,
               timeout: 30000,
               compression: 0,
-              batches: [{ topic: TOPIC, partition, messages: records(partition) }],
+              batches: [{ topic: TOPIC, partition, messages: owned(records(partition)) }],
             })
             .catch((e) => e)
 
@@ -1664,12 +1671,12 @@ describe('Producer > the idempotent drain loop', () => {
         harness.sendMessages.sendPartitioned({ acks: -1, timeout: 30000, compression: 0, batches })
 
       const sending = request([
-        { topic: TOPIC, partition: 0, messages: records(0) },
-        { topic: TOPIC, partition: 1, messages: records(1) },
-        { topic: OTHER_TOPIC, partition: 0, messages: records(0) },
+        { topic: TOPIC, partition: 0, messages: owned(records(0)) },
+        { topic: TOPIC, partition: 1, messages: owned(records(1)) },
+        { topic: OTHER_TOPIC, partition: 0, messages: owned(records(0)) },
       ]).catch((e) => e)
       await jest.advanceTimersByTimeAsync(1)
-      const sibling = request([{ topic: TOPIC, partition: 2, messages: records(2) }])
+      const sibling = request([{ topic: TOPIC, partition: 2, messages: owned(records(2)) }])
       await jest.advanceTimersByTimeAsync(1000)
       const error = await sending
 
@@ -1846,7 +1853,7 @@ describe('Producer > the idempotent drain loop', () => {
             acks: -1,
             timeout: 30000,
             compression: 0,
-            batches: [{ topic: TOPIC, partition: 0, messages: records(0), createdAt }],
+            batches: [{ topic: TOPIC, partition: 0, messages: owned(records(0)), createdAt }],
           })
           .catch((e) => e)
 
@@ -1873,7 +1880,7 @@ describe('Producer > the idempotent drain loop', () => {
           acks: -1,
           timeout: 30000,
           compression: 0,
-          batches: [{ topic: TOPIC, partition, messages: records(partition) }],
+          batches: [{ topic: TOPIC, partition, messages: owned(records(partition)) }],
         })
 
       const first = request(0)
@@ -2062,7 +2069,7 @@ describe('Producer > the idempotent drain loop', () => {
           acks: -1,
           timeout: 30000,
           compression: 0,
-          batches: [{ topic: TOPIC, partition: 1, messages: records(1), createdAt: 0 }],
+          batches: [{ topic: TOPIC, partition: 1, messages: owned(records(1)), createdAt: 0 }],
         })
         .catch((e) => e)
       const settled = settledFlag(Promise.all([queued, arriving]))
@@ -2087,7 +2094,7 @@ describe('Producer > the idempotent drain loop', () => {
           acks: -1,
           timeout: 30000,
           compression: 0,
-          batches: [{ topic: TOPIC, partition: 0, messages: records(0), createdAt: 1000 }],
+          batches: [{ topic: TOPIC, partition: 0, messages: owned(records(0)), createdAt: 1000 }],
         })
         .catch((e) => e)
       await jest.advanceTimersByTimeAsync(0)
@@ -2144,7 +2151,7 @@ describe('Producer > the idempotent drain loop', () => {
           acks: -1,
           timeout: 30000,
           compression: 0,
-          batches: [{ topic: TOPIC, partition: 0, messages: records(0), createdAt: 1000 }],
+          batches: [{ topic: TOPIC, partition: 0, messages: owned(records(0)), createdAt: 1000 }],
         })
         .catch((e) => e)
       const isSettled = settledFlag(sending)
@@ -2265,8 +2272,8 @@ describe('Producer > the idempotent drain loop', () => {
         timeout: 30000,
         compression: 0,
         batches: [
-          { topic: TOPIC, partition: 0, messages: records(0), settlers: [first] },
-          { topic: TOPIC, partition: 1, messages: records(1), settlers: [second] },
+          { topic: TOPIC, partition: 0, messages: owned(records(0)), settlers: [first] },
+          { topic: TOPIC, partition: 1, messages: owned(records(1)), settlers: [second] },
         ],
       })
 
@@ -2390,7 +2397,7 @@ describe('Producer > the idempotent drain loop', () => {
             messages: records(partition),
           }))
         ),
-        request([{ topic: TOPIC, partition: 4, messages: records(4) }], 30001),
+        request([{ topic: TOPIC, partition: 4, messages: owned(records(4)) }], 30001),
       ])
       await brokerHarness.pool.destroy()
 
@@ -2419,13 +2426,13 @@ describe('Producer > the idempotent drain loop', () => {
           acks: -1,
           timeout: 30000,
           compression: 0,
-          batches: [{ topic: TOPIC, partition: 0, messages: records(0) }],
+          batches: [{ topic: TOPIC, partition: 0, messages: owned(records(0)) }],
         }),
         harness.sendMessages.sendPartitioned({
           acks: -1,
           timeout: 30000,
           compression: 1,
-          batches: [{ topic: TOPIC, partition: 1, messages: records(1) }],
+          batches: [{ topic: TOPIC, partition: 1, messages: owned(records(1)) }],
         }),
       ])
       await settle()
@@ -2459,7 +2466,7 @@ describe('Producer > the idempotent drain loop', () => {
             acks: -1,
             timeout: 30000,
             compression: 0,
-            batches: [{ topic: TOPIC, partition, messages: records(partition) }],
+            batches: [{ topic: TOPIC, partition, messages: owned(records(partition)) }],
           })
         )
         await settle()
@@ -2488,6 +2495,7 @@ describe('Producer > the idempotent drain loop', () => {
 
     test('a batch the broker wrote but answered retriably is re-sent inside the broker’s 5-batch window and completes as a duplicate', async () => {
       const log = createPartitionLog()
+      const appended = []
       let calls = 0
       const harness = createHarness({
         layout: { [TOPIC]: { 0: 1 } },
@@ -2495,23 +2503,25 @@ describe('Producer > the idempotent drain loop', () => {
           calls += 1
           const call = calls
           const errors = {}
-          for (const { topic, partitions } of request.topicData) {
-            for (const { partition, firstSequence, messages } of partitions) {
-              const key = `${topic}/${partition}`
-              const code = log.append(
-                key,
-                request.producerEpoch,
-                firstSequence,
-                messages.length,
-                messages[0].value
-              )
-              if (code === OUT_OF_ORDER_SEQUENCE_NUMBER) {
-                errors[key] = code
-              } else if (code === 'duplicate') {
-                errors[key] = DUPLICATE_SEQUENCE_NUMBER
-              } else if (call === 3) {
-                errors[key] = REQUEST_TIMED_OUT
-              }
+          const sent = takeSent(request)
+          for (const [at, { topic, partition, firstSequence, count }] of sent.batches.entries()) {
+            const key = `${topic}/${partition}`
+            const code = log.append(
+              key,
+              request.producerEpoch,
+              firstSequence,
+              count,
+              `s${firstSequence}`
+            )
+            if (code === 0) {
+              appended.push({ sent, at })
+            }
+            if (code === OUT_OF_ORDER_SEQUENCE_NUMBER) {
+              errors[key] = code
+            } else if (code === 'duplicate') {
+              errors[key] = DUPLICATE_SEQUENCE_NUMBER
+            } else if (call === 3) {
+              errors[key] = REQUEST_TIMED_OUT
             }
           }
           return respond(request, nodeId, errors)
@@ -2524,12 +2534,18 @@ describe('Producer > the idempotent drain loop', () => {
           acks: -1,
           timeout: 30000,
           compression: 0,
-          batches: [{ topic: TOPIC, partition: 0, messages: [{ value: `m${index}` }] }],
+          batches: [{ topic: TOPIC, partition: 0, messages: owned([{ value: `m${index}` }]) }],
         })
       )
 
       await expect(Promise.all(sends)).resolves.toHaveLength(10)
-      expect(log.written).toEqual(Array.from({ length: 10 }, (_, index) => `topic-a/0:m${index}`))
+      expect(log.written).toEqual(Array.from({ length: 10 }, (_, index) => `topic-a/0:s${index}`))
+      const values = await Promise.all(
+        appended.map(async ({ sent, at }) =>
+          (await sent.read())[at].records.map(({ value }) => String(value))
+        )
+      )
+      expect(values).toEqual(Array.from({ length: 10 }, (_, index) => [`m${index}`]))
     })
 
     test('a fault in a pass fails the live sends with it, and the next send starts the loop again', async () => {
@@ -2791,7 +2807,7 @@ describe('Producer > the idempotent drain loop', () => {
           acks: -1,
           timeout: 30000,
           compression: 0,
-          batches: [{ topic: TOPIC, partition: 0, messages: records(0) }],
+          batches: [{ topic: TOPIC, partition: 0, messages: owned(records(0)) }],
         })
         .catch((e) => e)
       await jest.advanceTimersByTimeAsync(1000)
@@ -2815,8 +2831,8 @@ describe('Producer > the idempotent drain loop', () => {
           timeout: 30000,
           compression: 0,
           batches: [
-            { topic: TOPIC, partition: 0, messages: records(0) },
-            { topic: TOPIC, partition: 0, messages: records(0) },
+            { topic: TOPIC, partition: 0, messages: owned(records(0)) },
+            { topic: TOPIC, partition: 0, messages: owned(records(0)) },
           ],
         })
         .catch((e) => e)
@@ -2939,7 +2955,7 @@ describe('Producer > the idempotent drain loop', () => {
             acks: -1,
             timeout: 30000,
             compression: 0,
-            batches: [{ topic: TOPIC, partition, messages: records(partition) }],
+            batches: [{ topic: TOPIC, partition, messages: owned(records(partition)) }],
           })
           .then(
             () => 'sent',

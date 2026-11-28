@@ -19,6 +19,7 @@ const { Admission } = require('../state/admission')
 const PartitionSequencer = require('../state/partitionSequencer')
 const { countersOf, quiescent, watch } = require('./fixtures/bufferHarness')
 const { RequestBudget } = require('../state/recordSize')
+const { owned, takeSent } = require('./fixtures/bufferHarness')
 const { Schedule } = require('../../../testHelpers/schedule')
 const { createScriptedCluster, producerScript } = require('../../../testHelpers/scriptedCluster')
 
@@ -865,7 +866,7 @@ describe('Producer > the parts of a refused request', () => {
     id,
     topic: TOPIC,
     partition,
-    messages: [{ value: 'x'.repeat(size) }],
+    messages: owned([{ value: 'x'.repeat(size) }]),
     acks: -1,
     timeout: 30000,
     compression: 0,
@@ -935,7 +936,7 @@ describe('Producer > the parts of a refused request', () => {
   test('a detached child keeps its immutable count for sequence retirement and cannot return a range twice', () => {
     const sequencer = new PartitionSequencer({ logger })
     const child = batch(0, 1)
-    child.messages = [{ value: 'a' }, { value: 'b' }]
+    child.messages = owned([{ value: 'a' }, { value: 'b' }])
     child.recordCount = 2
     sequencer.enqueue([child])
     sequencer.drain(0, leaders([0]), gate())
@@ -1016,7 +1017,10 @@ describe('Producer > the accumulator cuts a send into chunks', () => {
     })
     await new Promise((resolve) => setImmediate(resolve))
 
-    expect(handed.map(({ messages, wire }) => [messages.length, wire])).toEqual([
+    const taken = takeSent({ batches: handed })
+    const wires = handed.map(({ wire }) => wire)
+    const chunks = await taken.read()
+    expect(wires.map((wire, index) => [chunks[index].records.length, wire])).toEqual([
       [3, 675],
       [3, 675],
       [3, 675],
@@ -1077,7 +1081,8 @@ describe('Producer > the accumulator cuts a send into chunks', () => {
       { resolve: (v) => outside.resolved.push(v), reject: (e) => outside.rejected.push(e) },
     ]
     const [head, tail] = Accumulator.cut({ ...batch, settlers }, 1)
-    expect([head.messages.length, tail.messages.length]).toEqual([1, 3])
+    const halves = takeSent({ batches: [head, tail] })
+    expect(halves.batches.map(({ count }) => count)).toEqual([1, 3])
     head.settlers.forEach((settler) =>
       settler.resolve({ topicName: TOPIC, partition: 0, baseOffset: '10' })
     )
@@ -1094,6 +1099,7 @@ describe('Producer > the accumulator cuts a send into chunks', () => {
     tail.retire()
     tail.retire()
     batch.retire()
+    expect((await halves.read()).map(({ records }) => records.length)).toEqual([1, 3])
   })
 })
 
@@ -1176,7 +1182,7 @@ describe('Producer > retained request children at their delivery owner', () => {
     const batches = [0, 1, 2].map((partition) => ({
       topic: TOPIC,
       partition,
-      messages: [{ value: String(partition) }],
+      messages: owned([{ value: String(partition) }]),
       createdAt: partition === 1 && condition === 'expiry' ? -500 : 0,
       settlers: [{ resolve: jest.fn(), reject: jest.fn() }],
     }))
@@ -1195,7 +1201,7 @@ describe('Producer > retained request children at their delivery owner', () => {
           {
             topic: TOPIC,
             partition: 3,
-            messages: [{ value: 'unrelated' }],
+            messages: owned([{ value: 'unrelated' }]),
             createdAt: 0,
             settlers: [],
           },
@@ -1285,7 +1291,7 @@ describe('Producer > retained request children at their delivery owner', () => {
           {
             topic: TOPIC,
             partition: 0,
-            messages: [{ value: 'a' }, { value: 'b' }],
+            messages: owned([{ value: 'a' }, { value: 'b' }]),
             createdAt: 0,
             settlers: [settler],
           },
@@ -1350,7 +1356,7 @@ describe('Producer > retained request children at their delivery owner', () => {
     const batch = {
       topic: TOPIC,
       partition: 0,
-      messages: [{ value: 'a' }, { value: 'b' }],
+      messages: owned([{ value: 'a' }, { value: 'b' }]),
       createdAt: 0,
       settlers: [settler],
       detach,
@@ -1427,7 +1433,7 @@ describe('Producer > retained request children at their delivery owner', () => {
         batches: [0, 1].map((partition) => ({
           topic: TOPIC,
           partition,
-          messages: [{ value: String(partition) }],
+          messages: owned([{ value: String(partition) }]),
           createdAt: 0,
           settlers: [],
         })),
