@@ -55,7 +55,39 @@ describe('createFakeSocketFactory', () => {
     expect(state.writes).toEqual([])
   })
 
+  test('deliver completes the active data emit and drops later chunks after destroy', async () => {
+    const { factory } = createFakeSocketFactory()
+    const socket = await dial(factory)
+    const first = Buffer.from([1])
+    const later = Buffer.from([2])
+    const onData = jest.fn()
+    socket.on('data', onData)
+    socket.prependOnceListener('data', () => {
+      socket.destroy()
+      socket.removeListener('data', onData)
+    })
+
+    expect(socket.deliver(first)).toBe(false)
+    socket.on('data', onData)
+    expect(socket.deliver(later)).toBe(false)
+    expect(onData.mock.calls).toEqual([[first]])
+  })
+
   describe('destroy', () => {
+    test('runs destruction callbacks synchronously once before emitting close', async () => {
+      const { factory } = createFakeSocketFactory()
+      const socket = await dial(factory)
+      const events = []
+      socket.onDestroy(() => events.push(['destroy', socket.destroyed]))
+      socket.on('close', () => events.push(['close']))
+
+      socket.destroy()
+      socket.destroy()
+      expect(events).toEqual([['destroy', true]])
+      await microtasks()
+      expect(events).toEqual([['destroy', true], ['close']])
+    })
+
     test('marks the socket destroyed at once and emits close, once, a microtask later', async () => {
       const { factory } = createFakeSocketFactory()
       const socket = await dial(factory)
