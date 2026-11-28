@@ -1,12 +1,16 @@
+const { execFileSync } = require('node:child_process')
+const { resolve } = require('node:path')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { decode } = require('../../protocol/requests/offsetForLeaderEpoch/v4/response')
 const { readRequestHeader } = require('testHelpers')
 const {
+  FixtureTracker,
   NODE_ID,
   TOPIC,
   apiVersionsBody,
   createFakeBroker,
   createFetchGroup,
+  trackFixtures,
   decodeOffsetForLeaderEpochRequests,
   offsetForLeaderEpochRawResponse,
   offsetForLeaderEpochResponse,
@@ -57,22 +61,7 @@ const validationRequest = (partition, leaderEpoch, currentLeaderEpoch = 9) => ({
   topics: [{ topic: TOPIC, partitions: [{ partition, currentLeaderEpoch, leaderEpoch }] }],
 })
 
-const harnesses = []
-
-/**
- * `createFetchGroup`, torn down after the test whatever its outcome.
- * @param {object} [options] the harness options
- * @returns {Promise<object>} the harness
- */
-const fetchGroup = async (options) => {
-  const harness = await createFetchGroup(options)
-  harnesses.push(harness)
-  return harness
-}
-
-afterEach(async () => {
-  await Promise.all(harnesses.splice(0).map((harness) => harness.teardown()))
-})
+trackFixtures()
 
 /** @returns {Promise<void>} once every queued immediate has run */
 const nextTurn = () => new Promise(setImmediate)
@@ -687,6 +676,7 @@ describe('Test harness > fake broker close', () => {
       await nextTurn()
       await nextTurn()
 
+      expect(asked).toHaveLength(1)
       expect(socket.destroyed).toBe(true)
       expect(outcome.mock.calls).toEqual([
         [
@@ -697,6 +687,192 @@ describe('Test harness > fake broker close', () => {
     } finally {
       await close()
     }
+  })
+
+  test('a frame whose size prefix disagrees with its length closes its connection without an answer and fails the request in flight on it', async () => {
+    const asked = []
+    const { broker, state, close } = createFakeBroker((header) => {
+      if (header.apiKey === apiKeys.ApiVersions) return apiVersionsBody(18)
+      asked.push(header.correlationId)
+      return new Promise(() => {})
+    })
+    await broker.connect()
+
+    try {
+      const outcome = jest.fn()
+      broker.offsetForLeaderEpoch(validationRequest(0, 4)).then(
+        () => outcome('answered'),
+        (error) => outcome(error.name, error.message)
+      )
+      while (asked.length === 0) await nextTurn()
+      const [socket] = state.sockets
+      const malformed = Buffer.from(socket.writes[socket.writes.length - 1])
+      malformed.writeInt32BE(0, 0)
+      // The header alone still reads: only the envelope is wrong.
+      expect(readRequestHeader(malformed).correlationId).toBe(asked[0])
+
+      socket.write(malformed)
+      await nextTurn()
+      await nextTurn()
+
+      expect(asked).toHaveLength(1)
+      expect(socket.destroyed).toBe(true)
+      expect(outcome.mock.calls).toEqual([
+        [
+          'KafkaJSConnectionError',
+          'Connection error: The fake broker could not read a request frame',
+        ],
+      ])
+    } finally {
+      await close()
+    }
+  })
+
+  /**
+   * A fake broker whose OffsetForLeaderEpoch playback closes it from the callback `closeIn` names,
+   * with its splitter, iterator and data events recorded after connecting.
+   * @param {'answer'|'answerThrows'|'thenable'|'destroy'|'chunks'|'chunkIterator'|'data'} closeIn
+   * @returns {Promise<{ broker: object, socket: object, data: Buffer[], closing: () => Promise<void>,
+   *   close: () => Promise<void>, playback: string[] }>}
+   */
+  const closingFrom = async (closeIn) => {
+    let closing = null
+    const playback = []
+    const closeNow = () => {
+      closing = fake.close()
+    }
+    const fake = createFakeBroker(
+      (header) => {
+        if (header.apiKey === apiKeys.ApiVersions) return apiVersionsBody(18)
+        if (closeIn === 'answer') closeNow()
+        if (closeIn === 'destroy') fake.state.sockets[0].destroy()
+        if (closeIn === 'answerThrows') {
+          closeNow()
+          throw new Error('the answer closed the fake broker, then threw')
+        }
+        if (closeIn === 'thenable') {
+          closeNow()
+          return {
+            get then() {
+              playback.push('thenable inspected')
+              return () => playback.push('thenable called')
+            },
+          }
+        }
+        return offsetForLeaderEpochResponse([{ partition: 0 }])
+      },
+      (frame, header) => {
+        if (header.apiKey !== apiKeys.OffsetForLeaderEpoch) return [frame]
+        playback.push('split')
+        if (closeIn === 'chunks') closeNow()
+        return {
+          *[Symbol.iterator]() {
+            try {
+              playback.push('first chunk')
+              yield frame.subarray(0, 6)
+              playback.push('second chunk')
+              if (closeIn === 'chunkIterator') closeNow()
+              yield frame.subarray(6)
+            } finally {
+              playback.push('iterator cleanup')
+            }
+          },
+        }
+      }
+    )
+    await fake.broker.connect()
+    const [socket] = fake.state.sockets
+    const data = []
+    socket.on('data', (chunk) => {
+      data.push(chunk)
+      if (closeIn === 'data') closeNow()
+    })
+    return {
+      broker: fake.broker,
+      socket,
+      data,
+      closing: () => closing,
+      close: fake.close,
+      playback,
+    }
+  }
+
+  test.each([
+    ['an answer that returns a body', 'answer', 0, []],
+    ['an answer that throws', 'answerThrows', 0, []],
+    ['an answer that returns a thenable', 'thenable', 0, []],
+    ['an answer that destroys the socket', 'destroy', 0, []],
+    ['the chunks callback', 'chunks', 0, ['split']],
+    [
+      'a chunk iterator between two chunks',
+      'chunkIterator',
+      1,
+      ['split', 'first chunk', 'second chunk', 'iterator cleanup'],
+    ],
+    ['a data listener', 'data', 1, ['split', 'first chunk', 'iterator cleanup']],
+  ])(
+    'close from %s stops playback and rejects the request through shutdown',
+    async (_where, closeIn, chunksBeforeClose, expectedPlayback) => {
+      const { broker, socket, data, closing, close, playback } = await closingFrom(closeIn)
+
+      try {
+        const outcome = jest.fn()
+        await broker.offsetForLeaderEpoch(validationRequest(0, 4)).then(
+          () => outcome('answered'),
+          (error) => outcome(error.name)
+        )
+        await closing()
+
+        expect(outcome.mock.calls).toEqual([['KafkaJSConnectionClosedError']])
+        expect(data).toHaveLength(chunksBeforeClose)
+        expect(playback).toEqual(expectedPlayback)
+        expect(socket.destroyed).toBe(true)
+      } finally {
+        await close()
+      }
+    }
+  )
+
+  test('an async answer that closes and rejects leaves no unhandled rejection', () => {
+    // Observe Node's unhandled-rejection events outside the Jest worker.
+    const script = `
+      const { apiVersionsBody, createFakeBroker, TOPIC, trackFixtures } = require(process.argv[1])
+      let after
+      trackFixtures({
+        beforeEach: (hook) => hook(),
+        afterEach: (hook) => { after = hook },
+      })
+      const unhandled = []
+      process.on('unhandledRejection', (error) => unhandled.push(error.message))
+      async function main() {
+        const fake = createFakeBroker(async ({ apiKey }) => {
+          if (apiKey === ${apiKeys.ApiVersions}) return apiVersionsBody(18)
+          fake.close()
+          throw new Error('the async answer rejected')
+        })
+        await fake.broker.connect()
+        const outcome = await fake.broker.offsetForLeaderEpoch({
+          topics: [{
+            topic: TOPIC,
+            partitions: [{ partition: 0, currentLeaderEpoch: 9, leaderEpoch: 4 }],
+          }],
+        }).then(() => 'answered', (error) => error.name)
+        await fake.close()
+        await after()
+        await new Promise(setImmediate)
+        process.stdout.write(JSON.stringify({ outcome, unhandled }))
+      }
+      main().catch((error) => {
+        process.stderr.write(error.stack)
+        process.exitCode = 1
+      })
+    `
+    const report = execFileSync(
+      process.execPath,
+      ['--unhandled-rejections=throw', '-e', script, require.resolve('./fixtures/fetchHarness')],
+      { env: { NODE_PATH: resolve(__dirname, '../../..') }, encoding: 'utf8', timeout: 10000 }
+    )
+    expect(JSON.parse(report)).toEqual({ outcome: 'KafkaJSConnectionClosedError', unhandled: [] })
   })
 
   test('close aborts a connect still waiting for its socket and refuses the connect queued behind it, with the clock frozen', async () => {
@@ -779,7 +955,7 @@ describe('Test harness > fake broker close', () => {
 
 describe('Test harness > fetch group routing', () => {
   test('by default the group sees a constant leader epoch and a forget only records the call', async () => {
-    const { cluster, installRouting } = await fetchGroup({ knownNodes: [0, 1] })
+    const { cluster, installRouting } = await createFetchGroup({ knownNodes: [0, 1] })
 
     installRouting({ 0: 1 })
     expect(cluster.leaderEpoch(TOPIC, 0)).toBe(5)
@@ -789,7 +965,7 @@ describe('Test harness > fetch group routing', () => {
   })
 
   test('with liveRouting the group sees the epoch the metadata cache holds, and a forget clears it there', async () => {
-    const { cluster, installRouting, metadataCache } = await fetchGroup({
+    const { cluster, installRouting, metadataCache } = await createFetchGroup({
       knownNodes: [0, 1],
       liveRouting: true,
     })
@@ -810,7 +986,7 @@ describe('Test harness > fetch group routing', () => {
   })
 
   test('with liveRouting an accepted leader hint moves routing, validation and Fetch to the new leader', async () => {
-    const h = await fetchGroup({
+    const h = await createFetchGroup({
       knownNodes: [0, 1],
       partitionLeaders: { 0: 1 },
       liveRouting: true,
@@ -851,11 +1027,12 @@ describe('Test harness > fetch group routing', () => {
   })
 
   test('with validationBrokers each node answers on its own connection and is told which node it is', async () => {
-    const { cluster, setValidationResponse, validationRequestsTo, writesTo } = await fetchGroup({
-      partitions: [0, 1],
-      knownNodes: [0, 1],
-      validationBrokers: true,
-    })
+    const { cluster, setValidationResponse, validationRequestsTo, writesTo } =
+      await createFetchGroup({
+        partitions: [0, 1],
+        knownNodes: [0, 1],
+        validationBrokers: true,
+      })
     const asked = []
     setValidationResponse((partitions, { nodeId, partitions: rows }) => {
       asked.push({ nodeId, partitions, epochs: rows.map(({ leaderEpoch }) => leaderEpoch) })
@@ -883,7 +1060,7 @@ describe('Test harness > fetch group routing', () => {
   })
 
   test('validation requests queued together each receive the rows of their own frame', async () => {
-    const { broker, setValidationResponse, validationRequests } = await fetchGroup({
+    const { broker, setValidationResponse, validationRequests } = await createFetchGroup({
       partitions: [0, 1],
     })
     setValidationResponse((_partitions, { partitions: rows }) =>
@@ -911,7 +1088,7 @@ describe('Test harness > fetch group routing', () => {
   })
 
   test('a held broker lookup waits until released while other nodes are found', async () => {
-    const { cluster, holdBrokerLookup } = await fetchGroup({
+    const { cluster, holdBrokerLookup } = await createFetchGroup({
       knownNodes: [0, 1],
       validationBrokers: true,
     })
@@ -930,7 +1107,7 @@ describe('Test harness > fetch group routing', () => {
   })
 
   test('a lookup held twice on one node waits for both releases', async () => {
-    const { cluster, holdBrokerLookup } = await fetchGroup({
+    const { cluster, holdBrokerLookup } = await createFetchGroup({
       knownNodes: [0, 1],
       validationBrokers: true,
     })
@@ -953,7 +1130,7 @@ describe('Test harness > fetch group routing', () => {
 
 describe('Test harness > fetch group teardown', () => {
   test('teardown fails a validation request whose answer is withheld', async () => {
-    const { broker, setValidationResponse, validationRequests, teardown } = await fetchGroup()
+    const { broker, setValidationResponse, validationRequests, teardown } = await createFetchGroup()
     setValidationResponse(() => new Promise(() => {}))
 
     const outcome = broker.offsetForLeaderEpoch(validationRequest(0, 4)).then(
@@ -968,7 +1145,7 @@ describe('Test harness > fetch group teardown', () => {
   })
 
   test('teardown cancels the answer of a frame written in the same turn, so no answer runs after it', async () => {
-    const { broker, setValidationResponse, validationRequests, teardown } = await fetchGroup()
+    const { broker, setValidationResponse, validationRequests, teardown } = await createFetchGroup()
     await broker.offsetForLeaderEpoch(validationRequest(0, 4))
     const answer = jest.fn(() => new Promise(() => {}))
     setValidationResponse(answer)
@@ -989,7 +1166,7 @@ describe('Test harness > fetch group teardown', () => {
   })
 
   test('teardown ends a held broker lookup with an error', async () => {
-    const { cluster, holdBrokerLookup, teardown } = await fetchGroup({
+    const { cluster, holdBrokerLookup, teardown } = await createFetchGroup({
       knownNodes: [0, 1],
       validationBrokers: true,
     })
@@ -1004,8 +1181,31 @@ describe('Test harness > fetch group teardown', () => {
     expect(await lookup).toBe('fetch harness torn down')
   })
 
+  test('once teardown has begun a broker lookup cannot be held again, so the lookup it woke still ends', async () => {
+    const { cluster, holdBrokerLookup, teardown, socketsTo } = await createFetchGroup({
+      knownNodes: [0, 1],
+      validationBrokers: true,
+    })
+    holdBrokerLookup(1)
+    const outcome = jest.fn()
+    cluster.findBroker({ nodeId: 1 }).then(
+      () => outcome('found'),
+      (error) => outcome(error.message)
+    )
+
+    const ending = teardown()
+    expect(() => holdBrokerLookup(1)).toThrow(new Error('fetch harness torn down'))
+    await ending
+
+    expect(outcome.mock.calls).toEqual([['fetch harness torn down']])
+    expect(socketsTo(1)).toEqual([])
+  })
+
   test('teardown refuses a lookup whose node was still connecting', async () => {
-    const { cluster, teardown } = await fetchGroup({ knownNodes: [0, 1], validationBrokers: true })
+    const { cluster, teardown } = await createFetchGroup({
+      knownNodes: [0, 1],
+      validationBrokers: true,
+    })
     // Node 1's broker is created by this lookup and connects over later turns.
     const lookup = cluster.findBroker({ nodeId: 1 }).then(
       () => 'found',
@@ -1018,7 +1218,7 @@ describe('Test harness > fetch group teardown', () => {
   })
 
   test('teardown aborts a node still waiting for its socket without waiting for its handshake, with the clock frozen', async () => {
-    const { cluster, teardown, socketsTo, writesTo } = await fetchGroup({
+    const { cluster, teardown, socketsTo, writesTo } = await createFetchGroup({
       knownNodes: [0, 1],
       validationBrokers: true,
     })
@@ -1054,7 +1254,7 @@ describe('Test harness > fetch group teardown', () => {
   })
 
   test('concurrent teardown callers wait for the same cleanup, which runs once', async () => {
-    const { broker, cluster, teardown } = await fetchGroup({
+    const { broker, cluster, teardown } = await createFetchGroup({
       knownNodes: [0, 1],
       validationBrokers: true,
     })
@@ -1078,5 +1278,553 @@ describe('Test harness > fetch group teardown', () => {
     expect(disconnects).toHaveBeenCalledTimes(1)
     expect(disconnects).toHaveBeenCalledWith({ drainTimeout: 0 })
     expect(await lookup).toBe('fetch harness torn down')
+  })
+})
+
+/**
+ * A second copy of the harness with a tracker of its own, so a test can run the hooks by hand
+ * without touching the tracker of the test that is running.
+ * @returns {object} the harness module
+ */
+const isolatedHarness = () => {
+  let isolated
+  jest.isolateModules(() => {
+    isolated = require('./fixtures/fetchHarness')
+  })
+  return isolated
+}
+
+/** @returns {{ hooks: { before?: Function, after?: Function }, api: object }} hooks to pass to `trackFixtures` */
+const manualHooks = () => {
+  const hooks = {}
+  return {
+    hooks,
+    api: {
+      beforeEach: (fn) => {
+        hooks.before = fn
+      },
+      afterEach: (fn) => {
+        hooks.after = fn
+      },
+    },
+  }
+}
+
+describe('Test harness > fixture tracking', () => {
+  /**
+   * @param {() => void|Promise<void>} release
+   * @returns {{ release: () => void|Promise<void>, remains: () => string[] }} a fixture that
+   *   holds nothing once released and had no work in flight
+   */
+  const fixture = (release) => ({ release, remains: () => [] })
+
+  test('releases the fixtures last created first', async () => {
+    const order = []
+    const tracker = new FixtureTracker()
+    for (const name of ['first', 'second', 'third']) {
+      tracker.add(
+        name,
+        fixture(async () => {
+          order.push(name)
+        })
+      )
+    }
+
+    await tracker.releaseAll()
+
+    expect(order).toEqual(['third', 'second', 'first'])
+  })
+
+  test('a failing release does not stop the others, and the first failure is rethrown', async () => {
+    const order = []
+    const early = new Error('the last created fixture failed')
+    const late = new Error('the middle fixture failed')
+    const tracker = new FixtureTracker()
+    tracker.add(
+      'first',
+      fixture(async () => order.push('first'))
+    )
+    tracker.add(
+      'second',
+      fixture(async () => {
+        order.push('second')
+        throw late
+      })
+    )
+    tracker.add(
+      'third',
+      fixture(async () => {
+        order.push('third')
+        throw early
+      })
+    )
+
+    await expect(tracker.releaseAll()).rejects.toBe(early)
+
+    expect(order).toEqual(['third', 'second', 'first'])
+  })
+
+  test('a fixture still not released after its teardown fails the test, naming its creator', async () => {
+    const tracker = new FixtureTracker()
+    tracker.add('createFetchGroup', {
+      release: async () => {},
+      remains: () => ['1 live socket at node 0'],
+    })
+
+    await expect(tracker.releaseAll()).rejects.toThrow(
+      'createFetchGroup: after its teardown it still holds 1 live socket at node 0'
+    )
+  })
+
+  test('a fixture created while the others are released is released too', async () => {
+    const order = []
+    const tracker = new FixtureTracker()
+    tracker.add(
+      'creating',
+      fixture(async () => {
+        order.push('creating')
+        tracker.add(
+          'late',
+          fixture(async () => order.push('late'))
+        )
+      })
+    )
+
+    await tracker.releaseAll()
+
+    expect(order).toEqual(['creating', 'late'])
+  })
+
+  test('a fixture a release creates is released before the older ones, and every release runs when one throws', async () => {
+    const order = []
+    const early = new Error('the second fixture failed')
+    const tracker = new FixtureTracker()
+    tracker.add(
+      'first',
+      fixture(async () => {
+        order.push('first')
+        throw new Error('the first fixture failed too')
+      })
+    )
+    tracker.add(
+      'second',
+      fixture(async () => {
+        order.push('second')
+        // Built from the first fixture, so it must go before it.
+        tracker.add(
+          'third',
+          fixture(async () => order.push('third'))
+        )
+        throw early
+      })
+    )
+
+    await expect(tracker.releaseAll()).rejects.toBe(early)
+
+    expect(order).toEqual(['second', 'third', 'first'])
+  })
+
+  test('the work each fixture left is read as the test ends, before a newer release can settle it, and a fixture a release creates is read as its own release begins', async () => {
+    const order = []
+    const olderWork = ['an OffsetForLeaderEpoch request']
+    const tracker = new FixtureTracker()
+    tracker.add('older', {
+      release: async () => order.push('older'),
+      outstanding: () => {
+        order.push('read older')
+        return olderWork
+      },
+      remains: () => [],
+    })
+    tracker.add('newer', {
+      release: async () => {
+        order.push('newer')
+        // Settles the older fixture's work, as a release that answers a shared request would.
+        olderWork.length = 0
+        tracker.add('late', {
+          release: async () => order.push('late'),
+          outstanding: () => {
+            order.push('read late')
+            return []
+          },
+          remains: () => [],
+        })
+      },
+      outstanding: () => {
+        order.push('read newer')
+        return []
+      },
+      remains: () => [],
+    })
+
+    await expect(tracker.releaseAll()).rejects.toThrow(
+      new Error(
+        'older: the test ended with work in flight, which its teardown abandoned: ' +
+          'an OffsetForLeaderEpoch request'
+      )
+    )
+
+    expect(order).toEqual(['read older', 'read newer', 'newer', 'read late', 'late', 'older'])
+  })
+
+  test('a fixture registered after the release finished is refused, naming its creator', async () => {
+    const tracker = new FixtureTracker()
+    tracker.add(
+      'first',
+      fixture(async () => {})
+    )
+    await tracker.releaseAll()
+
+    expect(() =>
+      tracker.add(
+        'createFakeBroker',
+        fixture(async () => {})
+      )
+    ).toThrow("createFakeBroker() ran after its test's fixtures were torn down")
+  })
+
+  test('a test that ends with a request in flight fails at teardown, naming the creator, request, correlation id and endpoint, once the request is rejected', async () => {
+    const { hooks, api } = manualHooks()
+    const harness = isolatedHarness()
+    harness.trackFixtures(api)
+    hooks.before()
+    const asked = []
+    const { broker, state } = harness.createFakeBroker((header) => {
+      if (header.apiKey === apiKeys.ApiVersions) return apiVersionsBody(18)
+      asked.push(header.correlationId)
+      return new Promise(() => {})
+    })
+    await broker.connect()
+    const outcome = jest.fn()
+    broker.offsetForLeaderEpoch(validationRequest(0, 4)).then(
+      () => outcome('answered'),
+      (error) => outcome(error.name)
+    )
+    while (asked.length === 0) await nextTurn()
+
+    await expect(hooks.after()).rejects.toThrow(
+      'createFakeBroker: the test ended with work in flight, which its teardown abandoned: ' +
+        `OffsetForLeaderEpoch request (correlation id ${asked[0]}) at 127.0.0.1:9092`
+    )
+    await nextTurn()
+
+    expect(outcome.mock.calls).toEqual([['KafkaJSConnectionClosedError']])
+    expect(state.sockets.map(({ destroyed }) => destroyed)).toEqual([true])
+  })
+
+  test('a fetch group that ends with a validation request in flight fails at teardown, naming the node', async () => {
+    const { hooks, api } = manualHooks()
+    const harness = isolatedHarness()
+    harness.trackFixtures(api)
+    hooks.before()
+    const h = await harness.createFetchGroup()
+    h.setValidationResponse(() => new Promise(() => {}))
+    const outcome = jest.fn()
+    h.broker.offsetForLeaderEpoch(validationRequest(0, 4)).then(
+      () => outcome('answered'),
+      (error) => outcome(error.name)
+    )
+    while (h.validationRequests().length === 0) await nextTurn()
+    const [frame] = h.writes().slice(-1)
+
+    await expect(hooks.after()).rejects.toThrow(
+      'createFetchGroup: the test ended with work in flight, which its teardown abandoned: ' +
+        `OffsetForLeaderEpoch request (correlation id ${readRequestHeader(frame).correlationId}) ` +
+        'at node 0'
+    )
+    await nextTurn()
+
+    expect(outcome.mock.calls).toEqual([['KafkaJSConnectionClosedError']])
+  })
+
+  test('a fetch group whose test ends with a held broker lookup fails at teardown, naming the lookup and its node, once the lookup is rejected', async () => {
+    const { hooks, api } = manualHooks()
+    const harness = isolatedHarness()
+    harness.trackFixtures(api)
+    hooks.before()
+    const h = await harness.createFetchGroup({ knownNodes: [0, 1], validationBrokers: true })
+    h.holdBrokerLookup(1)
+    const outcome = jest.fn()
+    h.cluster.findBroker({ nodeId: 1 }).then(
+      () => outcome('found'),
+      (error) => outcome(error.message)
+    )
+
+    let seenAtRejection
+    const release = hooks.after().catch((error) => {
+      seenAtRejection = [...outcome.mock.calls]
+      throw error
+    })
+    await expect(release).rejects.toThrow(
+      new Error(
+        'createFetchGroup: the test ended with work in flight, which its teardown abandoned: ' +
+          'a broker lookup at node 1'
+      )
+    )
+    expect(seenAtRejection).toEqual([['fetch harness torn down']])
+    expect(h.socketsTo(1)).toEqual([])
+  })
+
+  test('a fake broker whose test ends right after a connect call, before any connection setup, fails at teardown naming the connect, once the connect is refused', async () => {
+    const { hooks, api } = manualHooks()
+    const harness = isolatedHarness()
+    harness.trackFixtures(api)
+    hooks.before()
+    const answer = jest.fn(() => apiVersionsBody(18))
+    const { broker, state } = harness.createFakeBroker(answer)
+    const outcome = jest.fn()
+    broker.connect().then(
+      () => outcome('connected'),
+      (error) => outcome(error.name, error.message)
+    )
+    expect(state.sockets).toEqual([])
+
+    let seenAtRejection
+    const release = hooks.after().catch((error) => {
+      seenAtRejection = [...outcome.mock.calls]
+      throw error
+    })
+    await expect(release).rejects.toThrow(
+      new Error(
+        'createFakeBroker: the test ended with work in flight, which its teardown abandoned: ' +
+          'a broker connect at 127.0.0.1:9092'
+      )
+    )
+    expect(seenAtRejection).toEqual([['KafkaJSConnectionError', 'The fake broker was closed']])
+    expect(state.sockets).toEqual([])
+    expect(answer).not.toHaveBeenCalled()
+  })
+
+  test('a dropped broker connect rejected before setup surfaces as unhandled before teardown', () => {
+    // Run outside Jest so Node can report the unhandled rejection without failing this worker.
+    const script = `
+      const { createFakeBroker, trackFixtures } = require(process.argv[1])
+      let before
+      let after
+      trackFixtures({
+        beforeEach: (hook) => { before = hook },
+        afterEach: (hook) => { after = hook },
+      })
+      before()
+      const { broker, state } = createFakeBroker(() => Buffer.alloc(0))
+      const refusal = new Error('connect refused at entry')
+      const unhandled = []
+      process.on('unhandledRejection', (error) => unhandled.push(error === refusal))
+      broker.connect({ guard: () => refusal })
+      setImmediate(async () => {
+        const report = { unhandled: [...unhandled], sockets: state.sockets.length }
+        try {
+          await after()
+          process.stdout.write(JSON.stringify(report))
+        } catch (error) {
+          process.stderr.write(error.stack)
+          process.exitCode = 1
+        }
+      })
+    `
+    const report = execFileSync(
+      process.execPath,
+      ['--unhandled-rejections=throw', '-e', script, require.resolve('./fixtures/fetchHarness')],
+      { env: { NODE_PATH: resolve(__dirname, '../../..') }, encoding: 'utf8', timeout: 10000 }
+    )
+    expect(JSON.parse(report)).toEqual({ unhandled: [true], sockets: 0 })
+  })
+
+  test('a fixture whose disconnect returns without closing its socket fails at teardown, naming what it still holds', async () => {
+    const { hooks, api } = manualHooks()
+    const harness = isolatedHarness()
+    harness.trackFixtures(api)
+    hooks.before()
+    const { broker, state } = harness.createFakeBroker((header) =>
+      header.apiKey === apiKeys.ApiVersions ? apiVersionsBody(18) : Buffer.alloc(0)
+    )
+    await broker.connect()
+    const disconnect = jest.spyOn(broker, 'disconnect').mockResolvedValue()
+
+    try {
+      await expect(hooks.after()).rejects.toThrow(
+        'createFakeBroker: after its teardown it still holds 1 live socket at 127.0.0.1:9092'
+      )
+      expect(disconnect).toHaveBeenCalledWith({ drainTimeout: 0 })
+      expect(state.sockets.map(({ destroyed }) => destroyed)).toEqual([true])
+    } finally {
+      disconnect.mockRestore()
+      await broker.disconnect({ drainTimeout: 0 })
+    }
+  })
+
+  test('with the clock frozen a no-op disconnect during ApiVersions reports both leaks and still releases every fixture', async () => {
+    const { hooks, api } = manualHooks()
+    const harness = isolatedHarness()
+    harness.trackFixtures(api)
+    hooks.before()
+    const older = harness.createFakeBroker(() => Buffer.alloc(0))
+    const releaseOlder = jest.spyOn(older.broker, 'disconnect')
+    const withheld = harness.withheldAnswer()
+    const answer = jest.fn(() => withheld.promise)
+    const { broker, state } = harness.createFakeBroker(answer)
+    freezeClock()
+    const disconnect = jest.spyOn(broker, 'disconnect').mockResolvedValue()
+
+    try {
+      const connected = jest.fn()
+      broker.connect().then(
+        () => connected('connected'),
+        (error) => connected(error.name)
+      )
+      await reactions()
+      jest.advanceTimersByTime(0)
+      await reactions()
+      jest.advanceTimersByTime(0)
+      await reactions()
+
+      const [socket] = state.sockets
+      const [frame] = socket.writes
+      const header = readRequestHeader(frame)
+      expect(header.apiKey).toBe(apiKeys.ApiVersions)
+      expect(answer).toHaveBeenCalledWith(header, frame)
+      expect(connected).not.toHaveBeenCalled()
+      expect(jest.getTimerCount()).toBeGreaterThan(0)
+
+      const outcome = jest.fn()
+      hooks.after().then(
+        () => outcome('released'),
+        (error) => outcome(error.message, [...connected.mock.calls])
+      )
+      await reactions()
+
+      const request = `ApiVersions request (correlation id ${header.correlationId}) at 127.0.0.1:9092`
+      expect(outcome).toHaveBeenCalledTimes(1)
+      const [[message, connectOutcome]] = outcome.mock.calls
+      expect(message).toContain(
+        'createFakeBroker: the test ended with work in flight, which its teardown abandoned: ' +
+          `a broker connect at 127.0.0.1:9092, ${request}`
+      )
+      expect(message).toContain(
+        `after its teardown it still holds 1 live socket at 127.0.0.1:9092, ${request}`
+      )
+      expect(connectOutcome).toEqual([['KafkaJSConnectionClosedError']])
+      expect(disconnect).toHaveBeenCalledTimes(1)
+      expect(releaseOlder).toHaveBeenCalledTimes(1)
+      expect(socket.destroyed).toBe(true)
+      expect(jest.getTimerCount()).toBe(0)
+    } finally {
+      disconnect.mockRestore()
+      releaseOlder.mockRestore()
+      jest.useRealTimers()
+    }
+  })
+
+  test("a second copy of the harness shares the running test's tracker, and refuses a second trackFixtures", async () => {
+    const harness = isolatedHarness()
+
+    const { broker } = harness.createFakeBroker((header) =>
+      header.apiKey === apiKeys.ApiVersions ? apiVersionsBody(18) : Buffer.alloc(0)
+    )
+    await broker.connect()
+
+    expect(() => harness.trackFixtures()).toThrow(
+      'trackFixtures() was called twice in one spec file'
+    )
+  })
+
+  test('trackFixtures tears down every fixture a test created when the test ends, last created first', async () => {
+    const { hooks, api } = manualHooks()
+    const harness = isolatedHarness()
+    harness.trackFixtures(api)
+    hooks.before()
+
+    const group = await harness.createFetchGroup()
+    const fake = harness.createFakeBroker((header) =>
+      header.apiKey === apiKeys.ApiVersions ? apiVersionsBody(18, false) : Buffer.alloc(0)
+    )
+    await fake.broker.connect()
+    const order = []
+    for (const [name, broker] of [
+      ['group', group.broker],
+      ['fake', fake.broker],
+    ]) {
+      const disconnect = broker.disconnect.bind(broker)
+      jest.spyOn(broker, 'disconnect').mockImplementation(async (options) => {
+        order.push(name)
+        await disconnect(options)
+      })
+    }
+    expect(fake.state.socket.destroyed).toBe(false)
+
+    await hooks.after()
+
+    expect(order).toEqual(['fake', 'group'])
+    expect(fake.state.socket.destroyed).toBe(true)
+    await expect(group.cluster.findBroker({ nodeId: 0 })).rejects.toThrow('fetch harness torn down')
+  })
+
+  test.each([
+    ['a tracker installed and no test running', false],
+    ['its tracked test already ended', true],
+  ])(
+    'createFetchGroup, createFakeBroker and createFakeCoordinator throw naming themselves with %s',
+    async (_label, ended) => {
+      const harness = isolatedHarness()
+      const { hooks, api } = manualHooks()
+      harness.trackFixtures(api)
+      if (ended) {
+        hooks.before()
+        await hooks.after()
+      }
+      const answer = () => Buffer.alloc(0)
+
+      await expect(harness.createFetchGroup()).rejects.toThrow(
+        'createFetchGroup() ran outside a tracked test'
+      )
+      expect(() => harness.createFakeBroker(answer)).toThrow(
+        'createFakeBroker() ran outside a tracked test'
+      )
+      await expect(harness.createFakeCoordinator(answer)).rejects.toThrow(
+        'createFakeCoordinator() ran outside a tracked test'
+      )
+    }
+  )
+
+  test('trackFixtures called twice in one spec file throws', () => {
+    const harness = isolatedHarness()
+    const { api } = manualHooks()
+    harness.trackFixtures(api)
+
+    expect(() => harness.trackFixtures(api)).toThrow(
+      'trackFixtures() was called twice in one spec file'
+    )
+  })
+
+  test('createFakeCoordinator hands back the close of its fake broker, which stops it answering, and the test end tears it down', async () => {
+    const { hooks, api } = manualHooks()
+    const harness = isolatedHarness()
+    harness.trackFixtures(api)
+    hooks.before()
+    const asked = []
+    const { state, close } = await harness.createFakeCoordinator((header) => {
+      asked.push(header.apiKey)
+      return new Promise(() => {})
+    })
+    // The ApiVersions frame the connect wrote, relabelled as a Heartbeat so the coordinator
+    // hands it to this answer.
+    const [connectFrame] = state.writes.slice(-1)
+    const heartbeat = Buffer.from(connectFrame)
+    heartbeat.writeInt16BE(apiKeys.Heartbeat, 4)
+
+    state.socket.write(heartbeat)
+    await nextTurn()
+    expect(asked).toEqual([apiKeys.Heartbeat])
+
+    const socket = state.socket
+    await close()
+    socket.write(heartbeat)
+    await nextTurn()
+    await nextTurn()
+    expect(asked).toEqual([apiKeys.Heartbeat])
+    expect(socket.destroyed).toBe(true)
+
+    await hooks.after()
+    expect(state.sockets).toEqual([socket])
   })
 })

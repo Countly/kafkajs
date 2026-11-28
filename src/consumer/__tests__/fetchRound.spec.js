@@ -6,6 +6,7 @@ const {
   createFetchGroup,
   prepareRecordBatches,
   fetchResponse,
+  trackFixtures,
 } = require('./fixtures/fetchHarness')
 const { mulberry32 } = require('../../../testHelpers/fuzz')
 const ConsumerGroup = require('../consumerGroup')
@@ -32,11 +33,11 @@ const TWO_RECORDS = Buffer.from(
 
 let harness
 let CORRUPTED_RECORD_BATCH
+trackFixtures()
 beforeAll(async () => {
   ;({ CORRUPTED_RECORD_BATCH } = await prepareRecordBatches())
 })
-afterEach(async () => {
-  if (harness) await harness.broker.disconnect()
+afterEach(() => {
   harness = null
 })
 
@@ -183,22 +184,16 @@ describe('decoder limits of concurrent consumers', () => {
    */
   const fetchAll = async (settings, records, version = 18) => {
     const consumers = []
-    try {
-      for (const options of settings) {
-        consumers.push(await createFetchGroup({ fetchMaxVersion: version, ...options }))
-      }
-      for (const consumer of consumers) {
-        consumer.setResponse(
-          fetchResponse([{ partition: 0, errorCode: 0, records }], { apiVersion: version })
-        )
-      }
-      const batches = await Promise.all(consumers.map(({ group }) => group.fetch(NODE_ID)))
-      return { batches, consumers }
-    } finally {
-      harness = {
-        broker: { disconnect: () => Promise.all(consumers.map((c) => c.broker.disconnect())) },
-      }
+    for (const options of settings) {
+      consumers.push(await createFetchGroup({ fetchMaxVersion: version, ...options }))
     }
+    for (const consumer of consumers) {
+      consumer.setResponse(
+        fetchResponse([{ partition: 0, errorCode: 0, records }], { apiVersion: version })
+      )
+    }
+    const batches = await Promise.all(consumers.map(({ group }) => group.fetch(NODE_ID)))
+    return { batches, consumers }
   }
 
   it.each([
@@ -656,11 +651,6 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
 })
 
 describe('Consumer > ConsumerGroup > fetch round over the wire', () => {
-  afterEach(async () => {
-    for (const rig of rigs.splice(0)) await rig.broker.disconnect()
-  })
-  const rigs = []
-
   /**
    * Runs one round over generated leaders and pauses; the answer lists the requested partitions
    * in reverse order.
@@ -678,7 +668,6 @@ describe('Consumer > ConsumerGroup > fetch round over the wire', () => {
       partitions.map((p) => [p, p === 0 || random() < 0.6 ? NODE_ID : 1 + Math.floor(random() * 2)])
     )
     const rig = await createFetchGroup({ partitions, partitionLeaders, knownNodes: [0, 1, 2] })
-    rigs.push(rig)
     if (oracle) {
       rig.group.findReadReplicaForPartitions = oracleReadReplicas
       // No routing changes here: each partition of the round stands validated against the cached
@@ -725,7 +714,6 @@ describe('Consumer > ConsumerGroup > fetch round over the wire', () => {
   it('looks up each answered partition in its request once', async () => {
     const partitions = Array.from({ length: 300 }, (_, i) => i)
     const rig = await createFetchGroup({ partitions })
-    rigs.push(rig)
     const reads = { count: 0 }
     const build = rig.group.buildFetchRequests.bind(rig.group)
     rig.group.buildFetchRequests = (parts) =>

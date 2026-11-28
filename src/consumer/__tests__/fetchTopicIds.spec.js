@@ -8,7 +8,14 @@ const { KafkaJSNonRetriableError } = require('../../errors')
 const { newLogger, readRequestHeader } = require('testHelpers')
 // The wire decoder and the fake broker are shared with the other fetch specs: two copies of a
 // hand-written request decoder would drift the first time the request layout changes.
-const { apiVersionsBody, decodeFetchRequest, createFakeBroker } = require('./fixtures/fetchHarness')
+const {
+  apiVersionsBody,
+  decodeFetchRequest,
+  createFakeBroker,
+  trackFixtures,
+} = require('./fixtures/fetchHarness')
+
+trackFixtures()
 
 const TOPIC = 'test-topic'
 const OTHER_TOPIC = 'other-topic'

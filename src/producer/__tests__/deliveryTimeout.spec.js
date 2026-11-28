@@ -24,7 +24,8 @@ describe('Producer > deliveryTimeout', () => {
 
   beforeEach(() => {
     // Delivery deadlines read Date.now(); CPU load must not spend the test's retry budget.
-    jest.useFakeTimers({ now: 0, doNotFake: ['nextTick', 'setImmediate'] })
+    // The default linger of 0 hands a batch on through queueMicrotask, which must stay real.
+    jest.useFakeTimers({ now: 0, doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
   })
 
   afterEach(async () => {
@@ -45,11 +46,11 @@ describe('Producer > deliveryTimeout', () => {
       new Kafka({ brokers: ['localhost:9092'], logLevel: LEVELS.NOTHING, ...options })
 
     test.each([
-      ['the default requestTimeout and linger', {}, {}, 30005],
-      ['requestTimeout: 1000', { requestTimeout: 1000 }, {}, 1005],
+      ['the default requestTimeout and linger', {}, {}, 30000],
+      ['requestTimeout: 1000', { requestTimeout: 1000 }, {}, 1000],
       ['linger: 20', { requestTimeout: 1000 }, { linger: 20 }, 1020],
       ['linger: 0', { requestTimeout: 1000 }, { linger: 0 }, 1000],
-      ['batchSize alone', { requestTimeout: 1000 }, { batchSize: 1 }, 1005],
+      ['batchSize alone', { requestTimeout: 1000 }, { batchSize: 1 }, 1000],
     ])('with %s it must be at least linger + requestTimeout', (_, client, producer, floor) => {
       const kafka = createKafka(client)
       const create = (deliveryTimeout) => kafka.producer({ ...producer, deliveryTimeout })

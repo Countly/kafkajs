@@ -1,5 +1,7 @@
 const SubscriptionState = require('../subscriptionState')
-const { createFetchGroup, TOPIC } = require('./fixtures/fetchHarness')
+const { createFetchGroup, trackFixtures, TOPIC } = require('./fixtures/fetchHarness')
+
+trackFixtures()
 
 describe('pause subscription lifetime', () => {
   it('keeps pauseAll and resumed exceptions across revoke and reassign', () => {
@@ -56,9 +58,6 @@ const fetched = async (group) => {
 
 describe('pause across a rebalance on the real apply paths', () => {
   let h
-  afterEach(async () => {
-    if (h) await h.broker.disconnect()
-  })
 
   /** Applies an assignment of `partitions` of TOPIC and primes their committed offsets. */
   const apply = async (partitions, options) => {

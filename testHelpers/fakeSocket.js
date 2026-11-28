@@ -69,6 +69,7 @@ const createFakeSocketFactory = ({ bounded = null } = {}) => {
       throw error
     }
     const socket = new EventEmitter()
+    const destroyCallbacks = new Set()
     let connecting = null
     socket.endpoint = { host, port }
     socket.destroyed = false
@@ -88,6 +89,24 @@ const createFakeSocketFactory = ({ bounded = null } = {}) => {
     }
     socket.end = () => {}
     socket.unref = () => {}
+    /**
+     * Emits a single data chunk on a live socket.
+     * @param {Buffer} chunk
+     * @returns {boolean} whether the socket is still live after dispatch
+     */
+    socket.deliver = (chunk) => {
+      if (socket.destroyed) return false
+      socket.emit('data', chunk)
+      return !socket.destroyed
+    }
+    /**
+     * Registers synchronous cleanup for a live socket.
+     * @param {() => void} callback
+     * @returns {void}
+     */
+    socket.onDestroy = (callback) => {
+      if (!socket.destroyed) destroyCallbacks.add(callback)
+    }
     socket.destroy = (error) => {
       if (!socket.destroyed) {
         socket.destroyed = true
@@ -95,6 +114,8 @@ const createFakeSocketFactory = ({ bounded = null } = {}) => {
           clearImmediate(connecting)
           connecting = null
         }
+        for (const callback of destroyCallbacks) callback()
+        destroyCallbacks.clear()
         queueMicrotask(() => {
           if (error) {
             socket.emit('error', error)
@@ -142,21 +163,34 @@ const socketCounts = ({ sockets, issued, closed, bounded }) =>
 /**
  * Frames a response the way a broker does: size, correlation id, optional header tag buffer,
  * then the body.
- * @param {{ socket: EventEmitter }} state
  * @param {number} correlationId
  * @param {0|1} headerVersion 0 = classic, 1 = flexible (ApiVersions is always 0)
  * @param {Buffer} body
  * @param {{ tag: number, value: Buffer }[]} [headerTags] tagged fields to put in a flexible
  *        response header; omit for the empty section every real broker sends today
+ * @returns {Buffer} the complete response frame
  */
-const respondWithFrame = (state, correlationId, headerVersion, body, headerTags) => {
+const encodeResponseFrame = (correlationId, headerVersion, body, headerTags) => {
   const header = new Encoder().writeInt32(correlationId)
   if (headerVersion === 1) {
     header.writeTaggedFields(headerTags)
   }
 
   const framed = new Encoder().writeEncoder(header).writeBuffer(body)
-  state.socket.emit('data', new Encoder().writeInt32(framed.size()).writeEncoder(framed).buffer)
+  return new Encoder().writeInt32(framed.size()).writeEncoder(framed).buffer
+}
+
+/**
+ * Emits a complete broker response frame.
+ * @param {{ socket: EventEmitter }} state
+ * @param {number} correlationId
+ * @param {0|1} headerVersion
+ * @param {Buffer} body
+ * @param {{ tag: number, value: Buffer }[]} [headerTags]
+ * @returns {void}
+ */
+const respondWithFrame = (state, correlationId, headerVersion, body, headerTags) => {
+  state.socket.emit('data', encodeResponseFrame(correlationId, headerVersion, body, headerTags))
 }
 
 /**
@@ -186,4 +220,10 @@ const readRequestHeader = (frame) => {
   return { apiKey, apiVersion, correlationId, clientId, byteLength: decoder.offset }
 }
 
-module.exports = { createFakeSocketFactory, socketCounts, respondWithFrame, readRequestHeader }
+module.exports = {
+  createFakeSocketFactory,
+  socketCounts,
+  encodeResponseFrame,
+  respondWithFrame,
+  readRequestHeader,
+}

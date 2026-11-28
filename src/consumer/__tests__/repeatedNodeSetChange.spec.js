@@ -1,5 +1,8 @@
 const { ROUND_ALLOWANCE_MS } = require('./fixtures/fetchRoutingOracle')
 const { RoutingSeam, EPOCH, WAKE_MS } = require('./fixtures/routingSeam')
+const { trackFixtures } = require('./fixtures/fetchHarness')
+
+trackFixtures()
 
 /** The leader the moved partition starts with, the node that is lost. */
 const OLD = 3

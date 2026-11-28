@@ -13,7 +13,10 @@ const {
   buildRecordBatch,
   decodeFetchRequest,
   createFakeBroker,
+  trackFixtures,
 } = require('./fixtures/fetchHarness')
+
+trackFixtures()
 
 const TOPIC = 'test-topic'
 const OTHER_TOPIC = 'other-topic'
@@ -21,14 +24,12 @@ const TOPIC_ID = '01020304-0506-0708-090a-0b0c0d0e0f10'
 const OTHER_TOPIC_ID = '11121314-1516-1718-191a-1b1c1d1e1f20'
 const NODE_ID = 0
 
-const brokers = []
 let RECORDS
 beforeAll(async () => {
   RECORDS = await buildRecordBatch()
 })
-afterEach(async () => {
+afterEach(() => {
   shuffle.mockClear()
-  await Promise.all(brokers.splice(0).map((broker) => broker.disconnect()))
 })
 
 /**
@@ -96,7 +97,6 @@ const createGroup = async ({
       : respond(header)
   )
   await broker.connect()
-  brokers.push(broker)
 
   const topicIds = { [TOPIC]: TOPIC_ID, [OTHER_TOPIC]: OTHER_TOPIC_ID }
   const cluster = {
@@ -403,7 +403,6 @@ describe('Broker > a full Fetch request answered for one partition', () => {
       header.apiKey === apiKeys.ApiVersions ? apiVersionsBody(version, false) : body
     )
     await broker.connect()
-    brokers.push(broker)
     return broker
   }
 

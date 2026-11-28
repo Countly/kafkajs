@@ -19,8 +19,10 @@ const {
   scriptedEpochLog,
   withheldAnswer,
   createFetchGroup,
+  trackFixtures,
 } = require('./fixtures/fetchHarness')
 
+trackFixtures()
 beforeAll(prepareRecordBatches)
 
 /**
