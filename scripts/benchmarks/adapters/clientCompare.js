@@ -86,9 +86,9 @@ const plannedSeconds = ({ command, arms, profile, diagnostic }, runs = RUNS) => 
 /**
  * @param {object} output one run's JSON line
  * @param {string} workload the row's `--workload`
- * @returns {string[]} what the arm ran with: producer or consumer settings, LZ4 or gzip codec, the
- *   workload's shape (records per send, unawaited sends, keys, headers, partitioner, value type),
- *   Fetch version, passes and corpus layout
+ * @returns {string[]} what the arm ran with: producer or consumer settings and the overrides it
+ *   applied or ignored, LZ4 or gzip codec, the workload's shape (records per send, unawaited
+ *   sends, keys, headers, partitioner, value type), Fetch version, passes and corpus layout
  */
 const notesOf = (output, workload) => {
   const pairs = (settings) =>
@@ -106,6 +106,16 @@ const notesOf = (output, workload) => {
     const custom = output.shape?.partitioner === 'custom'
     notes.push(
       `${client} settings in force (this package's defaults${custom ? ', except the partitioner, which is the custom one' : ''}): ${defaults ? pairs(defaults) : 'unknown package'}`
+    )
+  }
+  if (output.settings?.overrides) {
+    notes.push(
+      `${client} overrides in force on this arm only, each replacing the default of the same name: ${pairs(output.settings.overrides)}`
+    )
+  }
+  if (output.settings?.ignoredOverrides) {
+    notes.push(
+      `this arm ran with its own defaults: the row's fork-only overrides (${pairs(output.settings.ignoredOverrides)}) do not apply to it`
     )
   }
   if (output.codec) {

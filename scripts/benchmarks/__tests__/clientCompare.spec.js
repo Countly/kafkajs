@@ -65,7 +65,9 @@ const legacyPartitioner = () => () => 0
  * consumer's handler, which gets each record in send order from its partition, with offsets counted
  * per partition, and a sought partition's records again from the sought offset.
  * `threadCpu: false` stands for a Node without `process.threadCpuUsage`; `state.gc` records when the
- * full-GC count started, stopped, counted and closed, in callbacks.
+ * full-GC count started, stopped, counted and closed, in callbacks. Each send tells the listeners
+ * of the producer's request event, as a real producer does before its send resolves, of one
+ * Metadata request and of `requestsPerSend(n)` Produce requests, `n` counting the sends from 0.
  */
 const fakeKafka = ({
   failSend = false,
@@ -77,6 +79,7 @@ const fakeKafka = ({
   metadata = [],
   offsets,
   threadCpu = true,
+  requestsPerSend = () => 1,
 } = {}) => {
   const state = {
     topics: new Map(),
@@ -98,6 +101,7 @@ const fakeKafka = ({
     seeks: [],
     compressions: [],
     listeners: [],
+    producerListeners: [],
     delay: { enabledAt: [], disabledAt: [] },
     gc: { startedAt: [], stoppedAt: [], countedAt: [], closedAt: [] },
     allGcs: { started: 0, stopped: 0, resulted: 0, closed: 0 },
@@ -240,12 +244,23 @@ const fakeKafka = ({
     producer(config) {
       state.producerConfigs.push(config)
       return {
+        events: { REQUEST: 'producer.network.request' },
+        on: (event, listener) => {
+          if (event === 'producer.network.request') state.producerListeners.push(listener)
+          return () => {}
+        },
         connect: () => connect('producer'),
         send: async ({ topic, messages, compression }) => {
           if (failSend || state.sends.length === failAfter) throw new Error('send failed')
           const durationMs = sendMs ?? (state.sends.length === 0 ? 1000 : state.sends.length)
           state.compressions.push(compression)
           elapsedNs += BigInt(durationMs) * 1000000n
+          for (const listener of state.producerListeners) {
+            listener({ payload: { apiName: 'Metadata' } })
+            for (let i = 0; i < requestsPerSend(state.sends.length); i++) {
+              listener({ payload: { apiName: 'Produce' } })
+            }
+          }
           state.sends.push(messages.length)
           state.topics.get(topic).push(...messages)
         },
@@ -641,6 +656,54 @@ describe('Benchmarks > clientCompare', () => {
         ['--workload', 'consume-throughput', '--probe', 'on'],
         ['--workload', 'produce-throughput', '--probe', 'off'],
         ['--workload', 'produce-throughput', '--probe'],
+      ]) {
+        expect(() => parse(...bad)).toThrow(/usage/)
+      }
+    })
+
+    test('parseArgs reads --fork-linger as a non-negative integer and --fork-idempotent as true or false on produce-throughput, and leaves them absent otherwise', () => {
+      const parse = (...extra) =>
+        parseArgs([
+          '--client',
+          '/c',
+          '--package',
+          'kafkajs',
+          '--workload',
+          'produce-throughput',
+          ...extra,
+        ])
+
+      expect(parse('--fork-linger', '0')).toMatchObject({ forkLinger: 0 })
+      expect(parse('--fork-linger', '25')).toMatchObject({ forkLinger: 25 })
+      expect(parse('--fork-idempotent', 'false')).toMatchObject({ forkIdempotent: false })
+      expect(parse('--fork-idempotent', 'true')).toMatchObject({ forkIdempotent: true })
+      expect(parse('--fork-linger', '0', '--fork-idempotent', 'false')).toMatchObject({
+        forkLinger: 0,
+        forkIdempotent: false,
+      })
+      const plain = parse()
+      for (const key of ['forkLinger', 'forkIdempotent']) {
+        expect([key, plain[key]]).toEqual([key, undefined])
+      }
+    })
+
+    test('parseArgs refuses --fork-linger and --fork-idempotent outside produce-throughput, with --settings same, and with a value that is not a non-negative integer or true or false', () => {
+      const parse = (...extra) => parseArgs(['--client', '/c', '--package', 'kafkajs', ...extra])
+
+      for (const bad of [
+        ['--workload', 'produce-latency', '--fork-linger', '0'],
+        ['--workload', 'consume-throughput', '--fork-linger', '0'],
+        ['--workload', 'produce-latency', '--fork-idempotent', 'false'],
+        ['--workload', 'consume-throughput', '--fork-idempotent', 'false'],
+        ['--workload', 'produce-throughput', '--settings', 'same', '--fork-linger', '0'],
+        ['--workload', 'produce-throughput', '--settings', 'same', '--fork-idempotent', 'false'],
+        ['--workload', 'produce-throughput', '--fork-linger', '-1'],
+        ['--workload', 'produce-throughput', '--fork-linger', '1.5'],
+        ['--workload', 'produce-throughput', '--fork-linger', ''],
+        ['--workload', 'produce-throughput', '--fork-linger', 'x'],
+        ['--workload', 'produce-throughput', '--fork-idempotent', 'no'],
+        ['--workload', 'produce-throughput', '--fork-idempotent', '0'],
+        ['--workload', 'produce-throughput', '--fork-linger', '0', '--fork-linger', '1'],
       ]) {
         expect(() => parse(...bad)).toThrow(/usage/)
       }
@@ -1104,6 +1167,138 @@ describe('Benchmarks > clientCompare', () => {
         [10, 11, 0, 1, 2],
       ])
       expect(windowOf(few)).toEqual(windowOf(many))
+    })
+
+    test('--fork-linger and --fork-idempotent set the producer options of the fork only, and a package that is not the fork ignores them and reports that it did', async () => {
+      const asFork = () => {
+        const kafka = fakeKafka()
+        kafka.client.name = '@countly/kafkajs'
+        return kafka
+      }
+      const asBaseline = () => {
+        const kafka = fakeKafka()
+        kafka.client.name = 'kafkajs'
+        return kafka
+      }
+      const flags = { messages: 5, forkLinger: 5, forkIdempotent: false }
+
+      const fork = await runWith('produce-throughput', flags, asFork())
+      const baseline = await runWith('produce-throughput', flags, asBaseline())
+
+      expect(PRODUCER_DEFAULTS['@countly/kafkajs'].linger).toBe(0)
+      expect(fork.state.producerConfigs).toEqual([{ linger: 5, idempotent: false }])
+      expect(fork.metrics.settings).toEqual({
+        defaults: PRODUCER_DEFAULTS['@countly/kafkajs'],
+        overrides: { linger: 5, idempotent: false },
+      })
+      expect(baseline.state.producerConfigs).toEqual([{}])
+      expect(baseline.metrics.settings).toEqual({
+        defaults: PRODUCER_DEFAULTS.kafkajs,
+        ignoredOverrides: { linger: 5, idempotent: false },
+      })
+    })
+
+    test('--fork-linger alone leaves idempotence and every other producer option at its default, and --fork-idempotent alone leaves the linger', async () => {
+      const fork = () => {
+        const kafka = fakeKafka()
+        kafka.client.name = '@countly/kafkajs'
+        return kafka
+      }
+
+      const linger = await runWith('produce-throughput', { messages: 5, forkLinger: 5 }, fork())
+      const plain = await runWith(
+        'produce-throughput',
+        { messages: 5, forkIdempotent: false },
+        fork()
+      )
+      const custom = await runWith(
+        'produce-throughput',
+        { messages: 5, forkLinger: 5, partitioner: 'custom' },
+        fork()
+      )
+
+      expect(linger.state.producerConfigs).toEqual([{ linger: 5 }])
+      expect(linger.metrics.settings.overrides).toEqual({ linger: 5 })
+      expect(plain.state.producerConfigs).toEqual([{ idempotent: false }])
+      expect(plain.metrics.settings.overrides).toEqual({ idempotent: false })
+      expect(custom.state.producerConfigs).toEqual([
+        { createPartitioner: expect.any(Function), linger: 5 },
+      ])
+    })
+
+    test('a run without --fork-linger or --fork-idempotent reports no overrides on either package and leaves the producer options as they were', async () => {
+      const fork = fakeKafka()
+      fork.client.name = '@countly/kafkajs'
+      const baseline = fakeKafka()
+      baseline.client.name = 'kafkajs'
+
+      const forked = await runWith('produce-throughput', { messages: 5 }, fork)
+      const old = await runWith('produce-throughput', { messages: 5 }, baseline)
+
+      expect(forked.state.producerConfigs).toEqual([{}])
+      expect(old.state.producerConfigs).toEqual([{}])
+      expect(forked.metrics.settings).toEqual({ defaults: PRODUCER_DEFAULTS['@countly/kafkajs'] })
+      expect(old.metrics.settings).toEqual({ defaults: PRODUCER_DEFAULTS.kafkajs })
+    })
+
+    test('produce-throughput with --probe on reports the Produce requests each round completed, as a median and a maximum, counting no request outside a round of the window', async () => {
+      // Sends 0 (the first), 1, 2 and 3 take 1, 2, 4 and 3 Produce requests; only 1 to 3 are rounds
+      // of the window.
+      const requests = [1, 2, 4, 3]
+      const kafka = fakeKafka({ requestsPerSend: (n) => requests[n] })
+
+      const { metrics, state } = await runWith(
+        'produce-throughput',
+        { messages: 1500, durationMs: null, probe: 'on' },
+        kafka
+      )
+
+      expect(state.sends).toEqual([1, 500, 500, 500])
+      expect(metrics.produceRequestsPerRoundP50).toBe(3)
+      expect(metrics.produceRequestsPerRoundMax).toBe(4)
+    })
+
+    test('the rounds of the warm-up and the Metadata requests of every send do not reach the Produce request figures', async () => {
+      // 50 warm-up sends of 100 ms, then the window; a warm-up send takes 7 requests and a send of
+      // the window 1.
+      const kafka = fakeKafka({ sendMs: 100, requestsPerSend: (n) => (n <= 50 ? 7 : 1) })
+
+      const { metrics } = await runWith(
+        'produce-throughput',
+        { messages: null, durationMs: 30000, probe: 'on' },
+        kafka
+      )
+
+      expect(metrics.produceRequestsPerRoundP50).toBe(1)
+      expect(metrics.produceRequestsPerRoundMax).toBe(1)
+    })
+
+    test('with --unawaited a round is every send issued together, so its requests are the sum over those sends', async () => {
+      const kafka = fakeKafka({ requestsPerSend: (n) => (n === 0 ? 9 : 1) })
+
+      const { metrics, state } = await runWith(
+        'produce-throughput',
+        { messages: 8, durationMs: null, unawaited: 4, probe: 'on' },
+        kafka
+      )
+
+      expect(state.sends).toEqual(Array(9).fill(1))
+      expect(metrics.produceRequestsPerRoundP50).toBe(4)
+      expect(metrics.produceRequestsPerRoundMax).toBe(4)
+    })
+
+    test('a run listens for the producer request event only with --probe on, and reports no request count without it', async () => {
+      const plain = await runWith('produce-throughput', { messages: 1000 })
+      const probed = await runWith('produce-throughput', { messages: 1000, probe: 'on' })
+
+      expect(plain.state.producerListeners).toEqual([])
+      expect(Object.keys(plain.metrics).filter((key) => key.startsWith('produceRequests'))).toEqual(
+        []
+      )
+      expect(probed.state.producerListeners).toHaveLength(1)
+      expect(
+        Object.keys(probed.metrics).filter((key) => key.startsWith('produceRequests'))
+      ).toEqual(['produceRequestsPerRoundP50', 'produceRequestsPerRoundMax'])
     })
 
     test('produce-throughput with --probe on reports the send-call time, peak memory and collections of the measured window only', async () => {
