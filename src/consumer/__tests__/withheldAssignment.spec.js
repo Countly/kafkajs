@@ -27,6 +27,7 @@ const {
   createFetchGroup,
   fetchResponse,
   prepareRecordBatches,
+  trackFixtures,
 } = require('./fixtures/fetchHarness')
 const { createPatternGroup } = require('./fixtures/patternGroup')
 const { CloseRig, batchAt } = require('./fixtures/closeRig')
@@ -186,12 +187,13 @@ const trackRegistrations = (fence) => {
 
 let h
 beforeAll(() => prepareRecordBatches())
-afterEach(async () => {
+afterEach(() => {
   jest.clearAllTimers()
   jest.useRealTimers()
-  if (h) await h.broker.disconnect()
   h = null
 })
+// After the hook that restores real timers, so a teardown never runs under fake ones.
+trackFixtures()
 
 describe('assignment ownership states', () => {
   test('a withhold keeps the current token and refuses it as assignment-refused with the refusal as cause', () => {
