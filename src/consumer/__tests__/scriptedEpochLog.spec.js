@@ -788,7 +788,14 @@ describe('Test harness > fake broker close', () => {
       data.push(chunk)
       if (closeIn === 'data') closeNow()
     })
-    return { broker: fake.broker, socket, data, closing: () => closing, close: fake.close, playback }
+    return {
+      broker: fake.broker,
+      socket,
+      data,
+      closing: () => closing,
+      close: fake.close,
+      playback,
+    }
   }
 
   test.each([
