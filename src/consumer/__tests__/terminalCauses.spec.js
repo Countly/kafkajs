@@ -1,4 +1,5 @@
 const ConsumerGroup = require('../consumerGroup')
+const { MemberAssignment } = require('../assignerProtocol')
 const { KafkaJSError, KafkaJSTopicRecreatedError } = require('../../errors')
 const {
   advanceUntil,
@@ -193,6 +194,570 @@ const closeClean = async (run) => {
   expect(jest.getTimerCount()).toBe(0)
   forget()
 }
+
+/**
+ * Starts the same scripted assignment through either handler API and any supported group path.
+ * @param {string} protocol the group path
+ * @param {string} handler the handler API
+ * @param {Function} handle receives the payload, partition and first offset
+ * @param {object} [options] assignment, records, retry options and fixture preparation
+ * @returns {Promise<object>} the running consumer and its scripted broker
+ */
+const startRetryRun = (protocol, handler, handle, options = {}) => {
+  const { retry: overrides, ...rest } = options
+  const retry = { ...RETRY, retries: 1, restartOnFailure: async () => false, ...overrides }
+  const handlers = {
+    [handler]: (payload) =>
+      handler === 'eachMessage'
+        ? handle(payload, payload.partition, payload.message.offset)
+        : handle(payload, payload.batch.partition, payload.batch.firstOffset()),
+  }
+  if (protocol === 'consumer') return start({ ...rest, retry, ...handlers })
+  return startClassic('classic', {
+    ...rest,
+    ...handlers,
+    config: {
+      retry,
+      maxPollInterval: 4000,
+      heartbeatInterval: 500,
+      ...(protocol === 'cooperative' && {
+        partitionAssigners: [
+          () => ({
+            name: 'eager',
+            version: 0,
+            supportedProtocols: () => ['cooperative'],
+            protocol: () => ({ name: 'eager', metadata: Buffer.alloc(0) }),
+            assign: async () => [],
+          }),
+        ],
+      }),
+    },
+  })
+}
+
+/** Routes two partitions to different scripted brokers without changing the Fetch response API. */
+const splitBrokers = async ({ cluster }) => {
+  const broker = await cluster.findBroker(0)
+  const other = { fetch: jest.fn(broker.fetch.getMockImplementation()) }
+  cluster.getNodeIds = () => [0, 1]
+  cluster.findTopicPartitionMetadata = () => [
+    { partitionId: 0, leader: 0 },
+    { partitionId: 1, leader: 1 },
+  ]
+  cluster.findBroker.mockImplementation(async (nodeId) => (nodeId === 1 ? other : broker))
+}
+
+describe.each(['eager', 'cooperative', 'consumer'])(
+  'Consumer > handler retries with %s',
+  (protocol) => {
+    it.each(['eachMessage', 'eachBatch'])(
+      '%s exhausts one retry across two poll expiries',
+      async (handler) => {
+        const deliveries = []
+        const order = []
+        const error = failure(true)
+        const run = await startRetryRun(protocol, handler, async () => {
+          const held = deferred()
+          deliveries.push(held)
+          order.push('delivery')
+          await held.promise
+          throw error
+        })
+        const expiries = []
+        run.consumer.on(run.consumer.events.POLL_INTERVAL_EXCEEDED, () => expiries.push(Date.now()))
+        run.consumer.on(run.consumer.events.GROUP_JOIN, () => order.push('join'))
+        run.consumer.on(run.consumer.events.CRASH, () => order.push('crash'))
+
+        try {
+          for (let attempt = 0; attempt < 2; attempt++) {
+            await advanceUntil(() => expiries.length > attempt, 6000)
+            expect(deliveries).toHaveLength(attempt + 1)
+            await jest.advanceTimersByTimeAsync(50)
+            deliveries[attempt].resolve()
+          }
+          await advanceUntil(() => run.crashes.length > 0)
+          expect(order).toEqual(['delivery', 'join', 'delivery', 'join', 'crash'])
+          expect(run.crashes[0].error).toMatchObject({
+            name: 'KafkaJSNumberOfRetriesExceeded',
+            retryCount: 1,
+            cause: error,
+          })
+          expect(run.runner.partitionRetries.size).toBe(0)
+        } finally {
+          for (const held of deliveries) held.resolve()
+        }
+      },
+      30000
+    )
+
+    it.each(['eachMessage', 'eachBatch'])(
+      '%s charges every partition in an outage and never shortens the backoff',
+      async (handler) => {
+        const times = [[], []]
+        const gates = [deferred(), deferred(), deferred()]
+        const run = await startRetryRun(
+          protocol,
+          handler,
+          async (_payload, partition) => {
+            const attempt = times[partition].length
+            times[partition].push(Date.now())
+            await gates[attempt]?.promise
+            throw failure(true)
+          },
+          {
+            partitions: [0, 1],
+            records: { 'topic-a|0': [40], 'topic-a|1': [40] },
+            retry: { retries: 2, multiplier: 0.5 },
+            run: { partitionsConsumedConcurrently: 2, autoCommit: false },
+          }
+        )
+        try {
+          for (let round = 0; round < gates.length; round++) {
+            await advanceUntil(() => times.every((values) => values.length > round))
+            expect(times.map((values) => values.length)).toEqual([round + 1, round + 1])
+            gates[round].resolve()
+          }
+          await advanceUntil(() => run.crashes.length > 0)
+          expect(run.crashes[0].error).toMatchObject({
+            name: 'KafkaJSNumberOfRetriesExceeded',
+            retryCount: 2,
+          })
+          for (const [first, second, third] of times) {
+            expect(second - first).toBeGreaterThanOrEqual(300)
+            expect(third - second).toBeGreaterThanOrEqual(second - first)
+          }
+          expect(times.map((values) => values.length)).toEqual([3, 3])
+          expect(run.runner.partitionRetries.size).toBe(0)
+        } finally {
+          for (const gate of gates) gate.resolve()
+        }
+      },
+      30000
+    )
+  }
+)
+
+describe('Consumer > partition handler retry state', () => {
+  it.each([
+    ['eager', 'join'],
+    ['eager', 'backoff'],
+    ['consumer', 'join'],
+    ['consumer', 'backoff'],
+  ])(
+    '%s recovery expiry during %s crashes before another Fetch',
+    async (protocol, phase) => {
+      const held = deferred()
+      const policy = jest.fn(async () => false)
+      const handler = jest.fn(async () => {
+        await held.promise
+        throw failure(true)
+      })
+      const run = await startRetryRun(protocol, 'eachMessage', handler, {
+        retry: { initialRetryTime: 120000, restartOnFailure: policy },
+      })
+      try {
+        await advanceUntil(() => handler.mock.calls.length === 1)
+        const fetches = () => run.log.filter(({ kind }) => kind === 'fetch').length
+        const before = fetches()
+        const retryJoin = jest.spyOn(run.runner.rebalanceCoordinator, 'retryJoin')
+        const joins = jest.spyOn(run.group, 'joinAndSync').mockImplementation(async (round) => {
+          if (phase === 'join') return round.wait(() => new Promise(() => {}))
+          throw failure(true)
+        })
+
+        run.runner.rebalanceCoordinator.requestRejoin({
+          kind: 'lost',
+          reason: 'lost',
+          error: protocol === 'consumer' ? fenced() : protocolError(22),
+        })
+        held.resolve()
+        await advanceUntil(() => joins.mock.calls.length === 1)
+        expect(joins).toHaveBeenCalledTimes(1)
+        if (phase === 'backoff') {
+          await advanceUntil(() => retryJoin.mock.calls.length > 0)
+          expect(retryJoin).toHaveBeenCalledWith(expect.any(Function), expect.any(Object), {
+            retryCount: 0,
+            retryTime: 120000,
+          })
+        }
+        expect(run.crashes).toEqual([])
+        await jest.advanceTimersByTimeAsync(125000)
+        expect(fetches()).toBe(before)
+        expect(handler).toHaveBeenCalledTimes(1)
+        expect(joins).toHaveBeenCalledTimes(1)
+        expect(run.crashes).toHaveLength(1)
+        expect(run.crashes[0].error).toMatchObject({ type: 'JOIN_DEADLINE_EXCEEDED' })
+        expect(policy).toHaveBeenCalledTimes(1)
+      } finally {
+        held.resolve()
+      }
+    },
+    30000
+  )
+
+  it('drops retry state when cooperative rounds revoke and reacquire during backoff', async () => {
+    const deliveries = jest.fn(() => {
+      throw failure(true)
+    })
+    const run = await startRetryRun('cooperative', 'eachBatch', deliveries, {
+      retry: { initialRetryTime: 2000 },
+    })
+    await advanceUntil(() => run.runner.partitionRetries.size === 1)
+    const key = 'topic-a|0'
+    const first = run.group.acquired.get(key).assignmentToken
+    const accepted = []
+    run.consumer.on(run.consumer.events.GROUP_JOIN, ({ payload }) => {
+      accepted.push({
+        partitions: payload.memberAssignment['topic-a'] ?? [],
+        retries: run.runner.partitionRetries.size,
+      })
+    })
+    run.coordinator.syncGroup.mockResolvedValueOnce({
+      memberAssignment: MemberAssignment.encode({ version: 0, assignment: { 'topic-a': [] } }),
+    })
+    run.runner.rebalanceCoordinator.requestRejoin({
+      kind: 'revoked',
+      reason: 'rebalance-in-progress',
+      error: protocolError(REBALANCE_IN_PROGRESS),
+    })
+    await advanceUntil(() => accepted.length === 2, 1000)
+    expect(accepted).toEqual([
+      { partitions: [], retries: 0 },
+      { partitions: [0], retries: 0 },
+    ])
+    expect(run.group.acquired.get(key).assignmentToken).not.toBe(first)
+    expect(deliveries).toHaveBeenCalledTimes(1)
+    await advanceUntil(() => run.crashes.length > 0, 6000)
+    expect(deliveries).toHaveBeenCalledTimes(3)
+    expect(run.crashes[0].error).toMatchObject({ retryCount: 1 })
+  })
+
+  it('retries an escaped join when a foreground loss takes over cooperative recovery', async () => {
+    const held = deferred()
+    const rejectJoin = deferred()
+    const error = failure(false)
+    const handler = jest.fn(async () => {
+      await held.promise
+      throw error
+    })
+    const run = await startRetryRun('cooperative', 'eachMessage', handler)
+    const rebalancer = run.runner.rebalanceCoordinator
+    try {
+      await advanceUntil(() => handler.mock.calls.length === 1)
+      const join = jest.fn(async () => {
+        await rejectJoin.promise
+        throw protocolError(7)
+      })
+      run.coordinator.joinGroup.mockImplementationOnce(join)
+      rebalancer.requestRejoin({
+        kind: 'revoked',
+        reason: 'rebalance-in-progress',
+        error: protocolError(REBALANCE_IN_PROGRESS),
+      })
+      await advanceUntil(() => join.mock.calls.length === 1)
+      expect(join).toHaveBeenCalledTimes(1)
+      rebalancer.requestRejoin({ kind: 'lost', reason: 'lost', error: protocolError(22) })
+      held.resolve()
+      await advanceUntil(() => rebalancer.recovery?.step)
+      expect(rebalancer.recovery?.step).toMatchObject({ retryCount: 0, retryTime: 300 })
+      rejectJoin.resolve()
+      await advanceUntil(() => run.crashes.length === 1)
+      expect(run.coordinator.joinGroup.mock.calls.length).toBeGreaterThanOrEqual(3)
+      expect(handler).toHaveBeenCalledTimes(1)
+      expect(run.crashes[0].error.cause).toBe(error)
+    } finally {
+      held.resolve()
+      rejectJoin.resolve()
+    }
+  })
+
+  it('clears a pending retry when a filtering-only batch resolves its offset', async () => {
+    const handler = jest.fn(({ pause }) => {
+      pause()
+      throw failure(true)
+    })
+    const run = await startRetryRun('eager', 'eachMessage', handler)
+    await advanceUntil(() => run.runner.partitionRetries.size === 1)
+    const ended = jest.fn()
+    run.consumer.on(run.consumer.events.END_BATCH_PROCESS, ended)
+    run.state.controlOffset = 40
+    run.consumer.resume([{ topic: 'topic-a', partitions: [0] }])
+    await advanceUntil(() => ended.mock.calls.length > 0)
+    expect(ended).toHaveBeenCalled()
+    expect(handler).toHaveBeenCalledTimes(1)
+    expect(run.runner.partitionRetries.size).toBe(0)
+    await closeClean(run)
+  })
+
+  it('keeps the longest backoff when another partition starts failing', async () => {
+    const times = [[], []]
+    const run = await startRetryRun(
+      'eager',
+      'eachBatch',
+      (_payload, partition) => {
+        const calls = times[partition]
+        calls.push(Date.now())
+        if (partition === 0 ? calls.length <= 2 : calls.length === 3) throw failure(true)
+      },
+      {
+        partitions: [0, 1],
+        records: { 'topic-a|0': [40], 'topic-a|1': [40] },
+        retry: { retries: 3, multiplier: 2 },
+        run: {
+          autoCommit: false,
+          eachBatchAutoResolve: false,
+          partitionsConsumedConcurrently: 2,
+        },
+      }
+    )
+    await advanceUntil(() => times.every((calls) => calls.length >= 4))
+    const [first, second, third, fourth] = times[0]
+    expect(second - first).toBeGreaterThanOrEqual(300)
+    expect(third - second).toBeGreaterThanOrEqual(600)
+    expect(fourth - third).toBeGreaterThanOrEqual(600)
+    expect(run.crashes).toEqual([])
+    await closeClean(run)
+  })
+
+  it.each(['eachMessage', 'eachBatch'])(
+    '%s gets a fresh budget when delivery starts beyond the failed offset',
+    async (handler) => {
+      const offsets = []
+      const run = await startRetryRun(
+        'eager',
+        handler,
+        ({ pause }, _partition, offset) => {
+          offsets.push(offset)
+          if (offsets.length === 1) pause()
+          throw failure(true)
+        },
+        { records: { 'topic-a|0': [40] } }
+      )
+      await advanceUntil(() => run.runner.partitionRetries.size === 1)
+      run.state.queue['topic-a|0'] = [41]
+      run.consumer.resume([{ topic: 'topic-a', partitions: [0] }])
+      await advanceUntil(() => run.crashes.length > 0)
+      expect(offsets).toEqual(['40', '41', '41'])
+      expect(run.crashes[0].error).toMatchObject({ retryCount: 1 })
+    }
+  )
+
+  it.each([
+    ['seek', 'eachMessage'],
+    ['seek', 'eachBatch'],
+    ['offset reset', 'eachMessage'],
+    ['offset reset', 'eachBatch'],
+  ])(
+    '%s during %s prevents the old failure from spending the new budget',
+    async (change, handler) => {
+      const held = deferred()
+      const error = failure(true)
+      const offsets = []
+      const run = await startRetryRun(
+        'eager',
+        handler,
+        async (_payload, _partition, offset) => {
+          offsets.push(offset)
+          if (offsets.length === 1) {
+            await held.promise
+            if (change === 'seek')
+              run.consumer.seek({ topic: 'topic-a', partition: 0, offset: '41' })
+          }
+          throw error
+        },
+        { records: { 'topic-a|0': [40, 41] }, run: { autoCommit: false } }
+      )
+      try {
+        await advanceUntil(() => offsets.length === 1)
+        if (change === 'offset reset') {
+          await run.group.recoverFromOffsetOutOfRange({ topic: 'topic-a', partition: 0 })
+        }
+        held.resolve()
+        await advanceUntil(() => run.crashes.length > 0)
+        expect(offsets).toEqual(change === 'seek' ? ['40', '41', '41'] : ['40', '40', '40'])
+        expect(run.crashes[0].error).toMatchObject({ retryCount: 1, cause: error })
+        expect(run.runner.partitionRetries.size).toBe(0)
+      } finally {
+        held.resolve()
+      }
+    }
+  )
+
+  it.each(['eachMessage', 'eachBatch'])(
+    '%s clears its record after each accepted offset',
+    async (handler) => {
+      const calls = new Map()
+      const records = Array.from({ length: 12 }, (_, index) => 40 + index)
+      const run = await startRetryRun(
+        'eager',
+        handler,
+        (_payload, _partition, offset) => {
+          const count = calls.get(offset) ?? 0
+          calls.set(offset, count + 1)
+          if (count === 0) throw failure(true)
+        },
+        { records: { 'topic-a|0': records }, run: { autoCommit: false } }
+      )
+      await advanceUntil(() => calls.get('51') === 2, 10000)
+      await advanceUntil(() => run.runner.partitionRetries.size === 0)
+      expect([...calls.values()]).toEqual(records.map(() => 2))
+      expect(run.runner.partitionRetries.size).toBe(0)
+      expect(run.crashes).toEqual([])
+      await closeClean(run)
+    }
+  )
+
+  it('keeps the failed offset after a partial manual batch resolution', async () => {
+    const ranges = []
+    const run = await startRetryRun(
+      'eager',
+      'eachBatch',
+      ({ batch, resolveOffset, pause }) => {
+        ranges.push(batch.messages.map(({ offset }) => offset))
+        if (ranges.length === 2) {
+          resolveOffset('40')
+          pause()
+          return
+        }
+        throw failure(true)
+      },
+      {
+        prepare: ({ state }) => {
+          state.batchSize = 2
+        },
+        records: { 'topic-a|0': [40, 41] },
+        run: { autoCommit: false, eachBatchAutoResolve: false },
+      }
+    )
+    await advanceUntil(() => ranges.length === 2)
+    expect(run.runner.partitionRetries.size).toBe(1)
+    run.consumer.resume([{ topic: 'topic-a', partitions: [0] }])
+    await advanceUntil(() => run.crashes.length > 0)
+    expect(ranges).toEqual([['40', '41'], ['40', '41'], ['41']])
+    expect(run.crashes[0].error).toMatchObject({ retryCount: 1 })
+  })
+
+  it.each([
+    ['one broker', false],
+    ['two brokers', true],
+  ])('charges a concurrent failure on %s even when its sibling pauses', async (_kind, split) => {
+    const calls = [0, 0]
+    const gate = deferred()
+    const error = failure(true)
+    const run = await startRetryRun(
+      'eager',
+      'eachMessage',
+      async ({ pause }, partition) => {
+        calls[partition] += 1
+        await gate.promise
+        if (partition === 0) pause()
+        throw error
+      },
+      {
+        partitions: [0, 1],
+        records: { 'topic-a|0': [40], 'topic-a|1': [40] },
+        prepare: split ? splitBrokers : undefined,
+        run: { partitionsConsumedConcurrently: 2, autoCommit: false },
+      }
+    )
+    try {
+      await advanceUntil(() => calls.every(Boolean))
+      expect(calls).toEqual([1, 1])
+      gate.resolve()
+      await advanceUntil(() => run.runner.partitionRetries.size === 2)
+      expect(run.runner.partitionRetries.size).toBe(2)
+      await advanceUntil(() => run.crashes.length > 0)
+      expect(calls).toEqual([1, 2])
+      expect(run.crashes[0].error).toMatchObject({ retryCount: 1, cause: error })
+    } finally {
+      gate.resolve()
+    }
+  })
+
+  it.each([
+    ['one broker', 0, false],
+    ['one broker', 1, false],
+    ['two brokers', 0, true],
+    ['two brokers', 1, true],
+  ])(
+    'reports a concurrent non-retriable failure on %s at partition %i',
+    async (_kind, permanent, split) => {
+      const calls = []
+      const gate = deferred()
+      const error = failure(false)
+      const run = await startRetryRun(
+        'eager',
+        'eachBatch',
+        async (_payload, partition) => {
+          calls.push(partition)
+          await gate.promise
+          throw partition === permanent ? error : failure(true)
+        },
+        {
+          partitions: [0, 1],
+          records: { 'topic-a|0': [40], 'topic-a|1': [40] },
+          prepare: split ? splitBrokers : undefined,
+          run: { partitionsConsumedConcurrently: 2, autoCommit: false },
+        }
+      )
+      try {
+        await advanceUntil(() => calls.length === 2)
+        expect(calls).toHaveLength(2)
+        gate.resolve()
+        await advanceUntil(() => run.crashes.length > 0)
+        expect(calls).toHaveLength(2)
+        expect(run.crashes[0].error).toMatchObject({
+          name: 'KafkaJSNonRetriableError',
+          cause: error,
+        })
+      } finally {
+        gate.resolve()
+      }
+    }
+  )
+
+  it.each(['stop', 'disconnect'])(
+    '%s cancels handler backoff and releases the record',
+    async (method) => {
+      const run = await startRetryRun('eager', 'eachMessage', () => {
+        throw failure(true)
+      })
+      await advanceUntil(() => run.runner.cancelHandlerBackoff !== null)
+      expect(run.runner.partitionRetries.size).toBe(1)
+      const closing = settled(run.consumer[method]())
+      await advanceUntil(() => closing.done)
+      expect(closing).toMatchObject({ done: true, value: undefined })
+      expect(run.runner.partitionRetries.size).toBe(0)
+      expect(run.runner.cancelHandlerBackoff).toBeNull()
+      expect(run.crashes).toEqual([])
+      expect(jest.getTimerCount()).toBe(0)
+    }
+  )
+
+  it.each(['seek', 'recreate', 'truncate'])(
+    '%s clears a failed partition while it stays paused',
+    async (change) => {
+      const run = await startRetryRun('eager', 'eachMessage', ({ pause }) => {
+        pause()
+        throw failure(true)
+      })
+      await advanceUntil(() => run.runner.partitionRetries.size === 1)
+      const token = run.group.acquired.get('topic-a|0').assignmentToken
+      if (change === 'seek') run.consumer.seek({ topic: 'topic-a', partition: 0, offset: '40' })
+      if (change === 'recreate') run.group.invalidateTopic('topic-a')
+      if (change === 'truncate') {
+        await run.group.applyValidationOutcome('topic-a', 0, '40', {
+          action: 'truncated',
+          divergingOffset: '39',
+        })
+      }
+      expect(run.runner.partitionRetries.size).toBe(0)
+      expect(run.group.acquired.get('topic-a|0').assignmentToken).not.toBe(token)
+      expect(run.consumer.paused()).toEqual([{ topic: 'topic-a', partitions: [0] }])
+      await closeClean(run)
+    }
+  )
+})
 
 describe('Consumer > how a classic run ends', () => {
   describe('one cause alone', () => {
@@ -546,22 +1111,17 @@ describe('Consumer > how a classic run ends', () => {
 
   describe('a handler error after another end began while the handler ran', () => {
     it.each([
-      [
-        'stop()',
-        ['commit topic-a|0 41', 'final commit', 'leave member-1 null', 'STOP', 'DISCONNECT'],
-        [[{ preserveSetupState: true }]],
-        'CRASH restart false',
-      ],
+      ['stop()', ['commit topic-a|0 41', 'final commit', 'leave member-1 null', 'STOP'], [], false],
       [
         'disconnect()',
         ['commit topic-a|0 41', 'final commit', 'leave member-1 null', 'STOP', 'DISCONNECT'],
         [[]],
-        'CRASH restart false',
+        false,
       ],
-      ['disconnect({ timeout: 500 })', ['STOP', 'DISCONNECT'], [[{ drainTimeout: 0 }]], 'none'],
+      ['disconnect({ timeout: 500 })', ['STOP', 'DISCONNECT'], [[{ drainTimeout: 0 }]], true],
     ])(
-      'after %s it ends with this trail, and restartOnFailure returning true restarts nothing',
-      async (cause, cleanup, transport, crash) => {
+      'suppresses the handler failure while %s is in progress',
+      async (cause, cleanup, transport, timed) => {
         const error = failure(false)
         const policy = jest.fn(async () => true)
         const run = await begin({
@@ -580,7 +1140,7 @@ describe('Consumer > how a classic run ends', () => {
         )
         await jest.advanceTimersByTimeAsync(1000)
 
-        if (crash === 'none') {
+        if (timed) {
           expect(ending).toMatchObject({ done: true, value: undefined })
           expect(trail(run)).toEqual(cleanup)
         } else {
@@ -589,15 +1149,14 @@ describe('Consumer > how a classic run ends', () => {
         }
 
         run.held.resolve()
-        await advanceUntil(() => ending.done && (crash === 'none' || run.crashes.length > 0), 2000)
+        await advanceUntil(() => ending.done, 2000)
         await jest.advanceTimersByTimeAsync(1000)
 
         expect(ending).toMatchObject({ done: true, value: undefined })
-        expect(trail(run)).toEqual(crash === 'none' ? cleanup : [...cleanup, crash])
-        expect(run.crashes.map(({ error: { cause } }) => cause)).toEqual(
-          crash === 'none' ? [] : [error]
-        )
-        expect(policy).toHaveBeenCalledTimes(crash === 'none' ? 0 : 1)
+        expect(trail(run)).toEqual(cleanup)
+        expect(run.crashes).toEqual([])
+        expect(policy).not.toHaveBeenCalled()
+
         expect(run.cluster.disconnect.mock.calls).toEqual(transport)
         expect(run.cluster.connect).toHaveBeenCalledTimes(1)
         expect(jest.getTimerCount()).toBe(0)

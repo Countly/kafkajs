@@ -656,9 +656,7 @@ module.exports = class OffsetManager {
     // A handler can still be running for a partition this member lost during a cooperative
     // round. Writing its position back would resolve an offset against a generation that no
     // longer owns the partition, and the commit would then roll the new owner back.
-    if (!this.owns(topic, partition)) {
-      return
-    }
+    if (!this.owns(topic, partition)) return false
 
     const offsets = this.resolvedOffsets[topic]
     const previous = offsets[partition]
@@ -672,6 +670,7 @@ module.exports = class OffsetManager {
         .add(resolvedProgress(offsets[partition], committed))
         .subtract(resolvedProgress(previous, committed))
     }
+    return true
   }
 
   /**
@@ -885,14 +884,14 @@ module.exports = class OffsetManager {
    * @param {import("../../../types").TopicPartition} topicPartition
    * @param {{guard: () => Error|null, fence: import('../../producer/generation')}} [preparation]
    *   the caller's immutable preparation identity; see `seek`
-   * @returns {Promise<void>}
+   * @returns {Promise<boolean>} whether the reset changed the position
    */
   async setDefaultOffset({ topic, partition }, preparation) {
     if (this.topicConfigurations[topic].resetPolicy?.kind === 'by_duration') {
       return this.resetByDuration({ topic, partition }, preparation)
     }
     const defaultOffset = this.cluster.defaultOffset(this.topicConfigurations[topic])
-    await this.commitAndClear({ topic, partition, offset: defaultOffset }, preparation)
+    return this.commitAndClear({ topic, partition, offset: defaultOffset }, preparation)
   }
 
   /**

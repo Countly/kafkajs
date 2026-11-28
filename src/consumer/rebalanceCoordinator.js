@@ -1,14 +1,13 @@
 const describeThrown = require('../network/describeThrown')
 const handlerContext = require('./handlerContext')
 const RebalanceHooks = require('./rebalanceHooks')
-const { KafkaJSRebalanceNotConvergedError } = require('../errors')
+const { KafkaJSRebalanceNotConvergedError, isFencedInstance } = require('../errors')
 const {
   REBALANCE_PATHS,
   rebalanceAction,
   rebalanceReason,
   pollIntervalExceededError,
   isStaleMembershipVerdict,
-  isHeartbeatFatal,
   isConsumerProtocolFatal,
   sentOwnership,
   stampOwnership,
@@ -109,6 +108,7 @@ module.exports = class RebalanceCoordinator {
    *   before `GROUP_JOIN` is delivered, so state it records is visible to every observer of that
    *   event whatever the order public instrumentation reaches them in
    * @param {import('../retry').Retrier} [options.retryJoin] retries for foreground recovery
+   * @param {() => void} [options.onFatalVerdict] ends any handler retry wait
    */
   constructor({
     runner,
@@ -121,6 +121,7 @@ module.exports = class RebalanceCoordinator {
     groupId,
     onJoinComplete = () => {},
     retryJoin,
+    onFatalVerdict = () => {},
   }) {
     this.runner = runner
     this.consumerGroup = consumerGroup
@@ -132,6 +133,7 @@ module.exports = class RebalanceCoordinator {
     this.groupId = groupId
     this.onJoinComplete = onJoinComplete
     this.retryJoin = retryJoin
+    this.onFatalVerdict = onFatalVerdict
 
     /** @type {Promise<void>|null} the running chain; also the single-flight marker */
     this.inFlight = null
@@ -219,11 +221,12 @@ module.exports = class RebalanceCoordinator {
    * @param {string|null} reason null only for the first round of a run, which emits no
    *   `REBALANCING`
    * @param {'lost'|'revoked'|'initial'} kind
-   * @param {boolean} [retryJoin] whether to retry transient join failures during recovery
+   * @param {object} [retryStep] the foreground retry count and delay at entry
    * @returns {Promise<void>} the chain; the same promise for a re-entrant call
    */
-  runRound(reason, kind, retryJoin = false) {
+  runRound(reason, kind, retryStep) {
     if (this.inFlight) {
+      if (retryStep) this.recovery.step = retryStep
       if (kind === 'lost') {
         this.pendingKind = 'lost'
         this.pendingJoinCount = this.consumerGroup.joinCount
@@ -235,8 +238,10 @@ module.exports = class RebalanceCoordinator {
       return this.inFlight
     }
 
-    this.inFlight = this.runChain(reason, kind, retryJoin).finally(() => {
+    const recovery = (this.recovery = { step: retryStep })
+    this.inFlight = this.runChain(reason, kind, recovery).finally(() => {
       this.inFlight = null
+      this.recovery = null
       this.rounds = 0
       this.pendingKind = null
       this.pendingJoinCount = null
@@ -261,13 +266,13 @@ module.exports = class RebalanceCoordinator {
    * @private
    * @param {string|null} reason
    * @param {'lost'|'revoked'|'initial'} kind
-   * @param {boolean} retryJoin whether to retry transient join failures during recovery
+   * @param {object} recovery foreground recovery policy, which can be acquired mid-chain
    * @returns {Promise<void>}
    * @throws {KafkaJSRebalanceNotConvergedError} when a classic cooperative chain does not converge
    */
-  async runChain(reason, kind, retryJoin) {
+  async runChain(reason, kind, recovery) {
     try {
-      await this.runRounds(reason, kind, retryJoin)
+      await this.runRounds(reason, kind, recovery)
     } catch (error) {
       if (
         this.consumerGroup.kind === 'consumer' &&
@@ -302,7 +307,7 @@ module.exports = class RebalanceCoordinator {
    * @returns {Promise<void>}
    * @throws {KafkaJSRebalanceNotConvergedError} when a classic cooperative chain does not converge
    */
-  async runRounds(reason, kind, retryJoin) {
+  async runRounds(reason, kind, recovery) {
     do {
       if (this.runner.stopRequested) {
         return
@@ -353,9 +358,7 @@ module.exports = class RebalanceCoordinator {
         }
 
         const roundStartedAt = Date.now()
-        const result = await (retryJoin
-          ? this.joinWithRecovery(round)
-          : this.consumerGroup.joinAndSync(round))
+        const result = await this.joinWithRecovery(round, recovery)
         const applyResult = () =>
           this.consumerGroup.applyRebalanceResult(result, {
             rebuildOffsets,
@@ -440,23 +443,37 @@ module.exports = class RebalanceCoordinator {
    * Retries an error that escaped the join's own retry policy. The existing round keeps its
    * deadline, assignment pin and listener state throughout the backoff.
    * @param {object} round the active round and its cancellation scope
+   * @param {object} recovery foreground recovery policy, which can be acquired mid-join
    * @returns {Promise<object>} the join result for this round to apply
    */
-  joinWithRecovery(round) {
-    return this.retryJoin(async (bail) => {
-      try {
-        return await this.consumerGroup.joinAndSync(round)
-      } catch (error) {
-        if (
-          round.guard() ||
-          error?.retriable !== true ||
-          (this.consumerGroup.kind === 'consumer' && isConsumerProtocolFatal(error))
-        ) {
-          return bail(error)
-        }
-        throw error
-      }
-    }, round)
+  async joinWithRecovery(round, recovery) {
+    try {
+      return await this.consumerGroup.joinAndSync(round)
+    } catch (firstError) {
+      if (!recovery.step || round.guard()) throw firstError
+      let first = true
+      return this.retryJoin(
+        async (bail) => {
+          try {
+            if (first) {
+              first = false
+              throw firstError
+            }
+            return await this.consumerGroup.joinAndSync(round)
+          } catch (error) {
+            if (
+              round.guard() ||
+              (this.consumerGroup.kind === 'consumer' && isConsumerProtocolFatal(error))
+            ) {
+              return bail(error)
+            }
+            throw error
+          }
+        },
+        round,
+        recovery.step
+      )
+    }
   }
 
   /**
@@ -710,6 +727,7 @@ module.exports = class RebalanceCoordinator {
 
     if (aborting) {
       this.verdict = this.mergeVerdict(this.verdict, verdict)
+      if (this.hasFatalVerdict()) this.onFatalVerdict()
       if (verdict.kind === 'lost' && this.consumerGroup.kind === 'consumer') {
         this.consumerGroup.roundContext?.retire(verdict.error)
       }
@@ -739,8 +757,11 @@ module.exports = class RebalanceCoordinator {
     // `start()` - the round has to be driven from here, in the background.
     // Created outside any handler or callback store, with its catch inside it: the internal chain
     // and its observers must not inherit the triggering callback's authority.
-    this.runInternal(() =>
-      this.runRound(verdict.reason, verdict.kind).catch(async (error) => {
+    this.runInternal(() => {
+      const chain = this.runRound(verdict.reason, verdict.kind)
+      const recovery = this.recovery
+      return chain.catch(async (error) => {
+        if (recovery?.step) return
         try {
           // `onCrash` owns the CRASH event; if it throws there is nothing left to notify with, and
           // this chain is nobody's `await`, so the rejection would be unobserved.
@@ -754,7 +775,7 @@ module.exports = class RebalanceCoordinator {
           })
         }
       })
-    )
+    })
   }
 
   /**
@@ -845,7 +866,19 @@ module.exports = class RebalanceCoordinator {
    * @returns {boolean}
    */
   hasFatalVerdict() {
-    return this.verdict !== null && isConsumerProtocolFatal(this.verdict.error)
+    return this.verdict !== null && this.isFatalVerdict(this.verdict)
+  }
+
+  /**
+   * Checks whether this membership protocol can recover from a verdict.
+   * @param {Verdict} verdict the classified membership failure
+   * @returns {boolean} whether the verdict ends the run
+   */
+  isFatalVerdict({ error }) {
+    return (
+      isFencedInstance(error) ||
+      (this.consumerGroup.kind === 'consumer' && isConsumerProtocolFatal(error))
+    )
   }
 
   /** Drops whatever is in the slot, without acting on it. @returns {void} */
@@ -1012,10 +1045,9 @@ module.exports = class RebalanceCoordinator {
       return incoming.kind === 'revoked' ? { ...incoming, kind: 'lost' } : incoming
     }
 
-    if (pending.kind === 'lost') {
-      const fatal = isHeartbeatFatal(incoming.error) && !isConsumerProtocolFatal(pending.error)
-      return fatal ? incoming : pending
-    }
+    if (this.isFatalVerdict(pending)) return pending
+    if (this.isFatalVerdict(incoming)) return incoming
+    if (pending.kind === 'lost') return pending
 
     return incoming.kind === 'lost' ? incoming : pending
   }

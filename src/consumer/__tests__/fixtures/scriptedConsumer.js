@@ -116,8 +116,12 @@ const buildConsumer = (options = {}) => {
         partitions: partitions.map(({ partition, fetchOffset }) => {
           const messages = (state.queue[`${topic}|${partition}`] || [])
             .filter((offset) => offset >= Number(fetchOffset))
-            .slice(0, 1)
-            .map(record)
+            .slice(0, state.batchSize ?? 1)
+            .map((offset) => {
+              const message = record(offset)
+              if (state.controlOffset === offset) message.isControlRecord = true
+              return message
+            })
           served = served || messages.length > 0
           return {
             partition,
@@ -254,6 +258,10 @@ async function start({
   initial,
   onZero,
   autoCommitThreshold,
+  partitions = [0],
+  records,
+  run,
+  prepare,
 } = {}) {
   const coordinators = []
   const runRound = RebalanceCoordinator.prototype.runRound
@@ -261,12 +269,14 @@ async function start({
     if (!coordinators.includes(this)) coordinators.push(this)
     return runRound.apply(this, args)
   })
-  const { consumer, state, log, crashes, cluster, coordinator } = buildConsumer({
+  const built = buildConsumer({
     maxPollInterval: 4000,
     rebalanceTimeout: 3000,
     ...(retry && { retry }),
     ...(logger && { logger }),
   })
+  if (prepare) await prepare(built)
+  const { consumer, state, log, crashes, cluster, coordinator } = built
   const held = deferred()
   let first = true
   let armed = false
@@ -275,17 +285,18 @@ async function start({
     if (req.memberEpoch === 0 && first) {
       first = false
       if (initial) throw initial()
-      return target(1, { 'topic-a': [0] })
+      return target(1, { 'topic-a': partitions })
     }
     if (req.memberEpoch > 0 && armed) {
       armed = false
       faultAt = Date.now()
       throw fault()
     }
-    if (req.memberEpoch === 0) return onZero?.(req) ?? target(2, { 'topic-a': [0] })
+    if (req.memberEpoch === 0) return onZero?.(req) ?? target(2, { 'topic-a': partitions })
     return target(req.memberEpoch, null)
   }
-  if (eachMessage || eachBatch) state.queue['topic-a|0'] = [40]
+  if (records) Object.assign(state.queue, records)
+  else if (eachMessage || eachBatch) state.queue['topic-a|0'] = [40]
   await consumer.subscribe({ topic: 'topic-a' })
   const started = settled(
     consumer.run({
@@ -293,6 +304,7 @@ async function start({
       eachBatch: eachBatch && ((payload) => eachBatch(payload, held)),
       ...(hook && { rebalanceListener: hook }),
       ...(autoCommitThreshold && { autoCommitThreshold }),
+      ...run,
     })
   )
   await advanceUntil(() => started.done)
@@ -312,6 +324,8 @@ async function start({
     held,
     coordinators,
     coordinator,
+    runner: coordinators[0]?.runner,
+    group: coordinators[0]?.consumerGroup,
     arm: () => {
       armed = true
     },
@@ -383,7 +397,7 @@ const startClassic = async (
       log.push({ kind: 'CRASH', restart: payload.restart, at: Date.now() })
     )
   }
-  prepare?.(built)
+  if (prepare) await prepare(built)
   Object.assign(coordinator, {
     joinGroup: jest.fn(async () => {
       await joined?.promise
