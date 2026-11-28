@@ -1,6 +1,7 @@
 const {
   KafkaJSError,
   KafkaJSNonRetriableError,
+  KafkaJSCommitFailedError,
   isLostMember,
   isRevoked,
   isFencedInstance,
@@ -237,6 +238,36 @@ const rebalanceAction = (error, path, { kind = 'classic' } = {}) => {
   }
 
   return { action: null, fatal: false, clearsMemberId: false }
+}
+
+/**
+ * Whether a failure a handler propagated was caused by a rebalance, its own membership's or an
+ * earlier one's, rather than meeting it by chance. It was when it is, or wraps:
+ * - the waiting verdict's own error;
+ * - a commit refused because its membership authority was gone (`KafkaJSCommitFailedError`);
+ * - an answer that is itself a rebalance: `rebalanceAction` says lost or revoked, on the
+ *   OffsetCommit path for an error an OffsetCommit raised and on the fetch path otherwise.
+ *
+ * Request provenance alone is not causality: an OffsetCommit answered with any other error, such
+ * as `TOPIC_AUTHORIZATION_FAILED`, is the handler's own failure, even when a verdict is waiting
+ * and even when the membership the commit was sent for has been replaced since.
+ * @param {unknown} error what the handler threw
+ * @param {{ error: Error }|null} verdict the rebalance verdict the failure met, if any
+ * @param {{ kind?: 'classic' | 'consumer' | 'manual' }} [membership] the membership protocol
+ * @returns {boolean}
+ */
+const isCausedByRebalance = (error, verdict, { kind = 'classic' } = {}) => {
+  for (
+    let cause = error, depth = 0;
+    cause && typeof cause === 'object' && depth < MAX_CAUSE_DEPTH;
+    cause = cause.cause, depth++
+  ) {
+    if (cause === verdict?.error || cause instanceof KafkaJSCommitFailedError) return true
+    const path = cause[OFFSET_COMMIT_ORIGIN] ? REBALANCE_PATHS.OFFSET_COMMIT : REBALANCE_PATHS.FETCH
+    const { action } = rebalanceAction(cause, path, { kind })
+    if (action === 'lost' || action === 'revoked') return true
+  }
+  return false
 }
 
 /**
@@ -492,6 +523,7 @@ module.exports = {
   REBALANCE_PATHS,
   rebalanceAction,
   rebalanceReason,
+  isCausedByRebalance,
   isConsumerProtocolFatal,
   stampHeartbeatFatal,
   isHeartbeatFatal,

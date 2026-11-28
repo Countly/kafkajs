@@ -727,7 +727,9 @@ says so, `groupProtocol: 'consumer'`.
   dropped, so that work is redelivered after the rejoin. If that handler fails, the failure still
   counts against `retry.retries` as in 2.2.4, or crashes the consumer when it is non-retriable,
   but only after the rejoin, so the crash cleanup of a dynamic member then leaves the group a second
-  time.
+  time. Unlike 2.2.4, that rejoin, or any other rebalance, does not refill `retry.retries`: they
+  refill only once a handler call has returned, so a record that fails on every delivery gets
+  exactly `retry.retries` more deliveries however many rebalances land between them.
   In kafkajs 2.2.4 a long handler was never evicted as long as it called `heartbeat()`. If you have
   handlers that legitimately run for a long time, set `maxPollInterval` to cover them.
 - An error thrown by your `POLL_INTERVAL_EXCEEDED` listener is logged and no longer stops cleanup or the rejoin. There is no option to restore a listener’s ability to strand the consumer.

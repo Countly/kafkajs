@@ -9,6 +9,7 @@ const {
   teardown,
   forget,
   beats,
+  fenced,
   inCauseChain,
   protocolError,
   recordingLogger,
@@ -1045,49 +1046,296 @@ describe('Consumer > how a classic run ends', () => {
   })
 
   describe('a REBALANCE_IN_PROGRESS heartbeat answer while the handler runs', () => {
-    it('then a non-retriable failure of that handler is reported after the eager rejoin: one CRASH carries it, nothing is redelivered and the crash cleanup leaves the new membership', async () => {
-      const error = failure(false)
-      const policy = jest.fn(async () => false)
-      const run = await begin({
-        config: { heartbeatInterval: 500 },
-        retry: { ...RETRY, restartOnFailure: policy },
-        eachMessage: async ({ message }, held, call) => {
-          if (message.offset !== '41' || call !== 2) return
-          await held.promise
-          throw error
-        },
+    const ILLEGAL_GENERATION = 22
+    const TOPIC_AUTHORIZATION_FAILED = 29
+
+    /** How each step of a traced rejoin reads. */
+    const REJOIN_STEPS = {
+      join: ({ memberId }) => `join ${memberId}`,
+      GROUP_JOIN: ({ memberId }) => `GROUP_JOIN ${memberId}`,
+      leave: STEPS.leave,
+      policy: () => 'restartOnFailure',
+      CRASH: STEPS.CRASH,
+    }
+
+    /** @returns {string[]} the rejoins, accepted joins, leaves, restart decision and CRASH, in order */
+    const rejoinTrail = (run) =>
+      run.log
+        .filter(({ kind }) => REJOIN_STEPS[kind])
+        .map((entry) => REJOIN_STEPS[entry.kind](entry))
+
+    /** @returns {number} when the `index`-th traced step of `kind` happened, on the fake clock */
+    const stepAt = (run, kind, index = 0) =>
+      run.log.filter((entry) => entry.kind === kind)[index].at
+
+    /**
+     * Records each later JoinGroup and each accepted join (`GROUP_JOIN`) in `run.log`, and answers
+     * the n-th later JoinGroup with the member id `member-(n + 1)` once the returned gate opens, so
+     * a LeaveGroup names the membership it leaves.
+     * @returns {{ promise: Promise<void>, resolve: () => void }} the gate later JoinGroups wait on
+     */
+    const traceRejoins = (run) => {
+      const gate = deferred()
+      const answer = run.coordinator.joinGroup.getMockImplementation()
+      let rejoins = 0
+      run.coordinator.joinGroup.mockImplementation(async (...args) => {
+        rejoins += 1
+        const memberId = `member-${rejoins + 1}`
+        run.log.push({ kind: 'join', memberId, at: Date.now() })
+        await gate.promise
+        return { ...(await answer(...args)), memberId }
       })
-      await advanceUntil(() => run.delivered.length === 2)
+      run.consumer.on(run.consumer.events.GROUP_JOIN, ({ payload }) =>
+        run.log.push({ kind: 'GROUP_JOIN', memberId: payload.memberId, at: Date.now() })
+      )
+      return gate
+    }
+
+    /** Answers the member's next heartbeat with `code` and waits until it was sent. */
+    const answerNextHeartbeat = async (run, code) => {
       const sent = run.coordinator.heartbeat.mock.calls.length
       run.coordinator.heartbeat.mockImplementationOnce(async () => {
-        throw protocolError(REBALANCE_IN_PROGRESS)
+        throw protocolError(code)
       })
       await advanceUntil(() => run.coordinator.heartbeat.mock.calls.length > sent, 2000)
       await jest.advanceTimersByTimeAsync(100)
       expect(run.coordinator.heartbeat.mock.calls.length).toBeGreaterThan(sent)
-      expect(trail(run)).toEqual([])
-      expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(1)
+    }
+
+    /**
+     * Starts an eager member of topic-a/0, serving offset 40, whose eachMessage runs
+     * `handle(held, call)`, and waits for the first call.
+     * @returns {Promise<object>} the run of `begin`
+     */
+    const viaEachMessage = async ({ retry, handle }) => {
+      const run = await begin({
+        config: { heartbeatInterval: 500 },
+        retry,
+        records: { 'topic-a|0': [40] },
+        eachMessage: (_payload, held, call) => handle(held, call),
+      })
+      await advanceUntil(() => run.delivered.length === 1)
+      return run
+    }
+
+    /**
+     * Starts the same member with an eachBatch handler, records what `begin` records for a close
+     * (LeaveGroup, DISCONNECT, CRASH), and waits for the first call.
+     * @returns {Promise<object>} the run, with `delivered`: `partition|firstOffset` of each call
+     */
+    const viaEachBatch = async ({ retry, handle }) => {
+      const delivered = []
+      const run = await startClassic('classic', {
+        autoCommitThreshold: 100,
+        records: { 'topic-a|0': [40] },
+        config: { heartbeatInterval: 500, retry },
+        eachBatch: async ({ batch }, held) => {
+          delivered.push(`${batch.partition}|${batch.firstOffset()}`)
+          await handle(held, delivered.length)
+        },
+      })
+      run.coordinator.leaveGroup.mockImplementation(async ({ memberId, groupInstanceId }) => {
+        run.log.push({ kind: 'leave', memberId, groupInstanceId })
+      })
+      run.consumer.on(run.consumer.events.DISCONNECT, () => run.log.push({ kind: 'DISCONNECT' }))
+      run.consumer.on(run.consumer.events.CRASH, ({ payload }) =>
+        run.log.push({ kind: 'CRASH', restart: payload.restart })
+      )
+      await advanceUntil(() => delivered.length === 1)
+      return Object.assign(run, { delivered })
+    }
+
+    it.each([
+      ['eachMessage', viaEachMessage],
+      ['eachBatch', viaEachBatch],
+    ])(
+      'then a non-retriable failure of that %s handler is reported only once the eager rejoin is accepted: one CRASH carries it, nothing is redelivered and the crash cleanup leaves the new membership',
+      async (_kind, startRun) => {
+        const error = failure(false)
+        const policy = jest.fn(async () => {
+          run.log.push({ kind: 'policy' })
+          return false
+        })
+        const run = await startRun({
+          retry: { ...RETRY, restartOnFailure: policy },
+          handle: async (held) => {
+            await held.promise
+            throw error
+          },
+        })
+        await answerNextHeartbeat(run, REBALANCE_IN_PROGRESS)
+        expect(trail(run)).toEqual([])
+        expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(1)
+        const rejoin = traceRejoins(run)
+
+        run.held.resolve()
+        await advanceUntil(() => run.coordinator.joinGroup.mock.calls.length === 2, 2000)
+        await jest.advanceTimersByTimeAsync(500)
+        expect(rejoinTrail(run)).toEqual(['join member-2'])
+        expect(run.crashes).toEqual([])
+        expect(policy).not.toHaveBeenCalled()
+
+        rejoin.resolve()
+        await advanceUntil(() => run.crashes.length > 0, 2000)
+        await jest.advanceTimersByTimeAsync(1000)
+
+        expect(rejoinTrail(run)).toEqual([
+          'join member-2',
+          'GROUP_JOIN member-2',
+          'leave member-2 null',
+          'restartOnFailure',
+          'CRASH restart false',
+        ])
+        expect(trail(run).slice(-3)).toEqual(['STOP', 'DISCONNECT', 'CRASH restart false'])
+        expect(run.delivered).toEqual(['0|40'])
+        expect(run.crashes).toHaveLength(1)
+        expect(run.crashes[0].error.name).toBe('KafkaJSNonRetriableError')
+        expect(run.crashes[0].error.cause).toBe(error)
+        expect(policy).toHaveBeenCalledTimes(1)
+        expect(policy.mock.calls[0][0]).toBe(run.crashes[0].error)
+        expect(jest.getTimerCount()).toBe(0)
+      },
+      30000
+    )
+
+    it('then a retriable failure of that handler spends the one retry, and a second REBALANCE_IN_PROGRESS answered during the retry backoff does not refill it: the redelivery after the backoff fails and CRASH reports KafkaJSNumberOfRetriesExceeded', async () => {
+      const error = failure(true)
+      const policy = jest.fn(async () => false)
+      const deliveredAt = []
+      const run = await viaEachMessage({
+        retry: { retries: 1, factor: 0, initialRetryTime: 2000, restartOnFailure: policy },
+        handle: async (held, call) => {
+          deliveredAt.push(Date.now())
+          if (call === 1) await held.promise
+          throw error
+        },
+      })
+      await answerNextHeartbeat(run, REBALANCE_IN_PROGRESS)
+      traceRejoins(run).resolve()
 
       run.held.resolve()
+      await advanceUntil(() => rejoinTrail(run).includes('GROUP_JOIN member-2'), 2000)
+      expect(run.crashes).toEqual([])
+
+      await answerNextHeartbeat(run, REBALANCE_IN_PROGRESS)
+      expect(rejoinTrail(run)).toEqual(['join member-2', 'GROUP_JOIN member-2'])
+      expect(run.delivered).toEqual(['0|40'])
+
+      await advanceUntil(() => run.crashes.length > 0, 5000)
+      await jest.advanceTimersByTimeAsync(1000)
+
+      expect(rejoinTrail(run)).toEqual([
+        'join member-2',
+        'GROUP_JOIN member-2',
+        'join member-3',
+        'GROUP_JOIN member-3',
+        'leave member-3 null',
+        'CRASH restart false',
+      ])
+      expect(stepAt(run, 'join', 1) - stepAt(run, 'GROUP_JOIN')).toBeGreaterThanOrEqual(2000)
+      expect(deliveredAt[1]).toBeGreaterThanOrEqual(stepAt(run, 'GROUP_JOIN', 1))
+      expect(run.delivered).toEqual(['0|40', '0|40'])
+      expect(run.crashes).toHaveLength(1)
+      expect(run.crashes[0].error.name).toBe('KafkaJSNumberOfRetriesExceeded')
+      expect(run.crashes[0].error.cause).toBe(error)
+      expect(run.crashes[0].error.retryCount).toBe(1)
+      expect(policy).toHaveBeenCalledTimes(1)
+      expect(jest.getTimerCount()).toBe(0)
+    }, 30000)
+
+    /**
+     * Starts an eager member whose first handler call, once released, commits offset 41 and
+     * rethrows what the commit rejects with; releases it and holds that OffsetCommit until
+     * `answer(how)` is called, `how` being what the coordinator double then does.
+     * @param {Function} policy the consumer's `restartOnFailure`
+     * @returns {Promise<object>} the run, with `answer(how)` and `refused()`: the commit's rejection
+     */
+    const commitHeld = async (policy) => {
+      const ref = {}
+      const reply = deferred()
+      let refused = null
+      const run = await viaEachMessage({
+        retry: { ...RETRY, restartOnFailure: policy },
+        handle: async (held, call) => {
+          if (call !== 1) return
+          await held.promise
+          try {
+            await ref.run.consumer.commitOffsets([{ topic: 'topic-a', partition: 0, offset: '41' }])
+          } catch (error) {
+            refused = error
+            throw error
+          }
+        },
+      })
+      ref.run = run
+      let respond = null
+      const sent = run.coordinator.offsetCommit.mock.calls.length
+      run.coordinator.offsetCommit.mockImplementationOnce(async () => {
+        await reply.promise
+        await respond()
+      })
+      run.held.resolve()
+      await advanceUntil(() => run.coordinator.offsetCommit.mock.calls.length > sent, 1000)
+      expect(run.coordinator.offsetCommit.mock.calls.length).toBeGreaterThan(sent)
+      return Object.assign(run, {
+        answer: (how) => {
+          respond = how
+          reply.resolve()
+        },
+        refused: () => refused,
+      })
+    }
+
+    it("then a commit the handler awaits, answered TOPIC_AUTHORIZATION_FAILED after that REBALANCE_IN_PROGRESS, is the handler's own failure: rethrown, it is reported once the eager rejoin is accepted, though the commit was sent for the membership the rejoin replaced", async () => {
+      const denied = protocolError(TOPIC_AUTHORIZATION_FAILED)
+      const policy = jest.fn(async () => {
+        run.log.push({ kind: 'policy' })
+        return false
+      })
+      const run = await commitHeld(policy)
+      await answerNextHeartbeat(run, REBALANCE_IN_PROGRESS)
+      expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(1)
+      traceRejoins(run).resolve()
+
+      run.answer(async () => {
+        throw denied
+      })
       await advanceUntil(() => run.crashes.length > 0, 2000)
       await jest.advanceTimersByTimeAsync(1000)
 
-      expect(trail(run)).toEqual([
-        'commit topic-a|0 41',
-        'final commit',
-        'leave member-1 null',
-        'STOP',
-        'DISCONNECT',
+      expect(run.refused()?.name).toBe('KafkaJSNonRetriableError')
+      expect(inCauseChain(run.refused(), denied)).toBe(true)
+      expect(rejoinTrail(run)).toEqual([
+        'join member-2',
+        'GROUP_JOIN member-2',
+        'leave member-2 null',
+        'restartOnFailure',
         'CRASH restart false',
       ])
-      expect(run.coordinator.joinGroup).toHaveBeenCalledTimes(2)
-      expect(run.delivered).toEqual(['0|40', '0|41'])
+      expect(run.delivered).toEqual(['0|40'])
       expect(run.crashes).toHaveLength(1)
       expect(run.crashes[0].error.name).toBe('KafkaJSNonRetriableError')
-      expect(run.crashes[0].error.cause).toBe(error)
+      expect(inCauseChain(run.crashes[0].error, denied)).toBe(true)
       expect(policy).toHaveBeenCalledTimes(1)
-      expect(policy.mock.calls[0][0]).toBe(run.crashes[0].error)
       expect(jest.getTimerCount()).toBe(0)
+    }, 30000)
+
+    it('then a commit the handler awaits, refused because an ILLEGAL_GENERATION heartbeat answer took its membership meanwhile, stays part of the rejoin when rethrown: no CRASH, and the record is redelivered to the new membership', async () => {
+      const policy = jest.fn(async () => false)
+      const run = await commitHeld(policy)
+      await answerNextHeartbeat(run, ILLEGAL_GENERATION)
+      traceRejoins(run).resolve()
+
+      run.answer(async () => {})
+      await advanceUntil(() => run.delivered.length === 2, 2000)
+      await jest.advanceTimersByTimeAsync(1000)
+
+      expect(run.refused()?.name).toBe('KafkaJSCommitFailedError')
+      expect(rejoinTrail(run)).toEqual(['join member-2', 'GROUP_JOIN member-2'])
+      expect(run.delivered).toEqual(['0|40', '0|40'])
+      expect(run.crashes).toEqual([])
+      expect(policy).not.toHaveBeenCalled()
+      await closeClean(run)
     }, 30000)
   })
 
@@ -1470,5 +1718,85 @@ describe('Consumer > how a consumer-protocol run ends', () => {
     expect(leaves(run)).toEqual([-1, -1, -1])
     expect(run.calls).toEqual(['40', '40'])
     expect(jest.getTimerCount()).toBe(0)
+  }, 60000)
+
+  it('a poll expiry, then a retriable failure of the stuck handler, then a fenced heartbeat answer during the retry backoff: the second loss does not refill the retries, so the redelivery after the backoff fails and CRASH reports KafkaJSNumberOfRetriesExceeded', async () => {
+    const failed = failure(true)
+    const policy = jest.fn(async () => false)
+    const calledAt = []
+    const run = await begin(
+      async (_payload, held, call) => {
+        calledAt.push(Date.now())
+        if (call === 1) await held.promise
+        throw failed
+      },
+      {
+        fault: fenced,
+        retry: { retries: 1, factor: 0, initialRetryTime: 2000, restartOnFailure: policy },
+      }
+    )
+    const joins = beats(run, false)
+    /** @returns {number} when the member sent its `index`-th epoch-zero heartbeat */
+    const joinedAt = (index) =>
+      run.log.filter(({ kind, epoch }) => kind === 'heartbeat' && epoch === 0)[index].at
+    await advanceUntil(() => leaves(run).length === 1, 10000)
+    run.held.resolve()
+    await advanceUntil(() => beats(run, false) === joins + 1, 5000)
+    expect(run.crashes).toEqual([])
+
+    run.arm()
+    await advanceUntil(() => run.faultAt() !== null, 1500)
+    expect(run.faultAt()).not.toBeNull()
+    expect(run.calls).toEqual(['40'])
+    expect(beats(run, false)).toBe(joins + 1)
+
+    await advanceUntil(() => run.crashes.length > 0, 5000)
+    await jest.advanceTimersByTimeAsync(1000)
+
+    expect(run.calls).toEqual(['40', '40'])
+    expect(joinedAt(joins + 1) - joinedAt(joins)).toBeGreaterThanOrEqual(2000)
+    expect(calledAt[1]).toBeGreaterThanOrEqual(joinedAt(joins + 1))
+    expect(beats(run, false)).toBe(joins + 2)
+    expect(
+      run.crashes.map(({ error, restart }) => [error.name, error.cause === failed, restart])
+    ).toEqual([['KafkaJSNumberOfRetriesExceeded', true, false]])
+    expect(run.crashes[0].error.retryCount).toBe(1)
+    expect(policy).toHaveBeenCalledTimes(1)
+    expect(jest.getTimerCount()).toBe(0)
+  }, 60000)
+
+  it('a poll expiry, then the stuck handler rethrowing the refusal of its own commit: the refusal stays part of the rejoin, nothing is sent or reported and the record is redelivered', async () => {
+    const ref = {}
+    let refused = null
+    const policy = jest.fn(async () => false)
+    const run = await begin(
+      async ({ topic, partition }, held, call) => {
+        if (call !== 1) return
+        await held.promise
+        try {
+          await ref.run.consumer.commitOffsets([{ topic, partition, offset: '41' }])
+        } catch (error) {
+          refused = error
+          throw error
+        }
+      },
+      { retry: { ...RETRY, restartOnFailure: policy }, autoCommitThreshold: 100 }
+    )
+    ref.run = run
+    const joins = beats(run, false)
+    await advanceUntil(() => leaves(run).length === 1, 10000)
+    await jest.advanceTimersByTimeAsync(500)
+
+    run.held.resolve()
+    await advanceUntil(() => run.calls.length === 2, 5000)
+    await jest.advanceTimersByTimeAsync(1000)
+
+    expect(refused?.name).toBe('KafkaJSCommitFailedError')
+    expect(count(run, 'commit')).toBe(0)
+    expect(beats(run, false)).toBe(joins + 1)
+    expect(leaves(run)).toEqual([-1])
+    expect(run.calls).toEqual(['40', '40'])
+    expect(run.crashes).toEqual([])
+    expect(policy).not.toHaveBeenCalled()
   }, 60000)
 })

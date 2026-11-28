@@ -29,6 +29,7 @@ const {
   REBALANCE_PATHS,
   isOffsetCommitError,
   rebalanceReason,
+  isCausedByRebalance,
   isConsumerProtocolFatal,
   isHeartbeatFatal,
   sentOwnership,
@@ -175,6 +176,8 @@ module.exports = class Runner extends EventEmitter {
     this.fatal = null
     /** Handlers currently inside `eachMessage`/`eachBatch`. */
     this.inFlightHandlers = 0
+    /** `eachMessage`/`eachBatch` calls that returned; see `scheduleFetchManager`. */
+    this.handlerReturns = 0
     /** Set while an eager rebalance is stopping the world; see `handleRebalanceError`. */
     this.quiescing = false
     this.pollTimer = new PollTimer({ pollDeadline: maxPollInterval })
@@ -425,6 +428,12 @@ module.exports = class Runner extends EventEmitter {
    * does not refill the retries that other errors have spent. A handler's errors, whatever they
    * are, count as before, also when a rebalance verdict the failure did not cause was waiting:
    * that rebalance runs first.
+   *
+   * The retrier refills its retries only when an attempt resolves, and an attempt resolves only
+   * once a handler has returned since it began (or the run stops). A rebalance, a dropped answer
+   * of a replaced membership or a ride runs the attempt again in place instead, so a verdict that
+   * lands during a retry's backoff or during a recovery cannot buy a failing record a delivery
+   * beyond `retry.retries`.
    * @returns {void}
    */
   scheduleFetchManager() {
@@ -446,10 +455,12 @@ module.exports = class Runner extends EventEmitter {
      * @param {(error: Error) => void} bail
      * @param {number} retryCount
      * @param {number} retryTime
-     * @returns {Promise<true|undefined>} true when it rode out a lost connection: the retrier's
-     *   attempt then runs it again, so a ride never refills the retries other errors have spent
+     * @param {number} since `handlerReturns` when the retrier's attempt began
+     * @returns {Promise<true|undefined>} true when the retrier's attempt must run it again: after
+     *   a ridden lost connection, and after a recovered rebalance while no handler has returned
+     *   since the retrier's attempt began. Neither refills the retries other errors have spent.
      */
-    const attempt = async (bail, retryCount, retryTime) => {
+    const attempt = async (bail, retryCount, retryTime, since) => {
       if (!this.running) {
         return
       }
@@ -476,11 +487,21 @@ module.exports = class Runner extends EventEmitter {
         }
       }
 
+      /**
+       * Whether the retrier's attempt goes on after a rebalance that did not bail. Only a handler
+       * that returned since the attempt began ends it successfully, refilling the retries; a
+       * recovery alone does not, so a verdict queued during a retry's backoff, or during the
+       * recovery, cannot buy a failing record another delivery.
+       */
+      const goOn = (bailed) =>
+        !bailed && this.running && !this.stopRequested && this.handlerReturns === since
+          ? true
+          : undefined
+
       const waiting = this.rebalanceCoordinator.takeVerdict()
 
       if (waiting) {
-        await rebalance(waiting)
-        return
+        return goOn(await rebalance(waiting))
       }
 
       try {
@@ -501,25 +522,25 @@ module.exports = class Runner extends EventEmitter {
         const merged =
           thrown && pending ? this.mergeThrownWithSlot(thrown, pending) : thrown || pending
 
+        const independent = !thrown && this.isIndependentHandlerFailure(e, pending)
         if (merged) {
-          // Read before the recovery can renew ownership.
-          const independent = !thrown && this.isIndependentHandlerFailure(e, pending)
           const bailed = await rebalance(merged)
           // A fatal verdict the recovery left in the slot is the outcome: the next attempt acts
           // on it. A recoverable one is not, and the crash's stop clears it. An independent
           // failure goes on below, as if no verdict had been waiting.
           const settled = !bailed && !this.rebalanceCoordinator.hasFatalVerdict()
-          if (!independent || !settled || !this.running || this.stopRequested) return
+          if (!independent || !settled || !this.running || this.stopRequested) return goOn(bailed)
         }
 
-        // An answer for a membership a completed round already replaced changes nothing.
-        if (obsoleteOwnership(this.consumerGroup.ownership, e)) {
+        // An answer for a membership a completed round already replaced changes nothing. A
+        // handler's own failure is not such an answer, whichever membership its request was for.
+        if (!independent && obsoleteOwnership(this.consumerGroup.ownership, e)) {
           this.logger.debug('Ignoring an error from a membership already replaced', {
             groupId: this.consumerGroup.groupId,
             memberId: this.consumerGroup.memberId,
             error: e.message,
           })
-          return
+          return goOn(false)
         }
 
         const delay = this.rideOutage(e)
@@ -546,12 +567,13 @@ module.exports = class Runner extends EventEmitter {
 
       const verdict = this.rebalanceCoordinator.takeVerdict()
       if (verdict) {
-        await rebalance(verdict)
+        return goOn(await rebalance(verdict))
       }
     }
 
     this.fetchRetrier(async (bail, retryCount, retryTime) => {
-      while (await attempt(bail, retryCount, retryTime));
+      const since = this.handlerReturns
+      while (await attempt(bail, retryCount, retryTime, since));
     })
       .then(() => {
         this.scheduleFetchManager()
@@ -589,26 +611,23 @@ module.exports = class Runner extends EventEmitter {
   }
 
   /**
-   * Whether a handler's own failure arrived together with a rebalance verdict it did not cause,
-   * under either group protocol. The rebalance runs first; the failure then goes to the fetch
-   * retrier as it would have without the verdict, so it crashes or spends a retry by the ordinary
-   * rules instead of being consumed by the rebalance. Ownership refusals, OffsetCommit errors and
-   * errors wrapping the verdict's error are the rebalance itself, and a fatal consumer-protocol
-   * verdict is the run's outcome.
+   * Whether the fetch attempt failed with a handler's own failure, one no rebalance caused, under
+   * either group protocol. Such a failure goes to the fetch retrier, after any waiting rebalance,
+   * so it crashes or spends a retry by the ordinary rules; it is neither consumed by the
+   * rebalance nor dropped because the membership its request was sent for has been replaced. A
+   * failure a rebalance caused (`isCausedByRebalance`) is the rebalance itself, and a fatal
+   * consumer-protocol verdict is the run's outcome.
    * @private
    * @param {unknown} error what the fetch attempt threw, with no verdict of its own
-   * @param {import('./rebalanceCoordinator').Verdict} pending the slot entry
+   * @param {import('./rebalanceCoordinator').Verdict|null} pending the slot entry, if any
    * @returns {boolean}
    */
   isIndependentHandlerFailure(error, pending) {
-    if (this.requestClasses.get(error) !== 'handler' || isConsumerProtocolFatal(pending.error)) {
-      return false
-    }
-    if (error instanceof KafkaJSCommitFailedError || isOffsetCommitError(error)) return false
-    for (let cause = error, depth = 0; cause && depth < 8; cause = cause.cause, depth++) {
-      if (cause === pending.error) return false
-    }
-    return true
+    return (
+      this.requestClasses.get(error) === 'handler' &&
+      !(pending && isConsumerProtocolFatal(pending.error)) &&
+      !isCausedByRebalance(error, pending, { kind: this.consumerGroup.kind })
+    )
   }
 
   /**
@@ -1420,6 +1439,7 @@ module.exports = class Runner extends EventEmitter {
         await this.commitAfterHandlerError(batch)
         throw e
       }
+      this.handlerReturns++
 
       this.resolveBatchOffset(
         batch,
@@ -1548,6 +1568,7 @@ module.exports = class Runner extends EventEmitter {
       await this.commitAfterHandlerError(batch)
       throw e
     }
+    this.handlerReturns++
 
     // resolveOffset for the last offset can be disabled to allow the users of eachBatch to
     // stop their consumers without resolving unprocessed offsets (issues/18)
