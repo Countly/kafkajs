@@ -12,7 +12,10 @@ const {
   NODE_ID,
   fetchResponse,
   createFetchGroup,
+  trackFixtures,
 } = require('./fixtures/fetchHarness')
+
+trackFixtures()
 
 const BOUND = 4 * MIB
 

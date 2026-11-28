@@ -7,8 +7,11 @@ const {
   createFakeBroker,
   decodeFetchRequest,
   fetchResponse,
+  trackFixtures,
 } = require('../../consumer/__tests__/fixtures/fetchHarness')
 const apiKeys = require('../../protocol/requests/apiKeys')
+
+trackFixtures()
 
 const OLD_ID = '21222324-2526-2728-292a-2b2c2d2e2f30'
 const partition = (id) => ({ partition: id, fetchOffset: String(id * 10), maxBytes: 4096 })

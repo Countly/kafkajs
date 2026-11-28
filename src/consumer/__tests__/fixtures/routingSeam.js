@@ -262,7 +262,8 @@ class RoutingSeam {
   }
 
   /**
-   * Stops the fetchers, ends every poll, restores real timers and disconnects the brokers.
+   * Stops the fetchers, ends every poll and restores real timers. The brokers belong to the test:
+   * its tracker (`trackFixtures()` in the spec) closes and disconnects them when it ends.
    * @returns {Promise<void>}
    * @throws {Error} what the fetch manager ended with
    */
@@ -274,8 +275,6 @@ class RoutingSeam {
     } finally {
       jest.clearAllTimers()
       jest.useRealTimers()
-      await Promise.all([...this.brokers.values()].map((broker) => broker.disconnect()))
-      await this.harness.broker.disconnect()
     }
   }
 
