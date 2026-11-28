@@ -29,9 +29,9 @@ const TOPIC_ID = '01020304-0506-0708-090a-0b0c0d0e0f10'
  * One fixture as its tracker sees it.
  * @typedef {object} TrackedFixture
  * @property {() => void|Promise<void>} release ends the fixture; may run more than once
- * @property {() => string[]} [outstanding] the work the test left unfinished, read before
- *   `release`: each item names the work and where it is (a request with its correlation id, a
- *   connect in progress); none by default
+ * @property {() => string[]} [outstanding] the work the test left unfinished, read before any
+ *   release of its test: each item names the work and where it is (a request with its correlation
+ *   id, a broker connect or a broker lookup not yet settled); none by default
  * @property {() => string[]} remains what the fixture still holds, read after `release`; empty
  *   when it is really released
  */
@@ -64,19 +64,27 @@ class FixtureTracker {
    * goes on top of the stack, so it is released before the older fixtures it may use. Every
    * release runs even when an earlier one failed. Once the stack is empty the tracker is closed,
    * in the same turn, and refuses new fixtures.
+   *
+   * The work each fixture left unfinished is read before anything is released: a release may
+   * settle an older fixture's work, which the test still abandoned. A fixture a release creates
+   * is read as its own release begins.
    * @returns {Promise<void>}
    * @throws {Error} the first failure: a read or release that threw, or a fixture that had work in
    *   flight when the test ended or still holds something after its release, naming its creator
    */
   async releaseAll() {
     let failure = null
-    for (let entry = this.entries.pop(); entry; entry = this.entries.pop()) {
-      let abandoned = []
+    const read = (entry) => {
       try {
-        abandoned = entry.outstanding()
+        return entry.outstanding()
       } catch (error) {
         failure ??= { error }
+        return []
       }
+    }
+    const atTestEnd = new Map(this.entries.map((entry) => [entry, read(entry)]))
+    for (let entry = this.entries.pop(); entry; entry = this.entries.pop()) {
+      const abandoned = atTestEnd.get(entry) ?? read(entry)
       try {
         await entry.release()
         const held = entry.remains()
@@ -137,8 +145,9 @@ const trackerFor = (creator) => {
  * The one way a spec gets its fixtures torn down: call it once at the top of the spec file, where
  * Jest allows hooks. Every fixture the creators below build during a test is then torn down in
  * `afterEach`, the last created first, whatever the test's outcome. The test fails when a
- * fixture still had work in flight as the test ended (a request no answer reached, a connect in
- * progress; a test that means to abandon work closes the fixture itself first), or still holds a
+ * fixture still had work in flight as the test ended (a request no answer reached, a broker
+ * connect or a held broker lookup not yet settled; a test that means to abandon work closes the
+ * fixture itself first and waits for that), or still holds a
  * socket or a request after its teardown; the message names the creator, the work and where it
  * is. A creator that runs when no tracked test is running (the spec never called this, or the
  * call is at module load or in `beforeAll`) throws naming itself.
@@ -779,7 +788,9 @@ const subscribe = (thenable, handlers) => {
  * request and socket (`KafkaJSConnectionError` 'The fake broker was closed'), and cancels all
  * queued work; it then closes the connection without draining, which rejects every request the
  * broker never answered (queued, withheld, or mid-handshake) with `KafkaJSConnectionClosedError`
- * and aborts a connect still in progress. It resolves once the connection is closed. A frame
+ * and aborts a connect still in progress. It resolves once the connection is closed and every
+ * `broker.connect()` called before has settled, one still waiting for the broker lock included,
+ * so none settles after its test. A frame
  * written to a socket afterwards is recorded and never answered. No answer may run after its
  * test, so `createFakeBroker` closes it when the test ends.
  *
@@ -1007,6 +1018,28 @@ const buildFakeBroker = (answer, chunks) => {
   const broker = new Broker({ connectionPool, logger: newLogger() })
 
   /**
+   * Every `broker.connect()` not yet settled, from its call on: before it holds the broker lock
+   * there is no connection setup or request to see it by.
+   * @type {Set<Promise<void>>}
+   */
+  const connects = new Set()
+  const connect = broker.connect.bind(broker)
+  /**
+   * The broker's own `connect`, accounted from its call until it settles.
+   * @param {...*} args what `Broker#connect` takes
+   * @returns {Promise<void>} the broker's own promise
+   */
+  broker.connect = (...args) => {
+    const call = connect(...args)
+    const settled = call.then(
+      () => connects.delete(settled),
+      () => connects.delete(settled)
+    )
+    connects.add(settled)
+    return call
+  }
+
+  /**
    * Closes the fake broker for good, as the factory's documentation says.
    * @returns {Promise<void>} the one close every caller shares
    */
@@ -1015,17 +1048,19 @@ const buildFakeBroker = (answer, chunks) => {
       closed = true
       for (const socket of [...owned.keys()]) release(socket)
       await broker.disconnect({ drainTimeout: 0 })
+      while (connects.size > 0) await Promise.all(connects)
     })())
 
   /**
-   * The work the connection has not finished, read from its own state: a connect in progress
-   * and every request still queued or in flight.
+   * The work the broker has not finished, read from its own state: every `broker.connect()` not
+   * yet settled, a connection setup in progress and every request still queued or in flight.
    * @returns {string[]}
    */
   const unfinished = () => {
     const { inflight, pending } = connection.requestQueue
     return [
-      ...(connection.setupAttempt ? ['a connect in progress'] : []),
+      ...[...connects].map(() => 'a broker connect'),
+      ...(connection.setupAttempt ? ['a connection setup'] : []),
       ...[...inflight.values(), ...pending].map(
         ({ entry, correlationId }) => `${entry.apiName} request (correlation id ${correlationId})`
       ),
@@ -1274,7 +1309,9 @@ const buildConsumerGroup = ({
  * per node when nodes hold different states.
  *
  * `holdBrokerLookup(nodeId)` makes every `cluster.findBroker` for that node wait until the
- * returned release function is called, or until `teardown()`, which rejects it.
+ * returned release function is called, or until `teardown()`, which rejects it; once teardown has
+ * begun, `holdBrokerLookup` throws. A lookup that waits, for a hold or for its node's broker, is
+ * work in flight until it settles.
  *
  * `joinAndSync` is stubbed (and returned) because the contract under test is that a partition
  * error never reaches it; leaving the real one in place would attempt a real join. `sync()` still
@@ -1437,16 +1474,28 @@ const createFetchGroup = async ({
   const nodeBrokers = new Map([[NODE_ID, { ...nodeBroker, ready: Promise.resolve() }]])
   /** @type {Map<number, Set<{ released: Promise<void>, release: () => void }>>} */
   const heldLookups = new Map()
-  let tornDown = false
   /**
-   * `read` of every node, each item placed at its node.
+   * Every `cluster.findBroker` that waits, for a hold or its node's broker, from its call until it
+   * settles.
+   * @type {Set<{ nodeId: number, settled: Promise<void> }>}
+   */
+  const lookups = new Set()
+  let tornDown = false
+  /** @throws {Error} once the fixture is torn down */
+  const refuseAfterTeardown = () => {
+    if (tornDown) throw new Error('fetch harness torn down')
+  }
+  /**
+   * `read` of every node, each item placed at its node, after the broker lookups not yet settled.
    * @param {(node: { inFlight: () => string[], holds: () => string[] }) => string[]} read
    * @returns {string[]}
    */
-  const atNodes = (read) =>
-    [...nodeBrokers].flatMap(([nodeId, node]) =>
+  const atNodes = (read) => [
+    ...[...lookups].map(({ nodeId }) => `a broker lookup at node ${nodeId}`),
+    ...[...nodeBrokers].flatMap(([nodeId, node]) =>
       read(node).map((item) => `${item} at node ${nodeId}`)
-    )
+    ),
+  ]
   /** @type {Promise<void>|null} */
   let tearingDown = null
   /**
@@ -1455,8 +1504,8 @@ const createFetchGroup = async ({
    * handshake: its connect is aborted, every request no answer reached is rejected, and nothing
    * queued runs on a later turn. The test's tracker runs it when the test ends, so a failed
    * assertion cannot leave a withheld answer or a held lookup pending; a spec may call it earlier.
-   * The cleanup runs once; every caller waits for that same cleanup, which closes every node
-   * before it rejects with the first close failure.
+   * The cleanup runs once; every caller waits for that same cleanup, which closes every node and
+   * waits for every lookup to settle before it rejects with the first close failure.
    * @returns {Promise<void>}
    */
   const teardown = () =>
@@ -1466,6 +1515,7 @@ const createFetchGroup = async ({
         for (const hold of [...holds]) hold.release()
       }
       const closes = await Promise.allSettled([...nodeBrokers.values()].map(({ close }) => close()))
+      await Promise.all([...lookups].map(({ settled }) => settled))
       const failure = closes.find(({ status }) => status === 'rejected')
       if (failure) throw failure.reason
     })())
@@ -1481,8 +1531,11 @@ const createFetchGroup = async ({
    * one node stack: a lookup waits until every one of them is released.
    * @param {number} nodeId
    * @returns {() => void} the release
+   * @throws {Error} once teardown has begun: its sweep released every hold, so a later one would
+   *   keep a woken lookup waiting
    */
   const holdBrokerLookup = (nodeId) => {
+    refuseAfterTeardown()
     let resolve
     const hold = { released: new Promise((done) => (resolve = done)) }
     hold.release = () => {
@@ -1514,10 +1567,6 @@ const createFetchGroup = async ({
   }
   const writesTo = (nodeId) => nodeBrokers.get(nodeId)?.state.writes ?? []
   const socketsTo = (nodeId) => nodeBrokers.get(nodeId)?.state.sockets ?? []
-  /** @throws {Error} once the fixture is torn down */
-  const refuseAfterTeardown = () => {
-    if (tornDown) throw new Error('fetch harness torn down')
-  }
 
   const leaders = new Map(
     partitions.map((partition) => [
@@ -1588,20 +1637,28 @@ const createFetchGroup = async ({
       // The default path resolves in the same turns it always did.
       if (!validationBrokers && heldLookups.size === 0) return broker
       const nodeId = Number(args.nodeId)
-      while (heldLookups.has(nodeId)) {
-        await heldLookups.get(nodeId).values().next().value.released
-      }
-      refuseAfterTeardown()
-      let found
+      let settle
+      const lookup = { nodeId, settled: new Promise((done) => (settle = done)) }
+      lookups.add(lookup)
       try {
-        found = await brokerFor(nodeId)
-      } catch (error) {
-        // Teardown aborts a node that was still connecting.
+        while (heldLookups.has(nodeId)) {
+          await heldLookups.get(nodeId).values().next().value.released
+        }
         refuseAfterTeardown()
-        throw error
+        let found
+        try {
+          found = await brokerFor(nodeId)
+        } catch (error) {
+          // Teardown aborts a node that was still connecting.
+          refuseAfterTeardown()
+          throw error
+        }
+        refuseAfterTeardown()
+        return found
+      } finally {
+        lookups.delete(lookup)
+        settle()
       }
-      refuseAfterTeardown()
-      return found
     },
     findGroupCoordinator: async () => coordinator,
     findTopicPartitionMetadata: () =>
