@@ -4,8 +4,10 @@ const {
   prepareRecordBatches,
   fetchResponse,
   createFetchGroup,
+  trackFixtures,
 } = require('./fixtures/fetchHarness')
 
+trackFixtures()
 beforeAll(prepareRecordBatches)
 
 describe('Consumer > fetch partition error contract', () => {

@@ -3,7 +3,7 @@ const path = require('path')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const Encoder = require('../../protocol/encoder')
 const { MemberMetadata, MemberAssignment } = require('../assignerProtocol')
-const { createFakeCoordinator } = require('./fixtures/fetchHarness')
+const { createFakeCoordinator, trackFixtures } = require('./fixtures/fetchHarness')
 const ClassicGroupProtocol = require('../groupProtocol/classic')
 const ConsumerGroup = require('../consumerGroup')
 const IdleWait = require('../idleWait')
@@ -19,6 +19,8 @@ const { createErrorFromCode } = require('../../protocol/error')
 const sleep = require('../../utils/sleep')
 
 const FIXTURES = path.join(__dirname, 'fixtures', 'classicGroupProtocol')
+
+trackFixtures()
 
 /** Rounds the cases below begin, retired after each case. */
 const rounds = []
@@ -209,7 +211,7 @@ describe('Consumer > classic group protocol > golden frames', () => {
 
   let bodyOf
 
-  beforeAll(async () => {
+  beforeEach(async () => {
     bodyOf = await recordFrames()
   })
 

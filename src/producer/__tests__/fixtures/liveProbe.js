@@ -16,6 +16,7 @@ const {
   plainTextBrokers,
 } = require('../../../../testHelpers')
 const { NEVER, STOP_GRACE_MS, bounded, delay, liveRun } = require('./bounded')
+const { batchesOf } = require('./bufferHarness')
 
 /** The most one probe record carries, an independent conservative bound. */
 const MAX_PROBE_RECORD_BYTES = 32768
@@ -230,8 +231,8 @@ class CleanupStack {
  * @property {number} producerEpoch
  * @property {number} acks
  * @property {Array<{ topic: string, partition: number, firstSequence: number|undefined,
- *   records: number, first: string }>} partitions the batches it carried; `first` is the start of
- *   the first record's value
+ *   records: number, first: string }>} partitions the batches it carried, taken when the call
+ *   started; `first` is the start of the first record's value
  * @property {Array<{ topic: string, partition: number, errorCode: number, baseOffset: string }>|null} results
  *   the broker's answer, absent while pending and when the call failed
  * @property {Error|null} error what the call threw
@@ -289,6 +290,8 @@ class ProduceLedger {
   }
 
   /**
+   * Records a call synchronously, as it starts: it writes and decodes nothing, so the call's
+   * timing and outcome are the broker's alone.
    * @param {object} request the arguments of `Broker#produce`
    * @returns {ProduceCall}
    */
@@ -298,15 +301,13 @@ class ProduceLedger {
       producerId: String(request.producerId),
       producerEpoch: request.producerEpoch,
       acks: request.acks,
-      partitions: request.topicData.flatMap(({ topic, partitions }) =>
-        partitions.map(({ partition, firstSequence, messages }) => ({
-          topic,
-          partition,
-          firstSequence,
-          records: messages.length,
-          first: String(messages[0]?.value).slice(0, 40),
-        }))
-      ),
+      partitions: batchesOf(request).map(({ topic, partition, firstSequence, messages }) => ({
+        topic,
+        partition,
+        firstSequence,
+        records: messages.length,
+        first: String(messages[0]?.value).slice(0, 40),
+      })),
       results: null,
       error: null,
     }

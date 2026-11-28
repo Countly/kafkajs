@@ -4,15 +4,17 @@ const {
   createFetchGroup,
   prepareRecordBatches,
   fetchResponse,
+  trackFixtures,
 } = require('./fixtures/fetchHarness')
 
 let harness
 beforeAll(() => prepareRecordBatches())
-afterEach(async () => {
-  if (harness) await harness.broker.disconnect()
+afterEach(() => {
   harness = null
   jest.useRealTimers()
 })
+// After the hook that restores real timers, so a teardown never runs under fake ones.
+trackFixtures()
 
 /** @returns {Promise<void>} yields one event-loop turn without arming a timer */
 const turn = () => new Promise(setImmediate)

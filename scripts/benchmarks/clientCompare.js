@@ -201,7 +201,7 @@ const PRODUCER_DEFAULTS = {
     idempotent: true,
     maxInFlightRequests: 5,
     retries: 2147483647,
-    linger: 5,
+    linger: 0,
     batchSize: 16384,
     partitioner: 'UniformStickyPartitioner (adaptive)',
     acks: -1,
