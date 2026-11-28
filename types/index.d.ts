@@ -570,7 +570,15 @@ export type GroupMember = {
 
 export type GroupMemberAssignment = { memberId: string; memberAssignment: Buffer }
 
-export type GroupState = { name: string; metadata: Buffer }
+export type GroupState = {
+  /**
+   * The protocol name JoinGroup offers. The coordinator answers with the one it selects, and the
+   * leader runs the assigner that offered it. Two assigners must not offer different names that
+   * are written as the same bytes (a lone surrogate is written as U+FFFD).
+   */
+  name: string
+  metadata: Buffer
+}
 
 export type Assigner = {
   name: string
@@ -583,6 +591,27 @@ export type Assigner = {
     /** Authoritative when present; an absent name has no partitions. */
     groupTopicMetadata?: ReadonlyMap<string, PartitionMetadata[]>
   }): Promise<GroupMemberAssignment[]>
+  /**
+   * Under the cooperative protocol the leader checks the returned plan against the partitions the
+   * members report owning, and refuses one that puts a partition in two assignments, or gives a
+   * partition to a member that does not report owning it while another member does. To move a
+   * partition, leave it out this round. Withholding, and keeping a partition with any one member
+   * that reports owning it, are always allowed; when several report owning it, the assigner chooses
+   * which one keeps it (for example by `generationId` or its own userData). The leader does not
+   * rank claims, and the built-in `cooperative-sticky` assigner has no exemption.
+   */
+  assign(group: {
+    members: GroupMember[]
+    topics: string[]
+    /** Sorted union; topics remains the leader's own subscription. */
+    groupTopics?: string[]
+    /** Authoritative when present; an absent name has no partitions. */
+    groupTopicMetadata?: ReadonlyMap<string, PartitionMetadata[]>
+  }): Promise<GroupMemberAssignment[]>
+  /**
+   * A cooperative assigner must write the `ownedPartitions` it is given into a subscription of
+   * version 1 or higher; otherwise the leader cannot see what its members own.
+   */
   protocol(subscription: {
     topics: string[]
     ownedPartitions?: Array<{ topic: string; partitions: number[] }>

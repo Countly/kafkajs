@@ -98,12 +98,12 @@ describe('Consumer > assigners > CooperativeStickyAssigner', () => {
       topics: ['topic-A'],
     })
 
-    // member-2 reported the higher generation, so its claim wins and it keeps partition 0 (its
-    // quota is one); member-1's claim is dropped and it is filled with partition 1. Without the
-    // fallback both would report the default generation, the claims would cancel out, and the
-    // partitions would go out in member order as [0] and [1] instead.
+    // member-2 reported the higher generation, so it owns both partitions and keeps partition 0
+    // (its quota is one); partition 1 moves to member-1 and is withheld until member-2 revokes it.
+    // Without the fallback both would report the default generation, both claims would tie, and
+    // neither member would get anything this round.
     expect(decodeAssignment(result)).toEqual({
-      'member-1': { 'topic-A': [1] },
+      'member-1': {},
       'member-2': { 'topic-A': [0] },
     })
   })
@@ -133,10 +133,9 @@ describe('Consumer > assigners > CooperativeStickyAssigner', () => {
       topics: ['topic-A'],
     })
 
-    // Reading the -1 as a real generation would make both claims equal, cancel them out, and hand
-    // the partitions out in member order as [0] and [1].
+    // Reading the -1 as a real generation would make both claims tie and withhold both partitions.
     expect(decodeAssignment(result)).toEqual({
-      'member-1': { 'topic-A': [1] },
+      'member-1': {},
       'member-2': { 'topic-A': [0] },
     })
   })

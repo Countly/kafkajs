@@ -1275,6 +1275,7 @@ describe('Consumer > cooperative rebalance apply', () => {
       protocol.leaderId = 'member-1'
       protocol.generationId = 1
       protocol.groupProtocol = groupProtocol
+      protocol.selectedAssigner = assigner
       protocol.members = [
         {
           memberId: 'member-1',
@@ -1339,7 +1340,7 @@ describe('Consumer > cooperative rebalance apply', () => {
       expect(error.message).toContain('member-2')
     })
 
-    it('exempts cooperative-sticky, whose own withhold rule guarantees it', async () => {
+    it('checks a custom assigner that offers the name cooperative-sticky', async () => {
       const protocol = buildProtocol({
         mode: COOPERATIVE,
         groupProtocol: 'cooperative-sticky',
@@ -1353,7 +1354,28 @@ describe('Consumer > cooperative rebalance apply', () => {
           beforeSync: () => {},
           round: realRound(),
         })
-      ).resolves.toMatchObject({ assignment: {} })
+      ).rejects.toThrow(/topic-a-1.*member-1/)
+      expect(protocol.coordinator.syncGroup).not.toHaveBeenCalled()
+    })
+
+    it('checks an assignment returned as a string by the bytes the encoder writes for it', async () => {
+      // Every byte of this assignment is ASCII, so the string's UTF-8 is the assignment itself.
+      const asString = encodeAssignment({ [TOPIC_A]: [0, 1] }).toString('latin1')
+      const protocol = buildProtocol({
+        mode: COOPERATIVE,
+        groupProtocol: 'range',
+        assignment: [{ memberId: 'member-1', memberAssignment: asString }],
+      })
+
+      await expect(
+        protocol.sync({
+          topics: [TOPIC_A],
+          topicsSubscribed: [TOPIC_A],
+          beforeSync: () => {},
+          round: realRound(),
+        })
+      ).rejects.toThrow(`${TOPIC_A}-1 to member-1 while member-2 still owns it`)
+      expect(protocol.coordinator.syncGroup).not.toHaveBeenCalled()
     })
 
     it('does not check under eager, where every member revoked everything first', async () => {

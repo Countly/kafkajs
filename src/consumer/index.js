@@ -39,6 +39,7 @@ const {
   stampOwnership,
 } = require('./rebalanceErrorContract')
 const { roundRobin } = require('./assigners')
+const AssignerOffers = require('./groupProtocol/assignerOffers')
 const {
   EARLIEST_OFFSET,
   LATEST_OFFSET,
@@ -329,6 +330,9 @@ module.exports = (params) => {
     : partitionAssigners.map((createAssigner) =>
         createAssigner({ groupId, logger, cluster, rackAware: rackAwareAssignment })
       )
+  // The names the assigners declare must already be apart; what each one offers at join is
+  // checked again where JoinGroup is written.
+  AssignerOffers.declared(assigners)
 
   /** @type {Record<string, { fromBeginning?: boolean, resetPolicy?: object }>} */
   const topics = dictionary()

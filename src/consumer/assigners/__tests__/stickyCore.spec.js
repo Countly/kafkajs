@@ -1,4 +1,4 @@
-const { assignSticky, DEFAULT_GENERATION, keyOf } = require('../stickyAssigner/stickyCore')
+const { assignSticky, DEFAULT_GENERATION } = require('../stickyAssigner/stickyCore')
 
 /**
  * @param {string} memberId
@@ -539,36 +539,65 @@ describe('Consumer > assigners > stickyCore > a claim on a partition the topic n
     expect(plain(assignment)['member-b'].y).toEqual([0])
   })
 
-  test('a partition two members claim at one generation after the topic shrank is assigned once and contested', () => {
-    const contested = new Set()
+  test('a partition two members claim at one generation after the topic shrank is assigned once', () => {
     const assignment = assignSticky({
       partitionsPerTopic: { x: partitions(1) },
       members: [
         member('member-a', { topics: ['x'], owned: { x: [0, 1] }, generationId: 2 }),
         member('member-b', { topics: ['x'], owned: { x: [0] }, generationId: 2 }),
       ],
-      contested,
     })
 
     expect(allAssigned(assignment)).toEqual(['x-0'])
-    expect([...contested]).toEqual([keyOf('x', 0)])
   })
 
-  test('a claim on a partition the topic no longer has is never contested', () => {
-    const contested = new Set()
+  test('two claims on a partition the topic no longer has leave each member its own live partition', () => {
     const assignment = assignSticky({
       partitionsPerTopic: { x: partitions(2) },
       members: [
         member('member-a', { topics: ['x'], owned: { x: [0, 2] }, generationId: 2 }),
         member('member-b', { topics: ['x'], owned: { x: [1, 2] }, generationId: 2 }),
       ],
-      contested,
     })
 
     expect(plain(assignment)).toEqual({
       'member-a': { x: [0] },
       'member-b': { x: [1] },
     })
-    expect([...contested]).toEqual([])
   })
+})
+
+describe('Consumer > assigners > stickyCore > an older tie beside a newer claim', () => {
+  // member-a and member-b tie at generation 2 on x-0; member-c claims it at generation 9.
+  const tiedThenNewer = [
+    member('member-a', { topics: ['x'], owned: { x: [0] }, generationId: 2 }),
+    member('member-b', { topics: ['x'], owned: { x: [0] }, generationId: 2 }),
+    member('member-c', { topics: ['x'], owned: { x: [0] }, generationId: 9 }),
+  ]
+  const ORDERS = [
+    ['as listed', tiedThenNewer],
+    ['reversed', [...tiedThenNewer].reverse()],
+  ]
+
+  test.each(ORDERS)(
+    'lets the newest claimant keep the partition when ties yield to newer claims, members %s',
+    (_order, members) => {
+      const assignment = assignSticky({
+        partitionsPerTopic: { x: partitions(1) },
+        members,
+        tiesYieldToNewerClaims: true,
+      })
+
+      expect(plain(assignment)).toEqual({ 'member-a': {}, 'member-b': {}, 'member-c': { x: [0] } })
+    }
+  )
+
+  test.each(ORDERS)(
+    "keeps Java's behaviour by default: the older tie still stops the newest claimant keeping it, members %s",
+    (_order, members) => {
+      const assignment = assignSticky({ partitionsPerTopic: { x: partitions(1) }, members })
+
+      expect(plain(assignment)).toEqual({ 'member-a': { x: [0] }, 'member-b': {}, 'member-c': {} })
+    }
+  )
 })

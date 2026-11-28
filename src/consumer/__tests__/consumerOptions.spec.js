@@ -207,6 +207,39 @@ describe('Consumer > configuration > maxPollInterval', () => {
   })
 })
 
+describe('Consumer > configuration > partitionAssigners', () => {
+  /** @param {string} name @returns {Function} the factory of an assigner named `name` */
+  const named = (name) => () => ({
+    name,
+    version: 0,
+    protocol: () => ({ name, metadata: Buffer.alloc(0) }),
+    assign: async () => [],
+  })
+
+  it.each([
+    ['two names that differ only in a lone surrogate', 'planner-\uD800', 'planner-\uDBFF'],
+    ['a name with U+FFFD beside one with a lone surrogate', 'planner-�', 'planner-\uD800'],
+  ])(
+    'refuses %s when the consumer is created: both are sent as the same bytes',
+    (_, first, second) => {
+      const create = () => offlineConsumer({ partitionAssigners: [named(first), named(second)] })
+
+      expect(create).toThrow(KafkaJSNonRetriableError)
+      expect(create).toThrow(
+        `The partition assigners "${first}" and "${second}" are both sent as "planner-�", so the group cannot tell them apart`
+      )
+    }
+  )
+
+  it('accepts one name listed twice and names sent as different bytes', () => {
+    const { consumer } = offlineConsumer({
+      partitionAssigners: [named('planner'), named('planner'), named('planner-\uD800')],
+    })
+
+    expect(typeof consumer.run).toBe('function')
+  })
+})
+
 describe('Consumer > subscribe > regex', () => {
   const consumer = (config = {}) =>
     kafka().consumer({ groupId: 'group-a', groupProtocol: 'consumer', ...config })

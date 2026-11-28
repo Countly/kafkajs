@@ -29,8 +29,14 @@ const decodeMembers = (decoder) => ({
   errorCode: decoder.readInt16(),
 })
 
+/**
+ * Throws the top-level error first, then the first member's error, as v4 does.
+ * @param {object} data the decoded answer
+ * @returns {Promise<object>} `data`
+ * @throws {import('../../../../errors').KafkaJSProtocolError}
+ */
 const parse = async (data) => {
-  const parsed = parseV2(data)
+  const parsed = await parseV2(data)
 
   const memberWithError = data.members.find((member) => failure(member.errorCode))
   if (memberWithError) {

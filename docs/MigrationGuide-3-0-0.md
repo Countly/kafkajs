@@ -780,11 +780,24 @@ says so, `groupProtocol: 'consumer'`.
   coordinator picking `cooperative-sticky` for everyone because it is the only name they share. That
   is safe by construction: an eager member's JoinGroup advertises no owned partitions — it has
   given everything up before it rejoins — and the cooperative algorithm never hands a partition to a
-  member that still owns it. It also withholds a partition that two members claim in the same
-  generation, which is what happens when one of them is working from a membership it has already
-  lost: neither gets it for a round, and the follow-up round hands it to whichever member is still
-  in the group. Going straight to deploy 2 splits the group with `INCONSISTENT_GROUP_PROTOCOL` until
-  the rollout finishes.
+  new member while another member still owns it; the partition either stays with one member that
+  reports owning it or waits a round until its owner has revoked it. It also withholds a partition
+  that two members claim in the same generation, which is what happens when one of them is working
+  from a membership it has already lost: neither gets it for a round, and the follow-up round hands
+  it to whichever member is still in the group. Going straight to deploy 2 splits the group with
+  `INCONSISTENT_GROUP_PROTOCOL` until the rollout finishes.
+
+  The group leader computes every plan, so in a rolling upgrade or a mixed group the client version
+  that leads decides the plan. The `cooperative-sticky` assigner in this release withholds a
+  partition from a member that reports owning it from an older generation while a newer owner still
+  claims it, so that partition can arrive one round later than under a leader that hands it over at
+  once. Every cooperative leader in this release also checks every plan before it sends it: it
+  refuses a plan that puts a partition in two members' assignments, or that gives a partition to a
+  member that does not report owning it while another member does. Keeping a partition with any one
+  member that reports owning it is always allowed; which one keeps it is the assigner's choice. A
+  custom cooperative assigner must write the `ownedPartitions` it is given into a subscription of
+  version 1 or higher so the leader can see them. See
+  [Custom partition assigner](Consuming.md#custom-partition-assigner).
 
 - **Java-compatible assigners are available.** `PartitionAssigners.range`, `.sticky` and
   `.cooperativeSticky` implement the Java algorithms and advertise the Java names `range`, `sticky`

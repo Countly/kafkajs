@@ -5,6 +5,9 @@ const Encoder = require('../../protocol/encoder')
 const { MemberMetadata, MemberAssignment } = require('../assignerProtocol')
 const { createFakeCoordinator, trackFixtures } = require('./fixtures/fetchHarness')
 const ClassicGroupProtocol = require('../groupProtocol/classic')
+const AssignerOffers = require('../groupProtocol/assignerOffers')
+const { COOPERATIVE, EAGER } = require('../groupProtocol/interface')
+const cooperativeSticky = require('../assigners/cooperativeStickyAssigner')
 const ConsumerGroup = require('../consumerGroup')
 const IdleWait = require('../idleWait')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
@@ -14,7 +17,7 @@ const {
 const { newLogger } = require('testHelpers')
 const Generation = require('../../producer/generation')
 const GroupOwnership = require('../groupOwnership')
-const { KafkaJSConnectionError } = require('../../errors')
+const { KafkaJSConnectionError, KafkaJSNonRetriableError } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 const sleep = require('../../utils/sleep')
 
@@ -56,20 +59,43 @@ const MEMBER_ASSIGNMENT = MemberAssignment.encode({
   assignment: { 'golden-topic-a': [0, 1], 'golden-topic-b': [0] },
 })
 
-const joinGroupResponse = () =>
+/**
+ * A JoinGroup v5 answer.
+ * @param {object} [fields]
+ * @param {number} [fields.errorCode]
+ * @param {string} [fields.protocolName] the protocol the coordinator selected
+ * @param {string} [fields.leaderId]
+ * @param {string} [fields.memberId] the id the answer gives this member
+ * @param {{ memberId: string, metadata: Buffer, groupInstanceId?: string|null }[]} [fields.members]
+ *   the leader's member list; a member's instance id is the golden one unless it names its own
+ * @returns {Buffer}
+ */
+const joinResponse = ({
+  errorCode = 0,
+  protocolName = 'RoundRobinAssigner',
+  leaderId = MEMBER_ID,
+  memberId = MEMBER_ID,
+  members = [{ memberId: MEMBER_ID, metadata: PROTOCOL_METADATA }],
+} = {}) =>
   new Encoder()
     .writeInt32(0)
-    .writeInt16(0)
+    .writeInt16(errorCode)
     .writeInt32(GENERATION_ID)
-    .writeString('RoundRobinAssigner')
-    .writeString(MEMBER_ID)
-    .writeString(MEMBER_ID)
-    .writeArray([
-      new Encoder()
-        .writeString(MEMBER_ID)
-        .writeString(GROUP_INSTANCE_ID)
-        .writeBytes(PROTOCOL_METADATA),
-    ]).buffer
+    .writeString(protocolName)
+    .writeString(leaderId)
+    .writeString(memberId)
+    .writeArray(
+      members.map((member) =>
+        new Encoder()
+          .writeString(member.memberId)
+          .writeString(
+            member.groupInstanceId === undefined ? GROUP_INSTANCE_ID : member.groupInstanceId
+          )
+          .writeBytes(member.metadata)
+      )
+    ).buffer
+
+const joinGroupResponse = (protocolName = 'RoundRobinAssigner') => joinResponse({ protocolName })
 
 const syncGroupResponse = () =>
   new Encoder().writeInt32(0).writeInt16(0).writeBytes(MEMBER_ASSIGNMENT).buffer
@@ -453,6 +479,7 @@ describe('Consumer > classic group protocol > the leader round guards', () => {
       leaderId: 'm1',
       memberId: 'm1',
       groupProtocol: 'custom',
+      selectedAssigner: protocol.assigners[0] ?? null,
       members: [],
     })
     return protocol
@@ -524,6 +551,17 @@ describe('Consumer > classic group protocol > the leader round guards', () => {
     ).rejects.toThrow('Unsupported partition assigner "custom"')
   })
 
+  it('drops the selected assigner of the joined membership with its leader and selected protocol when the generation is reset', () => {
+    const protocol = leader({ assigners: [{ name: 'custom', assign: async () => [] }] })
+    expect(protocol.selectedAssigner).toBe(protocol.assigners[0])
+
+    protocol.resetGeneration()
+
+    expect(protocol.leaderId).toBeNull()
+    expect(protocol.groupProtocol).toBeNull()
+    expect(protocol.selectedAssigner).toBeNull()
+  })
+
   it('does not upload an assignment once the round retired during the assign window', async () => {
     const syncGroup = jest.fn()
     const beforeSync = jest.fn()
@@ -554,7 +592,7 @@ describe('Consumer > classic group protocol > the leader round guards', () => {
       { memberId: 'm3', memberAssignment: Buffer.alloc(0) },
       { memberId: 'm2', memberAssignment: taken },
     ]
-    expect(() => protocol.assertNoDoubleAssignment({ members, assignment })).toThrow(
+    expect(() => protocol.ownershipOf(members).assertPlan(assignment)).toThrow(
       'a-0 to m2 while m1 still owns it'
     )
   })
@@ -912,5 +950,619 @@ describe('Consumer > classic group protocol > the idle heartbeat probe', () => {
 
     expect(forward(Object.create(ConsumerProtocol.prototype))).toBe(false)
     expect(forward({ heartbeatIdle: (interval) => interval === INTERVAL })).toBe(true)
+  })
+})
+
+describe('Consumer > classic group protocol > the protocols a join offers', () => {
+  /** @returns {jest.Mock} an `assign` that gives the one member its golden assignment */
+  const assigns = () =>
+    jest.fn(async () => [{ memberId: MEMBER_ID, memberAssignment: MEMBER_ASSIGNMENT }])
+
+  /**
+   * @param {string} declared the assigner's own `name`
+   * @param {string} offered the name its `protocol()` returns
+   * @param {jest.Mock} [assign]
+   * @returns {object} an assigner whose declared and offered names can differ
+   */
+  const assigner = (declared, offered, assign = assigns()) => ({
+    name: declared,
+    protocol: () => ({ name: offered, metadata: PROTOCOL_METADATA }),
+    assign,
+  })
+
+  /**
+   * One classic round, over a real broker and socket, against a coordinator that selects `selected`.
+   * @param {object[]} assigners
+   * @param {string} selected the protocol name the JoinGroup answer carries
+   * @param {object} [options]
+   * @param {string} [options.mode] the rebalance protocol of the member
+   * @param {(joinNumber: number) => Buffer} [options.joinAnswers] the answer to the nth JoinGroup,
+   *   counted from 1; the plain selection of `selected` when absent
+   * @param {(broker: object) => void} [options.prepare] called with the real broker before the round
+   * @param {number} [options.partitions=0] how many partitions the cluster knows for each topic
+   * @returns {Promise<{ outcome: Promise<object>, bodyOf: Function, protocol: ClassicGroupProtocol }>}
+   *   the round's result, the reader of the frames written and the member
+   */
+  const roundSelecting = async (
+    assigners,
+    selected,
+    {
+      mode,
+      joinAnswers = () => joinGroupResponse(selected),
+      prepare = () => {},
+      partitions = 0,
+    } = {}
+  ) => {
+    let joins = 0
+    const { broker, bodyOf } = await createFakeCoordinator((header) =>
+      header.apiKey === apiKeys.JoinGroup ? joinAnswers((joins += 1)) : answer(header)
+    )
+    prepare(broker)
+    const protocol = new ClassicGroupProtocol({
+      cluster: {
+        findGroupCoordinator: async () => broker,
+        refreshMetadata: async () => {},
+        findTopicPartitionMetadata: () =>
+          Array.from({ length: partitions }, (_, partitionId) => ({
+            partitionId,
+            leader: 0,
+            replicas: [0],
+          })),
+      },
+      groupId: GROUP_ID,
+      groupInstanceId: null,
+      sessionTimeout: SESSION_TIMEOUT,
+      rebalanceTimeout: REBALANCE_TIMEOUT,
+      assigners,
+      mode,
+      instrumentationEmitter: new InstrumentationEventEmitter(),
+      logger: newLogger(),
+    })
+    const outcome = protocol.rebalance({
+      topics: TOPICS,
+      topicsSubscribed: TOPICS,
+      beforeSync: () => {},
+      round: realRound(),
+    })
+    outcome.catch(() => {})
+    return { outcome, bodyOf, protocol }
+  }
+
+  it('keeps only the selected assigner once the join is installed, not the offers and the metadata they copied', async () => {
+    const chosen = assigner('declared-name', 'offered-name')
+
+    const { outcome, protocol } = await roundSelecting([chosen], 'offered-name')
+
+    await outcome
+    expect(protocol.selectedAssigner).toBe(chosen)
+    expect(Object.values(protocol).filter((value) => value instanceof AssignerOffers)).toEqual([])
+  })
+
+  it('refuses two assigners whose offered names, not their declared ones, are written as the same bytes, and writes no JoinGroup', async () => {
+    const first = assigner('first', 'planner-\uD800')
+    const second = assigner('second', 'planner-\uDBFF')
+
+    const { outcome, bodyOf } = await roundSelecting([first, second], 'planner-�')
+
+    await expect(outcome).rejects.toBeInstanceOf(KafkaJSNonRetriableError)
+    await expect(outcome).rejects.toThrow(
+      'The partition assigners "planner-\uD800" and "planner-\uDBFF" are both sent as "planner-�", so the group cannot tell them apart'
+    )
+    expect(() => bodyOf(apiKeys.JoinGroup)).toThrow('no request written')
+    expect(first.assign).not.toHaveBeenCalled()
+    expect(second.assign).not.toHaveBeenCalled()
+  })
+
+  it('hands the round to the assigner that offered the name the coordinator selected, whatever it declares', async () => {
+    const chosen = assigner('declared-name', 'offered-name')
+    const other = assigner('other-declared', 'other-offered')
+
+    const { outcome } = await roundSelecting([other, chosen], 'offered-name')
+
+    await expect(outcome).resolves.toMatchObject({ assignment: expect.any(Object) })
+    expect(chosen.assign).toHaveBeenCalledTimes(1)
+    expect(other.assign).not.toHaveBeenCalled()
+  })
+
+  it('finds the one assigner whose offered name holds a lone surrogate when the coordinator selects the name as it was written', async () => {
+    const lone = assigner('planner-\uD800', 'planner-\uD800')
+
+    const { outcome } = await roundSelecting([lone], 'planner-�')
+
+    await expect(outcome).resolves.toMatchObject({ assignment: expect.any(Object) })
+    expect(lone.assign).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the first of two assigners that offer the same name', async () => {
+    const first = assigner('twin', 'twin')
+    const second = assigner('twin', 'twin')
+
+    const { outcome } = await roundSelecting([first, second], 'twin')
+
+    await outcome
+    expect(first.assign).toHaveBeenCalledTimes(1)
+    expect(second.assign).not.toHaveBeenCalled()
+  })
+
+  it('refuses a selected name no assigner offered, as the assigner list did before', async () => {
+    const { outcome } = await roundSelecting([assigner('known', 'known')], 'unknown')
+
+    await expect(outcome).rejects.toThrow(
+      'Unsupported partition assigner "unknown", the assigner wasn\'t found in the assigners list'
+    )
+  })
+
+  it('sends and resolves the offers as the assigners made them when one changes its reused offer during the member-id handshake', async () => {
+    const metadata = MemberMetadata.encode({ version: 0, topics: [TOPICS[0]] })
+    const offered = Buffer.from(metadata)
+    const reused = { name: 'offered-name', metadata }
+    const chosen = { name: 'declared-name', protocol: () => reused, assign: assigns() }
+    const other = assigner('other-declared', 'other-offered')
+
+    const { outcome, bodyOf } = await roundSelecting([other, chosen], 'offered-name', {
+      joinAnswers: (joinNumber) => {
+        if (joinNumber > 1) return joinGroupResponse('offered-name')
+        reused.name = 'changed-name'
+        metadata.fill(0)
+        return joinResponse({ errorCode: 79, leaderId: '', memberId: 'assigned-id', members: [] })
+      },
+    })
+
+    await expect(outcome).resolves.toMatchObject({ assignment: expect.any(Object) })
+    const { body } = bodyOf(apiKeys.JoinGroup)
+    expect(body.includes('assigned-id')).toBe(true)
+    expect(body.includes('offered-name')).toBe(true)
+    expect(body.includes(offered)).toBe(true)
+    expect(body.includes('changed-name')).toBe(false)
+    expect(chosen.assign).toHaveBeenCalledTimes(1)
+    expect(other.assign).not.toHaveBeenCalled()
+  })
+
+  describe('the leader checks every cooperative plan against the partitions members report owning', () => {
+    const A = MEMBER_ID
+    const B = 'golden-member-2'
+    const C = 'golden-member-3'
+    const TOPIC = TOPICS[0]
+    const ORDERS = ['as listed', 'reversed']
+    const STICKY = 'cooperative-sticky'
+
+    /**
+     * One member's subscription to `TOPIC`.
+     * @param {{ owned?: number[], version?: number, generation?: number, userData?: Buffer }} [claim]
+     *   `generation` is written from version 2 on
+     * @returns {Buffer}
+     */
+    const subscription = ({
+      owned = [],
+      version = 3,
+      generation = -1,
+      userData = Buffer.alloc(0),
+    } = {}) =>
+      MemberMetadata.encode({
+        version,
+        topics: [TOPIC],
+        userData,
+        ownedPartitions: [{ topic: TOPIC, partitions: owned }],
+        generationId: generation,
+      })
+
+    /** @param {number} generation @returns {Buffer} the built-in assigner's four-byte userData */
+    const generationData = (generation) => new Encoder().writeInt32(generation).buffer
+
+    /**
+     * @param {{[memberId: string]: number[]|null}} byMember null for no topic row at all
+     * @param {number} [version=1]
+     * @returns {{ memberId: string, memberAssignment: Buffer }[]} plan rows, in this order
+     */
+    const planOf = (byMember, version = 1) =>
+      Object.entries(byMember).map(([memberId, partitions]) => ({
+        memberId,
+        memberAssignment: MemberAssignment.encode({
+          version,
+          assignment: partitions === null ? {} : { [TOPIC]: partitions },
+        }),
+      }))
+
+    /** @returns {Buffer} the bytes the SyncGroup request writes for one plan row */
+    const written = ({ memberId, memberAssignment }) =>
+      new Encoder().writeString(memberId).writeBytes(memberAssignment).buffer
+
+    /** @returns {object} a cooperative assigner offering `name` whose plan is `rows` */
+    const returning = (name, rows) => ({
+      name,
+      protocol: () => ({ name, metadata: PROTOCOL_METADATA }),
+      supportedProtocols: () => ['cooperative'],
+      assign: jest.fn(async () => rows),
+    })
+
+    /**
+     * One leader round whose JoinGroup answer lists the dynamic members of `claims` in that order,
+     * or reversed.
+     * @returns {Promise<{ outcome: Promise<object>, bodyOf: Function }>}
+     */
+    const leaderRound = ({
+      assigner,
+      name,
+      claims,
+      order,
+      mode = COOPERATIVE,
+      partitions = 2,
+      prepare,
+    }) => {
+      const members = Object.entries(claims).map(([memberId, claim]) => ({
+        memberId,
+        groupInstanceId: null,
+        metadata: subscription(claim),
+      }))
+      if (order === 'reversed') members.reverse()
+      return roundSelecting([assigner], name, {
+        mode,
+        partitions,
+        prepare,
+        joinAnswers: () => joinResponse({ protocolName: name, members }),
+      })
+    }
+
+    const expectWritten = async (round, rows) => {
+      const { outcome, bodyOf } = await round
+      await outcome
+      const { body } = bodyOf(apiKeys.SyncGroup)
+      for (const row of rows) expect(body.includes(written(row))).toBe(true)
+    }
+
+    const expectRefused = async (round, message) => {
+      const { outcome, bodyOf } = await round
+      await expect(outcome).rejects.toThrow(message)
+      await expect(outcome).rejects.toBeInstanceOf(KafkaJSNonRetriableError)
+      expect(() => bodyOf(apiKeys.SyncGroup)).toThrow('no request written')
+    }
+
+    /** @returns {Array<Array<*>>} each case once per broker member order, the order second */
+    const inBothOrders = (cases) =>
+      cases.flatMap(([title, ...rest]) => ORDERS.map((order) => [title, order, ...rest]))
+
+    describe('any one claimant may keep a partition several members claim', () => {
+      const claims = {
+        [A]: { owned: [0], generation: -1, userData: generationData(9) },
+        [B]: { owned: [0], generation: -1, userData: Buffer.from('not a generation') },
+      }
+
+      test.each(
+        inBothOrders([
+          ['the leader', A],
+          ['the other member', B],
+        ])
+      )(
+        'writes the plan that keeps it with %s, members %s, reading neither GenerationId -1 nor userData',
+        async (_label, order, keeper) => {
+          const rows = planOf({ [keeper]: [0] })
+          await expectWritten(
+            leaderRound({ assigner: returning(STICKY, rows), name: STICKY, claims, order }),
+            rows
+          )
+        }
+      )
+    })
+
+    describe('a custom assigner may keep a partition with a member whose generation only its userData holds', () => {
+      test.each(
+        inBothOrders([
+          ['a version-2 member at GenerationId 5', { owned: [0], version: 2, generation: 5 }],
+          ['another version-1 member', { owned: [0], version: 1, userData: generationData(5) }],
+        ])
+      )('writes the plan beside %s, members %s', async (_label, order, other) => {
+        const rows = planOf({ [A]: [0], [B]: [] })
+        const claims = { [A]: { owned: [0], version: 1, userData: generationData(9) }, [B]: other }
+        await expectWritten(
+          leaderRound({ assigner: returning('custom', rows), name: 'custom', claims, order }),
+          rows
+        )
+      })
+    })
+
+    describe('a partition its owner claims never goes to a member that does not claim it', () => {
+      test.each(
+        inBothOrders([
+          ['with an empty row for the owner', { [A]: [], [C]: [0] }],
+          ['with no row for the owner', { [C]: [0] }],
+        ])
+      )('refuses the plan %s, members %s, and writes no SyncGroup', async (_label, order, plan) => {
+        const claims = { [A]: { owned: [0] }, [C]: {} }
+        await expectRefused(
+          leaderRound({
+            assigner: returning('custom', planOf(plan)),
+            name: 'custom',
+            claims,
+            order,
+          }),
+          `${TOPIC}-0 to ${C} while ${A} still owns it`
+        )
+      })
+    })
+
+    describe('a partition is in at most one assignment', () => {
+      const twice = planOf({ [A]: [0], [B]: [0] })
+      const inTwoRows = new Encoder()
+        .writeInt16(1)
+        .writeArray([
+          new Encoder().writeString(TOPIC).writeArray([1]),
+          new Encoder().writeString(TOPIC).writeArray([0]),
+        ])
+        .writeBytes(Buffer.alloc(0)).buffer
+      const second = `${TOPIC}-0 to ${B} while ${A} is assigned it too`
+
+      test.each(
+        inBothOrders([
+          ['nobody claims it', {}, twice, second],
+          ['one member claims it', { [A]: [0] }, twice, second],
+          ['both members claim it', { [A]: [0], [B]: [0] }, twice, second],
+          [
+            'the second copy is in a repeated topic row',
+            {},
+            [...planOf({ [B]: [0] }), { memberId: A, memberAssignment: inTwoRows }],
+            `${TOPIC}-0 to ${A} while ${B} is assigned it too`,
+          ],
+        ])
+      )(
+        'refuses the plan when %s, members %s, and writes no SyncGroup',
+        async (_label, order, owned, rows, message) => {
+          const claims = { [A]: { owned: owned[A] ?? [] }, [B]: { owned: owned[B] ?? [] } }
+          await expectRefused(
+            leaderRound({ assigner: returning('custom', rows), name: 'custom', claims, order }),
+            message
+          )
+        }
+      )
+    })
+
+    describe('withholding, an unclaimed partition and a sole claimant keeping its partition all pass', () => {
+      test.each(
+        inBothOrders([
+          ['an unclaimed partition goes to one member', {}, { [A]: [0], [B]: [1] }],
+          ['the sole claimant keeps its partition', { [A]: [0] }, { [A]: [0], [B]: [1] }],
+          [
+            'a claimed partition is withheld from everyone',
+            { [A]: [0], [B]: [0] },
+            { [A]: [1], [B]: [] },
+          ],
+        ])
+      )('writes the plan when %s, members %s', async (_label, order, owned, plan) => {
+        const rows = planOf(plan)
+        const claims = { [A]: { owned: owned[A] ?? [] }, [B]: { owned: owned[B] ?? [] } }
+        await expectWritten(
+          leaderRound({ assigner: returning('custom', rows), name: 'custom', claims, order }),
+          rows
+        )
+      })
+    })
+
+    describe('the built-in cooperative-sticky assigner passes the same check by construction', () => {
+      const sent = (byMember) => planOf(byMember, 3)
+      const builtInRound = (claims, order, partitions) =>
+        leaderRound({
+          assigner: cooperativeSticky({ cluster: {} }),
+          name: STICKY,
+          claims,
+          order,
+          partitions,
+        })
+
+      test.each(
+        inBothOrders([
+          [
+            'a stale claimant is not handed a partition the newer owner still claims',
+            { [A]: { owned: [0, 1], generation: 9 }, [B]: { owned: [1], generation: 2 } },
+            2,
+            sent({ [A]: [0], [B]: null }),
+          ],
+          [
+            'a stale claimant does not keep a partition the newer owner claims',
+            { [A]: { owned: [0], generation: 9 }, [B]: { owned: [0], generation: 2 } },
+            1,
+            sent({ [A]: [0], [B]: null }),
+          ],
+          [
+            'a tie at the highest generation is withheld from both claimants',
+            { [A]: { owned: [0], generation: 5 }, [B]: { owned: [0], generation: 5 } },
+            1,
+            sent({ [A]: null, [B]: null }),
+          ],
+          [
+            'the newest claimant keeps the partition past an older tie',
+            {
+              [A]: { owned: [0], generation: 2 },
+              [B]: { owned: [0], generation: 2 },
+              [C]: { owned: [0], generation: 9 },
+            },
+            1,
+            sent({ [A]: null, [B]: null, [C]: [0] }),
+          ],
+        ])
+      )('writes its plan when %s, members %s', async (_label, order, claims, partitions, rows) => {
+        await expectWritten(builtInRound(claims, order, partitions), rows)
+      })
+
+      test.each(ORDERS)(
+        'writes the tied partition to exactly one member the next round, once both revoked it, members %s',
+        async (order) => {
+          const claims = { [A]: { generation: 6 }, [B]: { generation: 6 } }
+          const { outcome, bodyOf } = await builtInRound(claims, order, 1)
+          await outcome
+          const { body } = bodyOf(apiKeys.SyncGroup)
+          const holders = [A, B].filter((id) => body.includes(written(sent({ [id]: [0] })[0])))
+          expect(holders).toHaveLength(1)
+        }
+      )
+    })
+
+    describe('every assigner goes through the same check, whatever its name or object', () => {
+      const claims = { [A]: { owned: [0, 1], generation: 4 }, [B]: { generation: 4 } }
+      const MOVES = {
+        rows: planOf({ [A]: [0], [B]: [1] }),
+        message: `${TOPIC}-1 to ${B} while ${A} still owns it`,
+      }
+      const DUPLICATES = {
+        rows: planOf({ [A]: [0, 1], [B]: [1] }),
+        message: `${TOPIC}-1 to ${B} while ${A} is assigned it too`,
+      }
+
+      /** @returns {object} an assigner under its own name that changes the built-in's plan */
+      const wrapping = (rows) => {
+        const inner = cooperativeSticky({ cluster: {} })
+        return {
+          name: 'wrapped-sticky',
+          supportedProtocols: () => inner.supportedProtocols(),
+          protocol: (offer) => ({ ...inner.protocol(offer), name: 'wrapped-sticky' }),
+          assign: jest.fn(async (group) => {
+            await inner.assign(group)
+            return rows
+          }),
+          onAssignment: (assignment, metadata) => inner.onAssignment(assignment, metadata),
+        }
+      }
+
+      const replacedAssign = (rows) =>
+        Object.assign(cooperativeSticky({ cluster: {} }), { assign: jest.fn(async () => rows) })
+
+      test.each(
+        inBothOrders([
+          [
+            'the built-in with a replaced assign moves an owned partition',
+            () => replacedAssign(MOVES.rows),
+            STICKY,
+            MOVES.message,
+          ],
+          [
+            'the built-in with a replaced assign duplicates a partition',
+            () => replacedAssign(DUPLICATES.rows),
+            STICKY,
+            DUPLICATES.message,
+          ],
+          [
+            'the built-in with its withhold step replaced moves an owned partition',
+            () =>
+              Object.assign(cooperativeSticky({ cluster: {} }), {
+                withholdTransferringPartitions: () => {},
+              }),
+            STICKY,
+            MOVES.message,
+          ],
+          [
+            'a wrapper of the built-in under another name moves an owned partition',
+            () => wrapping(MOVES.rows),
+            'wrapped-sticky',
+            MOVES.message,
+          ],
+          [
+            'a wrapper of the built-in under another name duplicates a partition',
+            () => wrapping(DUPLICATES.rows),
+            'wrapped-sticky',
+            DUPLICATES.message,
+          ],
+          [
+            'a custom assigner offering the name cooperative-sticky moves an owned partition',
+            () => returning(STICKY, MOVES.rows),
+            STICKY,
+            MOVES.message,
+          ],
+          [
+            'a custom assigner offering the name cooperative-sticky duplicates a partition',
+            () => returning(STICKY, DUPLICATES.rows),
+            STICKY,
+            DUPLICATES.message,
+          ],
+        ])
+      )(
+        'refuses the plan when %s, members %s, and writes no SyncGroup',
+        async (_label, order, make, name, message) => {
+          await expectRefused(leaderRound({ assigner: make(), name, claims, order }), message)
+        }
+      )
+    })
+
+    describe('what is checked and written cannot change after the claims are read', () => {
+      test.each(ORDERS)(
+        'writes a plan that moves an owned partition unchecked under eager, members %s',
+        async (order) => {
+          const rows = planOf({ [A]: [0], [B]: [1] })
+          const assigner = { ...returning('custom', rows), supportedProtocols: () => ['eager'] }
+          const claims = { [A]: { owned: [0, 1] }, [B]: {} }
+          await expectWritten(
+            leaderRound({ assigner, name: 'custom', claims, order, mode: EAGER }),
+            rows
+          )
+        }
+      )
+
+      test.each(ORDERS)(
+        'checks the claims the members sent when the assigner edits a subscription in its input, members %s, and writes no SyncGroup',
+        async (order) => {
+          const assigner = returning('custom', planOf({ [A]: [0, 1], [B]: [] }))
+          const plan = assigner.assign.getMockImplementation()
+          assigner.assign.mockImplementation(async (group) => {
+            group.members.find(({ memberId }) => memberId === B).memberMetadata = subscription()
+            return plan(group)
+          })
+          const claims = { [A]: { owned: [0] }, [B]: { owned: [1] } }
+
+          await expectRefused(
+            leaderRound({ assigner, name: 'custom', claims, order }),
+            `${TOPIC}-1 to ${A} while ${B} still owns it`
+          )
+          expect(assigner.assign).toHaveBeenCalledTimes(1)
+        }
+      )
+
+      test.each(ORDERS)(
+        'writes the plan it checked when the assigner changes the rows it returned while the send is held, members %s',
+        async (order) => {
+          const rows = planOf({ [A]: [0], [B]: [1] })
+          const checked = rows.map((row) => ({
+            ...row,
+            memberAssignment: Buffer.from(row.memberAssignment),
+          }))
+          const takeover = planOf({ [B]: [0, 1] })[0].memberAssignment
+
+          let release
+          const held = new Promise((resolve) => (release = resolve))
+          let reached
+          const reachedSync = new Promise((resolve) => (reached = resolve))
+          const holdSync = (broker) => {
+            const pool = broker.connectionPool
+            const getConnectionByRequest = pool.getConnectionByRequest
+            pool.getConnectionByRequest = async (protocolRequest, ...rest) => {
+              if (protocolRequest.request.apiKey === apiKeys.SyncGroup) {
+                reached()
+                await held
+              }
+              return getConnectionByRequest.call(pool, protocolRequest, ...rest)
+            }
+          }
+          const claims = { [A]: { owned: [0] }, [B]: { owned: [1] } }
+
+          const { outcome, bodyOf } = await leaderRound({
+            assigner: returning('custom', rows),
+            name: 'custom',
+            claims,
+            order,
+            prepare: holdSync,
+          })
+
+          await reachedSync
+          expect(() => bodyOf(apiKeys.SyncGroup)).toThrow('no request written')
+          rows[0].memberAssignment.fill(0)
+          rows[1].memberAssignment = takeover
+          rows.push({ memberId: C, memberAssignment: takeover })
+          release()
+
+          await expect(outcome).resolves.toMatchObject({ assignment: expect.any(Object) })
+          const { body } = bodyOf(apiKeys.SyncGroup)
+          expect(body.includes(written(checked[0]))).toBe(true)
+          expect(body.includes(written(checked[1]))).toBe(true)
+          expect(body.includes(takeover)).toBe(false)
+          expect(body.includes(C)).toBe(false)
+        }
+      )
+    })
   })
 })

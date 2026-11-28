@@ -72,6 +72,29 @@ describe('Broker > leaveGroup', () => {
     ).rejects.toMatchObject({ code: 16 })
   })
 
+  test('at v3 a top-level error beside a member error rejects with the top-level error and leaves no unhandled rejection', async () => {
+    const hex = new Encoder()
+      .writeInt32(0)
+      .writeInt16(15)
+      .writeArray([new Encoder().writeString('test-member').writeString(null).writeInt16(25)])
+      .buffer.toString('hex')
+    const unhandled = []
+    const onUnhandled = (reason) => unhandled.push(reason)
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      await expect(
+        brokerAt(3, { hex }).leaveGroup({ groupId: 'test-group', memberId: 'test-member' })
+      ).rejects.toMatchObject({ code: 15 })
+      await new Promise((resolve) => setImmediate(resolve))
+      await new Promise((resolve) => setImmediate(resolve))
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+
+    expect(harness.requests.map(({ apiVersion }) => apiVersion)).toEqual([3])
+    expect(unhandled).toEqual([])
+  })
+
   test.each([
     [5, true],
     [4, false],
