@@ -1,10 +1,7 @@
 const Accumulator = require('../accumulator')
 const Long = require('../../../utils/long')
-const Decoder = require('../../../protocol/decoder')
-const recordBatchDecoder = require('../../../protocol/recordBatch/v0/decoder')
-const buildRecordBatch = require('../../../protocol/requests/produce/buildRecordBatch')
-const { Types: Compression } = require('../../../protocol/message/compression')
 const { KafkaJSInvalidConfigurationError } = require('../../../errors')
+const { sentRecords } = require('../../__tests__/fixtures/bufferHarness')
 
 const TOPIC = 'topic-a'
 const INT64_MAX = 2n ** 63n - 1n
@@ -31,11 +28,15 @@ const createAccumulator = () => {
     })
   )
   const accumulator = new Accumulator({ linger: 0, batchSize: 16384, partition, sendPartitioned })
-  /** The values of the records of every batch handed on, in order. */
-  const handedOn = () =>
-    sendPartitioned.mock.calls.flatMap(([{ batches }]) =>
-      batches.flatMap(({ messages }) => messages.map(({ value }) => value))
+  /** The values of the records of every batch handed on, in order, as a broker reads them. */
+  const handedOn = async () => {
+    const read = await Promise.all(
+      sendPartitioned.mock.calls.map(([request]) => sentRecords(request))
     )
+    return read.flatMap((batches) =>
+      batches.flatMap(({ records }) => records.map(({ value }) => value.toString()))
+    )
+  }
   return { accumulator, partition, sendPartitioned, handedOn }
 }
 
@@ -92,7 +93,7 @@ describe('Producer > the accumulator > timestamp range', () => {
 
       await expect(append(accumulator, [{ value: 'v', timestamp }])).resolves.toHaveLength(1)
 
-      expect(handedOn()).toEqual(['v'])
+      expect(await handedOn()).toEqual(['v'])
     })
   })
 
@@ -135,7 +136,7 @@ describe('Producer > the accumulator > timestamp range', () => {
     ).rejects.toBeInstanceOf(KafkaJSInvalidConfigurationError)
     await expect(append(accumulator, [{ value: 'later', timestamp: 2 }])).resolves.toHaveLength(1)
 
-    expect(handedOn()).toEqual(['later'])
+    expect(await handedOn()).toEqual(['later'])
   })
 
   test.each([[0], [0n], [null], [undefined]])(
@@ -145,7 +146,7 @@ describe('Producer > the accumulator > timestamp range', () => {
 
       await expect(append(accumulator, [{ value: 'v', timestamp }])).resolves.toHaveLength(1)
 
-      expect(handedOn()).toEqual(['v'])
+      expect(await handedOn()).toEqual(['v'])
     }
   )
 
@@ -159,8 +160,8 @@ describe('Producer > the accumulator > timestamp range', () => {
     })
 
     /**
-     * Sends `timestamps` through the accumulator, encodes the one batch it hands on and reads the
-     * record timestamps back with the batch decoder.
+     * Sends `timestamps` through the accumulator and reads the record timestamps of the first
+     * batch it hands on as a broker reads them.
      * @param {Array} timestamps
      * @returns {Promise<bigint[]>}
      */
@@ -170,14 +171,7 @@ describe('Producer > the accumulator > timestamp range', () => {
         accumulator,
         timestamps.map((timestamp) => ({ value: 'v', timestamp }))
       )
-      const [{ batches }] = sendPartitioned.mock.calls[0]
-      const { buffer } = await buildRecordBatch({
-        compression: Compression.None,
-        messages: batches[0].messages,
-        producerId: Long.fromValue(-1),
-        producerEpoch: 0,
-      })
-      const { records } = await recordBatchDecoder(new Decoder(buffer))
+      const [{ records }] = await sentRecords(sendPartitioned.mock.calls[0][0])
       return records.map(({ timestamp }) => BigInt(timestamp))
     }
 
