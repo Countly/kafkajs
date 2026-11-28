@@ -100,11 +100,14 @@ const timeoutOf = (options, ignoreNonObject) => {
 
 /**
  * The accumulator's, the delivery deadline's and the buffer's defaults: the Java client's 4.x
- * `linger.ms`, `batch.size`, `delivery.timeout.ms`, `buffer.memory` and `max.block.ms`.
+ * `batch.size`, `delivery.timeout.ms`, `buffer.memory` and `max.block.ms`. `linger` is 0, not the
+ * Java client's 5 ms: `send` returns one promise, so a wait on every lone send would add its full
+ * length to an awaited send, as in kafkajs 2.2.4. Sends made in one turn of the event loop still
+ * merge, and an idempotent producer gathers a partition's next batch behind the one in flight.
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/ProducerConfig.java
  */
 const DEFAULTS = Object.freeze({
-  linger: 5,
+  linger: 0,
   batchSize: 16384,
   deliveryTimeout: 120000,
   bufferMemory: 33554432,
@@ -151,7 +154,7 @@ const definedKeys = (options) =>
  *   or `acks` an error instead of a reason to turn idempotence off with a warning
  * @param {string} [params.transactionalId]
  * @param {number} [params.transactionTimeout]
- * @param {number} [params.linger=5] ms a batch waits for more records; 0 sends it at once
+ * @param {number} [params.linger=0] ms a batch waits for more records; 0 sends it at once
  * @param {number} [params.batchSize=16384] bytes of keys and values at which a batch is sent
  * @param {{ gzip?: number, zstd?: number }} [params.compressionLevels] per-codec levels
  * @param {number} [params.deliveryTimeout] ms one send may take, retries included; past it the
