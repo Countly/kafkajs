@@ -775,7 +775,14 @@ describe('Test harness > fake broker close', () => {
       data.push(chunk)
       if (closeIn === 'data') closeNow()
     })
-    return { broker: fake.broker, socket, data, closing: () => closing, close: fake.close, playback }
+    return {
+      broker: fake.broker,
+      socket,
+      data,
+      closing: () => closing,
+      close: fake.close,
+      playback,
+    }
   }
 
   test.each([
@@ -1488,8 +1495,9 @@ describe('Test harness > fixture tracking', () => {
       (error) => outcome(error.message)
     )
 
+    let seenAtRejection
     const release = hooks.after().catch((error) => {
-      expect(outcome.mock.calls).toEqual([['fetch harness torn down']])
+      seenAtRejection = [...outcome.mock.calls]
       throw error
     })
     await expect(release).rejects.toThrow(
@@ -1498,6 +1506,7 @@ describe('Test harness > fixture tracking', () => {
           'a broker lookup at node 1'
       )
     )
+    expect(seenAtRejection).toEqual([['fetch harness torn down']])
     expect(h.socketsTo(1)).toEqual([])
   })
 
@@ -1515,8 +1524,9 @@ describe('Test harness > fixture tracking', () => {
     )
     expect(state.sockets).toEqual([])
 
+    let seenAtRejection
     const release = hooks.after().catch((error) => {
-      expect(outcome.mock.calls).toEqual([['KafkaJSConnectionError', 'The fake broker was closed']])
+      seenAtRejection = [...outcome.mock.calls]
       throw error
     })
     await expect(release).rejects.toThrow(
@@ -1525,6 +1535,7 @@ describe('Test harness > fixture tracking', () => {
           'a broker connect at 127.0.0.1:9092'
       )
     )
+    expect(seenAtRejection).toEqual([['KafkaJSConnectionError', 'The fake broker was closed']])
     expect(state.sockets).toEqual([])
     expect(answer).not.toHaveBeenCalled()
   })
