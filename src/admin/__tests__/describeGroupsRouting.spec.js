@@ -1585,20 +1585,42 @@ describe('Admin > describeGroups > routing', () => {
         asked,
         moves: ['g2'],
       })
-      const admin = createAdmin({ logger: newLogger(), retry, cluster })
+      const refreshMetadata = jest.spyOn(cluster, 'refreshMetadata')
+      jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
+      try {
+        const admin = createAdmin({
+          logger: newLogger(),
+          retry: { ...tenMsRetry, retries: 1 },
+          cluster,
+        })
+        const outcome = observe(admin.describeGroups(['g1', 'g2', 'g3']))
 
-      const { groups } = await admin.describeGroups(['g1', 'g2', 'g3'])
+        await jest.advanceTimersByTimeAsync(0)
+        await new Promise(setImmediate)
+        await jest.advanceTimersByTimeAsync(9)
+        expect(asked).toEqual([['g1', 'g2', 'g3']])
+        expect(found).toEqual(['g1', 'g2', 'g3'])
+        expect(refreshMetadata).not.toHaveBeenCalled()
 
-      expect(asked[0]).toEqual(['g1', 'g2', 'g3'])
-      expect(asked.slice(1).sort()).toEqual([['g1'], ['g2']])
-      expect(found).toEqual(['g1', 'g2', 'g3', 'g2'])
-      expect(
-        groups.map(({ groupId, errorCode, members }) => [groupId, errorCode, members[0].memberId])
-      ).toEqual([
-        ['g3', 0, 'first'],
-        ['g1', 0, 'again'],
-        ['g2', 0, 'again'],
-      ])
+        await jest.advanceTimersByTimeAsync(1)
+        await new Promise(setImmediate)
+        expect(outcome.settled).toBe(true)
+        expect(outcome.error).toBeUndefined()
+        expect(asked.slice(1).sort()).toEqual([['g1'], ['g2']])
+        expect(found).toEqual(['g1', 'g2', 'g3', 'g2'])
+        expect(refreshMetadata).toHaveBeenCalledTimes(1)
+        expect(
+          outcome.value.groups
+            .map(({ groupId, errorCode, members }) => [groupId, errorCode, members[0].memberId])
+            .sort()
+        ).toEqual([
+          ['g1', 0, 'again'],
+          ['g2', 0, 'again'],
+          ['g3', 0, 'first'],
+        ])
+      } finally {
+        jest.useRealTimers()
+      }
     })
 
     it('does not ask a healthy coordinator again when another coordinator fails', async () => {
