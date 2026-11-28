@@ -743,9 +743,13 @@ says so, `groupProtocol: 'consumer'`.
   overrunning handler. A single stuck handler does not trip it while another broker's fetcher keeps
   polling or another partition keeps flowing — in practice that means a single-broker assignment
   with `partitionsConsumedConcurrently: 1`. The batch the overrunning handler finally returns is
-  dropped, so that work is redelivered after the rejoin.
+  dropped, so that work can be redelivered after the rejoin.
   In kafkajs 2.2.4 a long handler was never evicted as long as it called `heartbeat()`. If you have
   handlers that legitimately run for a long time, set `maxPollInterval` to cover them.
+- Handler retries are counted per partition. A rebalance no longer refills them for a partition you keep. Handle the error or send the failed record to a dead-letter topic inside your handler, or raise `retry.retries`.
+- A handler failure on one partition no longer spends another partition's retries.
+- A handler failure independent of a queued recoverable rebalance is reported once the rejoin succeeds. A failure that belongs to the rebalance, such as its cause or a refused commit of the replaced membership, is part of the rejoin and is not reported. A concurrent non-retriable handler failure is no longer hidden.
+
 - An error thrown by your `POLL_INTERVAL_EXCEEDED` listener is logged and no longer stops cleanup or the rejoin. There is no option to restore a listener’s ability to strand the consumer.
 - Late accepted consumer-protocol joins are counted and obsolete stored loss notifications are compared with the ownership that sent them, including when the broker reuses a numeric generation. A consumer-protocol rejoin waits for the leave of its current membership to settle. No application change is required; current rejoin obligations remain honored.
 

@@ -526,11 +526,14 @@ module.exports = class OffsetManager {
       settle(false)
       const stampRefusal = (refusal) =>
         stampOwnership(
-          stampGeneration(stampOffsetCommit(refusal), payload.groupGenerationId),
+          stampGeneration(stampOffsetCommit(refusal, this.ownership), payload.groupGenerationId),
           token
         )
       const stamped = stampMembership(
-        stampOwnership(stampGeneration(stampOffsetCommit(error), payload.groupGenerationId), token),
+        stampOwnership(
+          stampGeneration(stampOffsetCommit(error, this.ownership), payload.groupGenerationId),
+          token
+        ),
         revision
       )
       const callerRefusal = guard?.()
@@ -653,9 +656,7 @@ module.exports = class OffsetManager {
     // A handler can still be running for a partition this member lost during a cooperative
     // round. Writing its position back would resolve an offset against a generation that no
     // longer owns the partition, and the commit would then roll the new owner back.
-    if (!this.owns(topic, partition)) {
-      return
-    }
+    if (!this.owns(topic, partition)) return false
 
     const offsets = this.resolvedOffsets[topic]
     const previous = offsets[partition]
@@ -669,6 +670,7 @@ module.exports = class OffsetManager {
         .add(resolvedProgress(offsets[partition], committed))
         .subtract(resolvedProgress(previous, committed))
     }
+    return true
   }
 
   /**

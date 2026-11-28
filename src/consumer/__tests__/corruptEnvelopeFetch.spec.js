@@ -398,7 +398,9 @@ class HaltCase {
       const acquired = this.group.acquired.get(`${TOPIC}|${partition}`)
       expect(acquired).toEqual({
         acquiredAt: expect.any(Number),
+        assignmentToken: expect.any(Symbol),
         changedAt: expect.any(Number),
+        positionChangedAt: 0,
         recreatedAt: 0,
         soughtAt: 0,
         retired: false,

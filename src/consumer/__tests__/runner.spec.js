@@ -120,6 +120,8 @@ describe('Consumer > Runner', () => {
       leaveForPollExpiry: jest.fn(async () => {}),
       needsReconciliation: jest.fn(() => false),
       resolvedOffsetAt: jest.fn(() => undefined),
+      // The real group's acquisitions by partition key; these batches carry none of their own.
+      acquired: new Map(),
     }
     instrumentationEmitter = new InstrumentationEventEmitter()
 

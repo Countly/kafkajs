@@ -152,13 +152,14 @@ const createRetriable = (configs, backoff, resolve, reject, fn, scope) => {
 }
 
 /**
- * @typedef {(fn: (bail: (err: Error) => void, retryCount: number, retryTime: number) => any, scope?: object) => Promise<ReturnType<fn>>} Retrier
+ * @typedef {(fn: (bail: (err: Error) => void, retryCount: number, retryTime: number) => any, scope?: object, step?: { retryCount: number, retryTime: number }) => Promise<ReturnType<fn>>} Retrier
  */
 
 /**
  * Builds a retrier: it runs `fn`, and on a retriable failure runs it again after the backoff
  * schedule above, up to `retries` more times. An optional private call scope owns the whole
  * promise and each backoff timer; callers without a scope retain the existing retry semantics.
+ * Foreground consumer recovery can carry the current retry step into its bounded join scope.
  *
  * `maxTotalTime` (ms) adds a deadline measured from the first attempt: when the wait before the
  * next attempt would end past it, the retrier rejects with `KafkaJSDeliveryTimeout` - its `cause`
@@ -173,7 +174,7 @@ const createRetriable = (configs, backoff, resolve, reject, fn, scope) => {
 const createRetry = (opts = {}) => {
   assertMaxTotalTime(opts?.maxTotalTime)
 
-  return (fn, scope) => {
+  return (fn, scope, step) => {
     if (opts?.fence) {
       const configs = Object.assign({}, RETRY_DEFAULT, opts)
       return new FencedRetry({
@@ -188,13 +189,14 @@ const createRetry = (opts = {}) => {
         const configs = Object.assign({}, RETRY_DEFAULT, opts)
         const backoff = backoffOf(configs)
         const start = createRetriable(configs, backoff, resolve, reject, fn, scope)
-        start(backoff.initial())
+        start(step?.retryTime ?? backoff.initial(), step?.retryCount)
       })
     return scope ? scope.wait(run) : run()
   }
 }
 
 createRetry.backoff = createBackoff
+createRetry.isErrorRetriable = isErrorRetriable
 
 /**
  * The values the retrier gives an option the caller leaves unset - the test defaults under

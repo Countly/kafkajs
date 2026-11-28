@@ -34,6 +34,7 @@ const {
 } = require('../errors')
 const {
   isConsumerProtocolFatal,
+  isHandlerCrash,
   isJoinDeadline,
   consumerStoppingError,
   stampOwnership,
@@ -1527,7 +1528,10 @@ module.exports = (params) => {
         }
       }
 
-      if (isFencedInstance(e) || (isConsumerProtocol && isConsumerProtocolFatal(e))) {
+      if (
+        !isHandlerCrash(e) &&
+        (isFencedInstance(e) || (isConsumerProtocol && isConsumerProtocolFatal(e)))
+      ) {
         // A fenced static member (82) has been evicted by a duplicate groupInstanceId elsewhere,
         // and a fatal membership error - unsupported assignor, invalid subscription regex,
         // unreleased instance id, group at capacity, a revoked group ACL, a malformed request, a

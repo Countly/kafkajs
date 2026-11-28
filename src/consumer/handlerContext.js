@@ -5,8 +5,9 @@ const storage = new AsyncLocalStorage()
 /**
  * One partition acquisition of one run: the consumer group keeps one per owned partition and
  * replaces it, never reuses it, when the partition is acquired again. `retired` latches once the
- * acquisition ends (revoke, rebuild, end of the run). Holds numbers only, never a batch or a client.
- * @typedef {{ acquiredAt: number, changedAt: number, recreatedAt: number, soughtAt: number, retired: boolean }} Acquisition
+ * acquisition ends (revoke, rebuild, end of the run). The retry token follows a continuous
+ * assignment through a rebuild until an accepted position change.
+ * @typedef {{ acquiredAt: number, changedAt: number, recreatedAt: number, soughtAt: number, retired: boolean, assignmentToken?: symbol, positionChangedAt?: number }} Acquisition
  */
 
 /**

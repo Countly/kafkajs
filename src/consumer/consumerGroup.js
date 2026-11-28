@@ -523,7 +523,8 @@ module.exports = class ConsumerGroup {
    *   membership that hands its fatal heartbeat answers to the run
    * @returns {void}
    */
-  attach({ rebalanceCoordinator, heartbeatManager, onHeartbeatFatal }) {
+  attach({ rebalanceCoordinator, heartbeatManager, onHeartbeatFatal, clearPartitionRetry }) {
+    this.clearPartitionRetry = clearPartitionRetry
     this.rebalanceCoordinator = rebalanceCoordinator
     this.groupMembership.attach({
       rebalanceCoordinator,
@@ -1079,17 +1080,20 @@ module.exports = class ConsumerGroup {
    * loss before it changes anything, so the runner's LOST round reports and discards it first.
    *
    * @param {{ assignment: Object, userData?: Buffer|null }} result the decoded sync result
-   * @param {{ rebuildOffsets?: boolean, lost?: boolean, round?: object, additionHold?: object }}
+   * @param {{ rebuildOffsets?: boolean, lost?: boolean, round?: object, additionHold?: object,
+   *   recover?: <T>(step: () => Promise<T>) => Promise<T> }}
    *   [options] `rebuildOffsets: false` selects the incremental apply; it still builds the first
    *   manager, because there is nothing to keep. `lost` marks the LOST round's apply.
    *   `additionHold` is the round's token for the partitions this apply adds: they are held before
    *   they are published and the caller releases the token once its assigned callback has returned.
+   *   `recover` is the round's foreground recovery: it retries the metadata refresh made before
+   *   anything is installed.
    * @returns {Promise<import('./groupProtocol/interface').RebalanceResult>}
    * @throws {Error} the round's refusal, the fatal error, or the loss the ownership carries
    */
   async applyRebalanceResult(
     result,
-    { rebuildOffsets = true, lost = false, round, additionHold } = {}
+    { rebuildOffsets = true, lost = false, round, additionHold, recover } = {}
   ) {
     const check = () => {
       const membershipError =
@@ -1171,8 +1175,10 @@ module.exports = class ConsumerGroup {
 
         // If the consumer is not aware of all assigned partitions, refresh metadata
         // and update the list of partitions per subscribed topic. It's enough to perform
-        // this operation once since refresh metadata will update metadata for all topics
-        await this.cluster.refreshMetadata({ guard: round?.guard })
+        // this operation once since refresh metadata will update metadata for all topics.
+        // Nothing is installed yet, so foreground recovery may retry the refresh alone.
+        const refresh = () => this.cluster.refreshMetadata({ guard: round?.guard })
+        await (recover ? recover(refresh) : refresh())
         check()
         this.partitionsPerSubscribedTopic = this.generatePartitionsPerSubscribedTopic()
         break
@@ -1284,9 +1290,10 @@ module.exports = class ConsumerGroup {
     // Wholesale in both branches: its members are broker node ids, not partitions.
     this.validationUnusableLogged.clear()
 
+    const previousAcquisitions = rebuildOffsets ? this.acquired : null
     if (rebuildOffsets) {
       this.retireAcquisitions()
-      this.acquired.clear()
+      this.acquired = new Map()
       this.haltedPartitions.clear()
     }
     for (const { topic, partitions } of revoked) {
@@ -1295,6 +1302,7 @@ module.exports = class ConsumerGroup {
         const acquired = this.acquired.get(key)
         if (acquired) acquired.retired = true
         this.acquired.delete(key)
+        if (!rebuildOffsets) this.clearPartitionRetry?.(key)
         this.haltedPartitions.delete(key)
         this.seekOffset.pop(topic, partition)
       }
@@ -1304,8 +1312,11 @@ module.exports = class ConsumerGroup {
         const key = `${topic}|${partition}`
         if (!this.acquired.has(key)) {
           const acquiredAt = (this.lastAcquiredAt = ++this.acquireClock)
+          const previous = previousAcquisitions?.get(key)
           this.acquired.set(key, {
             acquiredAt,
+            assignmentToken: previous?.assignmentToken ?? Symbol('partition retry position'),
+            positionChangedAt: previous?.positionChangedAt ?? 0,
             changedAt: acquiredAt,
             recreatedAt: 0,
             soughtAt: 0,
@@ -1315,6 +1326,11 @@ module.exports = class ConsumerGroup {
             this.markSought(topic, partition)
           }
         }
+      }
+    }
+    if (previousAcquisitions && this.clearPartitionRetry) {
+      for (const key of previousAcquisitions.keys()) {
+        if (!this.acquired.has(key)) this.clearPartitionRetry(key)
       }
     }
     if (additionHold) {
@@ -1898,7 +1914,7 @@ module.exports = class ConsumerGroup {
    * @param {import("../../types").TopicPartitionOffset & { leaderEpoch?: number }} topicPartitionOffset
    */
   resolveOffset({ topic, partition, offset, leaderEpoch }) {
-    this.offsetManager.resolveOffset({ topic, partition, offset, leaderEpoch })
+    return this.offsetManager.resolveOffset({ topic, partition, offset, leaderEpoch })
   }
 
   /**
@@ -1972,8 +1988,24 @@ module.exports = class ConsumerGroup {
    * @returns {void}
    */
   markChanged(topic, partition) {
-    const acquired = this.acquired.get(`${topic}|${partition}`)
-    if (acquired) acquired.changedAt = ++this.acquireClock
+    const key = `${topic}|${partition}`
+    const acquired = this.acquired.get(key)
+    if (!acquired) return
+    acquired.changedAt = ++this.acquireClock
+    this.replaceRetryPosition(key, acquired, acquired.changedAt)
+  }
+
+  /**
+   * Gives the new log position its own retry identity and invalidates the old position at once.
+   * @param {string} key the partition key
+   * @param {import('./handlerContext').Acquisition} acquired the current acquisition
+   * @param {number} clock when the position changed
+   * @returns {void}
+   */
+  replaceRetryPosition(key, acquired, clock) {
+    acquired.positionChangedAt = clock
+    acquired.assignmentToken = Symbol('partition retry position')
+    this.clearPartitionRetry?.(key)
   }
 
   /**
@@ -1993,6 +2025,7 @@ module.exports = class ConsumerGroup {
     const acquired = this.acquired.get(key)
     if (!acquired) return
     acquired.soughtAt = this.lastSoughtAt = ++this.acquireClock
+    this.replaceRetryPosition(key, acquired, acquired.soughtAt)
   }
 
   /**
@@ -2181,6 +2214,7 @@ module.exports = class ConsumerGroup {
     const acquired = this.acquired.get(key)
     if (!acquired) return
     acquired.changedAt = acquired.recreatedAt = ++this.acquireClock
+    this.replaceRetryPosition(key, acquired, acquired.recreatedAt)
   }
 
   pause(topicPartitions) {

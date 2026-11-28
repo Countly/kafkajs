@@ -9,6 +9,7 @@ const {
   isUnknownMemberId,
   KafkaJSCommitFailedError,
   KafkaJSNonRetriableError,
+  KafkaJSNumberOfRetriesExceeded,
   KafkaJSRebalanceListenerError,
   KafkaJSRebalanceNotConvergedError,
   COORDINATOR_LOAD_IN_PROGRESS_CODE,
@@ -29,8 +30,13 @@ const {
   REBALANCE_PATHS,
   isOffsetCommitError,
   rebalanceReason,
+  handlerRebalanceDisposition,
+  markHandlerCrash,
+  stampCommitRefusal,
+  stampHeartbeat,
   isConsumerProtocolFatal,
   isHeartbeatFatal,
+  isJoinDeadline,
   sentOwnership,
   sentMembership,
   obsoleteOwnership,
@@ -45,6 +51,7 @@ const isSameOffset = (offsetA, offsetB) => Long.fromValue(offsetA).equals(Long.f
 const CONSUMING_START = 'consuming-start'
 const CONSUMING_STOP = 'consuming-stop'
 const HANDLERS_IDLE = 'handlers-idle'
+const HANDLER_DELIVERY = Symbol('handler delivery')
 
 /**
  * The close callback a forced fatal claim delivered.
@@ -130,7 +137,7 @@ module.exports = class Runner extends EventEmitter {
       fetch: (nodeId) => this.fetch(nodeId),
       retryDelay: (error, nodeId) => this.fetchRetryDelay(error, nodeId),
       onRetire: (nodeId) => this.outages.fetch.end(nodeId),
-      handler: (batch) => this.handleBatch(batch),
+      handler: (batch) => this.handleBatch(batch, true),
       concurrency,
     })
 
@@ -175,6 +182,13 @@ module.exports = class Runner extends EventEmitter {
     this.fatal = null
     /** Handlers currently inside `eachMessage`/`eachBatch`. */
     this.inFlightHandlers = 0
+    /** @type {Map<string, { clearOffset: Long, retryCount: number, retryTime: number, assignmentToken: symbol }>} */
+    this.partitionRetries = new Map()
+    this.roundHandlerFailures = null
+    /** The first non-handler error of the round: a failed Fetch or a worker's own request. */
+    this.roundLoopError = null
+    this.handlerRetryDelay = 0
+    this.cancelHandlerBackoff = null
     /** Set while an eager rebalance is stopping the world; see `handleRebalanceError`. */
     this.quiescing = false
     this.pollTimer = new PollTimer({ pollDeadline: maxPollInterval })
@@ -205,10 +219,15 @@ module.exports = class Runner extends EventEmitter {
       instrumentationEmitter,
       logger: this.logger,
       groupId: consumerGroup.groupId,
-      onJoinComplete,
+      onJoinComplete: () => {
+        this.prunePartitionRetries()
+        onJoinComplete?.()
+      },
+      retryJoin: (attempt, round, step) => this.fetchRetrier(attempt, round, step),
     })
 
     consumerGroup.attach({
+      clearPartitionRetry: (key) => this.partitionRetries.delete(key),
       rebalanceCoordinator: this.rebalanceCoordinator,
       heartbeatManager: this.heartbeatManager,
       onHeartbeatFatal: (error) => this.reserveFatal(error),
@@ -423,7 +442,11 @@ module.exports = class Runner extends EventEmitter {
    * success (see `Outage`): the next round reconnects, and the heartbeat and the commit look the
    * coordinator up again. The ride runs the attempt again inside the same retrier attempt, so it
    * does not refill the retries that other errors have spent. A handler's errors, whatever they
-   * are, count as before.
+   * are, count as before, also when a rebalance verdict the failure did not cause was waiting:
+   * that rebalance runs first.
+   *
+   * A completed rebalance closes the Fetch attempt. Each failing partition owns its handler retry
+   * budget for as long as the assignment and failed position remain current.
    * @returns {void}
    */
   scheduleFetchManager() {
@@ -445,8 +468,7 @@ module.exports = class Runner extends EventEmitter {
      * @param {(error: Error) => void} bail
      * @param {number} retryCount
      * @param {number} retryTime
-     * @returns {Promise<true|undefined>} true when it rode out a lost connection: the retrier's
-     *   attempt then runs it again, so a ride never refills the retries other errors have spent
+     * @returns {Promise<true|undefined>} true to continue the attempt after a ridden outage
      */
     const attempt = async (bail, retryCount, retryTime) => {
       if (!this.running) {
@@ -454,99 +476,117 @@ module.exports = class Runner extends EventEmitter {
       }
 
       /**
-       * Runs one rebalance for the loop. A failed awaited callback, a classic chain refused at its
-       * round limit and a heartbeat answer marked fatal end the loop through `bail`, so the
-       * retrier hands the typed error to the crash policy unchanged instead of retrying it or
-       * wrapping it.
+       * Runs one foreground rebalance, and a fatal verdict that replaced it, before any more Fetch
+       * requests are admitted. A verdict the rebalance leaves behind stays queued: the caller decides
+       * first, and the next attempt recovers it before it fetches. Every error that escapes ends the
+       * run through `bail`: the typed rebalance outcomes unchanged, anything else wrapped as the fetch
+       * retrier wraps a non-retriable error.
+       * @param {import('./rebalanceCoordinator').Verdict} verdict the verdict to recover
+       * @returns {Promise<boolean>} true when recovery bailed or the run stopped
        */
-      const rebalance = async (verdict) => {
-        try {
-          await this.handleRebalanceError(verdict)
-        } catch (error) {
-          if (
-            error instanceof KafkaJSRebalanceListenerError ||
-            error instanceof KafkaJSRebalanceNotConvergedError ||
-            isHeartbeatFatal(error)
-          ) {
-            bail(error)
+      const recover = async (verdict) => {
+        for (;;) {
+          try {
+            await this.handleRebalanceError(verdict, { retryCount, retryTime })
+            return !this.running || this.stopRequested
+          } catch (error) {
+            if (error?.type === 'CONSUMER_STOPPING' && this.stopRequested) return true
+            if (!isHeartbeatFatal(error) && this.rebalanceCoordinator.hasFatalVerdict()) {
+              verdict = this.rebalanceCoordinator.takeVerdict()
+              continue
+            }
+            const typed =
+              error instanceof KafkaJSRebalanceListenerError ||
+              error instanceof KafkaJSRebalanceNotConvergedError ||
+              error instanceof KafkaJSNumberOfRetriesExceeded ||
+              isHeartbeatFatal(error) ||
+              isJoinDeadline(error)
+            bail(
+              typed ? error : new KafkaJSNonRetriableError(error, { cause: error.cause || error })
+            )
             return true
           }
-          throw error
         }
       }
 
-      const waiting = this.rebalanceCoordinator.takeVerdict()
-
+      const coordinator = this.rebalanceCoordinator
+      const waiting = coordinator.takeVerdict()
       if (waiting) {
-        await rebalance(waiting)
+        await recover(waiting)
         return
       }
 
+      this.roundHandlerFailures = []
+      this.roundLoopError = null
+      let failure
       try {
-        // The fetch manager (re)starting is the start of a fresh poll cycle: after a rebalance,
-        // after a retry backoff, and on every loop of the retrier.
         this.pollTimer.reset()
         await this.fetchManager.start()
-      } catch (e) {
-        // A retired run's own work refusing to continue is the stop, not a crash: a crash here would
-        // disconnect whatever run the consumer started since.
-        if (e?.type === 'CONSUMER_STOPPING' && this.stopRequested) return
+      } catch (error) {
+        failure = this.roundLoopError ?? (error?.[HANDLER_DELIVERY] ? null : { error })
+      }
+      const handlers = this.roundHandlerFailures
+      this.roundHandlerFailures = null
+      this.roundLoopError = null
+      if (!handlers?.length) this.handlerRetryDelay = 0
+      if (!handlers || this.stopRequested || this.retirement) return
 
-        // One rebalance must produce one REBALANCING and one join, even when the runner learns of
-        // it twice - once as this throw, once as a slot entry. Merging and clearing first is what
-        // guarantees that.
-        const pending = this.rebalanceCoordinator.takeVerdict()
-        const thrown = this.rebalanceCoordinator.classify(e, REBALANCE_PATHS.FETCH)
-        const merged =
-          thrown && pending ? this.mergeThrownWithSlot(thrown, pending) : thrown || pending
-
-        if (merged) {
-          // Read before the recovery can renew ownership.
-          const independent = !thrown && this.isIndependentHandlerFailure(e, pending)
-          const bailed = await rebalance(merged)
-          // A fatal verdict the recovery left in the slot is the outcome: the next attempt acts
-          // on it. A recoverable one is not, and the crash's stop clears it.
-          const settled = !bailed && !this.rebalanceCoordinator.hasFatalVerdict()
-          if (independent && settled && this.running && !this.stopRequested) throw e
-          return
+      const pending = coordinator.takeVerdict()
+      const group = this.consumerGroup
+      const fetchVerdict = failure && coordinator.classify(failure.error, REBALANCE_PATHS.FETCH)
+      let verdict = fetchVerdict ? coordinator.mergeVerdict(pending, fetchVerdict) : pending
+      const independent = []
+      for (const delivery of handlers) {
+        const disposition = handlerRebalanceDisposition(delivery.error, pending, group)
+        if (!disposition) {
+          independent.push(delivery)
+        } else if (typeof disposition === 'object') {
+          const membership = coordinator.classify(disposition.error, disposition.path)
+          if (membership) verdict = coordinator.mergeVerdict(verdict, membership)
         }
+      }
 
-        // An answer for a membership a completed round already replaced changes nothing.
-        if (obsoleteOwnership(this.consumerGroup.ownership, e)) {
-          this.logger.debug('Ignoring an error from a membership already replaced', {
-            groupId: this.consumerGroup.groupId,
-            memberId: this.consumerGroup.memberId,
-            error: e.message,
-          })
-          return
-        }
+      if (verdict && (await recover(verdict))) return
+      if (this.stopRequested || this.retirement) return
+      if (coordinator.hasFatalVerdict()) {
+        await recover(coordinator.takeVerdict())
+        return
+      }
 
-        const delay = this.rideOutage(e)
-        if (delay !== undefined) {
-          await sleep(delay)
-          return true
-        }
+      const result = this.accountHandlerFailures(independent, verdict)
+      if (result.error) return bail(markHandlerCrash(result.error))
+      const candidate =
+        failure && !fetchVerdict && (!verdict || handlers.length) ? failure.error : result.outage
+      const error = candidate && !obsoleteOwnership(group.ownership, candidate) ? candidate : null
+      const ride = error ? this.rideOutage(error) : undefined
+      if (
+        ride === undefined &&
+        (error?.name === 'KafkaJSNotImplemented' || error?.name === 'KafkaJSNoBrokerAvailableError')
+      ) {
+        return bail(error)
+      }
 
-        if (e.name === 'KafkaJSNotImplemented' || e.name === 'KafkaJSNoBrokerAvailableError') {
-          return bail(e)
-        }
-
+      // The handler round's backoff holds whichever way this attempt ends, so a ridden or counted
+      // loop error never admits the next Fetch sooner than the handler failures allow.
+      if (result.delay !== undefined)
+        await this.waitForHandlerRetry(Math.max(result.delay, ride ?? 0))
+      else if (ride !== undefined) await sleep(ride)
+      if (this.stopRequested || this.retirement) return
+      if (ride !== undefined) return true
+      if (error) {
         this.logger.debug('Error while scheduling fetch manager, trying again...', {
-          groupId: this.consumerGroup.groupId,
-          memberId: this.consumerGroup.memberId,
-          error: e.message,
-          stack: e.stack,
+          groupId: group.groupId,
+          memberId: group.memberId,
+          error: error.message,
+          stack: error.stack,
           retryCount,
           retryTime,
         })
-
-        throw e
+        throw error
       }
 
-      const verdict = this.rebalanceCoordinator.takeVerdict()
-      if (verdict) {
-        await rebalance(verdict)
-      }
+      const queued = coordinator.takeVerdict()
+      if (queued) await recover(queued)
     }
 
     this.fetchRetrier(async (bail, retryCount, retryTime) => {
@@ -564,6 +604,7 @@ module.exports = class Runner extends EventEmitter {
         // already stopped and skipping both.
         this.consuming = false
         this.disarmFatal()
+        this.clearHandlerRetries()
 
         try {
           await this.onCrash(e)
@@ -588,40 +629,6 @@ module.exports = class Runner extends EventEmitter {
   }
 
   /**
-   * Whether a handler's own non-retriable failure arrived together with a recoverable
-   * consumer-protocol loss it did not cause. The loss recovery runs first; this failure then
-   * still ends the run, instead of being consumed by the loss. Ownership refusals, OffsetCommit
-   * errors and errors wrapping the loss are the loss itself, not independent of it.
-   * @private
-   * @param {unknown} error what the fetch attempt threw, with no verdict of its own
-   * @param {import('./rebalanceCoordinator').Verdict} pending the slot entry
-   * @returns {boolean}
-   */
-  isIndependentHandlerFailure(error, pending) {
-    if (this.consumerGroup.kind !== 'consumer' || pending.kind !== 'lost') return false
-    if (isConsumerProtocolFatal(pending.error) || this.requestClasses.get(error) !== 'handler') {
-      return false
-    }
-    if (error.retriable !== false || error instanceof KafkaJSCommitFailedError) return false
-    if (isOffsetCommitError(error)) return false
-    for (let cause = error, depth = 0; cause && depth < 8; cause = cause.cause, depth++) {
-      if (cause === pending.error) return false
-    }
-    return true
-  }
-
-  /**
-   * Merges an error the fetch manager threw with whatever the slot already held, under the
-   * coordinator's LOST > REVOKED precedence. The slot entry is the pending one.
-   * @param {import('./rebalanceCoordinator').Verdict} thrown
-   * @param {import('./rebalanceCoordinator').Verdict} pending
-   * @returns {import('./rebalanceCoordinator').Verdict}
-   */
-  mergeThrownWithSlot(thrown, pending) {
-    return this.rebalanceCoordinator.mergeVerdict(pending, thrown)
-  }
-
-  /**
    * The one place a rebalance discards or auto-commits.
    *
    * LOST means the generation or member id the offsets belong to no longer exists, so committing
@@ -629,11 +636,12 @@ module.exports = class Runner extends EventEmitter {
    * allowed. A fenced static member does both halves of LOST and then dies: rejoining under a
    * fresh member id would walk straight back into the same fencing loop.
    *
-   * @param {Error} e
+   * @param {import('./rebalanceCoordinator').Verdict|Error} verdictOrError
+   * @param {{ retryCount: number, retryTime: number }} [retryJoin] the foreground retry step
    * @returns {Promise<void>}
    * @throws {Error} `e` itself for a fenced member, and for anything that is not a rebalance
    */
-  async handleRebalanceError(verdictOrError) {
+  async handleRebalanceError(verdictOrError, retryJoin = false) {
     const verdict = this.toVerdict(verdictOrError)
 
     if (
@@ -670,7 +678,7 @@ module.exports = class Runner extends EventEmitter {
       lost || (verdict.kind === 'revoked' && this.consumerGroup.rebalanceProtocol() !== COOPERATIVE)
 
     if (!stopsTheWorld) {
-      return this.resolveRebalanceVerdict(verdict)
+      return this.resolveRebalanceVerdict(verdict, retryJoin)
     }
 
     if (this.rebalanceHooks) {
@@ -678,7 +686,10 @@ module.exports = class Runner extends EventEmitter {
       // callback without waiting for handlers, an eager revoke quiesces before its revoked callback.
       this.quiescing = lost
       try {
-        return await this.resolveRebalanceVerdict({ ...verdict, membershipNotified: lost })
+        return await this.resolveRebalanceVerdict(
+          { ...verdict, membershipNotified: lost },
+          retryJoin
+        )
       } finally {
         this.quiescing = false
       }
@@ -698,10 +709,7 @@ module.exports = class Runner extends EventEmitter {
       await this.fetchManager.stop()
       await this.waitForHandlers()
 
-      return await this.resolveRebalanceVerdict({
-        ...verdict,
-        membershipNotified: lost,
-      })
+      return await this.resolveRebalanceVerdict({ ...verdict, membershipNotified: lost }, retryJoin)
     } finally {
       this.quiescing = false
     }
@@ -741,11 +749,16 @@ module.exports = class Runner extends EventEmitter {
    * @returns {Promise<void>}
    * @throws {Error} the verdict's error for a fenced member, and for anything that is not a
    *   rebalance
+   * @param {{ retryCount: number, retryTime: number }} [retryJoin] the foreground retry step
    */
-  async resolveRebalanceVerdict({ kind, reason, error: e, membershipNotified = false }) {
+  async resolveRebalanceVerdict({ kind, reason, error: e, membershipNotified = false }, retryJoin) {
     if (this.retirement) return
     const ownership = this.consumerGroup.ownership
     if (obsoleteOwnership(ownership, e)) return
+    const runRound = (kind) =>
+      retryJoin
+        ? this.rebalanceCoordinator.runRound(reason, kind, retryJoin)
+        : this.rebalanceCoordinator.runRound(reason, kind)
     if (kind === 'lost') {
       ownership?.lose(e, sentOwnership(e) ?? ownership.token())
       if (!membershipNotified) this.consumerGroup.onMembershipError(e)
@@ -778,7 +791,7 @@ module.exports = class Runner extends EventEmitter {
         this.consumerGroup.forgetMemberId(sentMembership(e))
       }
 
-      await this.rebalanceCoordinator.runRound(reason, 'lost')
+      await runRound('lost')
       return
     }
 
@@ -795,19 +808,18 @@ module.exports = class Runner extends EventEmitter {
         }
       } catch (error) {
         const failure = this.rebalanceCoordinator.classify(error, REBALANCE_PATHS.OFFSET_COMMIT)
-        if (failure?.kind === 'lost') return this.resolveRebalanceVerdict(failure)
+        if (failure?.kind === 'lost') return this.resolveRebalanceVerdict(failure, retryJoin)
         this.logger.warn('Pre-rebalance offset commit failed; rejoining anyway', {
           error: error.message,
         })
       }
       if (ownership?.refusal(ownership.token())) {
-        return this.resolveRebalanceVerdict({
-          kind: 'lost',
-          reason: 'lost',
-          error: ownership.refusal(ownership.token()),
-        })
+        return this.resolveRebalanceVerdict(
+          { kind: 'lost', reason: 'lost', error: ownership.refusal(ownership.token()) },
+          retryJoin
+        )
       }
-      await this.rebalanceCoordinator.runRound(reason, 'revoked')
+      await runRound('revoked')
       return
     }
 
@@ -1031,6 +1043,7 @@ module.exports = class Runner extends EventEmitter {
     this.stopLatched = true
     this.stopRequested = true
     this.running = false
+    this.clearHandlerRetries()
     // Ends the inter-round yield at once, so a chain waiting one out does not hold this stop open.
     this.rebalanceCoordinator.notifyStopRequested()
     // Before the manager is stopped, deliberately: a join waiting on its first heartbeat response
@@ -1240,7 +1253,7 @@ module.exports = class Runner extends EventEmitter {
         return
       }
 
-      throw this.markOwnRequest(e, 'heartbeat')
+      throw this.markOwnRequest(stampHeartbeat(e, this.consumerGroup.ownership), 'heartbeat')
     }
   }
 
@@ -1335,6 +1348,18 @@ module.exports = class Runner extends EventEmitter {
    * @returns {number|undefined} the fetcher's backoff delay in milliseconds, or undefined
    */
   fetchRetryDelay(error, nodeId) {
+    const delay = this.fetchOutageDelay(error, nodeId)
+    if (delay === undefined && this.roundHandlerFailures) this.roundLoopError ??= { error }
+    return delay
+  }
+
+  /**
+   * Decides whether a failed Fetch can be retried by its own broker fetcher.
+   * @param {Error} error the Fetch failure
+   * @param {number} nodeId the broker that failed
+   * @returns {number|undefined} the local retry delay, or undefined to end the fetcher
+   */
+  fetchOutageDelay(error, nodeId) {
     if (
       this.requestClassOf(error) !== 'fetch' ||
       this.rebalanceCoordinator.hasVerdict() ||
@@ -1378,7 +1403,149 @@ module.exports = class Runner extends EventEmitter {
     return error
   }
 
-  async processEachMessage(batch) {
+  /**
+   * Carries the visible delivery range with the failure across the fetch workers. Each rejection
+   * has its own envelope, even when concurrently failing handlers throw the same error object.
+   * Everything it records was read before the handler ran: the batch and its records are the
+   * application's to change.
+   * @param {Error} error thrown by the handler
+   * @param {import('./handlerContext').BatchIdentity} identity the batch identity taken at hand-off
+   * @param {string} first first visible offset in this callback
+   * @param {string} last last visible offset in this callback
+   * @param {boolean} captureDelivery whether the fetch loop owns the rejection
+   * @returns {Error} the original failure or the private fetch-loop envelope
+   */
+  handlerFailure(error, identity, first, last, captureDelivery) {
+    this.markOwnRequest(error, 'handler')
+    if (!captureDelivery) return error
+    const { topic, partition, acquisition, acquireClock } = identity
+    const assignmentToken =
+      acquisition?.positionChangedAt > acquireClock ? undefined : acquisition?.assignmentToken
+    this.roundHandlerFailures?.push({
+      topic,
+      partition,
+      assignmentToken,
+      acquireClock,
+      first,
+      last,
+      error,
+    })
+    const failure = new Error('Handler delivery failed', { cause: error })
+    failure[HANDLER_DELIVERY] = true
+    return failure
+  }
+
+  /**
+   * Drops retries whose continuous assignment no longer holds.
+   * @returns {void}
+   */
+  prunePartitionRetries() {
+    for (const [key, entry] of this.partitionRetries) {
+      if (this.consumerGroup.acquired.get(key)?.assignmentToken !== entry.assignmentToken) {
+        this.partitionRetries.delete(key)
+      }
+    }
+  }
+
+  /**
+   * Charges independent failures before the loop can sleep or process a later assignment.
+   *
+   * A failure is charged to the record of the assignment its batch was acquired under. A failure
+   * whose position was replaced (seek, reset, recreation) or whose partition is no longer held has
+   * no record to charge: it is judged on a fresh budget and stores nothing, so it still crashes
+   * when non-retriable or when `retries` is 0, and still backs off otherwise. A coordinator outage
+   * the handler propagated from its own client call keeps the loop's outage handling instead.
+   * @param {object[]} deliveries handler failures retained through worker drain
+   * @param {import('./rebalanceCoordinator').Verdict|null} verdict the recovered verdict
+   * @returns {{ error?: Error, delay?: number, outage?: Error }} the highest-priority handler
+   *   outcome, the backoff before the next Fetch, and the first propagated coordinator outage when
+   *   no verdict was recovered
+   */
+  accountHandlerFailures(deliveries, verdict) {
+    let nonRetriable
+    let exhausted
+    let delay
+    let outage
+    const retries = this.retryOptions.retries ?? createRetry.defaults.retries
+    const group = this.consumerGroup
+    for (const delivery of deliveries) {
+      const { topic, partition, assignmentToken, acquireClock, first, last, error } = delivery
+      if (handlerRebalanceDisposition(error, verdict, group)) continue
+      if (this.requestClassOf(error)) {
+        if (!verdict) outage ??= error
+        continue
+      }
+      if (!createRetry.isErrorRetriable(error)) {
+        nonRetriable ??= new KafkaJSNonRetriableError(error, { cause: error.cause || error })
+        continue
+      }
+      const key = `${topic}|${partition}`
+      const current = group.acquired.get(key)
+      const owner = current?.positionChangedAt > acquireClock ? undefined : assignmentToken
+      const previous = owner === undefined ? undefined : this.partitionRetries.get(key)
+      const end = Long.fromValue(last)
+      const entry =
+        previous !== undefined &&
+        previous.assignmentToken === owner &&
+        Long.fromValue(first).compare(previous.clearOffset) <= 0
+          ? previous
+          : undefined
+      const retryCount = entry?.retryCount ?? 0
+      const retryTime = entry?.retryTime ?? this.backoff.initial()
+      if (retryCount >= retries) {
+        exhausted ??= new KafkaJSNumberOfRetriesExceeded(error, { retryCount, retryTime })
+        continue
+      }
+
+      if (owner !== undefined && current?.assignmentToken === owner) {
+        this.partitionRetries.set(key, {
+          clearOffset: entry && entry.clearOffset.compare(end) > 0 ? entry.clearOffset : end,
+          retryCount: retryCount + 1,
+          retryTime: this.backoff.next(retryTime),
+          assignmentToken: owner,
+        })
+      }
+      delay = Math.max(delay ?? this.handlerRetryDelay, retryTime)
+    }
+    return { error: nonRetriable ?? exhausted, delay, outage }
+  }
+
+  /**
+   * Delays the next Fetch for a failed handler round. Stop or retirement ends the wait; a verdict
+   * queued meanwhile is recovered once it ends.
+   * @param {number} delay milliseconds to wait
+   * @returns {Promise<void>}
+   */
+  waitForHandlerRetry(delay) {
+    this.handlerRetryDelay = delay
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => this.cancelHandlerBackoff(), delay)
+      this.cancelHandlerBackoff = () => {
+        clearTimeout(timer)
+        this.cancelHandlerBackoff = null
+        resolve()
+      }
+    })
+  }
+
+  /**
+   * Releases retry state and any pending wait when this run ends.
+   * @returns {void}
+   */
+  clearHandlerRetries() {
+    this.partitionRetries.clear()
+    this.roundHandlerFailures = null
+    this.roundLoopError = null
+    this.handlerRetryDelay = 0
+    this.cancelHandlerBackoff?.()
+  }
+
+  /**
+   * @param {import('./batch')} batch the delivered records
+   * @param {import('./handlerContext').BatchIdentity} identity the batch identity at hand-off
+   * @param {boolean} [captureDelivery] whether to carry the delivery in a failure
+   */
+  async processEachMessage(batch, identity, captureDelivery) {
     const { topic, partition } = batch
     const authority = this.resolutionAuthority(batch)
 
@@ -1395,6 +1562,7 @@ module.exports = class Runner extends EventEmitter {
         break
       }
 
+      const { offset } = message
       try {
         await this.eachMessage({
           topic,
@@ -1404,12 +1572,12 @@ module.exports = class Runner extends EventEmitter {
           pause,
         })
       } catch (e) {
-        this.markOwnRequest(e, 'handler')
+        const failure = this.handlerFailure(e, identity, offset, offset, captureDelivery)
         if (!isKafkaJSError(e)) {
           this.logger.error(`Error when calling eachMessage`, {
             topic,
             partition,
-            offset: message.offset,
+            offset,
             stack: e.stack,
             error: e,
           })
@@ -1417,7 +1585,7 @@ module.exports = class Runner extends EventEmitter {
 
         // In case of errors, commit the previously consumed offsets unless autoCommit is disabled
         await this.commitAfterHandlerError(batch)
-        throw e
+        throw failure
       }
 
       this.resolveBatchOffset(
@@ -1443,10 +1611,18 @@ module.exports = class Runner extends EventEmitter {
     }
   }
 
-  async processEachBatch(batch) {
+  /**
+   * @param {import('./batch')} batch the delivered records
+   * @param {import('./handlerContext').BatchIdentity} identity the batch identity at hand-off
+   * @param {boolean} [captureDelivery] whether to carry the delivery in a failure
+   */
+  async processEachBatch(batch, identity, captureDelivery) {
     const { topic, partition } = batch
     const authority = this.resolutionAuthority(batch)
     const lastFilteredMessage = batch.messages[batch.messages.length - 1]
+    // The delivered range, read before the handler can change `batch.messages`.
+    const deliveredFirst = batch.messages[0].offset
+    const deliveredLast = lastFilteredMessage.offset
 
     const pause = () => {
       this.consumerGroup.pause([{ topic, partitions: [partition] }])
@@ -1531,7 +1707,13 @@ module.exports = class Runner extends EventEmitter {
           this.consumerGroup.hasSeekOffset({ topic, partition }) || this.isSought(batch),
       })
     } catch (e) {
-      this.markOwnRequest(e, 'handler')
+      const failure = this.handlerFailure(
+        e,
+        identity,
+        deliveredFirst,
+        deliveredLast,
+        captureDelivery
+      )
       if (!isKafkaJSError(e)) {
         this.logger.error(`Error when calling eachBatch`, {
           topic,
@@ -1545,7 +1727,7 @@ module.exports = class Runner extends EventEmitter {
       // eachBatch has a special resolveOffset which can be used
       // to keep track of the messages
       await this.commitAfterHandlerError(batch)
-      throw e
+      throw failure
     }
 
     // resolveOffset for the last offset can be disabled to allow the users of eachBatch to
@@ -1797,35 +1979,63 @@ module.exports = class Runner extends EventEmitter {
    * installed, a current ownership no loss refuses, and the partition still owned under that same
    * acquisition. It then writes to that manager. An ordinary apply that renews the ownership keeps
    * all of these; a loss, a rebuilt manager or a revoke and reacquire does not. Classic and manual
-   * resolution write to the current manager, as before.
+   * resolution write to the current manager, as before, but a write made while the ownership
+   * carries a refusal is not accepted progress.
    * @param {import('./batch')} batch the batch the record came from
    * @param {string} offset the handled record's offset
    * @param {number} leaderEpoch the epoch of the record at `offset`, -1 when none
    * @param {ReturnType<Runner['resolutionAuthority']>} [authority] the handler's authority;
    *   captured now when omitted
-   * @returns {void}
+   * @returns {boolean} whether the offset was resolved as accepted progress
    */
   resolveBatchOffset(batch, offset, leaderEpoch, authority = this.resolutionAuthority(batch)) {
-    if (this.isSuperseded(batch)) return
+    if (this.isSuperseded(batch)) return false
     const { topic, partition } = batch
     const group = this.consumerGroup
-    if (group.kind !== 'consumer') {
-      group.resolveOffset({ topic, partition, offset, leaderEpoch })
-      return
+    if (group.kind === 'consumer') {
+      const { manager, acquisition, key } = authority
+      if (
+        this.retirement ||
+        !manager ||
+        group.offsetManager !== manager ||
+        group.ownership?.refusal(group.ownership.token()) ||
+        group.acquired.get(key) !== acquisition ||
+        !group.isAssigned(topic, partition)
+      ) {
+        return false
+      }
     }
 
-    const { manager, acquisition, key } = authority
+    const resolved =
+      group.kind === 'consumer'
+        ? authority.manager.resolveOffset({ topic, partition, offset, leaderEpoch })
+        : group.resolveOffset({ topic, partition, offset, leaderEpoch }) === true &&
+          !group.ownership?.refusal(group.ownership.token())
+    if (resolved && this.partitionRetries.size) this.clearResolvedRetry(batch, offset)
+    return resolved === true
+  }
+
+  /**
+   * Clears a pending failure only when accepted progress covered its failed position.
+   * @param {import('./batch')} batch the batch that resolved the offset
+   * @param {string} offset the resolved record
+   * @returns {void}
+   */
+  clearResolvedRetry(batch, offset) {
+    const { topic, partition, acquireClock } = batch
+    const key = batch.ownershipKey ?? `${topic}|${partition}`
+    const entry = this.partitionRetries.get(key)
+    if (!entry) return
+    const group = this.consumerGroup
+    const current = group.acquired.get(key)
     if (
-      this.retirement ||
-      !manager ||
-      group.offsetManager !== manager ||
-      group.ownership?.refusal(group.ownership.token()) ||
-      group.acquired.get(key) !== acquisition ||
-      !group.isAssigned(topic, partition)
+      current?.assignmentToken === entry.assignmentToken &&
+      !(current.positionChangedAt > acquireClock) &&
+      !group.ownership?.refusal(group.ownership.token()) &&
+      Long.fromValue(offset).gte(entry.clearOffset)
     ) {
-      return
+      this.partitionRetries.delete(key)
     }
-    manager.resolveOffset({ topic, partition, offset, leaderEpoch })
   }
 
   /**
@@ -1834,9 +2044,10 @@ module.exports = class Runner extends EventEmitter {
    * made later by that handler can be refused once the run is retired, even when the replacement
    * run's counters happen to equal the old ones.
    * @param {object} batch the fetched batch
+   * @param {boolean} [captureDelivery] whether the fetch loop will consume handler failures
    * @returns {Promise<void>}
    */
-  async handleBatch(batch) {
+  async handleBatch(batch, captureDelivery = false) {
     if (!this.running) {
       this.logger.debug('consumer not running, exiting', {
         groupId: this.consumerGroup.groupId,
@@ -1999,9 +2210,13 @@ module.exports = class Runner extends EventEmitter {
           partition,
         })
       } else if (this.eachMessage) {
-        await handlerContext.run(identity, () => this.processEachMessage(batch))
+        await handlerContext.run(identity, () =>
+          this.processEachMessage(batch, identity, captureDelivery)
+        )
       } else if (this.eachBatch) {
-        await handlerContext.run(identity, () => this.processEachBatch(batch))
+        await handlerContext.run(identity, () =>
+          this.processEachBatch(batch, identity, captureDelivery)
+        )
       }
 
       this.instrumentationEmitter.emit(END_BATCH_PROCESS, {
@@ -2042,6 +2257,13 @@ module.exports = class Runner extends EventEmitter {
 
     try {
       await onBatch(batch)
+    } catch (error) {
+      // The worker queue and the fetch manager keep only one rejection; the round keeps the first
+      // non-handler one beside the collected handler failures, whatever the batch order.
+      if (captureDelivery && this.roundHandlerFailures && !error?.[HANDLER_DELIVERY]) {
+        this.roundLoopError ??= { error }
+      }
+      throw error
     } finally {
       this.inFlightHandlers--
       this.endHookBatch(batch)
@@ -2262,10 +2484,11 @@ module.exports = class Runner extends EventEmitter {
    */
   commitRefusal(token = this.consumerGroup.ownership?.token(), batch = handlerContext.current()) {
     if (this.retirement) return this.retirement
-    const refusal = this.consumerGroup.ownership?.refusal(token)
-    if (refusal) return refusal
+    const ownership = this.consumerGroup.ownership
+    const refusal = ownership?.refusal(token)
+    if (refusal) return stampCommitRefusal(refusal, ownership, token)
     if (!batch || !this.isBatchStale(batch)) return null
-    return handlerContext.markStaleBatch(
+    const stale = handlerContext.markStaleBatch(
       new KafkaJSCommitFailedError(
         handlerContext.isSought(batch)
           ? 'A seek superseded the handler batch'
@@ -2273,6 +2496,7 @@ module.exports = class Runner extends EventEmitter {
         { reason: 'stale-assignment' }
       )
     )
+    return stampCommitRefusal(stale, ownership, token)
   }
 
   /**

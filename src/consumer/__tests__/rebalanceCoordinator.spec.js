@@ -570,7 +570,8 @@ describe('Consumer > RebalanceCoordinator', () => {
     })
 
     it('lets a heartbeat answer marked fatal replace a pending recoverable LOST, in either order', () => {
-      const { coordinator } = build()
+      const { coordinator, consumerGroup } = build()
+      consumerGroup.kind = 'consumer'
       const fenced = verdict('lost', 'fenced')
       const fatal = { kind: 'lost', reason: 'lost', error: stampHeartbeatFatal(new Error('69')) }
       const authorization = Object.assign(new Error('30'), { code: 30 })
