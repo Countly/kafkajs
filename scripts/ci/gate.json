@@ -11950,7 +11950,7 @@
         "src/network/__tests__/idleReaping.spec.js \u203a an external reauthentication protects a socket while its token provider is pending",
         "src/network/__tests__/maxInFlightRequestsIntegration.spec.js \u203a Network > maxInFlightRequests > an overload on fake 50 concurrent Metadata calls keep at most 5 in flight and all resolve",
         "src/network/__tests__/obsoleteConnectionBound.spec.js \u203a Bounded obsolete connections a response before the bound finishes normally and clears the drain timer",
-        "src/network/__tests__/obsoleteConnectionBound.spec.js \u203a Bounded obsolete connections a seed and table alias keep their Broker while the replaced pool becomes permanently retired",
+        "src/network/__tests__/obsoleteConnectionBound.spec.js \u203a Bounded obsolete connections the seed keeps its Broker under its one node id while the replaced pool becomes permanently retired",
         "src/network/__tests__/obsoleteConnectionBound.spec.js \u203a Bounded obsolete connections hint recovery completes before an unanswered drain and fences old references",
         "src/network/__tests__/obsoleteConnectionBound.spec.js \u203a Bounded obsolete connections public disconnect remains reusable and builder carries the configured bound",
         "src/network/__tests__/obsoleteConnectionBound.spec.js \u203a Bounded obsolete connections rebootstrap recovery completes before an unanswered drain and fences old references",

@@ -126,16 +126,19 @@ describe('Bounded obsolete connections', () => {
     }
   })
 
-  it('a seed and table alias keep their Broker while the replaced pool becomes permanently retired', async () => {
+  it('the seed keeps its Broker under its one node id while the replaced pool becomes permanently retired', async () => {
     const h = await createBoundHarness({ target: 0 })
     try {
       const oldPool = h.old.connectionPool
-      h.cluster.brokerPool.brokers[9] = h.old
       const { first, second } = await h.overload()
       await h.replace('hint', NODES[2])
       expect(h.cluster.brokerPool.seedBroker).toBe(h.old)
       expect(h.cluster.brokerPool.brokers[0]).toBe(h.old)
-      expect(h.cluster.brokerPool.brokers[9]).toBe(h.old)
+      expect(
+        Object.keys(h.cluster.brokerPool.brokers).filter(
+          (nodeId) => h.cluster.brokerPool.brokers[nodeId] === h.old
+        )
+      ).toEqual(['0'])
       expect(h.old.connectionPool).not.toBe(oldPool)
       await jest.advanceTimersByTimeAsync(BOUND)
       expect((await first).error).toBeInstanceOf(KafkaJSConnectionClosedError)

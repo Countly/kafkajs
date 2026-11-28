@@ -1172,15 +1172,26 @@ module.exports = class BrokerPool {
 
   /**
    * Removes every alias of an obsolete broker from the table, synchronously and calling no
-   * application code; the active seed stays.
+   * application code; the active seed stays. A node it removes whose route is not a removal
+   * already gets an applied removal and loses its Metadata row, so the table and the node's newest
+   * claim keep agreeing and the next Metadata response that lists the node claims it again (a
+   * failure removal, a replaced seed that held a node id, a rebootstrap).
    * @private
    * @param {import('../broker')|undefined} broker replaced broker
    * @returns {void}
    */
   detachObsolete(broker) {
     if (!broker || broker === this.seedBroker) return
+    let observedAt
     for (const nodeId of keys(this.brokers)) {
-      if (this.brokers[nodeId] === broker) delete this.brokers[nodeId]
+      if (this.brokers[nodeId] !== broker) continue
+      delete this.brokers[nodeId]
+      if (this.endpointOrder.route(nodeId)?.source === 'removal') continue
+      observedAt ??= this.endpointStamp()
+      const removal = this.endpointOrder.claim(nodeId, observedAt, null, 'removal')
+      if (removal) this.endpointOrder.settle(removal)
+      this.metadataEndpointRows.delete(nodeId)
+      this.updateSetupEndpoint(nodeId, undefined)
     }
   }
 
@@ -1573,14 +1584,6 @@ module.exports = class BrokerPool {
       return
     if (this.seedBroker === broker) {
       this.seedBroker = shuffle(values(this.brokers).filter((candidate) => candidate !== broker))[0]
-    }
-    const observedAt = this.endpointStamp()
-    for (const nodeId of keys(this.brokers)) {
-      if (this.brokers[nodeId] !== broker) continue
-      const removal = this.endpointOrder.claim(nodeId, observedAt, null, 'removal')
-      if (removal) this.endpointOrder.settle(removal)
-      this.metadataEndpointRows.delete(nodeId)
-      this.updateSetupEndpoint(nodeId, undefined)
     }
     this.metadataExpireAt = null
     this.closeObsolete(broker)
