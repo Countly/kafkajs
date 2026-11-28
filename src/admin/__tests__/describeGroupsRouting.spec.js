@@ -1279,10 +1279,10 @@ describe('Admin > describeGroups > routing', () => {
           ['team-�'],
         ])
         expect(summary(groups)).toEqual([
-          ['other', 0, 'consumer'],
           [SURROGATE, 0, 'consumer'],
           [LITERAL, 0, 'consumer'],
           [SURROGATE, 0, 'consumer'],
+          ['other', 0, 'consumer'],
         ])
       })
 
@@ -1303,7 +1303,9 @@ describe('Admin > describeGroups > routing', () => {
       })
 
       it('returns the rows of two ordinary ids as the broker named them', async () => {
-        const consumerGroupDescribe = jest.fn(consumerEcho)
+        const consumerGroupDescribe = jest.fn(({ groupIds }) => ({
+          groups: [...groupIds].reverse().map(consumerGroupRow),
+        }))
 
         const groups = await run({ consumerGroupDescribe }, ['g1', 'g2'])
 
@@ -1516,13 +1518,20 @@ describe('Admin > describeGroups > routing', () => {
       assignorName: null,
       members: [],
     })
-    const stubbed = ({ first, found, asked, describeGroups = jest.fn(), moves = [] }) => {
+    const stubbed = ({
+      first,
+      found,
+      asked,
+      describeGroups = jest.fn(),
+      moves = [],
+      retryAnswer = (ids) => ({ groups: ids.map((id) => described(id, 'again')) }),
+    }) => {
       let answered = 0
       return stubCluster({
         consumerGroupDescribe: async ({ groupIds }) => {
           asked.push([...groupIds])
           answered += 1
-          return { groups: answered === 1 ? first : groupIds.map((id) => described(id, 'again')) }
+          return answered === 1 ? { groups: first } : retryAnswer(groupIds)
         },
         describeGroups,
         onFindCoordinator: (groupId) => found.push(groupId),
@@ -1572,9 +1581,15 @@ describe('Admin > describeGroups > routing', () => {
       }
     )
 
-    it('asks again only for the ids still unresolved when one is loading and another has moved', async () => {
+    /**
+     * Holds one retry response past the other and checks the same public result in either order.
+     * @param {string} heldId group whose retry response is delayed
+     * @param {string} firstRetryId group whose retry response arrives first
+     */
+    const checkMixedRetries = async (heldId, firstRetryId) => {
       const found = []
       const asked = []
+      const answeredRetries = []
       const cluster = stubbed({
         first: [
           codeRow('g1', COORDINATOR_LOAD_IN_PROGRESS),
@@ -1584,6 +1599,11 @@ describe('Admin > describeGroups > routing', () => {
         found,
         asked,
         moves: ['g2'],
+        retryAnswer: async ([id]) => {
+          if (id === heldId) await after(10)
+          answeredRetries.push(id)
+          return { groups: [described(id, 'again')] }
+        },
       })
       const refreshMetadata = jest.spyOn(cluster, 'refreshMetadata')
       jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
@@ -1604,15 +1624,24 @@ describe('Admin > describeGroups > routing', () => {
 
         await jest.advanceTimersByTimeAsync(1)
         await new Promise(setImmediate)
+        expect(asked.slice(1).sort()).toEqual([['g1'], ['g2']])
+        expect(answeredRetries).toEqual([firstRetryId])
+        expect(outcome.settled).toBeUndefined()
+
+        await jest.advanceTimersByTimeAsync(10)
+        await new Promise(setImmediate)
         expect(outcome.settled).toBe(true)
         expect(outcome.error).toBeUndefined()
+        expect(answeredRetries).toEqual([firstRetryId, heldId])
         expect(asked.slice(1).sort()).toEqual([['g1'], ['g2']])
         expect(found).toEqual(['g1', 'g2', 'g3', 'g2'])
         expect(refreshMetadata).toHaveBeenCalledTimes(1)
         expect(
-          outcome.value.groups
-            .map(({ groupId, errorCode, members }) => [groupId, errorCode, members[0].memberId])
-            .sort()
+          outcome.value.groups.map(({ groupId, errorCode, members }) => [
+            groupId,
+            errorCode,
+            members[0].memberId,
+          ])
         ).toEqual([
           ['g1', 0, 'again'],
           ['g2', 0, 'again'],
@@ -1621,6 +1650,14 @@ describe('Admin > describeGroups > routing', () => {
       } finally {
         jest.useRealTimers()
       }
+    }
+
+    it('asks again only for the ids still unresolved when one is loading and another has moved', async () => {
+      await checkMixedRetries('g2', 'g1')
+    })
+
+    it('keeps the same result order when the moved coordinator answers before the loading one', async () => {
+      await checkMixedRetries('g1', 'g2')
     })
 
     it('does not ask a healthy coordinator again when another coordinator fails', async () => {
@@ -2343,8 +2380,8 @@ describe('Admin > describeGroups > two coordinators', () => {
     expect(fallbackStarted).toBe(true)
     expect(outcome.error).toBeUndefined()
     expect(outcome.value.groups.map(({ groupId, groupType }) => [groupId, groupType])).toEqual([
-      ['b', 'consumer'],
       ['a', 'classic'],
+      ['b', 'consumer'],
     ])
   })
 
@@ -2390,8 +2427,8 @@ describe('Admin > describeGroups > two coordinators', () => {
     expect(nodes[1].consumerGroupDescribe).toHaveBeenCalledTimes(2)
     expect(events).toEqual(['b retried', 'a timed out', 'a retried'])
     expect(outcome.value.groups.map(({ groupId, errorCode }) => [groupId, errorCode])).toEqual([
-      ['b', 0],
       ['a', 0],
+      ['b', 0],
     ])
   })
 

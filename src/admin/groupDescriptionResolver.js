@@ -32,7 +32,6 @@ class GroupDescriptionResolver {
     this.retrier = operation ? (work) => operation.retry(work, retry) : this.scope.retrier(retry)
     this.consumer = { ...consumer, ready: new Map() }
     this.classic = { ...classic, ready: new Map() }
-    this.results = { consumer: [], classic: [] }
     this.flushHandle = null
     this.scope.own(() => {
       clearImmediate(this.flushHandle)
@@ -45,18 +44,18 @@ class GroupDescriptionResolver {
    * Runs each wire id through its own retry budget and transitions fallback ids as they are ready.
    * The original deadline owns the resolver; its terminal refusal also fences transport work.
    * @param {string[]} ids distinct wire ids
-   * @returns {Promise<{consumer: object[], classic: object[]}>} resolved rows by API
+   * @returns {Promise<object[]>} resolved rows in first-requested wire-id order
    */
   async resolve(ids) {
     const entries = new Map(ids.map((id) => [id, { id, nodeId: null, relocating: false }]))
     this.batchRequests = entries.size > 1
     const unown = this.parent?.own((error) => this.scope.stop(error))
     try {
-      await this.scope.wait(() =>
+      const results = await this.scope.wait(() =>
         Promise.all([...entries.values()].map((entry) => this.#resolveId(entry)))
       )
       this.parent?.check()
-      return this.results
+      return results.filter(Boolean)
     } finally {
       unown?.()
       this.scope.stop(new KafkaJSNonRetriableError('Group descriptions completed'))
@@ -66,7 +65,7 @@ class GroupDescriptionResolver {
   /**
    * Resolves one wire id. A classic fallback starts a fresh budget and retains the route by node id.
    * @param {object} entry call-owned state for one wire id
-   * @returns {Promise<void>}
+   * @returns {Promise<object|undefined>} the chosen row and its API, if a row was returned
    */
   async #resolveId(entry) {
     try {
@@ -75,10 +74,10 @@ class GroupDescriptionResolver {
       if (result.fallback) {
         const classic = await this.#resolveApi(entry, this.classic)
         this.scope.check()
-        if (classic?.row) this.results.classic.push({ row: classic.row, missing: result.missing })
-      } else {
-        this.results.consumer.push(result.row)
+        if (classic?.row) return { row: classic.row, classic: true, missing: result.missing }
+        return
       }
+      return { row: result.row, classic: false }
     } catch (error) {
       this.scope.stop(error)
       throw error

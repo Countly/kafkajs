@@ -2017,8 +2017,8 @@ module.exports = ({
    * Describes groups of both protocols by group id.
    *
    * Each id is described through ConsumerGroupDescribe where the broker supports it, and through
-   * DescribeGroups otherwise, so classic and consumer groups come back in one shape. Rows are not
-   * returned in the order the ids were given.
+   * DescribeGroups otherwise, so classic and consumer groups come back in one shape. Rows follow
+   * the first occurrence of each encoded id in the request, with that id's aliases kept together.
    *
    * @param {string[]} groupIds
    * @param {object} [options] additive call budget and authorization mask flag

@@ -98,7 +98,7 @@ class GroupDescriptions {
   /**
    * @param {string[]} groupIds
    * @param {object} [options] original consumer operation and requested authorization flag
-   * @returns {Promise<{ groups: object[] }>} one row per id, NOT in input order, each carrying
+   * @returns {Promise<{ groups: object[] }>} rows in first-requested wire-id order, each carrying
    *          every field 2.2.4 returned plus the additive ones. An id a coordinator leaves out of
    *          its answer is described through the older API rather than dropped
    * @throws {KafkaJSNonRetriableError} carrying the code, when a lookup or request fails in a way
@@ -170,23 +170,13 @@ class GroupDescriptions {
         outcomes: (rows, ids) => this.#classicOutcomes(rows, ids),
       },
     })
-    const { consumer, classic } = await resolver.resolve(names.ids)
+    const rows = await resolver.resolve(names.ids)
     const groups = []
-    for (const row of consumer) {
-      names.project(
-        groups,
-        row.groupId,
-        this.#shapeConsumerGroup(row, includeAuthorizedOperations),
-        true
-      )
-    }
-    for (const { row, missing } of classic) {
-      names.project(
-        groups,
-        row.groupId,
-        this.#shapeClassicGroup(row, missing, includeAuthorizedOperations),
-        false
-      )
+    for (const { row, classic, missing } of rows) {
+      const shaped = classic
+        ? this.#shapeClassicGroup(row, missing, includeAuthorizedOperations)
+        : this.#shapeConsumerGroup(row, includeAuthorizedOperations)
+      names.project(groups, row.groupId, shaped, !classic)
     }
     return { groups }
   }
