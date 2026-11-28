@@ -179,6 +179,20 @@ describe('Protocol > Requests > Produce > partition results', () => {
     expect(result.error.recordErrors).toEqual([{ batchIndex: 1, errorMessage: 'record too large' }])
   })
 
+  test('the record errors of a result and of a thrown failure are frozen where they are built', async () => {
+    const data = await decodeV8(fixture('v8_response_record_errors'))
+    const [result] = partitionResults(data)
+    const thrown = await parse(data).catch((e) => e)
+
+    for (const recordErrors of [result.error.recordErrors, thrown.recordErrors]) {
+      expect(Object.isFrozen(recordErrors)).toBe(true)
+      expect(recordErrors.every((entry) => Object.isFrozen(entry))).toBe(true)
+      expect(() => recordErrors.push({ batchIndex: 0 })).toThrow(TypeError)
+      expect(Reflect.set(recordErrors[0], 'record', {})).toBe(false)
+      expect(recordErrors).toEqual([{ batchIndex: 1, errorMessage: 'record too large' }])
+    }
+  })
+
   test('the leader hint the broker attaches to a leadership error rides on the result too', async () => {
     const [result] = partitionResults(await decodeV10(fixture('v10_response_not_leader')))
 

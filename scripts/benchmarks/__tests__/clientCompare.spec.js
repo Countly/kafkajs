@@ -16,6 +16,8 @@ const {
   CORPUS_PRODUCER_SETTINGS,
   CORPUS_LAYOUT,
   countFullGcs,
+  trackGcs,
+  customRouting,
 } = require('../clientCompare')
 
 const SCRIPT = path.join(__dirname, '..', 'clientCompare.js')
@@ -42,6 +44,9 @@ const installStub = (prefix, name, version, origin) => {
   )
 }
 
+/** Where the fake's performance clock starts, so it never equals its monotonic clock. */
+const PERFORMANCE_ORIGIN_MS = 5000
+
 /** What kafkajs 2.2.4's admin throws while a broker does not know a topic yet. */
 const unknownTopic = () =>
   Object.assign(new Error('This server does not host this topic-partition'), {
@@ -66,6 +71,7 @@ const fakeKafka = ({
   failSend = false,
   failConnect,
   failRun = false,
+  failAfter,
   manualDelivery = false,
   sendMs,
   metadata = [],
@@ -94,6 +100,9 @@ const fakeKafka = ({
     listeners: [],
     delay: { enabledAt: [], disabledAt: [] },
     gc: { startedAt: [], stoppedAt: [], countedAt: [], closedAt: [] },
+    allGcs: { started: 0, stopped: 0, resulted: 0, closed: 0 },
+    intervals: [],
+    clearedIntervals: [],
   }
   let elapsedNs = 0n
   let ready
@@ -102,6 +111,7 @@ const fakeKafka = ({
   })
   const timing = {
     now: () => elapsedNs,
+    performanceNow: () => Number(elapsedNs) / 1e6 + PERFORMANCE_ORIGIN_MS,
     setTimeout: (callback, delay) => {
       const timer = Symbol('timeout')
       state.timers.set(timer, { callback, delay })
@@ -127,6 +137,33 @@ const fakeKafka = ({
           return 3
         },
         close: () => state.gc.closedAt.push(state.callbacks),
+      }
+    },
+    memoryUsage: () => ({
+      rss: 1000 + 10 * state.sends.length,
+      arrayBuffers: 50 + state.sends.length,
+    }),
+    setInterval: (callback, delay) => {
+      const timer = Symbol('interval')
+      state.intervals.push({ timer, callback, delay })
+      return timer
+    },
+    clearInterval: (timer) => state.clearedIntervals.push(timer),
+    trackGcs: () => {
+      state.allGcs.started++
+      return {
+        open: (at) => {
+          state.allGcs.from = at
+        },
+        stop: (at) => {
+          state.allGcs.stopped++
+          state.allGcs.to = at
+        },
+        result: async () => {
+          state.allGcs.resulted++
+          return { count: 3, pauseMs: 1.5 }
+        },
+        close: () => state.allGcs.closed++,
       }
     },
     eventLoopDelay: () => ({
@@ -205,7 +242,7 @@ const fakeKafka = ({
       return {
         connect: () => connect('producer'),
         send: async ({ topic, messages, compression }) => {
-          if (failSend) throw new Error('send failed')
+          if (failSend || state.sends.length === failAfter) throw new Error('send failed')
           const durationMs = sendMs ?? (state.sends.length === 0 ? 1000 : state.sends.length)
           state.compressions.push(compression)
           elapsedNs += BigInt(durationMs) * 1000000n
@@ -274,10 +311,71 @@ const fakeKafka = ({
   const client = {
     Kafka,
     logLevel: { NOTHING: 0 },
-    CompressionTypes: { LZ4: 3 },
+    CompressionTypes: { GZIP: 1, LZ4: 3 },
     Partitioners: { DefaultPartitioner: legacyPartitioner },
   }
   return { client, state, timing }
+}
+
+/**
+ * Counts, for the producers a fake client creates from now on, how many sends are in flight at
+ * once: `peak` is the most any producer had unanswered together.
+ */
+const trackInFlight = ({ client }) => {
+  const tracker = { inFlight: 0, peak: 0 }
+  const create = client.Kafka.prototype.producer
+  client.Kafka.prototype.producer = function producer(config) {
+    const created = create.call(this, config)
+    const send = created.send
+    created.send = async (request) => {
+      tracker.peak = Math.max(tracker.peak, ++tracker.inFlight)
+      try {
+        return await send(request)
+      } finally {
+        tracker.inFlight--
+      }
+    }
+    return created
+  }
+  return tracker
+}
+
+/**
+ * Makes every send of the producers a fake client creates from now on wait until the test answers
+ * it: `sizes` lists the records of each send in call order, `answer(n)` answers the `n` oldest
+ * unanswered sends and `unanswered()` counts the rest.
+ */
+const holdReplies = ({ client }) => {
+  const sizes = []
+  const waiting = []
+  const create = client.Kafka.prototype.producer
+  client.Kafka.prototype.producer = function producer(config) {
+    const created = create.call(this, config)
+    created.send = ({ messages }) =>
+      new Promise((resolve) => {
+        sizes.push(messages.length)
+        waiting.push(resolve)
+      })
+    return created
+  }
+  return {
+    sizes,
+    answer: (count) => {
+      for (const resolve of waiting.splice(0, count)) resolve()
+    },
+    unanswered: () => waiting.length,
+  }
+}
+
+/** Lets the event loop turn `count` times, so awaited work that is ready can run. */
+const turns = async (count = 5) => {
+  for (let i = 0; i < count; i++) await new Promise(setImmediate)
+}
+
+/** Waits, turn by turn, until `condition` holds; fails after a hundred turns. */
+const until = async (condition) => {
+  for (let i = 0; i < 100 && !condition(); i++) await new Promise(setImmediate)
+  expect(condition()).toBe(true)
 }
 
 describe('Benchmarks > clientCompare', () => {
@@ -453,10 +551,96 @@ describe('Benchmarks > clientCompare', () => {
       for (const bad of [
         ['--workload', 'produce-throughput', '--duration-ms', '30000', '--messages', '5'],
         ['--workload', 'consume-throughput', '--duration-ms', '30000'],
-        ['--workload', 'produce-throughput', '--compression', 'gzip'],
+        ['--workload', 'produce-throughput', '--compression', 'zstd'],
         ['--workload', 'consume-throughput', '--settings', 'other'],
         ['--workload', 'produce-throughput', '--partitions', '0'],
         ['--workload', 'produce-throughput', '--duration-ms', '1.5'],
+      ]) {
+        expect(() => parse(...bad)).toThrow(/usage/)
+      }
+    })
+
+    test('parseArgs reads --batch, --unawaited, --keys, --headers, --partitioner and --value-type on the produce workloads, gzip as a compression, and leaves the flags absent otherwise', () => {
+      const parse = (...extra) => parseArgs(['--client', '/c', '--package', 'kafkajs', ...extra])
+
+      expect(
+        parse(
+          '--workload',
+          'produce-throughput',
+          '--batch',
+          '8',
+          '--keys',
+          'index',
+          '--headers',
+          '20',
+          '--partitioner',
+          'custom',
+          '--value-type',
+          'string',
+          '--compression',
+          'gzip'
+        )
+      ).toMatchObject({
+        batch: 8,
+        keys: 'index',
+        headers: 20,
+        partitioner: 'custom',
+        valueType: 'string',
+        compression: 'gzip',
+      })
+      expect(parse('--workload', 'produce-throughput', '--unawaited', '100')).toMatchObject({
+        unawaited: 100,
+      })
+      expect(parse('--workload', 'produce-latency', '--value-type', 'buffer')).toMatchObject({
+        valueType: 'buffer',
+      })
+      const plain = parse('--workload', 'produce-throughput')
+      for (const key of ['batch', 'unawaited', 'keys', 'headers', 'partitioner', 'valueType']) {
+        expect([key, plain[key]]).toEqual([key, undefined])
+      }
+    })
+
+    test('parseArgs refuses the shape flags outside produce-throughput, a bad key mode, partitioner, value type or count, --batch with --unawaited, and a custom partitioner with --settings same', () => {
+      const parse = (...extra) => parseArgs(['--client', '/c', '--package', 'kafkajs', ...extra])
+
+      for (const bad of [
+        ['--workload', 'consume-throughput', '--batch', '8'],
+        ['--workload', 'consume-throughput', '--unawaited', '2'],
+        ['--workload', 'consume-throughput', '--keys', 'index'],
+        ['--workload', 'consume-throughput', '--headers', '2'],
+        ['--workload', 'consume-throughput', '--partitioner', 'custom'],
+        ['--workload', 'consume-throughput', '--value-type', 'string'],
+        ['--workload', 'produce-latency', '--batch', '8'],
+        ['--workload', 'produce-latency', '--unawaited', '8'],
+        ['--workload', 'produce-latency', '--keys', 'index'],
+        ['--workload', 'produce-latency', '--headers', '8'],
+        ['--workload', 'produce-latency', '--partitioner', 'custom'],
+        ['--workload', 'produce-throughput', '--value-type', 'bytes'],
+        ['--workload', 'produce-throughput', '--keys', '1024'],
+        ['--workload', 'produce-throughput', '--partitioner', 'random'],
+        ['--workload', 'produce-throughput', '--batch', '0'],
+        ['--workload', 'produce-throughput', '--headers', '1.5'],
+        ['--workload', 'produce-throughput', '--batch', '8', '--unawaited', '8'],
+        ['--workload', 'produce-throughput', '--partitioner', 'custom', '--settings', 'same'],
+        ['--workload', 'produce-throughput', '--max-request-bytes', '1048576'],
+        ['--workload', 'produce-throughput', '--concurrency', '4'],
+      ]) {
+        expect(() => parse(...bad)).toThrow(/usage/)
+      }
+    })
+
+    test('parseArgs reads --probe on on produce-throughput only, and leaves it absent otherwise', () => {
+      const parse = (...extra) => parseArgs(['--client', '/c', '--package', 'kafkajs', ...extra])
+
+      expect(parse('--workload', 'produce-throughput', '--probe', 'on')).toMatchObject({
+        probe: 'on',
+      })
+      expect(parse('--workload', 'produce-throughput').probe).toBeUndefined()
+      for (const bad of [
+        ['--workload', 'produce-latency', '--probe', 'on'],
+        ['--workload', 'consume-throughput', '--probe', 'on'],
+        ['--workload', 'produce-throughput', '--probe', 'off'],
+        ['--workload', 'produce-throughput', '--probe'],
       ]) {
         expect(() => parse(...bad)).toThrow(/usage/)
       }
@@ -675,6 +859,450 @@ describe('Benchmarks > clientCompare', () => {
         cpuMicrosPerMessage: 1500 / 150000,
         settings: { defaults: null },
       })
+    })
+
+    test('produce-throughput with --batch sends that many records per send, warm-up and window alike', async () => {
+      const { metrics, state } = await runWith(
+        'produce-throughput',
+        { messages: null, durationMs: 30000, batch: 8 },
+        fakeKafka({ sendMs: 100 })
+      )
+
+      expect(state.sends).toEqual([1, ...Array(350).fill(8)])
+      expect(metrics).toMatchObject({ elapsedMs: 30000, measuredMessages: 300 * 8 })
+      expect(metrics.messagesPerSecond).toBeCloseTo(80, 6)
+    })
+
+    test('produce-throughput with --unawaited issues that many one-record sends before awaiting any, and counts every one', async () => {
+      const kafka = fakeKafka({ sendMs: 100 })
+      const flight = trackInFlight(kafka)
+
+      const { metrics, state } = await runWith(
+        'produce-throughput',
+        { messages: null, durationMs: 30000, unawaited: 4 },
+        kafka
+      )
+
+      expect(flight.peak).toBe(4)
+      expect(state.sends).toEqual([1, ...Array(52 + 300).fill(1)])
+      expect(metrics).toMatchObject({ elapsedMs: 30000, measuredMessages: 300 })
+    })
+
+    test('produce-throughput with --unawaited and a message count issues each round of that many sends together, waits for every reply before the next round, and ends on a shorter round', async () => {
+      const kafka = fakeKafka()
+      const held = holdReplies(kafka)
+
+      const pending = runWith('produce-throughput', { messages: 10, unawaited: 4 }, kafka)
+      await until(() => held.sizes.length === 1)
+      held.answer(1)
+      await until(() => held.sizes.length === 5)
+      expect(held.unanswered()).toBe(4)
+      held.answer(3)
+      await turns()
+      expect(held.sizes).toHaveLength(5)
+      held.answer(1)
+      await until(() => held.sizes.length === 9)
+      expect(held.unanswered()).toBe(4)
+      held.answer(4)
+      await until(() => held.sizes.length === 11)
+      expect(held.unanswered()).toBe(2)
+      held.answer(2)
+      const { metrics } = await pending
+
+      expect(held.sizes).toEqual(Array(11).fill(1))
+      expect(metrics.measuredMessages).toBe(10)
+    })
+
+    test('produce-throughput sends one send at a time unless --unawaited says otherwise', async () => {
+      const kafka = fakeKafka({ sendMs: 100 })
+      const flight = trackInFlight(kafka)
+
+      await runWith('produce-throughput', { messages: 1200, durationMs: null }, kafka)
+
+      expect(flight.peak).toBe(1)
+    })
+
+    test('produce-throughput with --keys gives message n of the window a key of n in seven digits across sends, the first send and the warm-up keyed too, and no key without it', async () => {
+      const keyed = await runWith(
+        'produce-throughput',
+        { messages: null, durationMs: 30000, batch: 3, keys: 'index' },
+        fakeKafka({ sendMs: 100 })
+      )
+      const sized = await runWith('produce-throughput', { messages: 25, batch: 7, keys: 'index' })
+      const plain = await runWith('produce-throughput', { messages: 5 })
+
+      const logOf = ({ state }) => state.topics.values().next().value
+      const seven = (n) => String(n).padStart(7, '0')
+      const [first, ...rest] = logOf(keyed)
+      const warmup = rest.slice(0, 50 * 3)
+      const window = rest.slice(50 * 3)
+      expect(first.key).toBe(seven(0))
+      expect(warmup.every(({ key }) => typeof key === 'string' && key.length === 7)).toBe(true)
+      expect(window).toHaveLength(300 * 3)
+      expect(window.map(({ key }) => key)).toEqual(
+        Array.from({ length: window.length }, (_, n) => seven(n))
+      )
+      expect(sized.state.sends).toEqual([1, 7, 7, 7, 4])
+      expect(logOf(sized).map(({ key }) => key)).toEqual([
+        seven(0),
+        ...Array.from({ length: 25 }, (_, n) => seven(n)),
+      ])
+      expect(logOf(plain).some((record) => 'key' in record)).toBe(false)
+    })
+
+    test('produce-throughput numbers the records of its window from 0 whatever its warm-up sent, so runs with different warm-ups walk the same keys and values from the start of the window', async () => {
+      const many = await runWith(
+        'produce-throughput',
+        { messages: null, durationMs: 30000, batch: 3, keys: 'index' },
+        fakeKafka({ sendMs: 100 })
+      )
+      const few = await runWith(
+        'produce-throughput',
+        { messages: null, durationMs: 30000, batch: 3, keys: 'index' },
+        fakeKafka({ sendMs: 250 })
+      )
+
+      const windowOf = ({ state }, warmupSends) =>
+        state.topics
+          .values()
+          .next()
+          .value.slice(1 + warmupSends * 3, 1 + warmupSends * 3 + 90)
+          .map(({ key, value }) => [key, String(value)])
+      expect(many.state.sends.slice(1, 51)).toEqual(Array(50).fill(3))
+      expect(few.state.sends.slice(1, 21)).toEqual(Array(20).fill(3))
+      expect(many.state.sends[51]).toBe(3)
+      expect(few.state.sends[21]).toBe(3)
+      const [manyWindow, fewWindow] = [windowOf(many, 50), windowOf(few, 20)]
+      expect(manyWindow[0][0]).toBe('0000000')
+      expect(fewWindow).toEqual(manyWindow)
+    })
+
+    test('produce-throughput with --headers gives every record of the run, the first send included, that many string headers', async () => {
+      const { state } = await runWith('produce-throughput', { messages: 5, headers: 3 })
+
+      const records = state.topics.values().next().value
+      expect(records).toHaveLength(6)
+      for (const { headers } of records) expect(headers).toEqual({ h0: 'v0', h1: 'v1', h2: 'v2' })
+    })
+
+    test('produce-throughput walks the corpus on a message count, repeats the first values on a timed run without a shape flag, and walks it on a timed run with one', async () => {
+      const pool = valuePool(8).map(String)
+      const counted = await runWith('produce-throughput', { messages: 1200 })
+      const timed = await runWith(
+        'produce-throughput',
+        { messages: null, durationMs: 30000 },
+        fakeKafka({ sendMs: 100 })
+      )
+      const shaped = await runWith(
+        'produce-throughput',
+        { messages: null, durationMs: 30000, batch: 8 },
+        fakeKafka({ sendMs: 100 })
+      )
+
+      const valuesOf = ({ state }) =>
+        state.topics
+          .values()
+          .next()
+          .value.map(({ value }) => String(value))
+      expect(valuesOf(counted)).toEqual([
+        pool[0],
+        ...Array.from({ length: 1200 }, (_, i) => pool[i % 1024]),
+      ])
+      const timedValues = valuesOf(timed)
+      expect(timedValues).toHaveLength(1 + 350 * 500)
+      expect(timedValues[0]).toBe(pool[0])
+      expect(timedValues.slice(1).every((value, i) => value === pool[i % 500])).toBe(true)
+      const shapedWindow = valuesOf(shaped).slice(1 + 50 * 8)
+      expect(shapedWindow).toHaveLength(300 * 8)
+      expect(shapedWindow.every((value, i) => value === pool[i % 1024])).toBe(true)
+    })
+
+    test('--partitioner custom gives the producer a plain partitioner that places record n in partition n % partitions, and the default gives it none', async () => {
+      const custom = await runWith('produce-throughput', { messages: 5, partitioner: 'custom' })
+      const plain = await runWith('produce-throughput', { messages: 5 })
+
+      const [{ createPartitioner }] = custom.state.producerConfigs
+      const place = createPartitioner()
+      const metadata = { partitionMetadata: Array(3).fill({}) }
+      expect(Array.from({ length: 7 }, () => place(metadata))).toEqual([0, 1, 2, 0, 1, 2, 0])
+      expect(createPartitioner()(metadata)).toBe(1)
+      expect(plain.state.producerConfigs).toEqual([{}])
+    })
+
+    test('customRouting keeps one count for every partitioner it creates and starts it again at reset', () => {
+      const routing = customRouting()
+      const first = routing.createPartitioner()
+      const second = routing.createPartitioner()
+      const metadata = { partitionMetadata: Array(4).fill({}) }
+
+      expect([first(metadata), second(metadata), first(metadata)]).toEqual([0, 1, 2])
+      routing.reset()
+      expect([second(metadata), first(metadata)]).toEqual([0, 1])
+    })
+
+    test('--partitioner custom reports the custom partitioner as the partitioner in force and the package defaults for every other setting, with or without --settings same', async () => {
+      const fork = fakeKafka()
+      fork.client.name = '@countly/kafkajs'
+      const defaults = await runWith(
+        'produce-throughput',
+        { messages: 5, partitioner: 'custom' },
+        fork
+      )
+      const same = await runWith('produce-throughput', {
+        messages: 5,
+        partitioner: 'custom',
+        settings: 'same',
+      })
+      const plain = await runWith('produce-throughput', { messages: 5 }, fakeKafka())
+
+      expect(defaults.metrics.settings).toEqual({
+        defaults: {
+          ...PRODUCER_DEFAULTS['@countly/kafkajs'],
+          partitioner: 'custom (record n of the window to partition n % partitions)',
+        },
+      })
+      expect(same.metrics.settings.same).toEqual({
+        ...SAME_PRODUCER_SETTINGS,
+        partitioner: 'custom (record n of the window to partition n % partitions)',
+      })
+      expect(plain.metrics.settings).toEqual({ defaults: null })
+    })
+
+    test('the custom routing of the measured window starts at partition 0 whatever the warm-up sent, so runs with different warm-ups route the first records of the window alike', async () => {
+      const routed = async (sendMs) => {
+        const kafka = fakeKafka({ sendMs })
+        const routes = []
+        const create = kafka.client.Kafka.prototype.producer
+        kafka.client.Kafka.prototype.producer = function producer(config) {
+          const created = create.call(this, config)
+          const place = config.createPartitioner()
+          const send = created.send
+          created.send = (request) => {
+            const metadata = { partitionMetadata: Array(12).fill({}) }
+            routes.push(request.messages.map(() => place(metadata)))
+            return send(request)
+          }
+          return created
+        }
+        await runWith(
+          'produce-throughput',
+          { messages: null, durationMs: 30000, partitions: 12, batch: 5, partitioner: 'custom' },
+          kafka
+        )
+        return { routes, warmupSends: Math.floor(5000 / sendMs) }
+      }
+
+      const many = await routed(100)
+      const few = await routed(250)
+
+      const windowOf = ({ routes, warmupSends }) =>
+        routes.slice(1 + warmupSends, 1 + warmupSends + 3)
+      expect(many.warmupSends).not.toBe(few.warmupSends)
+      expect(windowOf(many)).toEqual([
+        [0, 1, 2, 3, 4],
+        [5, 6, 7, 8, 9],
+        [10, 11, 0, 1, 2],
+      ])
+      expect(windowOf(few)).toEqual(windowOf(many))
+    })
+
+    test('produce-throughput with --probe on reports the send-call time, peak memory and collections of the measured window only', async () => {
+      const kafka = fakeKafka()
+
+      const { metrics, state } = await runWith(
+        'produce-throughput',
+        { messages: 1200, durationMs: null, probe: 'on' },
+        kafka
+      )
+
+      // The first send takes 1000 ms on this fake and the three measured sends 1, 2 and 3 ms.
+      expect(metrics.sendCallMicrosP50).toBeGreaterThanOrEqual(2000)
+      expect(metrics.sendCallMicrosP50).toBeLessThan(2010)
+      expect(metrics.sendCallMicrosP99).toBeGreaterThanOrEqual(3000)
+      expect(metrics.sendCallMicrosP99).toBeLessThan(3010)
+      expect(metrics).toMatchObject({
+        elapsedMs: 6,
+        peakRssBytes: 1040,
+        peakArrayBuffers: 54,
+        gcCountPer10kMessages: 25,
+        gcPauseMsPer10kMessages: 12.5,
+      })
+      expect(Object.hasOwn(metrics, 'shape')).toBe(false)
+      expect(state.intervals.map(({ delay }) => delay)).toEqual([100])
+      expect(state.clearedIntervals).toEqual([state.intervals[0].timer])
+      expect(state.allGcs).toMatchObject({ started: 1, stopped: 1, resulted: 1, closed: 1 })
+    })
+
+    test("the sampling timer's readings reach the peak memory: a transient peak it reads inside the window counts though the start and finish readings are lower", async () => {
+      const kafka = fakeKafka()
+      let reading = { rss: 100, arrayBuffers: 10 }
+      kafka.timing.memoryUsage = () => reading
+      const create = kafka.client.Kafka.prototype.producer
+      let sends = 0
+      kafka.client.Kafka.prototype.producer = function producer(config) {
+        const created = create.call(this, config)
+        const send = created.send
+        created.send = (request) => {
+          // The first send is the untimed one; this is the second send of the window.
+          if (++sends === 3) {
+            reading = { rss: 9000, arrayBuffers: 900 }
+            kafka.state.intervals[0].callback()
+            reading = { rss: 100, arrayBuffers: 10 }
+          }
+          return send(request)
+        }
+        return created
+      }
+
+      const { metrics } = await runWith(
+        'produce-throughput',
+        { messages: 1200, durationMs: null, probe: 'on' },
+        kafka
+      )
+
+      expect(sends).toBe(4)
+      expect(metrics).toMatchObject({ peakRssBytes: 9000, peakArrayBuffers: 900 })
+    })
+
+    test('the collections of a probed run are counted over the exact clock readings that bound the rate window', async () => {
+      const kafka = fakeKafka()
+      const marks = []
+      const read = kafka.timing.performanceNow
+      kafka.timing.performanceNow = () => {
+        const reading = read() + marks.length * 1000
+        marks.push(reading)
+        return reading
+      }
+
+      const { metrics, state } = await runWith(
+        'produce-throughput',
+        { messages: 1200, durationMs: null, probe: 'on' },
+        kafka
+      )
+
+      // The performance clock is read twice, for the window's start and its end, and nowhere
+      // else; the rate is those two readings' difference and the recorder gets the same two.
+      expect(marks).toHaveLength(2)
+      expect(marks[0]).toBeGreaterThanOrEqual(PERFORMANCE_ORIGIN_MS)
+      expect(state.allGcs.from).toBe(marks[0])
+      expect(state.allGcs.to).toBe(marks[1])
+      expect(marks[1] - marks[0]).toBe(metrics.elapsedMs)
+      expect(metrics.messagesPerSecond).toBe((1200 / metrics.elapsedMs) * 1000)
+    })
+
+    test('a probed run with a time window ends it, and computes its elapsed time, on the performance clock the collection recorder is given', async () => {
+      const kafka = fakeKafka({ sendMs: 100 })
+
+      const { metrics, state } = await runWith(
+        'produce-throughput',
+        { messages: null, durationMs: 30000, batch: 3, probe: 'on' },
+        kafka
+      )
+
+      expect(metrics).toMatchObject({ measuredMessages: 900, elapsedMs: 30000 })
+      expect(state.allGcs.to - state.allGcs.from).toBe(30000)
+      expect(state.allGcs.from).toBeGreaterThanOrEqual(PERFORMANCE_ORIGIN_MS)
+    })
+
+    test('the send-call time starts once the request is built and stops when send returns its promise, before the reply', async () => {
+      const kafka = fakeKafka({ sendMs: 5 })
+      const log = []
+      const read = kafka.timing.now
+      kafka.timing.now = () => {
+        log.push('clock')
+        return read()
+      }
+      const create = kafka.client.Kafka.prototype.producer
+      kafka.client.Kafka.prototype.producer = function producer(config) {
+        const created = create.call(this, config)
+        const send = created.send
+        created.send = (request) => {
+          log.push('send')
+          return send(request).then(() => kafka.timing.sleep(700))
+        }
+        return created
+      }
+      const padStart = String.prototype.padStart
+      const spy = jest.spyOn(String.prototype, 'padStart').mockImplementation(function (...args) {
+        if (args[0] === 7 && args[1] === '0') log.push('built')
+        return padStart.apply(this, args)
+      })
+
+      let result
+      try {
+        result = await runWith(
+          'produce-throughput',
+          { messages: 3, batch: 1, keys: 'index', probe: 'on' },
+          kafka
+        )
+      } finally {
+        spy.mockRestore()
+      }
+
+      const sends = log.flatMap((entry, at) => (entry === 'send' ? [at] : []))
+      expect(sends).toHaveLength(4)
+      expect(log[sends[0] - 1]).toBe('built')
+      for (const at of sends.slice(1)) {
+        expect(log.slice(at - 2, at + 2)).toEqual(['built', 'clock', 'send', 'clock'])
+      }
+      expect(result.metrics.sendCallMicrosP50).toBeGreaterThanOrEqual(5000)
+      expect(result.metrics.sendCallMicrosP50).toBeLessThan(5050)
+      expect(result.metrics.sendCallMicrosP99).toBeLessThan(5050)
+    })
+
+    test('a run without --probe adds no clock read per send, starts no memory sampling or collection observer, and reports none of their metrics', async () => {
+      const clockReads = async (messages, probe) => {
+        const kafka = fakeKafka()
+        let reads = 0
+        const read = kafka.timing.now
+        kafka.timing.now = () => {
+          reads++
+          return read()
+        }
+        let performanceReads = 0
+        const performanceRead = kafka.timing.performanceNow
+        kafka.timing.performanceNow = () => {
+          performanceReads++
+          return performanceRead()
+        }
+        const { metrics, state } = await runWith(
+          'produce-throughput',
+          { messages, durationMs: null, ...(probe && { probe }) },
+          kafka
+        )
+        return { reads, performanceReads, metrics, state }
+      }
+
+      const one = await clockReads(500)
+      const three = await clockReads(1500)
+      const probedOne = await clockReads(500, 'on')
+      const probedThree = await clockReads(1500, 'on')
+
+      expect(three.reads).toBe(one.reads)
+      expect([one.performanceReads, three.performanceReads]).toEqual([0, 0])
+      expect(probedThree.reads - probedOne.reads).toBe(2 * 2)
+      expect([probedOne.performanceReads, probedThree.performanceReads]).toEqual([2, 2])
+      expect(Object.keys(three.metrics).sort()).toEqual([
+        'cpuMicrosPerMessage',
+        'elapsedMs',
+        'measuredMessages',
+        'messagesPerSecond',
+        'settings',
+      ])
+      expect(three.state.intervals).toEqual([])
+      expect(three.state.allGcs).toEqual({ started: 0, stopped: 0, resulted: 0, closed: 0 })
+      expect(probedThree.state.allGcs).toMatchObject({ started: 1 })
+    })
+
+    test('a produce run that fails inside its window stops sampling memory and recording collections', async () => {
+      const kafka = fakeKafka({ failAfter: 2 })
+
+      await expect(
+        runWith('produce-throughput', { messages: 1200, durationMs: null, probe: 'on' }, kafka)
+      ).rejects.toThrow('send failed')
+
+      expect(kafka.state.clearedIntervals).toEqual([kafka.state.intervals[0].timer])
+      expect(kafka.state.allGcs).toMatchObject({ started: 1, stopped: 0, resulted: 0, closed: 1 })
     })
 
     test('produce-latency with --duration-ms times single sends only after the warm-up', async () => {
@@ -920,6 +1548,105 @@ describe('Benchmarks > clientCompare', () => {
       })
     })
 
+    describe('trackGcs', () => {
+      const entry = (startTime, duration, kind = constants.NODE_PERFORMANCE_GC_MINOR) => ({
+        startTime,
+        duration,
+        detail: { kind },
+      })
+      /** A `gc` observer the test drives, as in `countFullGcs`'s tests. */
+      const controlled = () => {
+        const observers = []
+        class Observer {
+          constructor(callback) {
+            this.callback = callback
+            this.buffered = []
+            this.disconnects = 0
+            observers.push(this)
+          }
+
+          observe(options) {
+            this.options = options
+          }
+
+          takeRecords() {
+            const taken = this.buffered
+            this.buffered = []
+            return taken
+          }
+
+          disconnect() {
+            this.disconnects++
+          }
+
+          deliver(...entries) {
+            this.callback({ getEntries: () => entries })
+          }
+        }
+        return { Observer, observers }
+      }
+
+      test('counts every collection kind that started between the two marks, with its pause, whether its entry came before, during or after the window, and not one that started in the gap before the start mark or after the end mark', async () => {
+        const { Observer, observers } = controlled()
+        const { MAJOR, MINOR, INCREMENTAL, WEAKCB } = {
+          MAJOR: constants.NODE_PERFORMANCE_GC_MAJOR,
+          MINOR: constants.NODE_PERFORMANCE_GC_MINOR,
+          INCREMENTAL: constants.NODE_PERFORMANCE_GC_INCREMENTAL,
+          WEAKCB: constants.NODE_PERFORMANCE_GC_WEAKCB,
+        }
+        // The marks are 20 and 30 on the performance clock; entries just before, at and just
+        // after each of them tell where the window's edges are.
+        const drain = async () => {
+          observer.deliver(entry(13, 5, MAJOR), entry(30, 3, WEAKCB))
+          observer.buffered.push(entry(30.001, 1, MINOR), entry(31, 7, MAJOR))
+        }
+        const tracker = trackGcs({ Observer, drain })
+        const [observer] = observers
+        observer.deliver(entry(12, 9, MAJOR))
+        tracker.open(20)
+        observer.deliver(entry(19.999, 4, MAJOR), entry(20, 2, MAJOR), entry(24, 6, INCREMENTAL))
+        tracker.stop(30)
+
+        const result = await tracker.result()
+
+        expect(new Set([MAJOR, MINOR, INCREMENTAL, WEAKCB]).size).toBe(4)
+        expect(observer.options).toEqual({ entryTypes: ['gc'] })
+        expect(result).toEqual({ count: 3, pauseMs: 11 })
+        expect(observer.disconnects).toBe(1)
+      })
+
+      test('ends its window at the stop mark, not at result: a collection that started after it is not counted, whenever its entry arrives', async () => {
+        const { Observer, observers } = controlled()
+        const drain = async () => {
+          observer.deliver(entry(18, 4), entry(26, 8))
+        }
+        const tracker = trackGcs({ Observer, drain })
+        const [observer] = observers
+        tracker.open(10)
+        observer.deliver(entry(11, 1))
+        tracker.stop(20)
+        observer.deliver(entry(19, 2), entry(30, 100))
+
+        const result = await tracker.result()
+
+        expect(result).toEqual({ count: 3, pauseMs: 7 })
+      })
+
+      test('counts nothing before its window is opened, and disconnects its observer once whether it ended or was only closed', async () => {
+        const { Observer, observers } = controlled()
+        const ended = trackGcs({ Observer, drain: async () => {} })
+        const closed = trackGcs({ Observer, drain: async () => {} })
+        observers[0].deliver(entry(1, 5))
+
+        expect(await ended.result()).toEqual({ count: 0, pauseMs: 0 })
+        ended.close()
+        closed.close()
+        closed.close()
+
+        expect(observers.map(({ disconnects }) => disconnects)).toEqual([1, 1])
+      })
+    })
+
     test('consume-throughput fails before consuming when a partition does not hold the records its layout puts there', async () => {
       const exact = [
         { partition: 0, offset: '2', high: '2', low: '0' },
@@ -1027,6 +1754,81 @@ describe('Benchmarks > clientCompare', () => {
       })
       expect(builtIn.client.CompressionCodecs).toEqual({})
       expect(kept.state.compressions).toEqual([3, 3])
+    })
+
+    test('gzip compresses every send with the built-in codec, registers nothing and reports the codec', async () => {
+      const kafka = fakeKafka()
+      kafka.client.CompressionCodecs = {}
+
+      const { metrics, state } = await runWith(
+        'produce-throughput',
+        { messages: 5, compression: 'gzip' },
+        kafka
+      )
+
+      expect(state.compressions).toEqual([1, 1])
+      expect(kafka.client.CompressionCodecs).toEqual({})
+      expect(metrics.codec).toEqual({
+        name: 'gzip',
+        codec: 'built-in',
+        package: 'zlib',
+        version: process.versions.zlib,
+      })
+    })
+
+    test('produce workloads with --value-type string send string values with the corpus text, and Buffers otherwise', async () => {
+      const asString = await runWith('produce-throughput', { messages: 5, valueType: 'string' })
+      const asLatency = await runWith('produce-latency', { messages: 3, valueType: 'string' })
+      const asBuffer = await runWith('produce-throughput', { messages: 5 })
+      const logOf = ({ state }) => state.topics.values().next().value
+
+      expect(logOf(asString).map(({ value }) => typeof value)).toEqual(Array(6).fill('string'))
+      expect(logOf(asLatency).map(({ value }) => typeof value)).toEqual(Array(4).fill('string'))
+      expect(logOf(asString)[0].value).toBe(valuePool(8)[0].toString())
+      expect(logOf(asBuffer).every(({ value }) => Buffer.isBuffer(value))).toBe(true)
+    })
+
+    test('a run reports its shape flags as shape, and no shape when none was given', async () => {
+      const plain = await runWith('produce-throughput', { messages: 5 })
+      const shaped = await runWith('produce-throughput', {
+        messages: 5,
+        batch: 2,
+        keys: 'index',
+        headers: 3,
+        partitioner: 'custom',
+        valueType: 'string',
+      })
+      const unawaited = await runWith('produce-throughput', { messages: 5, unawaited: 2 })
+
+      expect(Object.hasOwn(plain.metrics, 'shape')).toBe(false)
+      expect(shaped.metrics.shape).toEqual({
+        batch: 2,
+        keys: 'index',
+        headers: 3,
+        partitioner: 'custom',
+        valueType: 'string',
+      })
+      expect(unawaited.metrics.shape).toEqual({ unawaited: 2 })
+    })
+
+    test('a run creates its topic with no setting beyond quick file deletion, whatever its shape', async () => {
+      const { state } = await runWith('produce-throughput', {
+        messages: 5,
+        batch: 2,
+        keys: 'index',
+      })
+
+      expect(state.createdTopics[0].configEntries).toEqual([
+        { name: 'file.delete.delay.ms', value: '1000' },
+      ])
+    })
+
+    test('the corpus holds at most 64 MiB: a 1 MiB record size gives 64 values of that size', () => {
+      const values = valuePool(1048576)
+
+      expect(values).toHaveLength(64)
+      expect(values.every((value) => value.length === 1048576)).toBe(true)
+      expect(values[0].equals(values[1])).toBe(false)
     })
 
     test('the fork consumer defaults it reports are the ones its source sets', () => {

@@ -1796,7 +1796,8 @@ type Sender = {
    * Sends a produce request for one topic's messages. Rejects with a `KafkaJSProtocolError`
    * (`topic`, `partition`, `errorMessage` set) when the broker fails the whole batch; when it
    * rejected individual records (KIP-467), the error also carries
-   * `recordErrors: ProduceRecordError[]`.
+   * `recordErrors: readonly ProduceRecordError[]`. Sends that shared a batch each get an error of
+   * their own, unless the broker's answer is delivered as it is (see `ProduceRecordError`).
    */
   send(record: ProducerRecord): Promise<RecordMetadata[]>
   sendBatch(batch: ProducerBatch): Promise<RecordMetadata[]>
@@ -2942,7 +2943,7 @@ export class KafkaJSProtocolError extends KafkaJSError {
   /** The broker's own message for this error, when it sent one */
   readonly errorMessage?: string | null
   /** The records the broker rejected individually out of a failed produce batch (KIP-467) */
-  readonly recordErrors?: ProduceRecordError[]
+  readonly recordErrors?: readonly ProduceRecordError[]
   /**
    * Set on what `admin.deleteTopics` and `admin.createPartitions` throw: every topic the broker
    * failed, where the error itself names the first one's code.
@@ -2957,15 +2958,32 @@ export class KafkaJSProtocolError extends KafkaJSError {
 }
 
 /**
- * A single record the broker rejected out of an otherwise-failed produce batch (KIP-467).
- * `batchIndex` is the record's position as sent to that partition; `record` is the corresponding
- * entry from the `messages` array passed to `Producer#send`/`sendBatch`, when the client could
- * resolve it.
+ * A single record the broker rejected out of a failed Produce batch (KIP-467).
+ * For an eligible matched answer, each send gets a fresh native protocol error with the original
+ * public fields and category. An eligible idempotent delivery timeout has a fresh protocol
+ * cause for that send. Stacks are lazily formatted diagnostic text with unspecified frames.
+ * The protocol error's own array is created on first read in broker order. Only entries the
+ * send owns carry detached record bytes. Other entries are frozen and shared. Ineligible
+ * failures keep their original error or existing retry or delivery-timeout wrapper, with raw
+ * entries. See the migration guide for eligibility and failure handling.
  */
 export type ProduceRecordError = {
-  batchIndex: number
-  record?: Message
-  errorMessage: string | null
+  /** Position of the record inside the rejected batch, not an index into your `messages`. */
+  readonly batchIndex: number
+  /**
+   * A copy of the record as the producer wrote it, in a store of its own: `key`, `value` and the
+   * header values as `Buffer`s (strings UTF-8 encoded). A truthy supported snapshot timestamp is
+   * reported as a decimal string. Dates and objects with a bigint `value` are normalized to
+   * strings in the snapshot, including `'0'`. Numeric zero, `0n`, `null`, omission and other
+   * timestamp objects omit `timestamp`. An empty string is refused when the record is sent.
+   */
+  readonly record?: {
+    readonly key: Buffer | null
+    readonly value: Buffer | null
+    readonly headers: { readonly [key: string]: Buffer | readonly Buffer[] }
+    readonly timestamp?: string
+  }
+  readonly errorMessage: string | null
 }
 
 export class KafkaJSAggregateError extends Error {
