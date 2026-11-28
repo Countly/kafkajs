@@ -1,15 +1,18 @@
 const { KafkaJSInvariantViolation } = require('../../../errors')
+const asRequested = (key) => key
 /** Checks a response's complete identity set without assuming response order.
  * @param {object[]} actual response rows
  * @param {object[]|null} expected requested rows, null means all
  * @param {string} field identity property
  * @param {string} label diagnostic context
+ * @param {(key: any) => any} [sentOf] names a requested identity as the answer reads it; a name
+ *   the request writes with a lone surrogate comes back with U+FFFD in its place
  * @returns {void}
  * @throws {KafkaJSInvariantViolation} duplicate, foreign or missing identity
  */
-const exact = (actual, expected, field, label) => {
+const exact = (actual, expected, field, label, sentOf = asRequested) => {
   if (!Array.isArray(actual)) throw new KafkaJSInvariantViolation(`Missing ${label}`)
-  const wanted = expected == null ? null : new Set(expected.map((row) => row[field]))
+  const wanted = expected == null ? null : new Set(expected.map((row) => sentOf(row[field])))
   const seen = new Set()
   for (const row of actual) {
     const key = row?.[field]

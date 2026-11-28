@@ -1157,9 +1157,9 @@ Group visibility and the admin client.
   while the other groups come back normally. Every other group-level error that `DescribeGroups`
   itself reports still fails the call and is still retried exactly as before. A coordinator that
   is loading or has moved is retried on the configured budget as before, and a transport or
-  coordinator error that outlives it still fails the call. Rows are not returned in the order the
-  ids were passed, as before. Rows also gain `errorMessage` and `authorizedOperations`, and
-  members gain `groupInstanceId` (static membership). *What to do:* code that tested
+  coordinator error that outlives it still fails the call. Rows now follow the first occurrence
+  of each encoded group id across coordinators and both APIs. Rows also gain `errorMessage`
+  and `authorizedOperations`, and members gain `groupInstanceId` (static membership). *What to do:* code that tested
   `state === 'Dead'` keeps working; code that reads `errorCode: 0` as "the group exists", or
   compares a whole row for deep equality, needs updating.
 - **`createTopics` with `waitForLeaders` no longer fails while a new topic propagates.** On KRaft
@@ -1264,7 +1264,7 @@ Group visibility and the admin client.
   now carries `groupState` and `groupType`. `admin.describeGroups` describes classic and consumer
   groups in one shape; `errorCode` is retained on every row, as it always has been, and a group id
   that does not exist comes back as a `Dead` row carrying `errorCode: 69` instead of failing the
-  call. Rows are not returned in the order the ids were passed. See
+  call. Rows follow the first occurrence of each encoded group id. See
   [List groups](Admin.md#list-groups) and [Describe groups](Admin.md#describe-groups).
 - **A `KafkaJSAggregateError` says whether it can be retried.** `admin.createTopics()` and
   `admin.alterPartitionReassignments()` reject with it when topics fail, one child in `errors`

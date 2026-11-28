@@ -7,6 +7,7 @@ const {
   KafkaJSProtocolError,
 } = require('../errors')
 const { createErrorFromCode } = require('../protocol/error')
+const Encoder = require('../protocol/encoder')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { ADMIN_MUTATION } = require('../broker/privateOptions')
 const { responseSourceOf } = require('../broker/failureSource')
@@ -328,14 +329,21 @@ class TransactionAdmin {
     return [...result.values()]
   }
 
-  /** Describes transactions, batching only ids with the same coordinator.
+  /** Describes transactions, batching only ids with the same coordinator. An id is sent and matched
+   * by the name the request writes (each lone surrogate is written as U+FFFD), so two ids written
+   * as the same bytes are a duplicate; each result carries the id the caller gave.
    * @param {object} options nonempty unique transactionalIds
    * @returns {Promise<object[]>} per-id results; broker sentinel fields retained on errors
    * @throws {Error} invalid input, capability, identity or deadline failure
    */
   async describeTransactions(options) {
     const { transactionalIds } = this.options(options)
-    const items = this.unique(transactionalIds, (id) => this.text(id)).map((transactionalId) => ({
+    const callerIds = new Map()
+    const items = this.unique(transactionalIds, (id) => {
+      const sent = Encoder.sentForm(this.text(id))
+      callerIds.set(sent, id)
+      return sent
+    }).map((transactionalId) => ({
       transactionalId,
       state: 'Unknown',
       timeoutMs: 0,
@@ -347,7 +355,7 @@ class TransactionAdmin {
     const routes = new Map()
     const unown = currentDeadline()?.own(() => routes.clear())
     try {
-      return await this.items(
+      const rows = await this.items(
         items,
         (row) => {
           if (row.errorCode === 15 || row.errorCode === 16) routes.delete(row.transactionalId)
@@ -367,6 +375,12 @@ class TransactionAdmin {
               ).transactions
           )
       )
+      return rows.map((row) => {
+        const transactionalId = callerIds.get(row.transactionalId)
+        return transactionalId === undefined || transactionalId === row.transactionalId
+          ? row
+          : { ...row, transactionalId }
+      })
     } finally {
       unown?.()
       routes.clear()

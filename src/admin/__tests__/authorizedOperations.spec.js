@@ -2,6 +2,7 @@ const { createGroupDescriptions } = require('../groupDescriptions')
 const createAdmin = require('..')
 const Metadata = require('../../protocol/requests/metadata')
 const { createErrorFromCode } = require('../../protocol/error')
+const { UNCHECKED_ROWS } = require('../../broker/privateOptions')
 const logger = { namespace: () => logger, debug() {}, info() {}, warn() {}, error() {} }
 
 describe('authorized operations', () => {
@@ -24,7 +25,9 @@ describe('authorized operations', () => {
         })),
       }))
       const cluster = {
+        refreshMetadata: jest.fn(async () => {}),
         findGroupCoordinator: jest.fn(async ({ groupId }) => targets[Number(groupId.slice(1)) % 2]),
+        withCoordinatorBroker: (nodeId, work) => work(targets[nodeId]),
       }
       const ids = ['g0', 'g1', 'g2', 'g3', 'g4']
       const { groups } = await createGroupDescriptions({
@@ -42,7 +45,8 @@ describe('authorized operations', () => {
           expect.objectContaining({ includeAuthorizedOperations: requested })
         )
         expect(target.describeGroups).toHaveBeenCalledWith(
-          expect.objectContaining({ includeAuthorizedOperations: requested })
+          expect.objectContaining({ includeAuthorizedOperations: requested }),
+          { [UNCHECKED_ROWS]: true }
         )
       }
     }
@@ -71,7 +75,11 @@ describe('authorized operations', () => {
           })),
         })),
       }
-      const cluster = { findGroupCoordinator: jest.fn(async () => coordinator) }
+      const cluster = {
+        refreshMetadata: jest.fn(async () => {}),
+        findGroupCoordinator: jest.fn(async () => coordinator),
+        withCoordinatorBroker: (_nodeId, work) => work(coordinator),
+      }
       const descriptions = createGroupDescriptions({ cluster, logger })
       const ids = masks.map((_, index) => `g${index}`)
       const { groups } = await descriptions.describe(ids, {
@@ -119,6 +127,8 @@ describe('authorized operations', () => {
       }),
     }
     const cluster = {
+      refreshMetadata: jest.fn(async () => {}),
+      withCoordinatorBroker: (nodeId, work) => work(nodeId === 0 ? original : replacement),
       findGroupCoordinator: jest
         .fn()
         .mockResolvedValueOnce(original)
@@ -131,6 +141,7 @@ describe('authorized operations', () => {
     }).describe(['g'])
     expect(groups[0].groupId).toBe('g')
     expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(2)
+    expect(cluster.refreshMetadata).toHaveBeenCalledTimes(1)
     expect(original.describeGroups).toHaveBeenCalledTimes(1)
     expect(replacement.describeGroups).toHaveBeenCalledTimes(1)
   })

@@ -11,6 +11,7 @@ const {
   readRequestHeader,
 } = require('testHelpers')
 const { CloseRig, TOPIC, gate, pause } = require('./fixtures/closeRig')
+const descriptionCluster = require('./fixtures/descriptionCluster')
 const { pump } = require('./fixtures/lifecycleCase')
 const {
   TOPIC: HARNESS_TOPIC,
@@ -270,13 +271,13 @@ describe('describeGroup under one operation spanning its stages', () => {
       }),
       describeGroups: jest.fn(() => response.promise),
     }
-    const cluster = {
-      findGroupCoordinator: jest.fn(async () => {
+    const cluster = descriptionCluster(
+      coordinator,
+      jest.fn(async () => {
         await pause(stageMs)
         return coordinator
-      }),
-      refreshMetadata: jest.fn(),
-    }
+      })
+    )
     return { cluster, coordinator, response }
   }
   const describer = (cluster) =>

@@ -9,6 +9,8 @@ const NODES = [
   { id: 1, host: 'node1', port: 9092 },
 ]
 const RETRY = { retries: 2, initialRetryTime: 1, maxRetryTime: 2, factor: 0, multiplier: 1 }
+/** The string a broker reads back from the bytes a request carried for `id`. */
+const echoOf = (id) => Buffer.from(id, 'utf8').toString('utf8')
 /** The requests a member of the group would send; the admin sends none of them. */
 const MEMBERSHIP = [
   'JoinGroup',
@@ -517,6 +519,28 @@ describe('Admin > setOffsets > commits the offsets itself', () => {
       expect(described.calls).toEqual(['ConsumerGroupDescribe'])
       expect(apis().filter((api) => MEMBERSHIP.includes(api))).toEqual([])
     })
+
+    // A lone surrogate is written as U+FFFD, so a broker echoes that and not the string that was asked.
+    test('a group id with a lone surrogate is committed once the coordinator describes the empty group under the bytes it read', async () => {
+      described.restore()
+      described = describeGroupAs({ echo: echoOf })
+      await connect()
+
+      await expect(set(twoPartitions, 'team-\uD800')).resolves.toBeUndefined()
+      expect(described.calls).toEqual(['ConsumerGroupDescribe', 'DescribeGroups'])
+      expect(commits()).toHaveLength(1)
+      expect(commits()[0].fields.groupId).toBe('team-�')
+    })
+
+    test('an ordinary Unicode group id is described and committed unchanged', async () => {
+      described.restore()
+      described = describeGroupAs({ echo: echoOf })
+      await connect()
+
+      await expect(set(twoPartitions, 'über-\u{1F600}')).resolves.toBeUndefined()
+      expect(commits()).toHaveLength(1)
+      expect(commits()[0].fields.groupId).toBe('über-\u{1F600}')
+    })
   })
 
   describe('refused before any request', () => {
@@ -710,11 +734,13 @@ describe('Admin > setOffsets > commits the offsets itself, over a stub coordinat
     }
     const cluster = {
       addTargetTopic: async () => {},
+      refreshMetadata: async () => {},
       refreshMetadataIfNecessary: async () => {},
       findTopicPartitionMetadata: () => [{ partitionId: 0 }, { partitionId: 1 }],
       findGroupCoordinator: findGroupCoordinator
         ? jest.fn(() => findGroupCoordinator(coordinator))
         : async () => coordinator,
+      withCoordinatorBroker: (_nodeId, work) => work(coordinator),
     }
     return { admin: createAdmin({ cluster, logger, retry: RETRY }), coordinator }
   }

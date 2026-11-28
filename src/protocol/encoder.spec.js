@@ -123,6 +123,47 @@ describe('Protocol > Encoder', () => {
     })
   })
 
+  describe('sentForm', () => {
+    const written = (name) => new Decoder(new Encoder().writeString(name).buffer).readString()
+    const writtenCompact = (name) => decodeUString(ustring(name))
+
+    test.each([
+      ['a lone high surrogate', 'team-\uD800', 'team-�'],
+      ['a lone low surrogate', 'team-\uDC00', 'team-�'],
+      ['each of several lone surrogates', '\uDC00a\uD800b\uD800', '�a�b�'],
+      ['a high surrogate followed by a non-surrogate', '\uD800a', '�a'],
+    ])('names %s as the string both string writers put on the wire', (_, name, sent) => {
+      expect(Encoder.sentForm(name)).toBe(sent)
+      expect(written(name)).toBe(sent)
+      expect(writtenCompact(name)).toBe(sent)
+    })
+
+    test.each([
+      ['an ASCII name', 'team-a'],
+      ['a name with a replacement character', 'team-�'],
+      ['a name with a valid surrogate pair', 'über-\u{1F600}'],
+      ['the empty name', ''],
+    ])('returns %s as the same string', (_, name) => {
+      expect(Encoder.sentForm(name)).toBe(name)
+      expect(written(name)).toBe(name)
+    })
+
+    test('returns a value that is not a string as it is', () => {
+      expect(Encoder.sentForm(null)).toBeNull()
+      expect(Encoder.sentForm(undefined)).toBeUndefined()
+    })
+  })
+
+  describe('isEchoOf', () => {
+    test('accepts the string itself and the string a broker reads back, and refuses any other', () => {
+      expect(Encoder.isEchoOf('team-a', 'team-a')).toBe(true)
+      expect(Encoder.isEchoOf('team-�', 'team-\uD800')).toBe(true)
+      expect(Encoder.isEchoOf('team-��', 'team-\uD800')).toBe(false)
+      expect(Encoder.isEchoOf('team-b', 'team-a')).toBe(false)
+      expect(Encoder.isEchoOf(null, 'team-a')).toBe(false)
+    })
+  })
+
   test('serializes the encoded bytes as Buffer JSON', () => {
     const encoder = new Encoder().writeInt8(7).writeInt16(258)
 

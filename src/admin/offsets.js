@@ -10,6 +10,7 @@ const { ON_DECODED, UNCHECKED_ROWS } = require('../broker/privateOptions')
 const { itemRetry, isLocal } = require('./itemRetry')
 const { checked, waitOf, currentDeadline, endsCall, isAnsweredError } = require('./deadline')
 const { exact, validateTopics } = require('../protocol/requests/offsetFetch/responseIdentity')
+const Encoder = require('../protocol/encoder')
 const apiKeys = require('../protocol/requests/apiKeys')
 const { requests } = require('../protocol/requests')
 
@@ -127,6 +128,14 @@ const resultOf = (row) => ({
   error: row.errorCode === 0 ? null : createErrorFromCode(row.errorCode),
   errorMessage: row.errorMessage ?? null,
 })
+
+/** Gives a group's result back under the id the caller gave, not the name the request wrote.
+ * @param {object|undefined} value result carrying the written `groupId`
+ * @param {string} groupId the id the caller gave
+ * @returns {object|undefined} `value`, or a copy under `groupId` when the two differ
+ */
+const asCaller = (value, groupId) =>
+  value === undefined || value.groupId === groupId ? value : { ...value, groupId }
 
 /** OffsetCommit codes sent again, as the Java admin's `AlterConsumerGroupOffsetsHandler` does. */
 const COMMIT_RETRIES = [14, 15, 16, 27]
@@ -362,18 +371,25 @@ class OffsetAdmin {
 
   /** Fetches multiple groups with one batched request per coordinator when v8+ is supported.
    * Successful and terminal partitions are retained locally, never re-sent on stable retries.
-   * @param {object} options unique groups, optional requireStable and inherited apiTimeout
-   * @returns {Promise<object[]>} one data-result entry per group in caller order
+   * @param {object} options unique groups (ids written as the same bytes, as lone surrogates are,
+   *   count as one), optional requireStable and inherited apiTimeout
+   * @returns {Promise<object[]>} one data-result entry per group in caller order, each under the
+   *   id the caller gave
    * @throws {Error} input/identity/deadline failure or before-work capability/auth
    */
   async fetchOffsetsForGroups(options) {
     object(options)
     const { groups, requireStable = false } = options
     requireInput(typeof requireStable === 'boolean', 'requireStable')
-    unique(groups, (g) => (g && name(g.groupId) ? g.groupId : undefined), 'groups')
+    unique(
+      groups,
+      (g) => (g && name(g.groupId) ? Encoder.sentForm(g.groupId) : undefined),
+      'groups'
+    )
     requireInput(groups.length > 0, 'groups')
+    const callerIds = groups.map((g) => g.groupId)
     const normalized = groups.map((g) => ({
-      groupId: g.groupId,
+      groupId: Encoder.sentForm(g.groupId),
       topics: selection(g.topics, false),
     }))
     const resolved = checked(
@@ -564,7 +580,9 @@ class OffsetAdmin {
           return [row.groupId, row.value]
         })
       )
-      return groups.map((g) => empty.get(g.groupId) ?? done.get(g.groupId))
+      return normalized.map(({ groupId }, index) =>
+        asCaller(empty.get(groupId) ?? done.get(groupId), callerIds[index])
+      )
     } catch (error) {
       throw failureOf(error) ?? error
     } finally {

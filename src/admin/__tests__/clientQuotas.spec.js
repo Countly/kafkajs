@@ -94,6 +94,109 @@ describe('client quotas', () => {
     ])
   })
 
+  // A lone surrogate is written as U+FFFD, so a broker echoes that and not the string that was asked.
+  describe('an entity name with a lone surrogate', () => {
+    const echoOf = (name) => (name === null ? null : Buffer.from(name, 'utf8').toString('utf8'))
+    /** A broker that names each entity as the bytes it read, with `errorCode` on each row. */
+    const echoing = (errorCode = 0) => {
+      const sent = []
+      const broker = {
+        alterClientQuotas: jest.fn(async ({ entries }) => {
+          sent.push(...entries.map(({ entity }) => entity[0].entityName))
+          return {
+            entries: entries.map(({ entity }) => ({
+              entity: entity.map(({ entityType, entityName }) => ({
+                entityType,
+                entityName: echoOf(entityName),
+              })),
+              errorCode,
+              errorMessage: null,
+            })),
+          }
+        }),
+      }
+      const findConnectedBroker = jest.fn(async () => broker)
+      return {
+        sent,
+        broker,
+        findConnectedBroker,
+        admin: createAdmin({ cluster: { findConnectedBroker }, logger, retry }),
+      }
+    }
+
+    test('is answered under the name the caller gave when the broker echoes the bytes sent', async () => {
+      const { admin, sent } = echoing()
+
+      const result = await admin.alterClientQuotas({
+        entries: [entry('team-\uD800'), entry('plain')],
+      })
+
+      expect(result.map(({ entity, errorCode }) => [entity[0].entityName, errorCode])).toEqual([
+        ['team-\uD800', 0],
+        ['plain', 0],
+      ])
+      expect(sent.map(echoOf)).toEqual(['team-�', 'plain'])
+    })
+
+    test('keeps the error row the broker answered, under the name the caller gave', async () => {
+      const { admin, broker } = echoing(35)
+
+      const result = await admin.alterClientQuotas({ entries: [entry('team-\uD800')] })
+
+      expect(result.map(({ entity, errorCode }) => [entity[0].entityName, errorCode])).toEqual([
+        ['team-\uD800', 35],
+      ])
+      expect(result[0].error).toMatchObject({ code: 35 })
+      expect(broker.alterClientQuotas).toHaveBeenCalledTimes(1)
+    })
+
+    test('is refused, like a repeated name, when another entity has the same bytes', async () => {
+      const { admin, findConnectedBroker } = echoing()
+
+      await expect(
+        admin.alterClientQuotas({ entries: [entry('a\uD800'), entry('a\uD801')] })
+      ).rejects.toBeInstanceOf(KafkaJSInvalidConfigurationError)
+      expect(findConnectedBroker).not.toHaveBeenCalled()
+    })
+
+    test.each([['team-other'], ['team-��']])(
+      'is still refused an answer row for %s',
+      async (answered) => {
+        const broker = {
+          alterClientQuotas: async () => ({
+            entries: [{ entity: entity(answered), errorCode: 0, errorMessage: null }],
+          }),
+        }
+        await expect(
+          createAdmin({
+            cluster: { findConnectedBroker: async () => broker },
+            logger,
+            retry: { retries: 0 },
+          }).alterClientQuotas({ entries: [entry('team-\uD800')] })
+        ).rejects.toBeInstanceOf(KafkaJSInvariantViolation)
+      }
+    )
+  })
+
+  test('answers an ordinary Unicode entity name under that name', async () => {
+    const name = 'über-\u{1F600}'
+    const broker = {
+      alterClientQuotas: jest.fn(async ({ entries }) => ({
+        entries: entries.map(({ entity }) => ({ entity, errorCode: 0, errorMessage: null })),
+      })),
+    }
+    const admin = createAdmin({
+      cluster: { findConnectedBroker: async () => broker },
+      logger,
+      retry,
+    })
+
+    const result = await admin.alterClientQuotas({ entries: [entry(name)] })
+
+    expect(result.map(({ entity }) => entity[0].entityName)).toEqual([name])
+    expect(broker.alterClientQuotas.mock.calls[0][0].entries[0].entity[0].entityName).toBe(name)
+  })
+
   test('exhaustion retains the last typed row and a remove has zero only on the wire', async () => {
     const broker = {
       alterClientQuotas: jest.fn(async ({ entries }) => ({

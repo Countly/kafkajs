@@ -1,4 +1,5 @@
 const { requests } = require('../protocol/requests')
+const Encoder = require('../protocol/encoder')
 const { createErrorFromCode } = require('../protocol/error')
 const {
   KafkaJSInvalidConfigurationError,
@@ -16,6 +17,7 @@ const {
   isAnsweredError,
 } = require('./deadline')
 const { itemRetry } = require('./itemRetry')
+const { WireNames } = require('./wireNames')
 
 /** @see https://github.com/apache/kafka/blob/4.4.0/clients/src/main/java/org/apache/kafka/common/protocol/Errors.java */
 const COORDINATOR_LOAD_IN_PROGRESS = 14
@@ -168,7 +170,9 @@ class ShareGroups {
   /**
    * Describes share groups, one request per coordinator, and returns rows in caller order.
    * Groups are looked up and batched by coordinator node. A repeated id shares one lookup and one
-   * relocation allowance and comes back as a fresh row per repetition. Loading (14) is retried in
+   * relocation allowance and comes back as a fresh row per repetition; so do ids that are written
+   * as the same bytes (each lone surrogate is written as U+FFFD), and every row carries the id the
+   * caller gave. Loading (14) is retried in
    * place under the retry budget; a moved coordinator (15/16), answered or thrown by a request, is
    * looked up again once per id, after which the broker's code stays on that group's row (a thrown
    * one is retried on the same route under the budget). Settled rows are never resent. A lookup or
@@ -196,7 +200,7 @@ class ShareGroups {
       typeof includeAuthorizedOperations === 'boolean',
       'includeAuthorizedOperations must be a boolean'
     )
-    const ids = groupIds.slice()
+    const names = new WireNames(groupIds)
     const routes = new Map()
     const relocated = new Set()
     const operation = currentDeadline()
@@ -207,7 +211,7 @@ class ShareGroups {
     try {
       const rows = await itemRetry(
         {
-          items: [...new Set(ids)].map((groupId) => ({ groupId })),
+          items: names.ids.map((groupId) => ({ groupId })),
           keyOf: (row) => row.groupId,
           retry: this.retry,
           retryable: (row) => row.retryCoordinator,
@@ -220,7 +224,9 @@ class ShareGroups {
       checked(rows)
       const results = new Map(rows.map((row) => [row.groupId, row]))
       return {
-        groups: ids.map((id) => this.#description(results.get(id), includeAuthorizedOperations)),
+        groups: names.names.map((id, index) =>
+          this.#description(results.get(names.wire[index]), includeAuthorizedOperations, id)
+        ),
       }
     } catch (error) {
       currentDeadline()?.check()
@@ -534,11 +540,12 @@ class ShareGroups {
    * `null`. A row that never reached a broker (an unresolved coordinator) keeps only its error.
    * @param {object} row correlated row, or a local-failure row with `errorCode: -1`
    * @param {boolean} includeAuthorizedOperations whether the mask was requested
+   * @param {string} groupId the id the caller gave, which the row names as the broker read it
    * @returns {object} the public group description
    */
-  #description(row, includeAuthorizedOperations) {
+  #description(row, includeAuthorizedOperations, groupId) {
     return {
-      groupId: row.groupId,
+      groupId,
       state: row.groupState ?? '',
       groupEpoch: row.groupEpoch ?? 0,
       assignmentEpoch: row.assignmentEpoch ?? 0,
@@ -638,7 +645,7 @@ class ShareGroups {
     if (
       !Array.isArray(answer.groups) ||
       answer.groups.length !== 1 ||
-      answer.groups[0].groupId !== groupId
+      !Encoder.isEchoOf(answer.groups[0].groupId, groupId)
     )
       throw new KafkaJSInvariantViolation('Invalid share offset group result identity')
     return answer.groups[0]

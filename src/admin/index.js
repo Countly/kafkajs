@@ -39,6 +39,7 @@ const {
 } = require('../errors')
 const { staleMetadata, staleLeaderEpoch, createErrorFromCode } = require('../protocol/error')
 const { GROUP_TYPES } = require('../protocol/groupTypes')
+const Encoder = require('../protocol/encoder')
 const { createGroupDescriptions } = require('./groupDescriptions')
 const { createShareGroups } = require('./shareGroups')
 const { AggregateOutcome, isPerItemFailure } = require('./aggregateOutcome')
@@ -566,22 +567,23 @@ const assertIncrementalEntry = (entry, resourceKey) => {
  * @param {{ type: number, name: string, configEntries: unknown }[]} resources already past
  *   {@link assertResourceTypesAndNames}
  * @returns {void}
- * @throws {KafkaJSNonRetriableError} when a resource repeats, `configEntries` is not an array, an
- *   entry fails {@link assertIncrementalEntry}, or a config name repeats in one resource whatever
- *   its operation
+ * @throws {KafkaJSNonRetriableError} when a resource repeats (names written as the same bytes, as
+ *   lone surrogates are, repeat it), `configEntries` is not an array, an entry fails
+ *   {@link assertIncrementalEntry}, or a config name repeats in one resource whatever its operation
  */
 const assertIncrementalEntries = (resources) => {
   const seenResources = new Set()
 
   for (const { type, name, configEntries } of resources) {
     const resourceKey = `${type}/${name}`
+    const sentKey = `${type}/${Encoder.sentForm(name)}`
 
-    if (seenResources.has(resourceKey)) {
+    if (seenResources.has(sentKey)) {
       throw new KafkaJSNonRetriableError(
         `Invalid resources array, it cannot have multiple entries for the same resource: ${JSON.stringify({ type, name })}`
       )
     }
-    seenResources.add(resourceKey)
+    seenResources.add(sentKey)
 
     if (!Array.isArray(configEntries)) {
       throw new KafkaJSNonRetriableError(
@@ -606,7 +608,9 @@ const assertIncrementalEntries = (resources) => {
 
 /**
  * Puts per-broker `incrementalAlterConfigs` results back in the order the caller gave the
- * resources. A resource the brokers did not answer gets an `UNKNOWN` result, never a success.
+ * resources. A resource the brokers did not answer gets an `UNKNOWN` result, never a success. A
+ * broker names a resource as the bytes it read (a lone surrogate is written as U+FFFD), so results
+ * are matched by that name and returned under the name the caller gave.
  * @param {{ type: number, name: string }[]} resources the request, in the caller's order
  * @param {{ errorCode: number, errorMessage: string|null, resourceType: number,
  *   resourceName: string }[]} results every broker's results, in any order
@@ -618,15 +622,20 @@ const inRequestOrder = (resources, results) => {
     results.map((result) => [`${result.resourceType}/${result.resourceName}`, result])
   )
 
-  return resources.map(
-    ({ type, name }) =>
-      answered.get(`${type}/${name}`) ?? {
+  return resources.map(({ type, name }) => {
+    const result = answered.get(`${type}/${Encoder.sentForm(name)}`)
+
+    if (result === undefined) {
+      return {
         errorCode: -1,
         errorMessage: 'The broker did not answer for this resource',
         resourceType: type,
         resourceName: name,
       }
-  )
+    }
+
+    return result.resourceName === name ? result : { ...result, resourceName: name }
+  })
 }
 
 /**
@@ -2008,8 +2017,8 @@ module.exports = ({
    * Describes groups of both protocols by group id.
    *
    * Each id is described through ConsumerGroupDescribe where the broker supports it, and through
-   * DescribeGroups otherwise, so classic and consumer groups come back in one shape. Rows are not
-   * returned in the order the ids were given.
+   * DescribeGroups otherwise, so classic and consumer groups come back in one shape. Rows follow
+   * the first occurrence of each encoded id in the request, with that id's aliases kept together.
    *
    * @param {string[]} groupIds
    * @param {object} [options] additive call budget and authorization mask flag

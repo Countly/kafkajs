@@ -55,6 +55,8 @@ module.exports = {
   /**
    * `offsetCommit`: the caller reads every row of the answer itself, so the broker does not refuse
    * an answer whose rows do not match the request (a partition left out, repeated or added).
+   * `describeGroups`: returns outcomes for the ids the request asked. A row the version's own
+   * rule refuses carries that failure as `error` for the caller to handle.
    */
   UNCHECKED_ROWS: Symbol('uncheckedRows'),
   acceptedIndex,

@@ -13,9 +13,11 @@ const NO_AUTHORIZED_OPERATIONS = -2147483648
  * @param {object|null} [rows.consumer] fields of the ConsumerGroupDescribe row over a missing
  *   group's (code 69); null for a broker that does not offer ConsumerGroupDescribe
  * @param {object} [rows.classic] fields of the DescribeGroups row over an empty classic group's
+ * @param {(groupId: string) => string} [rows.echo] the group id a row names for a requested one;
+ *   a broker echoes the bytes it read, so the default is the id as requested
  * @returns {{ calls: string[], restore: () => void }} the describe APIs called, in order
  */
-const describeGroupAs = ({ consumer = {}, classic = {} } = {}) => {
+const describeGroupAs = ({ consumer = {}, classic = {}, echo = (groupId) => groupId } = {}) => {
   const calls = []
   const consumerSpy = jest
     .spyOn(Broker.prototype, 'consumerGroupDescribe')
@@ -28,7 +30,7 @@ const describeGroupAs = ({ consumer = {}, classic = {} } = {}) => {
         groups: groupIds.map((groupId) => ({
           errorCode: 69,
           errorMessage: null,
-          groupId,
+          groupId: echo(groupId),
           groupState: '',
           groupEpoch: -1,
           assignmentEpoch: -1,
@@ -47,7 +49,7 @@ const describeGroupAs = ({ consumer = {}, classic = {} } = {}) => {
         groups: groupIds.map((groupId) => ({
           errorCode: 0,
           errorMessage: null,
-          groupId,
+          groupId: echo(groupId),
           state: 'Empty',
           protocolType: 'consumer',
           protocol: '',

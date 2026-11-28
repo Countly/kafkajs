@@ -1,5 +1,5 @@
 const Decoder = require('../../../decoder')
-const { failure, createErrorFromCode } = require('../../../error')
+const { parseRows } = require('../responseRows')
 
 /**
  * DescribeGroups Response (Version: 0) => [groups]
@@ -43,16 +43,7 @@ const decode = async (rawData) => {
   }
 }
 
-const parse = async (data) => {
-  const groupsWithError = data.groups.filter(({ errorCode }) => failure(errorCode))
-  if (groupsWithError.length > 0) {
-    throw createErrorFromCode(groupsWithError[0].errorCode)
-  }
-
-  return data
-}
-
 module.exports = {
   decode,
-  parse,
+  parse: parseRows(0),
 }

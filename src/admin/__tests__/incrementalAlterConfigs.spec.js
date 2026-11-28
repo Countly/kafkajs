@@ -12,6 +12,9 @@ const { SET, DELETE, APPEND, SUBTRACT } = AlterConfigOpTypes
 const INVALID_CONFIG = 40
 const NOT_CONTROLLER = 41
 
+/** The string a broker reads back from the bytes a request carried for `id`. */
+const echoOf = (id) => Buffer.from(id, 'utf8').toString('utf8')
+
 /** @returns {{ type: number, name: string, configEntries: object[] }} a valid TOPIC resource */
 const topicResource = (overrides = {}) => ({
   type: TOPIC,
@@ -95,6 +98,14 @@ describe('Admin > incrementalAlterConfigs > validation', () => {
     [
       'the same resource appears twice',
       [topicResource(), topicResource()],
+      /^Invalid resources array, it cannot have multiple entries for the same resource/,
+    ],
+    [
+      'two resource names are written as the same bytes',
+      [
+        topicResource({ type: GROUP, name: 'team-\uD800' }),
+        topicResource({ type: GROUP, name: 'team-\uD801' }),
+      ],
       /^Invalid resources array, it cannot have multiple entries for the same resource/,
     ],
     [
@@ -293,6 +304,73 @@ describe('Admin > incrementalAlterConfigs > results', () => {
         resourceName: 'forgotten',
       },
     ])
+  })
+
+  // A lone surrogate is written as U+FFFD, so a broker echoes that and not the string that was asked.
+  describe('a resource name with a lone surrogate', () => {
+    const echoing = (overrides = {}) =>
+      adminOverStubs(async ({ resources }) => ({
+        resources: resources.map(({ type, name }) =>
+          resultFor({ type, name: echoOf(name) }, overrides)
+        ),
+      }))
+
+    test('is answered under the name the caller gave when the broker echoes the bytes sent', async () => {
+      const { admin, controller } = echoing()
+      const resources = [
+        topicResource({ type: GROUP, name: 'team-\uD800' }),
+        topicResource({ name: 'plain' }),
+      ]
+
+      const response = await admin.incrementalAlterConfigs({ resources })
+
+      expect(response).toEqual({
+        resources: resources.map(({ type, name }) => resultFor({ type, name })),
+      })
+      expect(
+        controller.incrementalAlterConfigs.mock.calls[0][0].resources.map((r) => echoOf(r.name))
+      ).toEqual(['team-�', 'plain'])
+      expect(controller.incrementalAlterConfigs).toHaveBeenCalledTimes(1)
+    })
+
+    test('keeps the code and message the broker answered, under the name the caller gave', async () => {
+      const { admin } = echoing({ errorCode: INVALID_CONFIG, errorMessage: 'not a list' })
+      const resources = [topicResource({ type: GROUP, name: 'team-\uD800' })]
+
+      const response = await admin.incrementalAlterConfigs({ resources })
+
+      expect(response.resources).toEqual([
+        resultFor(resources[0], { errorCode: INVALID_CONFIG, errorMessage: 'not a list' }),
+      ])
+    })
+
+    test('is still answered UNKNOWN when the broker answered only for a different name', async () => {
+      const { admin } = adminOverStubs(async () => ({
+        resources: [resultFor({ type: GROUP, name: 'team-��' })],
+      }))
+      const resources = [topicResource({ type: GROUP, name: 'team-\uD800' })]
+
+      const response = await admin.incrementalAlterConfigs({ resources })
+
+      expect(response.resources).toEqual([
+        {
+          errorCode: -1,
+          errorMessage: 'The broker did not answer for this resource',
+          resourceType: GROUP,
+          resourceName: 'team-\uD800',
+        },
+      ])
+    })
+  })
+
+  test('answers an ordinary Unicode resource name under that name', async () => {
+    const name = 'über-\u{1F600}'
+    const { admin } = adminOverStubs()
+    const resources = [topicResource({ type: GROUP, name })]
+
+    const response = await admin.incrementalAlterConfigs({ resources })
+
+    expect(response.resources).toEqual([resultFor(resources[0])])
   })
 
   test.each([[29], [INVALID_CONFIG], [42], [44]])(

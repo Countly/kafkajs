@@ -60,7 +60,10 @@ const build = ({ members, leaveGroup, group, classic, noRows = false } = {}) => 
           ],
     })),
   }
-  const cluster = { findGroupCoordinator: jest.fn(async () => coordinator) }
+  const cluster = {
+    findGroupCoordinator: jest.fn(async () => coordinator),
+    withCoordinatorBroker: (_nodeId, work) => work(coordinator),
+  }
 
   return {
     admin: createAdmin({ logger: newLogger(), retry: RETRY, cluster }),

@@ -159,7 +159,7 @@ const adminRegistry = (
   cluster.fetchTopicsOffset = async ([{ topic, partitions }]) => [
     { topic, partitions: partitions.map(({ partition }) => ({ partition, offset: '5' })) },
   ]
-  cluster.findGroupCoordinator = async () => ({
+  const coordinator = {
     offsetFetch: async () => ({
       responses: [{ topic: 'orders', partitions: [{ partition: 0, offset: '-1' }] }],
     }),
@@ -177,7 +177,9 @@ const adminRegistry = (
       options[ON_DECODED](reply)
       return reply
     },
-  })
+  }
+  cluster.findGroupCoordinator = async () => coordinator
+  cluster.brokerPool.withCoordinatorBroker = (_nodeId, work) => work(coordinator)
   const logger = {
     namespace() {
       return this

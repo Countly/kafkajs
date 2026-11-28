@@ -131,6 +131,7 @@ const play = async (capture) => {
     brokerPool: { brokers: { 0: coordinator } },
     findBroker: async () => coordinator,
     findGroupCoordinator: async () => coordinator,
+    withCoordinatorBroker: (_nodeId, work) => work(coordinator),
   }
   const admin = createAdmin({ logger: newLogger(), retry, cluster })
   let outcome
