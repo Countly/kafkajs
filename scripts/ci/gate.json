@@ -12423,6 +12423,8 @@
         "src/producer/__tests__/bufferHarness.spec.js \u203a Producer > fixtures > bufferHarness takeSent writes what the batch writer writes for the original record an empty Buffer value",
         "src/producer/__tests__/bufferHarness.spec.js \u203a Producer > fixtures > bufferHarness takeSent writes what the batch writer writes for the original record a null value",
         "src/producer/__tests__/bufferHarness.spec.js \u203a Producer > fixtures > bufferHarness takeSent writes what the batch writer writes for the original record a header with an empty value",
+        "src/producer/__tests__/bufferHarness.spec.js \u203a Producer > fixtures > bufferHarness takeSent copies a header named __proto__ and a repeated header with holes as the batch writer writes them, after later Buffer changes",
+        "src/producer/__tests__/bufferHarness.spec.js \u203a Producer > fixtures > bufferHarness takeSent leaves a falsy timestamp to the writer, which takes the send time when read() runs, not at the observation",
         "src/producer/__tests__/bufferHarness.spec.js \u203a Producer > fixtures > bufferHarness readBatch refuses a batch with one payload byte changed under its CRC",
         "src/producer/__tests__/beginTransaction.spec.js \u203a Producer > a transaction adds its partitions retrying AddPartitionsToTxn with the producer's retry options, not the cluster's",
         "src/producer/__tests__/beginTransaction.spec.js \u203a Producer > transaction() awaits the transaction it begins a coordinator lookup that fails while beginning rejects transaction() itself",

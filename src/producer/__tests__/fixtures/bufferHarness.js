@@ -83,19 +83,24 @@ const fieldOf = (field) => {
 }
 
 /**
- * A copy of a record's headers as they are now, header-value arrays included.
+ * A copy of a record's headers as they are now, header-value arrays included. The copy has no
+ * prototype, so a header named `__proto__` is stored as an own property like any other instead of
+ * reaching the inherited setter, and a repeated header's array keeps its holes, since the batch
+ * writer skips them: only the indices present in the original are copied.
  * @param {object|null|undefined} headers
  * @returns {object|null|undefined}
  */
 const headersOf = (headers) => {
   if (headers === null || typeof headers !== 'object') return headers
-  const copy = {}
+  const copy = Object.create(null)
   for (const name in headers) {
     if (!Object.hasOwn(headers, name)) continue
     const entry = headers[name]
     if (Array.isArray(entry)) {
       const list = new Array(entry.length)
-      for (let at = 0; at < entry.length; at++) list[at] = fieldOf(entry[at])
+      for (let at = 0; at < entry.length; at++) {
+        if (at in entry) list[at] = fieldOf(entry[at])
+      }
       copy[name] = list
     } else {
       copy[name] = fieldOf(entry)
@@ -160,11 +165,15 @@ const readBatch = async (buffer) => {
  *   they are, Buffer bytes copied, a `Date` or `Long` timestamp as a new one of the same value),
  *   so a later change to a record list, a record field or a Buffer byte is not seen;
  * - encoding, deferred to `read()`: the producer's batch writer writes the observed records and the
- *   consumer's decoder reads them back, CRC checked;
+ *   consumer's decoder reads them back, CRC checked. The writer takes the send time for a falsy
+ *   timestamp (absent, `null`, `0`, `0n`) when it runs, so that time is the clock at the `read()`
+ *   call, not at the observation. A test whose assertion depends on that time fixes the clock for
+ *   both calls or reads the write where the producer made it;
  * - bytes captured at a real write are not this helper's: a test that needs the bytes the producer
  *   itself put on the wire reads them where it captures that write.
  * The call is plain loops, indexed reads and writes, `Buffer.alloc`, `Buffer.isBuffer`,
- * `Array.isArray`, `Object.hasOwn`, `Date#getTime`, `new Date(time)` and `new Long`, so a fake
+ * `Array.isArray`, `Object.hasOwn`, `Object.create(null)`, `Date#getTime`, `new Date(time)` and
+ * `new Long`, so a fake
  * broker or probe that takes a request decides, records and answers at the same instant as one
  * that reads nothing, and a spec spying on another built-in or on the clock sees only the
  * producer's calls.

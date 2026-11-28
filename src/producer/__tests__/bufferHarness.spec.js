@@ -319,6 +319,52 @@ describe('Producer > fixtures > bufferHarness', () => {
     })
   })
 
+  test('takeSent copies a header named __proto__ and a repeated header with holes as the batch writer writes them, after later Buffer changes', async () => {
+    const own = Buffer.from('own')
+    const listed = Buffer.from('c1')
+    const many = new Array(3)
+    many[0] = Buffer.from('a0')
+    many[2] = listed
+    const headers = Object.defineProperty({ plain: 'p' }, '__proto__', {
+      value: own,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    })
+    headers.many = many
+    const record = { value: 'v', timestamp: 1, headers }
+    const { buffer } = await buildRecordBatch({ compression: Compression.None, messages: [record] })
+    const expected = (await readBatch(buffer)).records
+
+    const sent = takeSent({ batches: [{ topic: 'topic-a', partition: 0, messages: [record] }] })
+    own[0] = 0x30
+    listed[1] = 0x32
+    const [{ records }] = await sent.read()
+
+    expect(records).toEqual(expected)
+    const read = records[0].headers
+    expect(Object.keys(read)).toEqual(['plain', '__proto__', 'many'])
+    expect(Object.getPrototypeOf(read)).toBe(Object.prototype)
+    expect(Object.getOwnPropertyDescriptor(read, '__proto__').value).toEqual(Buffer.from('own'))
+    expect(read.many).toEqual([Buffer.from('a0'), Buffer.from('c1')])
+  })
+
+  test('takeSent leaves a falsy timestamp to the writer, which takes the send time when read() runs, not at the observation', async () => {
+    const now = jest.spyOn(Date, 'now').mockReturnValue(1000)
+    try {
+      const sent = takeSent({
+        batches: [{ topic: 'topic-a', partition: 0, messages: [{ value: 'v' }] }],
+      })
+      now.mockReturnValue(2000)
+
+      const [{ records }] = await sent.read()
+
+      expect(records.map(({ timestamp }) => timestamp)).toEqual(['2000'])
+    } finally {
+      now.mockRestore()
+    }
+  })
+
   test('readBatch refuses a batch with one payload byte changed under its CRC', async () => {
     const { buffer } = await buildRecordBatch({
       compression: Compression.None,
