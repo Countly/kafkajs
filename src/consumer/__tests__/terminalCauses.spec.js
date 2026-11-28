@@ -1,6 +1,6 @@
 const ConsumerGroup = require('../consumerGroup')
 const { MemberAssignment } = require('../assignerProtocol')
-const { KafkaJSError, KafkaJSTopicRecreatedError } = require('../../errors')
+const { KafkaJSError, KafkaJSTopicRecreatedError, KafkaJSConnectionError } = require('../../errors')
 const {
   advanceUntil,
   deferred,
@@ -715,6 +715,193 @@ describe('Consumer > partition handler retry state', () => {
       }
     }
   )
+
+  it.each(['eachMessage', 'eachBatch'])(
+    '%s keeps the delivered range and the original failure when the handler changes what it was handed',
+    async (handler) => {
+      const error = failure(true)
+      const delivered = []
+      const run = await startRetryRun(
+        'eager',
+        handler,
+        (payload) => {
+          if (handler === 'eachMessage') {
+            delivered.push([payload.message.offset])
+            // A later offset on every call would hand a stale reader a fresh budget each time.
+            payload.message.offset = String(1000 * delivered.length)
+          } else {
+            const work = payload.batch.messages.splice(0)
+            delivered.push(work.map(({ offset }) => offset))
+            if (delivered.length === 1) payload.resolveOffset(work[0].offset)
+          }
+          throw error
+        },
+        {
+          prepare: ({ state }) => {
+            state.batchSize = 2
+          },
+          records: { 'topic-a|0': [40, 41] },
+        }
+      )
+      await advanceUntil(() => run.crashes.length > 0)
+      expect(run.crashes).toHaveLength(1)
+      expect(run.crashes[0].error).toMatchObject({
+        name: 'KafkaJSNumberOfRetriesExceeded',
+        retryCount: 1,
+        cause: error,
+      })
+      expect(delivered).toEqual(
+        handler === 'eachMessage' ? [['40'], ['40']] : [['40', '41'], ['41']]
+      )
+      expect(
+        run.log.filter(({ kind }) => kind === 'commit').map(({ tp, offset }) => [tp, offset])
+      ).toEqual(handler === 'eachMessage' ? [] : [['topic-a|0', '41']])
+    }
+  )
+
+  it('a counted Fetch failure on another broker in the same round does not shorten the handler backoff', async () => {
+    const delivered = []
+    const failed = []
+    const gate = deferred()
+    let other
+    const run = await startRetryRun(
+      'eager',
+      'eachMessage',
+      async () => {
+        delivered.push(Date.now())
+        if (delivered.length === 3) await gate.promise
+        failed.push(Date.now())
+        throw failure(true)
+      },
+      {
+        partitions: [0, 1],
+        records: { 'topic-a|0': [40] },
+        prepare: async (built) => {
+          await splitBrokers(built)
+          other = await built.cluster.findBroker(1)
+        },
+        retry: { retries: 5, multiplier: 2 },
+        run: { partitionsConsumedConcurrently: 2, autoCommit: false },
+      }
+    )
+    try {
+      await advanceUntil(() => delivered.length === 3)
+      expect(delivered).toHaveLength(3)
+      const refused = jest.fn(async () => {
+        throw protocolError(7)
+      })
+      other.fetch.mockImplementationOnce(refused)
+      await advanceUntil(() => refused.mock.calls.length > 0)
+      expect(refused).toHaveBeenCalledTimes(1)
+      gate.resolve()
+      await advanceUntil(() => delivered.length === 4, 5000)
+      expect(delivered).toHaveLength(4)
+      expect(delivered[1] - failed[0]).toBeGreaterThanOrEqual(300)
+      expect(delivered[2] - failed[1]).toBeGreaterThanOrEqual(600)
+      expect(delivered[3] - failed[2]).toBeGreaterThanOrEqual(1200)
+      expect(run.crashes).toEqual([])
+    } finally {
+      gate.resolve()
+    }
+  })
+
+  it.each([0, 1])(
+    'reports the refused automatic commit of a successful sibling when partition %i fails retriably in the same round',
+    async (failing) => {
+      const gate = deferred()
+      const denied = protocolError(29)
+      const policy = jest.fn(async () => false)
+      const run = await startRetryRun(
+        'eager',
+        'eachBatch',
+        async (_payload, partition) => {
+          if (partition !== failing) return
+          await gate.promise
+          throw failure(true)
+        },
+        {
+          partitions: [0, 1],
+          records: { 'topic-a|0': [40], 'topic-a|1': [40] },
+          prepare: ({ coordinator }) => {
+            coordinator.offsetCommit.mockImplementationOnce(async () => {
+              gate.resolve()
+              throw denied
+            })
+          },
+          retry: { retries: 3, restartOnFailure: policy },
+          run: { partitionsConsumedConcurrently: 2 },
+        }
+      )
+      try {
+        await advanceUntil(() => run.crashes.length > 0, 5000)
+        expect(run.crashes).toHaveLength(1)
+        expect(run.crashes[0].error.name).toBe('KafkaJSNonRetriableError')
+        expect(inCauseChain(run.crashes[0].error, denied)).toBe(true)
+        expect(run.crashes[0].restart).toBe(false)
+        expect(policy).toHaveBeenCalledTimes(1)
+      } finally {
+        gate.resolve()
+      }
+    }
+  )
+
+  it('reports the join retrier exhaustion unchanged, with no Fetch after the rejoin starts', async () => {
+    const policy = jest.fn(async () => false)
+    const run = await startRetryRun('eager', 'eachMessage', async () => {}, {
+      retry: { restartOnFailure: policy },
+    })
+    const fetches = () => run.log.filter(({ kind }) => kind === 'fetch').length
+    await advanceUntil(() => fetches() > 0)
+    const joins = run.coordinator.joinGroup.mock.calls.length
+    run.coordinator.joinGroup.mockRejectedValue(protocolError(REBALANCE_IN_PROGRESS))
+    run.runner.rebalanceCoordinator.requestRejoin({
+      kind: 'revoked',
+      reason: 'rebalance-in-progress',
+      error: protocolError(REBALANCE_IN_PROGRESS),
+    })
+    const before = fetches()
+    await advanceUntil(() => run.crashes.length > 0, 10000)
+
+    expect(run.crashes).toHaveLength(1)
+    // retries 1: the second JoinGroup gives up after a 300 ms wait, at a 450 ms retry time.
+    expect(run.crashes[0].error).toMatchObject({
+      name: 'KafkaJSNumberOfRetriesExceeded',
+      retryCount: 1,
+      retryTime: 450,
+    })
+    expect(run.coordinator.joinGroup.mock.calls.length - joins).toBe(2)
+    expect(fetches()).toBe(before)
+    expect(policy).toHaveBeenCalledTimes(1)
+  })
+
+  it('retries a refused metadata refresh between SyncGroup and acceptance, with no Fetch in between', async () => {
+    const run = await startRetryRun('eager', 'eachMessage', async () => {})
+    const fetches = () => run.log.filter(({ kind }) => kind === 'fetch').length
+    await advanceUntil(() => fetches() > 0)
+    const accepted = []
+    run.consumer.on(run.consumer.events.GROUP_JOIN, ({ payload }) => {
+      accepted.push({ partitions: payload.memberAssignment['topic-a'], fetches: fetches() })
+    })
+    const refusal = new KafkaJSConnectionError('the broker went away')
+    const refreshes = run.cluster.refreshMetadata.mock.calls.length
+    run.state.partial.add('topic-a')
+    run.coordinator.syncGroup.mockResolvedValueOnce({
+      memberAssignment: MemberAssignment.encode({ version: 0, assignment: { 'topic-a': [0, 1] } }),
+    })
+    run.cluster.refreshMetadata.mockRejectedValueOnce(refusal)
+    run.runner.rebalanceCoordinator.requestRejoin({
+      kind: 'revoked',
+      reason: 'rebalance-in-progress',
+      error: protocolError(REBALANCE_IN_PROGRESS),
+    })
+    const before = fetches()
+    await advanceUntil(() => accepted.length > 0, 5000)
+
+    expect(accepted).toEqual([{ partitions: [0, 1], fetches: before }])
+    expect(run.cluster.refreshMetadata.mock.calls.length - refreshes).toBeGreaterThanOrEqual(2)
+    expect(run.crashes).toEqual([])
+    await closeClean(run)
+  })
 
   it.each(['stop', 'disconnect'])(
     '%s cancels handler backoff and releases the record',

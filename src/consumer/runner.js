@@ -185,7 +185,8 @@ module.exports = class Runner extends EventEmitter {
     /** @type {Map<string, { clearOffset: Long, retryCount: number, retryTime: number, assignmentToken: symbol }>} */
     this.partitionRetries = new Map()
     this.roundHandlerFailures = null
-    this.roundFetchError = null
+    /** The first non-handler error of the round: a failed Fetch or a worker's own request. */
+    this.roundLoopError = null
     this.handlerRetryDelay = 0
     this.cancelHandlerBackoff = null
     /** Set while an eager rebalance is stopping the world; see `handleRebalanceError`. */
@@ -516,17 +517,17 @@ module.exports = class Runner extends EventEmitter {
       }
 
       this.roundHandlerFailures = []
-      this.roundFetchError = null
+      this.roundLoopError = null
       let failure
       try {
         this.pollTimer.reset()
         await this.fetchManager.start()
       } catch (error) {
-        failure = error?.[HANDLER_DELIVERY] ? this.roundFetchError : { error }
+        failure = this.roundLoopError ?? (error?.[HANDLER_DELIVERY] ? null : { error })
       }
       const handlers = this.roundHandlerFailures
       this.roundHandlerFailures = null
-      this.roundFetchError = null
+      this.roundLoopError = null
       if (!handlers?.length) this.handlerRetryDelay = 0
       if (!handlers || this.stopRequested || this.retirement) return
 
@@ -554,21 +555,25 @@ module.exports = class Runner extends EventEmitter {
 
       const result = this.accountHandlerFailures(independent, verdict)
       if (result.error) return bail(markHandlerCrash(result.error))
-      const error =
+      const candidate =
         failure && !fetchVerdict && (!verdict || handlers.length) ? failure.error : result.outage
-      if (error && !obsoleteOwnership(group.ownership, error)) {
-        const delay = this.rideOutage(error)
-        if (delay !== undefined) {
-          if (result.delay === undefined) await sleep(delay)
-          else await this.waitForHandlerRetry(Math.max(delay, result.delay))
-          return true
-        }
-        if (
-          error.name === 'KafkaJSNotImplemented' ||
-          error.name === 'KafkaJSNoBrokerAvailableError'
-        ) {
-          return bail(error)
-        }
+      const error = candidate && !obsoleteOwnership(group.ownership, candidate) ? candidate : null
+      const ride = error ? this.rideOutage(error) : undefined
+      if (
+        ride === undefined &&
+        (error?.name === 'KafkaJSNotImplemented' || error?.name === 'KafkaJSNoBrokerAvailableError')
+      ) {
+        return bail(error)
+      }
+
+      // The handler round's backoff holds whichever way this attempt ends, so a ridden or counted
+      // loop error never admits the next Fetch sooner than the handler failures allow.
+      if (result.delay !== undefined)
+        await this.waitForHandlerRetry(Math.max(result.delay, ride ?? 0))
+      else if (ride !== undefined) await sleep(ride)
+      if (this.stopRequested || this.retirement) return
+      if (ride !== undefined) return true
+      if (error) {
         this.logger.debug('Error while scheduling fetch manager, trying again...', {
           groupId: group.groupId,
           memberId: group.memberId,
@@ -580,8 +585,6 @@ module.exports = class Runner extends EventEmitter {
         throw error
       }
 
-      if (result.delay !== undefined) await this.waitForHandlerRetry(result.delay)
-      if (this.stopRequested || this.retirement) return
       const queued = coordinator.takeVerdict()
       if (queued) await recover(queued)
     }
@@ -1346,7 +1349,7 @@ module.exports = class Runner extends EventEmitter {
    */
   fetchRetryDelay(error, nodeId) {
     const delay = this.fetchOutageDelay(error, nodeId)
-    if (delay === undefined && this.roundHandlerFailures) this.roundFetchError ??= { error }
+    if (delay === undefined && this.roundHandlerFailures) this.roundLoopError ??= { error }
     return delay
   }
 
@@ -1403,17 +1406,19 @@ module.exports = class Runner extends EventEmitter {
   /**
    * Carries the visible delivery range with the failure across the fetch workers. Each rejection
    * has its own envelope, even when concurrently failing handlers throw the same error object.
+   * Everything it records was read before the handler ran: the batch and its records are the
+   * application's to change.
    * @param {Error} error thrown by the handler
-   * @param {import('./batch')} batch the original batch
+   * @param {import('./handlerContext').BatchIdentity} identity the batch identity taken at hand-off
    * @param {string} first first visible offset in this callback
    * @param {string} last last visible offset in this callback
    * @param {boolean} captureDelivery whether the fetch loop owns the rejection
    * @returns {Error} the original failure or the private fetch-loop envelope
    */
-  handlerFailure(error, batch, first, last, captureDelivery) {
+  handlerFailure(error, identity, first, last, captureDelivery) {
     this.markOwnRequest(error, 'handler')
     if (!captureDelivery) return error
-    const { topic, partition, acquisition, acquireClock } = batch
+    const { topic, partition, acquisition, acquireClock } = identity
     const assignmentToken =
       acquisition?.positionChangedAt > acquireClock ? undefined : acquisition?.assignmentToken
     this.roundHandlerFailures?.push({
@@ -1530,16 +1535,17 @@ module.exports = class Runner extends EventEmitter {
   clearHandlerRetries() {
     this.partitionRetries.clear()
     this.roundHandlerFailures = null
-    this.roundFetchError = null
+    this.roundLoopError = null
     this.handlerRetryDelay = 0
     this.cancelHandlerBackoff?.()
   }
 
   /**
    * @param {import('./batch')} batch the delivered records
+   * @param {import('./handlerContext').BatchIdentity} identity the batch identity at hand-off
    * @param {boolean} [captureDelivery] whether to carry the delivery in a failure
    */
-  async processEachMessage(batch, captureDelivery) {
+  async processEachMessage(batch, identity, captureDelivery) {
     const { topic, partition } = batch
     const authority = this.resolutionAuthority(batch)
 
@@ -1556,6 +1562,7 @@ module.exports = class Runner extends EventEmitter {
         break
       }
 
+      const { offset } = message
       try {
         await this.eachMessage({
           topic,
@@ -1565,18 +1572,12 @@ module.exports = class Runner extends EventEmitter {
           pause,
         })
       } catch (e) {
-        const failure = this.handlerFailure(
-          e,
-          batch,
-          message.offset,
-          message.offset,
-          captureDelivery
-        )
+        const failure = this.handlerFailure(e, identity, offset, offset, captureDelivery)
         if (!isKafkaJSError(e)) {
           this.logger.error(`Error when calling eachMessage`, {
             topic,
             partition,
-            offset: message.offset,
+            offset,
             stack: e.stack,
             error: e,
           })
@@ -1612,12 +1613,16 @@ module.exports = class Runner extends EventEmitter {
 
   /**
    * @param {import('./batch')} batch the delivered records
+   * @param {import('./handlerContext').BatchIdentity} identity the batch identity at hand-off
    * @param {boolean} [captureDelivery] whether to carry the delivery in a failure
    */
-  async processEachBatch(batch, captureDelivery) {
+  async processEachBatch(batch, identity, captureDelivery) {
     const { topic, partition } = batch
     const authority = this.resolutionAuthority(batch)
     const lastFilteredMessage = batch.messages[batch.messages.length - 1]
+    // The delivered range, read before the handler can change `batch.messages`.
+    const deliveredFirst = batch.messages[0].offset
+    const deliveredLast = lastFilteredMessage.offset
 
     const pause = () => {
       this.consumerGroup.pause([{ topic, partitions: [partition] }])
@@ -1704,9 +1709,9 @@ module.exports = class Runner extends EventEmitter {
     } catch (e) {
       const failure = this.handlerFailure(
         e,
-        batch,
-        batch.messages[0].offset,
-        lastFilteredMessage.offset,
+        identity,
+        deliveredFirst,
+        deliveredLast,
         captureDelivery
       )
       if (!isKafkaJSError(e)) {
@@ -1974,13 +1979,14 @@ module.exports = class Runner extends EventEmitter {
    * installed, a current ownership no loss refuses, and the partition still owned under that same
    * acquisition. It then writes to that manager. An ordinary apply that renews the ownership keeps
    * all of these; a loss, a rebuilt manager or a revoke and reacquire does not. Classic and manual
-   * resolution write to the current manager, as before.
+   * resolution write to the current manager, as before, but a write made while the ownership
+   * carries a refusal is not accepted progress.
    * @param {import('./batch')} batch the batch the record came from
    * @param {string} offset the handled record's offset
    * @param {number} leaderEpoch the epoch of the record at `offset`, -1 when none
    * @param {ReturnType<Runner['resolutionAuthority']>} [authority] the handler's authority;
    *   captured now when omitted
-   * @returns {boolean} whether the current offset manager resolved the offset
+   * @returns {boolean} whether the offset was resolved as accepted progress
    */
   resolveBatchOffset(batch, offset, leaderEpoch, authority = this.resolutionAuthority(batch)) {
     if (this.isSuperseded(batch)) return false
@@ -2003,7 +2009,8 @@ module.exports = class Runner extends EventEmitter {
     const resolved =
       group.kind === 'consumer'
         ? authority.manager.resolveOffset({ topic, partition, offset, leaderEpoch })
-        : group.resolveOffset({ topic, partition, offset, leaderEpoch })
+        : group.resolveOffset({ topic, partition, offset, leaderEpoch }) === true &&
+          !group.ownership?.refusal(group.ownership.token())
     if (resolved && this.partitionRetries.size) this.clearResolvedRetry(batch, offset)
     return resolved === true
   }
@@ -2203,9 +2210,13 @@ module.exports = class Runner extends EventEmitter {
           partition,
         })
       } else if (this.eachMessage) {
-        await handlerContext.run(identity, () => this.processEachMessage(batch, captureDelivery))
+        await handlerContext.run(identity, () =>
+          this.processEachMessage(batch, identity, captureDelivery)
+        )
       } else if (this.eachBatch) {
-        await handlerContext.run(identity, () => this.processEachBatch(batch, captureDelivery))
+        await handlerContext.run(identity, () =>
+          this.processEachBatch(batch, identity, captureDelivery)
+        )
       }
 
       this.instrumentationEmitter.emit(END_BATCH_PROCESS, {
@@ -2246,6 +2257,13 @@ module.exports = class Runner extends EventEmitter {
 
     try {
       await onBatch(batch)
+    } catch (error) {
+      // The worker queue and the fetch manager keep only one rejection; the round keeps the first
+      // non-handler one beside the collected handler failures, whatever the batch order.
+      if (captureDelivery && this.roundHandlerFailures && !error?.[HANDLER_DELIVERY]) {
+        this.roundLoopError ??= { error }
+      }
+      throw error
     } finally {
       this.inFlightHandlers--
       this.endHookBatch(batch)

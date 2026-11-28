@@ -2,6 +2,7 @@ const describeThrown = require('../network/describeThrown')
 const handlerContext = require('./handlerContext')
 const RebalanceHooks = require('./rebalanceHooks')
 const { KafkaJSRebalanceNotConvergedError, isFencedInstance } = require('../errors')
+const { isErrorRetriable } = require('../retry')
 const {
   REBALANCE_PATHS,
   rebalanceAction,
@@ -300,7 +301,8 @@ module.exports = class RebalanceCoordinator {
    * @private
    * @param {string|null} reason
    * @param {'lost'|'revoked'|'initial'} kind
-   * @param {boolean} retryJoin whether to retry transient join failures during recovery
+   * @param {{ step?: { retryCount: number, retryTime: number } }} recovery foreground recovery
+   *   policy for transient failures of the join and the pre-install metadata
    * @returns {Promise<void>}
    * @throws {KafkaJSRebalanceNotConvergedError} when a classic cooperative chain does not converge
    */
@@ -355,13 +357,16 @@ module.exports = class RebalanceCoordinator {
         }
 
         const roundStartedAt = Date.now()
-        const result = await this.joinWithRecovery(round, recovery)
+        const result = await this.withRecovery(round, recovery, () =>
+          this.consumerGroup.joinAndSync(round)
+        )
         const applyResult = () =>
           this.consumerGroup.applyRebalanceResult(result, {
             rebuildOffsets,
             lost: kind === 'lost',
             round,
             ...(additionHold && { additionHold }),
+            ...(recovery.step && { recover: (step) => this.withRecovery(round, recovery, step) }),
           })
         // A listener's apply awaits user callbacks that carry their own deadline and retirement,
         // so their typed outcome is not raced against the round's wait.
@@ -437,17 +442,27 @@ module.exports = class RebalanceCoordinator {
   }
 
   /**
-   * Retries an error that escaped the join's own retry policy. The existing round keeps its
-   * deadline, assignment pin and listener state throughout the backoff.
+   * Runs one fallible step of a round that installs nothing (the join, or the metadata the apply
+   * needs before it installs the assignment) and, under foreground recovery, retries a retriable
+   * error that escaped it with the fetch loop's retry step. The round keeps its deadline,
+   * assignment pin and listener state throughout the backoff. A non-retriable error, such as the
+   * join's own `KafkaJSNumberOfRetriesExceeded`, ends the step unchanged.
+   * @template T
    * @param {object} round the active round and its cancellation scope
-   * @param {object} recovery foreground recovery policy, which can be acquired mid-join
-   * @returns {Promise<object>} the join result for this round to apply
+   * @param {{ step?: { retryCount: number, retryTime: number } }} recovery foreground recovery
+   *   policy, which can be acquired mid-round
+   * @param {() => Promise<T>} step the step to run again on a retriable failure
+   * @returns {Promise<T>} what the step returned
    */
-  async joinWithRecovery(round, recovery) {
+  async withRecovery(round, recovery, step) {
+    const terminal = (error) =>
+      round.guard() ||
+      !isErrorRetriable(error) ||
+      (this.consumerGroup.kind === 'consumer' && isConsumerProtocolFatal(error))
     try {
-      return await this.consumerGroup.joinAndSync(round)
+      return await step()
     } catch (firstError) {
-      if (!recovery.step || round.guard()) throw firstError
+      if (!recovery.step || terminal(firstError)) throw firstError
       let first = true
       return this.retryJoin(
         async (bail) => {
@@ -456,14 +471,9 @@ module.exports = class RebalanceCoordinator {
               first = false
               throw firstError
             }
-            return await this.consumerGroup.joinAndSync(round)
+            return await step()
           } catch (error) {
-            if (
-              round.guard() ||
-              (this.consumerGroup.kind === 'consumer' && isConsumerProtocolFatal(error))
-            ) {
-              return bail(error)
-            }
+            if (terminal(error)) return bail(error)
             throw error
           }
         },

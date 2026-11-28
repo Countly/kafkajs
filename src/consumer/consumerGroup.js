@@ -1080,17 +1080,20 @@ module.exports = class ConsumerGroup {
    * loss before it changes anything, so the runner's LOST round reports and discards it first.
    *
    * @param {{ assignment: Object, userData?: Buffer|null }} result the decoded sync result
-   * @param {{ rebuildOffsets?: boolean, lost?: boolean, round?: object, additionHold?: object }}
+   * @param {{ rebuildOffsets?: boolean, lost?: boolean, round?: object, additionHold?: object,
+   *   recover?: <T>(step: () => Promise<T>) => Promise<T> }}
    *   [options] `rebuildOffsets: false` selects the incremental apply; it still builds the first
    *   manager, because there is nothing to keep. `lost` marks the LOST round's apply.
    *   `additionHold` is the round's token for the partitions this apply adds: they are held before
    *   they are published and the caller releases the token once its assigned callback has returned.
+   *   `recover` is the round's foreground recovery: it retries the metadata refresh made before
+   *   anything is installed.
    * @returns {Promise<import('./groupProtocol/interface').RebalanceResult>}
    * @throws {Error} the round's refusal, the fatal error, or the loss the ownership carries
    */
   async applyRebalanceResult(
     result,
-    { rebuildOffsets = true, lost = false, round, additionHold } = {}
+    { rebuildOffsets = true, lost = false, round, additionHold, recover } = {}
   ) {
     const check = () => {
       const membershipError =
@@ -1172,8 +1175,10 @@ module.exports = class ConsumerGroup {
 
         // If the consumer is not aware of all assigned partitions, refresh metadata
         // and update the list of partitions per subscribed topic. It's enough to perform
-        // this operation once since refresh metadata will update metadata for all topics
-        await this.cluster.refreshMetadata({ guard: round?.guard })
+        // this operation once since refresh metadata will update metadata for all topics.
+        // Nothing is installed yet, so foreground recovery may retry the refresh alone.
+        const refresh = () => this.cluster.refreshMetadata({ guard: round?.guard })
+        await (recover ? recover(refresh) : refresh())
         check()
         this.partitionsPerSubscribedTopic = this.generatePartitionsPerSubscribedTopic()
         break
