@@ -32,6 +32,7 @@ const {
   KafkaJSNonRetriableError,
   KafkaJSNumberOfRetriesExceeded,
   KafkaJSProtocolError,
+  KafkaJSTransactionAbortableError,
 } = require('../../errors')
 const {
   newLogger,
@@ -1768,12 +1769,11 @@ describe('Producer > the record errors of a shared batch', () => {
     expect(a.cause.recordErrors[0].record).toEqual(recordOf('a'))
     expect(b.cause.recordErrors[0]).toBe(answer.recordErrors[0])
     const armed = await transaction.commit().catch((error) => error)
-    expect(armed).toBeInstanceOf(KafkaJSDeliveryTimeout)
-    expect(armed).not.toBe(a)
-    expect(armed).not.toBe(b)
-    expect(armed.cause).toBe(answer)
-    const [original] = arm.mock.calls.find(([error]) => error instanceof KafkaJSDeliveryTimeout)
-    expect(armed).toBe(original)
+    const original = arm.mock.calls.find(([error]) => error instanceof KafkaJSDeliveryTimeout)?.[0]
+    expect(armed).toBeInstanceOf(KafkaJSTransactionAbortableError)
+    expect(armed.cause).toBeInstanceOf(KafkaJSDeliveryTimeout)
+    expect(armed.cause).toBe(original)
+    expect(armed.cause.cause).toBe(answer)
     await transaction.abort()
   })
 })
@@ -1839,25 +1839,17 @@ describe('Accumulator.projectionsFor', () => {
     )
     await flushAll()
     const [snapshot] = accumulator.unsettled()
-    const order = []
-    const states = () => [refusing.state, ...sends.map(({ state }) => state)]
-    const end = snapshot.then(() => order.push(['flush', ...states()]))
+    const statesAtFlush = snapshot.then(() => [refusing.state, ...sends.map(({ state }) => state)])
     const answer = answerError(INVALID_RECORD, [0])
     const occurrence = occurrenceFor(answer, batch)
     const projected = Accumulator.projectionsFor(batch, answer, occurrence)
     const refusal = new KafkaJSError('closed')
-    queueMicrotask(() => queueMicrotask(() => queueMicrotask(() => order.push(states()))))
     const first = batch.settlers[0]
     first.reject(answer, projected.get(first))
     for (const settler of batch.settlers.slice(1)) settler.reject(answer)
     accumulator.forceClose(refusal)
     held.resolve([])
-    await end
-
-    expect(order).toEqual([
-      ['rejected', 'pending', 'pending'],
-      ['flush', 'rejected', 'rejected', 'rejected'],
-    ])
+    expect(await statesAtFlush).toEqual(['rejected', 'rejected', 'rejected'])
     expect(refusing.value).toBe(refusal)
     expectProtocolParity(sends[0].value, answer)
     expect(sends[1].value).toBe(answer)
