@@ -151,8 +151,11 @@ describe('Consumer > the fetch layer follows a changed assignment without a rest
     prepareRecordBatches,
     createFetchGroup,
     fetchResponse,
+    trackFixtures,
     TOPIC,
   } = require('./fixtures/fetchHarness')
+
+  trackFixtures()
 
   beforeAll(async () => {
     await prepareRecordBatches()

@@ -6,7 +6,9 @@ const Subscription = require('../subscription')
 const { FetchSessions } = require('../fetchSession')
 const dictionary = require('../../utils/dictionary')
 const ResetObligations = require('../offsetManager/resetObligations')
-const { createFetchGroup, TOPIC } = require('./fixtures/fetchHarness')
+const { createFetchGroup, trackFixtures, TOPIC } = require('./fixtures/fetchHarness')
+
+trackFixtures()
 
 describe.each(['classic', 'consumer'])('%s retention core', (kind) => {
   it('bounds pause, configuration, replica, grown-name and queued-seek state over churn', () => {
@@ -378,18 +380,11 @@ describe('recreation debt', () => {
 })
 
 describe('retention on the real apply paths', () => {
-  let h
-  afterEach(async () => {
-    if (h) await h.broker.disconnect()
-    h = null
-  })
-
   describe.each([true, false])(
     'both assignment branches drop orphan seeks and replicas',
     (rebuild) => {
       it(`rebuildOffsets ${rebuild}`, async () => {
-        h = await createFetchGroup({ partitions: [0, 1] })
-        const { group } = h
+        const { group } = await createFetchGroup({ partitions: [0, 1] })
         group.partitionsPerSubscribedTopic = group.generatePartitionsPerSubscribedTopic()
         await group.applyRebalanceResult({ assignment: { [TOPIC]: [0, 1] } })
         group.pause([{ topic: TOPIC, partitions: [0] }])

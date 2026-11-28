@@ -9,8 +9,10 @@ const {
   fetchResponse,
   offsetForLeaderEpochResponse,
   createFetchGroup,
+  trackFixtures,
 } = require('./fixtures/fetchHarness')
 
+trackFixtures()
 beforeAll(prepareRecordBatches)
 
 /**
