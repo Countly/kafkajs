@@ -836,7 +836,12 @@ describe('Test harness > fake broker close', () => {
   test('an async answer that closes and rejects leaves no unhandled rejection', () => {
     // Observe Node's unhandled-rejection events outside the Jest worker.
     const script = `
-      const { apiVersionsBody, createFakeBroker, TOPIC } = require(process.argv[1])
+      const { apiVersionsBody, createFakeBroker, TOPIC, trackFixtures } = require(process.argv[1])
+      let after
+      trackFixtures({
+        beforeEach: (hook) => hook(),
+        afterEach: (hook) => { after = hook },
+      })
       const unhandled = []
       process.on('unhandledRejection', (error) => unhandled.push(error.message))
       async function main() {
@@ -853,6 +858,7 @@ describe('Test harness > fake broker close', () => {
           }],
         }).then(() => 'answered', (error) => error.name)
         await fake.close()
+        await after()
         await new Promise(setImmediate)
         process.stdout.write(JSON.stringify({ outcome, unhandled }))
       }
@@ -1420,7 +1426,7 @@ describe('Test harness > fixture tracking', () => {
 
   test('the work each fixture left is read as the test ends, before a newer release can settle it, and a fixture a release creates is read as its own release begins', async () => {
     const order = []
-    let olderWork = ['an OffsetForLeaderEpoch request']
+    const olderWork = ['an OffsetForLeaderEpoch request']
     const tracker = new FixtureTracker()
     tracker.add('older', {
       release: async () => order.push('older'),
@@ -1434,7 +1440,7 @@ describe('Test harness > fixture tracking', () => {
       release: async () => {
         order.push('newer')
         // Settles the older fixture's work, as a release that answers a shared request would.
-        olderWork = []
+        olderWork.length = 0
         tracker.add('late', {
           release: async () => order.push('late'),
           outstanding: () => {
@@ -1590,8 +1596,6 @@ describe('Test harness > fixture tracking', () => {
   })
 
   test('a dropped broker connect rejected before setup surfaces as unhandled before teardown', () => {
-    const { execFileSync } = require('node:child_process')
-    const { resolve } = require('node:path')
     // Run outside Jest so Node can report the unhandled rejection without failing this worker.
     const script = `
       const { createFakeBroker, trackFixtures } = require(process.argv[1])
@@ -1621,11 +1625,7 @@ describe('Test harness > fixture tracking', () => {
     const report = execFileSync(
       process.execPath,
       ['--unhandled-rejections=throw', '-e', script, require.resolve('./fixtures/fetchHarness')],
-      {
-        env: { ...process.env, NODE_PATH: resolve(__dirname, '../../..') },
-        encoding: 'utf8',
-        timeout: 5000,
-      }
+      { env: { NODE_PATH: resolve(__dirname, '../../..') }, encoding: 'utf8', timeout: 10000 }
     )
     expect(JSON.parse(report)).toEqual({ unhandled: [true], sockets: 0 })
   })
@@ -1646,11 +1646,73 @@ describe('Test harness > fixture tracking', () => {
         'createFakeBroker: after its teardown it still holds 1 live socket at 127.0.0.1:9092'
       )
       expect(disconnect).toHaveBeenCalledWith({ drainTimeout: 0 })
+      expect(state.sockets.map(({ destroyed }) => destroyed)).toEqual([true])
     } finally {
       disconnect.mockRestore()
       await broker.disconnect({ drainTimeout: 0 })
     }
-    expect(state.sockets.map(({ destroyed }) => destroyed)).toEqual([true])
+  })
+
+  test('with the clock frozen a no-op disconnect during ApiVersions reports both leaks and still releases every fixture', async () => {
+    const { hooks, api } = manualHooks()
+    const harness = isolatedHarness()
+    harness.trackFixtures(api)
+    hooks.before()
+    const older = harness.createFakeBroker(() => Buffer.alloc(0))
+    const releaseOlder = jest.spyOn(older.broker, 'disconnect')
+    const withheld = harness.withheldAnswer()
+    const answer = jest.fn(() => withheld.promise)
+    const { broker, state } = harness.createFakeBroker(answer)
+    freezeClock()
+    const disconnect = jest.spyOn(broker, 'disconnect').mockResolvedValue()
+
+    try {
+      const connected = jest.fn()
+      broker.connect().then(
+        () => connected('connected'),
+        (error) => connected(error.name)
+      )
+      await reactions()
+      jest.advanceTimersByTime(0)
+      await reactions()
+      jest.advanceTimersByTime(0)
+      await reactions()
+
+      const [socket] = state.sockets
+      const [frame] = socket.writes
+      const header = readRequestHeader(frame)
+      expect(header.apiKey).toBe(apiKeys.ApiVersions)
+      expect(answer).toHaveBeenCalledWith(header, frame)
+      expect(connected).not.toHaveBeenCalled()
+      expect(jest.getTimerCount()).toBeGreaterThan(0)
+
+      const outcome = jest.fn()
+      hooks.after().then(
+        () => outcome('released'),
+        (error) => outcome(error.message, [...connected.mock.calls])
+      )
+      await reactions()
+
+      const request = `ApiVersions request (correlation id ${header.correlationId}) at 127.0.0.1:9092`
+      expect(outcome).toHaveBeenCalledTimes(1)
+      const [[message, connectOutcome]] = outcome.mock.calls
+      expect(message).toContain(
+        'createFakeBroker: the test ended with work in flight, which its teardown abandoned: ' +
+          `a broker connect at 127.0.0.1:9092, ${request}`
+      )
+      expect(message).toContain(
+        `after its teardown it still holds 1 live socket at 127.0.0.1:9092, ${request}`
+      )
+      expect(connectOutcome).toEqual([['KafkaJSConnectionClosedError']])
+      expect(disconnect).toHaveBeenCalledTimes(1)
+      expect(releaseOlder).toHaveBeenCalledTimes(1)
+      expect(socket.destroyed).toBe(true)
+      expect(jest.getTimerCount()).toBe(0)
+    } finally {
+      disconnect.mockRestore()
+      releaseOlder.mockRestore()
+      jest.useRealTimers()
+    }
   })
 
   test("a second copy of the harness shares the running test's tracker, and refuses a second trackFixtures", async () => {

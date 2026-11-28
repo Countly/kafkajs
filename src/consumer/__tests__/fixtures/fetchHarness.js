@@ -10,7 +10,7 @@ const OffsetManager = require('../../offsetManager')
 const { MemberAssignment } = require('../../assignerProtocol')
 const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
 const apiKeys = require('../../../protocol/requests/apiKeys')
-const { KafkaJSConnectionError } = require('../../../errors')
+const { KafkaJSConnectionClosedError, KafkaJSConnectionError } = require('../../../errors')
 const { errorCodes } = require('../../../protocol/error')
 const { responseHeaderVersion } = require('../../../protocol/headers')
 const { RecordBatch } = require('../../../protocol/recordBatch/v0')
@@ -73,7 +73,7 @@ class FixtureTracker {
     let failure = null
     const read = (entry) => {
       try {
-        return entry.outstanding()
+        return [...entry.outstanding()]
       } catch (error) {
         failure ??= { error }
         return []
@@ -84,6 +84,10 @@ class FixtureTracker {
       const abandoned = atTestEnd.get(entry) ?? read(entry)
       try {
         await entry.release()
+      } catch (error) {
+        failure ??= { error }
+      }
+      try {
         const held = entry.remains()
         const problems = []
         if (abandoned.length > 0) {
@@ -99,6 +103,18 @@ class FixtureTracker {
     }
     this.closed = true
     if (failure) throw failure.error
+  }
+}
+
+/**
+ * Lets tracked work settle while leaving the clock frozen.
+ * @param {() => boolean} isDone whether all tracked work settled
+ * @param {number} budget maximum number of microtask turns
+ * @returns {Promise<void>}
+ */
+const drainMicrotasks = async (isDone, budget) => {
+  for (let ticks = 0; ticks < budget && !isDone(); ticks += 1) {
+    await Promise.resolve()
   }
 }
 
@@ -805,11 +821,10 @@ const readFrameHeader = (frame) => {
  * request and socket (`KafkaJSConnectionError` 'The fake broker was closed'), and cancels all
  * queued work; it then closes the connection without draining, which rejects every request the
  * broker never answered (queued, withheld, or mid-handshake) with `KafkaJSConnectionClosedError`
- * and aborts a connect still in progress. It resolves once the connection is closed and every
- * `broker.connect()` called before has settled, one still waiting for the broker lock included,
- * so none settles after its test. A frame
- * written to a socket afterwards is recorded and never answered. No answer may run after its
- * test, so `createFakeBroker` closes it when the test ends.
+ * and aborts a connect still in progress. It records any transport left by disconnect before
+ * forcing it closed, then gives pending connects a bounded number of microtasks to settle. The
+ * tracker reports the recorded transport and any work that still has not settled. A frame
+ * written to a socket afterwards is recorded and never answered.
  *
  * A Buffer is played back at once. A thenable is a withheld answer: it is played back when it
  * resolves, and later requests are answered meanwhile. A broker answers one connection in order;
@@ -1050,54 +1065,34 @@ const buildFakeBroker = (answer, chunks) => {
   const broker = new Broker({ connectionPool, logger: newLogger() })
 
   /**
-   * Completion signals for every `broker.connect()` still running, including calls that have
+   * Entries for every `broker.connect()` still running, including calls that have
    * yet to acquire the broker lock or start connection setup.
-   * @type {Set<Promise<void>>}
+   * @type {Set<symbol>}
    */
   const connects = new Set()
   const connect = broker.connect.bind(broker)
   /**
-   * Tracks `connect` from entry through settlement. Close joins the private completion signal
-   * so a rejection of the caller's promise is reported normally if the caller drops it.
+   * Tracks `connect` from entry through settlement and propagates its outcome to the caller.
    * @param {...*} args what `Broker#connect` takes
    * @returns {Promise<void>} the caller's connect outcome
    */
   broker.connect = async (...args) => {
-    let complete
-    /** @type {Promise<void>} */
-    const settled = new Promise((resolve) => {
-      complete = resolve
-    })
-    connects.add(settled)
+    const pendingConnect = Symbol('pending broker connect')
+    connects.add(pendingConnect)
     try {
       return await connect(...args)
     } finally {
-      connects.delete(settled)
-      complete()
+      connects.delete(pendingConnect)
     }
   }
 
   /**
-   * Closes the fake broker for good, as the factory's documentation says.
-   * @returns {Promise<void>} the one close every caller shares
-   */
-  const close = () =>
-    (closing ??= (async () => {
-      closed = true
-      for (const socket of owned.keys()) cancelSocket(socket)
-      await broker.disconnect({ drainTimeout: 0 })
-      while (connects.size > 0) await Promise.all(connects)
-    })())
-
-  /**
-   * The work the broker has not finished, read from its own state: every `broker.connect()` not
-   * yet settled, a connection setup in progress and every request still queued or in flight.
+   * The setup and requests still owned by the connection.
    * @returns {string[]}
    */
-  const unfinished = () => {
+  const connectionWork = () => {
     const { inflight, pending } = connection.requestQueue
     return [
-      ...[...connects].map(() => 'a broker connect'),
       ...(connection.setupAttempt ? ['a connection setup'] : []),
       ...[...inflight.values(), ...pending].map(
         ({ entry, correlationId }) => `${entry.apiName} request (correlation id ${correlationId})`
@@ -1105,21 +1100,74 @@ const buildFakeBroker = (answer, chunks) => {
     ]
   }
 
+  /** @returns {string[]} the broker calls that still have to settle */
+  const pendingConnects = () => Array.from(connects, () => 'a broker connect')
+
   /**
    * The work in flight that a close would abandon; none once a close has begun, which is what
    * a test that means to abandon work calls.
    * @returns {string[]}
    */
-  const inFlight = () => (closed ? [] : unfinished())
+  const inFlight = () => (closed ? [] : [...pendingConnects(), ...connectionWork()])
 
   /**
-   * What the fake broker still holds, read from the sockets and the connection themselves.
-   * @returns {string[]} a socket not destroyed, then the connection's unfinished work
+   * The resources normal disconnect must release before it returns.
+   * @returns {string[]} live sockets and the work still owned by the connection
    */
-  const holds = () => {
+  const transportHolds = () => {
     const live = state.sockets.filter((socket) => !socket.destroyed).length
-    return [...(live > 0 ? [`${live} live socket${live === 1 ? '' : 's'}`] : []), ...unfinished()]
+    return [
+      ...(live > 0 ? [`${live} live socket${live === 1 ? '' : 's'}`] : []),
+      ...connectionWork(),
+    ]
   }
+
+  /** @type {string[]} transport left behind by normal disconnect */
+  let residual = []
+
+  /**
+   * Closes the broker, records any transport left by disconnect and releases it before draining
+   * the resulting connect reactions. A failed disconnect is rethrown after cleanup.
+   * @returns {Promise<void>} the one close every caller shares
+   */
+  const close = () =>
+    (closing ??= (async () => {
+      closed = true
+      for (const socket of owned.keys()) cancelSocket(socket)
+      let failure = null
+      try {
+        await broker.disconnect({ drainTimeout: 0 })
+      } catch (error) {
+        failure = { error }
+      }
+      residual = transportHolds()
+
+      if (residual.length > 0) {
+        try {
+          connection.failGeneration(
+            new KafkaJSConnectionClosedError('Closed connection', {
+              host: connection.host,
+              port: connection.port,
+            })
+          )
+        } catch (error) {
+          failure ??= { error }
+        }
+        for (const socket of state.sockets) {
+          if (socket.destroyed) continue
+          try {
+            socket.destroy()
+          } catch (error) {
+            failure ??= { error }
+          }
+        }
+      }
+      await drainMicrotasks(() => connects.size === 0, Math.max(32, connects.size * 8))
+      if (failure) throw failure.error
+    })())
+
+  /** @returns {string[]} transport leaks and work still unsettled after close */
+  const holds = () => [...new Set([...residual, ...transportHolds(), ...pendingConnects()])]
 
   return { broker, state, close, inFlight, holds }
 }
@@ -1515,7 +1563,7 @@ const createFetchGroup = async ({
   /**
    * Every `cluster.findBroker` that waits, for a hold or its node's broker, from its call until it
    * settles.
-   * @type {Set<{ nodeId: number, settled: Promise<void> }>}
+   * @type {Set<{ nodeId: number }>}
    */
   const lookups = new Set()
   let tornDown = false
@@ -1543,7 +1591,8 @@ const createFetchGroup = async ({
    * queued runs on a later turn. The test's tracker runs it when the test ends, so a failed
    * assertion cannot leave a withheld answer or a held lookup pending; a spec may call it earlier.
    * The cleanup runs once; every caller waits for that same cleanup, which closes every node and
-   * waits for every lookup to settle before it rejects with the first close failure.
+   * drains lookup reactions within a finite microtask budget before reporting the first close
+   * failure. The tracker reports any lookup that has not settled.
    * @returns {Promise<void>}
    */
   const teardown = () =>
@@ -1553,7 +1602,7 @@ const createFetchGroup = async ({
         for (const hold of [...holds]) hold.release()
       }
       const closes = await Promise.allSettled([...nodeBrokers.values()].map(({ close }) => close()))
-      await Promise.all([...lookups].map(({ settled }) => settled))
+      await drainMicrotasks(() => lookups.size === 0, Math.max(32, lookups.size * 8))
       const failure = closes.find(({ status }) => status === 'rejected')
       if (failure) throw failure.reason
     })())
@@ -1675,8 +1724,7 @@ const createFetchGroup = async ({
       // The default path resolves in the same turns it always did.
       if (!validationBrokers && heldLookups.size === 0) return broker
       const nodeId = Number(args.nodeId)
-      let settle
-      const lookup = { nodeId, settled: new Promise((done) => (settle = done)) }
+      const lookup = { nodeId }
       lookups.add(lookup)
       try {
         while (heldLookups.has(nodeId)) {
@@ -1695,7 +1743,6 @@ const createFetchGroup = async ({
         return found
       } finally {
         lookups.delete(lookup)
-        settle()
       }
     },
     findGroupCoordinator: async () => coordinator,

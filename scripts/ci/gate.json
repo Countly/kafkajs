@@ -7721,6 +7721,7 @@
         "src/consumer/__tests__/scriptedEpochLog.spec.js \u203a Test harness > fixture tracking a test that ends with a request in flight fails at teardown, naming the creator, request, correlation id and endpoint, once the request is rejected",
         "src/consumer/__tests__/scriptedEpochLog.spec.js \u203a Test harness > fixture tracking a fetch group that ends with a validation request in flight fails at teardown, naming the node",
         "src/consumer/__tests__/scriptedEpochLog.spec.js \u203a Test harness > fixture tracking a fixture whose disconnect returns without closing its socket fails at teardown, naming what it still holds",
+        "src/consumer/__tests__/scriptedEpochLog.spec.js \u203a Test harness > fixture tracking with the clock frozen a no-op disconnect during ApiVersions reports both leaks and still releases every fixture",
         "src/consumer/__tests__/scriptedEpochLog.spec.js \u203a Test harness > fixture tracking a second copy of the harness shares the running test's tracker, and refuses a second trackFixtures",
         "src/consumer/__tests__/scriptedEpochLog.spec.js \u203a Test harness > fixture tracking trackFixtures tears down every fixture a test created when the test ends, last created first",
         "src/consumer/__tests__/scriptedEpochLog.spec.js \u203a Test harness > fixture tracking createFetchGroup, createFakeBroker and createFakeCoordinator throw naming themselves with its tracked test already ended",
