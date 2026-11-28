@@ -63,6 +63,16 @@ const unsupportedReason = (factory) => {
 const lookupCodec = (type) => (Codecs[type] ? Codecs[type]() : null)
 
 /**
+ * Runs a registry factory the way a lookup does, with the registry as `this`, for a factory that
+ * was taken from it earlier and must not be looked up again. A factory registered by the caller
+ * may rely on that receiver. The call operation is the language's own, not a `call` property.
+ * @param {Function} factory a function read from `Codecs`
+ * @returns {object} the codec
+ * @throws {KafkaJSNotImplemented} same as `lookupCodec`
+ */
+const createCodec = (factory) => Reflect.apply(factory, Codecs, [])
+
+/**
  * @param {number} attributes the record batch / message-set attributes byte
  * @returns {?object} the codec encoded in the low 3 bits, or `null` for none
  * @throws {KafkaJSNotImplemented} same as `lookupCodec`
@@ -137,6 +147,7 @@ module.exports = {
   BUILT_IN,
   unsupportedReason,
   lookupCodec,
+  createCodec,
   lookupCodecByAttributes,
   decompressBounded,
   codecName,

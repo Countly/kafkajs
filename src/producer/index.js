@@ -551,8 +551,6 @@ const createProducer = ({
     lifecycle.check()
     throwIfFatal()
 
-    const { send: sendTxn, sendBatch: sendBatchTxn } = transactionalMessageProducer
-
     let transactionDidEnd = false
     endPrevious()
     endPrevious = () => {
@@ -577,9 +575,29 @@ const createProducer = ({
     }
 
     /**
-     * Wraps `send`, `sendBatch` or `sendOffsets`: refused once the transaction has ended, with the
-     * armed error while it can only be aborted or the producer is unusable, while its commit is
-     * pending, and once it is ending.
+     * The one eligibility rule of the transaction's operations: refused once the transaction has
+     * ended, with the armed error while it can only be aborted or the producer is unusable, while
+     * its commit is pending, and once it is ending. Asked when an operation is called and, for a
+     * send, again once the caller's own conversions have run, which can end the transaction.
+     * @param {string} method the name the pending-commit error gives the call
+     * @returns {?Error} why the operation is refused now; null when it may go on
+     */
+    const refusalOf = (method) => {
+      if (transactionDidEnd) {
+        return endedTransactionError()
+      }
+      const state = stateManager.state()
+      if (isArmed(state)) {
+        return stateManager.transaction.armedError()
+      }
+      if (stateManager.transaction.commitPending()) {
+        return TransactionState.pendingCommitError(method)
+      }
+      return ending !== null || state !== IN_TRANSACTION ? endedTransactionError() : null
+    }
+
+    /**
+     * Wraps `send`, `sendBatch` or `sendOffsets` with `refusalOf`.
      * @param {string} method the name the pending-commit error gives the call
      * @param {Function} fn
      * @returns {Function}
@@ -587,22 +605,12 @@ const createProducer = ({
     const transactionGuard =
       (method, fn) =>
       (...args) => {
-        if (transactionDidEnd) {
-          return Promise.reject(endedTransactionError())
-        }
-        const state = stateManager.state()
-        if (isArmed(state)) {
-          return Promise.reject(stateManager.transaction.armedError())
-        }
-        if (stateManager.transaction.commitPending()) {
-          return Promise.reject(TransactionState.pendingCommitError(method))
-        }
-        if (ending !== null || state !== IN_TRANSACTION) {
-          return Promise.reject(endedTransactionError())
-        }
-
-        return track(fn(...args))
+        const refused = refusalOf(method)
+        return refused === null ? track(fn(...args)) : Promise.reject(refused)
       }
+
+    const { send: sendTxn, sendBatch: sendBatchTxn } =
+      transactionalMessageProducer.sendersWith(refusalOf)
 
     /**
      * Ends the transaction once its own operations have settled. A `commit()` or `abort()` called

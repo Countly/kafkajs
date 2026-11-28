@@ -3,6 +3,7 @@ const { Kafka, CompressionTypes, CompressionCodecs } = require('../../../index')
 const {
   KafkaJSDeliveryTimeout,
   KafkaJSInvalidConfigurationError,
+  KafkaJSNonRetriableError,
   KafkaJSNotImplemented,
 } = require('../../errors')
 const apiKeys = require('../../protocol/requests/apiKeys')
@@ -20,6 +21,8 @@ const { TOPIC } = require('../../consumer/__tests__/fixtures/fetchHarness')
 const VALUE = 'send-option-row'
 const MESSAGES = [{ value: VALUE, timestamp: 1000 }]
 const ORIGINAL_CODECS = { ...CompressionCodecs }
+/** A registry key that is a symbol, registered as an alias by the rows that need one. */
+const ALIAS = Symbol('gzip alias')
 /** The real admission, taken before any spy replaces it, for spies that log and call through. */
 const ADMIT = Admission.prototype.acquire
 const CODECS = { 1: gzip, 2: snappy, 3: lz4, 4: zstd }
@@ -88,13 +91,14 @@ const producedBy = (cluster) =>
 class Rig {
   /**
    * @param {object} [options] producer options over `linger: 0`
-   * @param {{ silent?: boolean, partitions?: number }} [setup] `silent`: the broker never answers
-   *   a Produce request, as a broker does not answer one with acks 0
+   * @param {{ silent?: boolean, partitions?: number, profile?: string }} [setup] `silent`: the
+   *   broker never answers a Produce request, as a broker does not answer one with acks 0;
+   *   `profile`: what the cluster advertises, `tv2` for a transactional producer
    * @returns {Promise<Rig>} connected
    */
-  static async start(options = {}, { silent = false, partitions = 2 } = {}) {
+  static async start(options = {}, { silent = false, partitions = 2, profile } = {}) {
     const cluster = producerScript(
-      createScriptedCluster({ nodes: [{ id: 0, host: 'node0', port: 9092 }] }),
+      createScriptedCluster({ nodes: [{ id: 0, host: 'node0', port: 9092 }], profile }),
       { topic: TOPIC, partitions }
     )
     if (silent) cluster.answer('Produce', () => new Promise(() => {}))
@@ -137,6 +141,13 @@ const runs = (codec) => (codec === 3 ? lz4.isSupported : codec === 4 ? zstd.isSu
 const acks = (value) => () => ({ acks: value })
 const timeout = (value) => () => ({ timeout: value })
 const compression = (value) => () => ({ compression: value })
+
+/**
+ * @param {Function} method a conversion method
+ * @returns {Function} `method` with an own `call` that is not the language's, so only an
+ *   invocation that never reads `call` can run it
+ */
+const shadowed = (method) => Object.defineProperty(method, 'call', { value: undefined })
 
 const ACKS_WRITTEN = [
   ['absent', -1, () => ({})],
@@ -191,6 +202,17 @@ const ACKS_WRITTEN = [
     () => ({ acks: { valueOf: () => ({}), toString: () => '1' } }),
   ],
   ["{ toString: () => '-1' }", -1, () => ({ acks: { toString: () => '-1' } })],
+  ['a valueOf whose own call is undefined', 1, () => ({ acks: { valueOf: shadowed(() => 1) } })],
+  [
+    'a toString whose own call is undefined',
+    -1,
+    () => ({ acks: { toString: shadowed(() => '-1') } }),
+  ],
+  [
+    'a Symbol.toPrimitive whose own call is undefined',
+    1,
+    () => ({ acks: { [Symbol.toPrimitive]: shadowed(() => '1') } }),
+  ],
   ['new Date(1)', 1, () => ({ acks: new Date(1) })],
   ['new Date(-1)', -1, () => ({ acks: new Date(-1) })],
   ['new Date(0)', 0, () => ({ acks: new Date(0) })],
@@ -322,6 +344,10 @@ const COMPRESSION_REFUSED = [
     "{ valueOf: () => 2, toString: () => '1' }",
     () => ({ compression: { valueOf: () => 2, toString: () => '1' } }),
   ],
+  [
+    "{ [Symbol.toPrimitive]: (hint) => (hint === 'number' ? 1 : '0') }",
+    () => ({ compression: { [Symbol.toPrimitive]: (hint) => (hint === 'number' ? 1 : '0') } }),
+  ],
   ['9', compression(9)],
   ['-7', compression(-7)],
   ['1.5', compression(1.5)],
@@ -381,6 +407,14 @@ const REGISTRY_WRITTEN = [
       CompressionCodecs[9] = CompressionCodecs[1]
     },
     () => ({ compression: new Number(9) }),
+  ],
+  [
+    'an object that is 1 as a number and a symbol registered as CompressionCodecs[1] as a string',
+    1,
+    () => {
+      CompressionCodecs[ALIAS] = CompressionCodecs[1]
+    },
+    () => ({ compression: { [Symbol.toPrimitive]: (hint) => (hint === 'number' ? 1 : ALIAS) } }),
   ],
   [
     "0 with a function registered under '0'",
@@ -451,7 +485,7 @@ describe('Producer > send options', () => {
     } finally {
       rig = null
       jest.restoreAllMocks()
-      for (const key of Object.keys(CompressionCodecs)) {
+      for (const key of Reflect.ownKeys(CompressionCodecs)) {
         if (!(key in ORIGINAL_CODECS)) delete CompressionCodecs[key]
       }
       for (const [key, factory] of Object.entries(ORIGINAL_CODECS)) {
@@ -616,6 +650,14 @@ describe('Producer > send options', () => {
         },
       }))
       expect(error.cause).toBe(thrown)
+    })
+
+    test('a symbol key with no codec is refused naming the symbol, not as an unconvertible value', async () => {
+      const error = await expectRefused(() => ({
+        compression: { [Symbol.toPrimitive]: (hint) => (hint === 'number' ? 1 : ALIAS) },
+      }))
+      expect(error.message).toContain('CompressionCodecs[Symbol(gzip alias)]')
+      expect(error.cause).toBeUndefined()
     })
 
     test('a built-in codec this platform cannot run is refused at the call with KafkaJSNotImplemented', async () => {
@@ -953,5 +995,105 @@ describe('Producer > send options', () => {
         expect(batches[1].body.subarray(0, MARK.length)).toEqual(MARK)
       }
     )
+
+    test.each(PATHS)(
+      'on %s a factory that needs the registry as its receiver is called with it for the batch of its send, after the registry entry is replaced',
+      async (_, options) => {
+        const receivers = []
+        const factory = function () {
+          receivers.push(this)
+          return {
+            compress: async ({ buffer }) => Buffer.concat([MARK, buffer]),
+            decompress: async (buffer) => buffer.subarray(MARK.length),
+          }
+        }
+        const replaced = replacement()
+        rig = await Rig.start({ ...options, linger: 60000 })
+        CompressionCodecs[CompressionTypes.GZIP] = factory
+        const sent = rig.producer.send({
+          topic: TOPIC,
+          compression: CompressionTypes.GZIP,
+          messages: [{ value: VALUE, timestamp: 1000, partition: 0 }],
+        })
+        CompressionCodecs[CompressionTypes.GZIP] = replaced
+        await rig.producer.flush()
+        await expect(sent).resolves.toHaveLength(1)
+
+        expect(receivers.length).toBeGreaterThan(0)
+        for (const receiver of receivers) expect(receiver === CompressionCodecs).toBe(true)
+        expect(replaced).not.toHaveBeenCalled()
+        const [{ partitions }] = rig.produced()
+        expect(partitions[0].body.subarray(0, MARK.length)).toEqual(MARK)
+      }
+    )
+  })
+
+  describe('a transaction that ends while a send converts its options', () => {
+    /** The Produce requests the cluster saw, whatever version the profile negotiates. */
+    const produceRequests = () => rig.cluster.requests().filter(({ api }) => api === 'Produce')
+    const SENDS = [
+      ['send', (acks) => ({ topic: TOPIC, messages: MESSAGES, acks })],
+      ['sendBatch', (acks) => ({ topicMessages: [{ topic: TOPIC, messages: MESSAGES }], acks })],
+    ]
+
+    test.each(SENDS)(
+      '%s is refused after the conversion: nothing admitted, charged or written',
+      async (method, request) => {
+        rig = await Rig.start({ transactionalId: 'converting' }, { profile: 'tv2' })
+        const transaction = await rig.producer.transaction()
+        let aborted = null
+        const acks = {
+          valueOf: () => {
+            aborted = transaction.abort()
+            return -1
+          },
+        }
+
+        const error = await transaction[method](request(acks)).then(
+          () => null,
+          (failure) => failure
+        )
+
+        expect(error).toBeInstanceOf(KafkaJSNonRetriableError)
+        expect(error.message).toBe('Cannot continue to use transaction once ended')
+        await expect(aborted).resolves.toBeUndefined()
+        expect(acquire).not.toHaveBeenCalled()
+        expect(debit).not.toHaveBeenCalled()
+        expect(produceRequests()).toEqual([])
+        expect(transaction.isActive()).toBe(false)
+      }
+    )
+
+    test.each(SENDS)(
+      '%s of a transaction still open converts its options once and is written',
+      async (method, request) => {
+        rig = await Rig.start({ transactionalId: 'converting' }, { profile: 'tv2' })
+        const transaction = await rig.producer.transaction()
+        let conversions = 0
+        const acks = {
+          valueOf: () => {
+            conversions += 1
+            return -1
+          },
+        }
+
+        await expect(transaction[method](request(acks))).resolves.toHaveLength(1)
+        await transaction.commit()
+
+        expect(conversions).toBe(1)
+        expect(produceRequests()).toHaveLength(1)
+      }
+    )
+
+    test('a second argument to the public send reaches no refusal', async () => {
+      rig = await Rig.start()
+      const refusal = jest.fn(() => new Error('refused by the caller'))
+
+      await expect(
+        rig.producer.send({ topic: TOPIC, messages: MESSAGES }, refusal)
+      ).resolves.toHaveLength(1)
+
+      expect(refusal).not.toHaveBeenCalled()
+    })
   })
 })

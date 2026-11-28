@@ -33,8 +33,8 @@ const { classifyAcks, classifyTimeout, classifyCompression } = require('./sendOp
  * @param {object} options.instrumentationEmitter
  * @param {string} options.INITIALIZED
  * @param {() => import('./generation')|undefined} [options.getGeneration] current producer lifecycle
- * @returns {{ send: Function, sendBatch: Function, ensureInitialized: Function, flush: Function,
- *   close: Function, unsettled: () => Promise<void>[], forceClose: (surfaced?: Error) => void,
+ * @returns {{ send: Function, sendBatch: Function, sendersWith: Function,
+ *   ensureInitialized: Function, flush: Function, close: Function, unsettled: () => Promise<void>[], forceClose: (surfaced?: Error) => void,
  *   depthOf: (topic: string, partition: number) => number }} `depthOf` counts the batches
  *   waiting for a partition (see `Accumulator#depthOf`)
  */
@@ -242,11 +242,20 @@ module.exports = ({
    * @returns {Promise}
    * @throws {KafkaJSInvalidConfigurationError} as a rejection, an option `sendOptions.js` refuses
    */
-  const sendBatch = async (request) => {
+  const sendBatch = (request) => sendBatchBy(request, undefined)
+
+  /**
+   * `sendBatch` for a caller that can lose the right to send while the call's own option and
+   * record conversions run: its `refusal` is asked again once they are done.
+   * @param {SendBatchRequest} request
+   * @param {(() => ?Error)|undefined} refusal
+   * @returns {Promise}
+   */
+  const sendBatchBy = async (request, refusal) => {
     // The delivery deadline counts from here, the option reads included.
     const startedAt = Date.now()
     const { acks, timeout, compression, topicMessages = [] } = request
-    return produce(startedAt, acks, timeout, compression, topicMessages)
+    return produce(startedAt, acks, timeout, compression, topicMessages, refusal)
   }
 
   /**
@@ -256,14 +265,23 @@ module.exports = ({
    * @param {*} timeoutOption
    * @param {*} compressionOption
    * @param {TopicMessages[]} given the caller's records
+   * @param {(() => ?Error)|undefined} refusal asked once the caller's code has run (the options'
+   *   conversions, the records' getters) and before anything changes: the error the send is
+   *   refused with, or null
    * @returns {Promise<object[]>}
+   * @throws {Error} what `refusal` returned
    */
-  const produce = (startedAt, acksOption, timeoutOption, compressionOption, given) => {
+  const produce = (startedAt, acksOption, timeoutOption, compressionOption, given, refusal) => {
     const acks = classifyAcks(acksOption)
     const timeout = classifyTimeout(timeoutOption)
     const { bits: compression, factory: codec } = classifyCompression(compressionOption)
     // Every check below, the charge and the encoder read this copy, never the caller's records.
     const topicMessages = Accumulator.snapshot(given)
+
+    const refused = refusal?.() ?? null
+    if (refused !== null) {
+      throw refused
+    }
 
     if (topicMessages.some(({ topic }) => !topic)) {
       throw new KafkaJSNonRetriableError(`Invalid topic`)
@@ -343,15 +361,41 @@ module.exports = ({
    * @property {number} [timeout=30000] The time to await a response in ms
    * @property {Compression.Types} [compression=Compression.Types.None] Compression codec
    */
-  const send = async (request) => {
+  const send = (request) => sendBy(request, undefined)
+
+  /**
+   * `send` for a caller that can lose the right to send while the call's own conversions run.
+   * @param {ProduceRequest} request
+   * @param {(() => ?Error)|undefined} refusal see `produce`
+   * @returns {Promise}
+   */
+  const sendBy = async (request, refusal) => {
     const startedAt = Date.now()
     const { acks, timeout, compression, topic, messages } = request
-    return produce(startedAt, acks, timeout, compression, [{ topic, messages }])
+    return produce(startedAt, acks, timeout, compression, [{ topic, messages }], refusal)
+  }
+
+  /**
+   * The two sends of a caller that must be asked again before a send is admitted, such as a
+   * transaction, which can end while a send's option conversions run. They take exactly the
+   * request: nothing a caller of the public methods passes can reach `refusal`.
+   * @param {(method: 'send'|'sendBatch') => ?Error} refusal the error the named send must be
+   *   refused with now, or null
+   * @returns {{ send: (request: ProduceRequest) => Promise, sendBatch: (request: SendBatchRequest) => Promise }}
+   */
+  const sendersWith = (refusal) => {
+    const sendRefusal = () => refusal('send')
+    const sendBatchRefusal = () => refusal('sendBatch')
+    return {
+      send: (request) => sendBy(request, sendRefusal),
+      sendBatch: (request) => sendBatchBy(request, sendBatchRefusal),
+    }
   }
 
   return {
     send,
     sendBatch,
+    sendersWith,
     ensureInitialized,
     flush,
     close,

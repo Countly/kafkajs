@@ -4,6 +4,7 @@ const crc32C = require('../crc32C')
 const {
   Types: Compression,
   lookupCodec,
+  createCodec,
   COMPRESSION_CODEC_MASK,
 } = require('../../message/compression')
 
@@ -113,7 +114,7 @@ const RecordBatch = async ({
  * @throws {Error} for unavailable codecs or compression failures
  */
 const compressRecords = async (compression, records, { level, factory }) => {
-  const codec = factory ? factory() : lookupCodec(compression)
+  const codec = factory ? createCodec(factory) : lookupCodec(compression)
   const recordsEncoder = new Encoder()
 
   recordsEncoder.writeEncoderArray(records)
