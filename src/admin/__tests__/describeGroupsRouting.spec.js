@@ -1818,6 +1818,7 @@ describe('Admin > describeGroups > a DescribeGroups answer read row by row', () 
         return version === 6 ? answerOf(rows) : answerV2Of(rows)
       },
     })
+    harness.broker.nodeId = 0
     const cluster = {
       refreshMetadata: jest.fn(async () => {}),
       withCoordinatorBroker: (_nodeId, work) => work(harness.broker),
@@ -1862,6 +1863,11 @@ describe('Admin > describeGroups > a DescribeGroups answer read row by row', () 
       expect(found).toEqual(lookups)
       // A move refreshes metadata once before the moved id is looked up again; a load does not.
       expect(cluster.refreshMetadata).toHaveBeenCalledTimes(refreshes)
+      if (refreshes) {
+        expect(cluster.refreshMetadata.mock.invocationCallOrder[0]).toBeLessThan(
+          cluster.findGroupCoordinator.mock.invocationCallOrder[2]
+        )
+      }
       expect(
         outcome.value.groups.map(({ groupId, groupType, errorCode, members }) => [
           groupId,
@@ -1921,7 +1927,7 @@ describe('Admin > describeGroups > a DescribeGroups answer read row by row', () 
   })
 
   test('gives up on the retry budget when DescribeGroups keeps answering COORDINATOR_LOAD_IN_PROGRESS', async () => {
-    const { admin, found } = adminOver((asked) =>
+    const { admin, found, cluster } = adminOver((asked) =>
       asked.map((groupId) => ({ groupId, errorCode: COORDINATOR_LOAD_IN_PROGRESS }))
     )
 
@@ -1939,6 +1945,7 @@ describe('Admin > describeGroups > a DescribeGroups answer read row by row', () 
       [apiKeys.DescribeGroups, ['b']],
     ])
     expect(found).toEqual(['b'])
+    expect(cluster.refreshMetadata).not.toHaveBeenCalled()
   })
 })
 

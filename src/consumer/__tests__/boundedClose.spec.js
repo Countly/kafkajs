@@ -11,6 +11,7 @@ const RecordEncoder = require('../../protocol/recordBatch/record/v0')
 const { createGroupDescriptions } = require('../../admin/groupDescriptions')
 const { UNCHECKED_ROWS } = require('../../broker/privateOptions')
 const { TOPIC } = require('./fixtures/fetchHarness')
+const descriptionCluster = require('./fixtures/descriptionCluster')
 const {
   KafkaJSDeliveryTimeout,
   KafkaJSCommitFailedError,
@@ -1257,10 +1258,9 @@ describe('describeGroup under a consumer operation', () => {
         ],
       })),
     }
-    const cluster = {
-      findGroupCoordinator: jest.fn(async () => coordinator),
-      refreshMetadata: jest.fn(),
-    }
+    const findGroupCoordinator = jest.fn(async () => coordinator)
+    const cluster = descriptionCluster(coordinator, findGroupCoordinator)
+    const dispatch = jest.spyOn(cluster, 'withCoordinatorBroker')
     const operation = new ConsumerOperation({ deadlineAt: performance.now() + 5000 })
     const { groups } = await describer(cluster).describe(['g'], { operation })
     expect(groups).toHaveLength(1)
@@ -1271,7 +1271,12 @@ describe('describeGroup under a consumer operation', () => {
     expect(cluster.findGroupCoordinator).toHaveBeenCalledWith(
       expect.objectContaining({ fence: operation })
     )
+    expect(dispatch).toHaveBeenCalledTimes(2)
+    for (const [, , { fence }] of dispatch.mock.calls) {
+      expect(fence).toBe(operation)
+    }
     operation.finish()
+    dispatch.mockClear()
     coordinator.describeGroups.mockClear()
     await describer(cluster).describe(['g'])
     expect(coordinator.describeGroups).toHaveBeenCalledWith(
@@ -1282,6 +1287,8 @@ describe('describeGroup under a consumer operation', () => {
       { [UNCHECKED_ROWS]: true }
     )
     expect(cluster.findGroupCoordinator).toHaveBeenLastCalledWith({ groupId: 'g' })
+    const fences = dispatch.mock.calls.map(([, , { fence }]) => fence)
+    expect(fences).toEqual([undefined, undefined])
   })
 })
 

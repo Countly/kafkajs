@@ -105,7 +105,6 @@ class GroupDescriptionResolver {
           const broker = await this.cluster.findGroupCoordinator({
             groupId: entry.id,
             ...(fence && { fence }),
-            guard: this.scope.guard,
           })
           this.scope.check()
           entry.nodeId = broker.nodeId
