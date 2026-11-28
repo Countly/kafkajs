@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       rows:
-        description: Comma-separated manifest row names to run; empty runs every row
+        description: Comma-separated manifest row names to run; empty runs every row not marked namedOnly
         required: false
         default: ''
         type: string
