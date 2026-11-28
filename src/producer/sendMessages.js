@@ -104,23 +104,61 @@ const refreshesMetadata = (e) =>
     describeThrown(e, 'retriable') === 'true')
 
 /**
- * The topic ids of a produce request, when every topic in it has one: the request can then be
- * negotiated at v13, which keys topics by id (KIP-516).
+ * The topic id the cache holds for each topic of a produce request it knows one for, read as the
+ * request is built: the incarnation of the topic the request is sent for, which a leader hint in
+ * its answer must still describe (`bindHintIncarnation`).
  * @param {import("../../types").Cluster} cluster
- * @param {Iterable<string>} topics
- * @returns {Map<string, string>|undefined} undefined when any topic's id is unknown
+ * @param {Iterable<string>} topics the request's topics, each once
+ * @param {Map<string, string>} [incarnations] the map to fill
+ * @returns {Map<string, string>} `incarnations`, topic name to topic id
  */
-const topicIdsOf = (cluster, topics) => {
-  const topicIds = new Map()
+const topicIncarnationsOf = (cluster, topics, incarnations = new Map()) => {
   for (const topic of topics) {
     const topicId = cluster.topicId(topic)
-    if (topicId === undefined) {
-      return undefined
-    }
-    topicIds.set(topic, topicId)
+    if (topicId !== undefined) incarnations.set(topic, topicId)
   }
-  return topicIds
+  return incarnations
 }
+
+/**
+ * The topic ids of a produce request, when every topic in it has one: the request can then be
+ * negotiated at v13, which keys topics by id (KIP-516).
+ * @param {Map<string, string>} incarnations `topicIncarnationsOf` the request's topics
+ * @param {number} topicCount how many topics the request carries
+ * @returns {Map<string, string>|undefined} undefined when any topic's id is unknown
+ */
+const topicIdsOf = (incarnations, topicCount) =>
+  incarnations.size === topicCount ? incarnations : undefined
+
+/**
+ * Binds the leader hint (KIP-951) an answer's error carries to the incarnation of its topic the
+ * request was sent for, unless the error names one itself, as an error of a v13 answer does. The
+ * id the cache holds once the answer arrives is not used: the topic may have been recreated
+ * meanwhile, and the hint describes the one the request was sent to.
+ * @param {Error|null|undefined} error
+ * @param {Map<string, string>|undefined} incarnations `topicIncarnationsOf` the request's topics
+ * @returns {void}
+ */
+const bindHintIncarnation = (error, incarnations) => {
+  if (!error?.currentLeader || error.topicId !== undefined) return
+  const topicId = incarnations?.get(error.topic)
+  if (topicId !== undefined) error.topicId = topicId
+}
+
+/**
+ * The leader hint an error carries, as `Cluster#applyLeaderHint` takes it.
+ * @param {{ topic: string, partition: number, topicId?: string, nodeEndpoints?: object[],
+ *   currentLeader: { leaderId: number, leaderEpoch: number } }} error
+ * @returns {object}
+ */
+const leaderHintOf = (error) => ({
+  topic: error.topic,
+  partition: error.partition,
+  leaderId: error.currentLeader.leaderId,
+  leaderEpoch: error.currentLeader.leaderEpoch,
+  nodeEndpoints: error.nodeEndpoints,
+  topicId: error.topicId,
+})
 
 /**
  * The leaders of a topic's partitions: one cluster lookup answers for them all. That lookup
@@ -1174,11 +1212,15 @@ class DrainLoop {
     tail.then(() => {
       if (this.#handoffs.get(nodeId) === tail) this.#handoffs.delete(nodeId)
     })
+    let incarnations
     handed
-      .then(({ answer }) => answer)
+      .then((handoff) => {
+        incarnations = handoff.incarnations
+        return handoff.answer
+      })
       .then(
-        (results) => this.#answered(nodeId, batches, results),
-        (error) => this.#rejected(nodeId, batches, error)
+        (results) => this.#answered(nodeId, batches, results, incarnations),
+        (error) => this.#rejected(nodeId, batches, error, incarnations)
       )
       .catch(this.#fault)
   }
@@ -1189,9 +1231,11 @@ class DrainLoop {
    * @param {string} nodeId
    * @param {import('./state/partitionSequencer').PartitionBatch[]} batches
    * @param {ProduceAttempt} attempt fixed request membership and transmission right
-   * @returns {Promise<{ answer: Promise<import('../protocol/requests/produce/partitionResults').PartitionResult[]|undefined> }>}
-   *   once the request is handed to the broker; `answer` settles with its answer, and is wrapped so
-   *   that waiting for the hand-off does not wait for the answer
+   * @returns {Promise<{ answer: Promise<import('../protocol/requests/produce/partitionResults').PartitionResult[]|undefined>,
+   *   incarnations: Map<string, string> }>} once the request is handed to the broker; `answer`
+   *   settles with its answer, and is wrapped so that waiting for the hand-off does not wait for
+   *   the answer; `incarnations` are the topic ids the request was sent for
+   *   (`topicIncarnationsOf`)
    */
   async #handOff(nodeId, batches, attempt) {
     const refusal = attempt.guard()
@@ -1205,6 +1249,10 @@ class DrainLoop {
     const [{ acks, timeout, compression, producerId, producerEpoch }] = batches
     const topicData = topicDataOf(batches)
     const transactional = this.#eosManager.isTransactional()
+    const incarnations = topicIncarnationsOf(
+      this.#cluster,
+      topicData.map(({ topic }) => topic)
+    )
 
     const answer = broker.produce({
       transactionalId: transactional ? this.#eosManager.getTransactionalId() : undefined,
@@ -1220,17 +1268,12 @@ class DrainLoop {
             ? this.#compressionLevels?.zstd
             : undefined,
       topicData,
-      topicIds: transactional
-        ? undefined
-        : topicIdsOf(
-            this.#cluster,
-            topicData.map(({ topic }) => topic)
-          ),
+      topicIds: transactional ? undefined : topicIdsOf(incarnations, topicData.length),
       transactionVersion: this.#eosManager.stateManager.transactionVersion(),
       perPartitionResults: true,
       guard: attempt.guard,
     })
-    return { answer }
+    return { answer, incarnations }
   }
 
   /**
@@ -1255,9 +1298,10 @@ class DrainLoop {
    * @param {import('./state/partitionSequencer').PartitionBatch[]} batches
    * @param {import('../protocol/requests/produce/partitionResults').PartitionResult[]} answer
    *   anything else - an `acks: 0` request has no answer - carries no partition
+   * @param {Map<string, string>} [incarnations] the topic ids the request was sent for
    * @returns {void}
    */
-  #answered(nodeId, batches, answer) {
+  #answered(nodeId, batches, answer, incarnations) {
     this.#answeredBy(nodeId)
     if (this.#generation?.closed) {
       for (const batch of batches) {
@@ -1278,7 +1322,7 @@ class DrainLoop {
       if (deliveryOf(batch).settled) {
         if (result?.error === null) manager.complete(batch, result)
         else if (result?.error?.code === 46) manager.complete(batch, { duplicate: true })
-        if (result?.error) this.#sideChannels(result.error)
+        if (result?.error) this.#sideChannels(result.error, incarnations)
         if (!deliveryOf(batch).expired) manager.sequencer.fail(batch)
         deliveryOf(batch).retire()
         return
@@ -1294,7 +1338,7 @@ class DrainLoop {
         resolveBatch(batch, metadataOf(result))
       } else {
         resolveFailingRecords(result.error, batch.messages)
-        this.#sideChannels(result.error)
+        this.#sideChannels(result.error, incarnations)
         this.#failed(manager, batch, result.error, result)
       }
     })
@@ -1305,9 +1349,11 @@ class DrainLoop {
    * @param {string} nodeId
    * @param {import('./state/partitionSequencer').PartitionBatch[]} batches
    * @param {Error} error
+   * @param {Map<string, string>} [incarnations] the topic ids the request was sent for; none when
+   *   it was never handed to the broker
    * @returns {void}
    */
-  #rejected(nodeId, batches, error) {
+  #rejected(nodeId, batches, error, incarnations) {
     this.#answeredBy(nodeId)
     if (this.#generation?.closed) {
       for (const batch of batches) {
@@ -1322,7 +1368,7 @@ class DrainLoop {
       deliveryOf(batch).dispatched = false
     }
 
-    if (!(error instanceof ProduceAttemptRefused)) this.#sideChannels(error)
+    if (!(error instanceof ProduceAttemptRefused)) this.#sideChannels(error, incarnations)
     const refused = []
     for (const batch of batches) {
       const delivery = deliveryOf(batch)
@@ -1427,27 +1473,21 @@ class DrainLoop {
    * Routing work a failure asks for before the next drain: a closed connection's broker is
    * dropped, a KIP-951 leader hint is applied, and stale metadata is refreshed. All best effort.
    * @param {Error} e
+   * @param {Map<string, string>} [incarnations] the topic ids the request was sent for, which the
+   *   hint is bound to (`bindHintIncarnation`)
    * @returns {void}
    */
-  #sideChannels(e) {
+  #sideChannels(e, incarnations) {
     if (this.#generation?.closed) return
     if (e.name === 'KafkaJSConnectionClosedError') {
       this.#cluster.removeBroker({ host: e.host, port: e.port, source: failureSourceOf(e) })
     }
 
     if (e.currentLeader) {
+      bindHintIncarnation(e, incarnations)
       this.#hints.push(
         Promise.resolve(
-          this.#cluster.applyLeaderHint(
-            {
-              topic: e.topic,
-              partition: e.partition,
-              leaderId: e.currentLeader.leaderId,
-              leaderEpoch: e.currentLeader.leaderEpoch,
-              nodeEndpoints: e.nodeEndpoints,
-            },
-            ...fenceArgs(this.#generation)
-          )
+          this.#cluster.applyLeaderHint(leaderHintOf(e), ...fenceArgs(this.#generation))
         ).catch((hintError) => {
           this.#logger.debug(`Best-effort leader hint application failed: ${hintError.message}`)
         })
@@ -1746,16 +1786,7 @@ const createSendMessages = ({
     // below.
     if (e.name === 'KafkaJSProtocolError' && e.currentLeader) {
       await cluster
-        .applyLeaderHint(
-          {
-            topic: e.topic,
-            partition: e.partition,
-            leaderId: e.currentLeader.leaderId,
-            leaderEpoch: e.currentLeader.leaderEpoch,
-            nodeEndpoints: e.nodeEndpoints,
-          },
-          ...fenceArgs(generation)
-        )
+        .applyLeaderHint(leaderHintOf(e), ...fenceArgs(generation))
         .catch((hintError) => {
           logger.debug(
             `Best-effort leader hint application failed, continuing with the original error: ${hintError.message}`
@@ -1820,24 +1851,21 @@ const createSendMessages = ({
    * Topic ids are decided per broker request, not per send(): a global rule would downgrade one
    * broker's request because a *different* broker's topic had an unknown id.
    * @param {string[]} topics the request's topics
+   * @param {Map<string, string>} incarnations filled with the topic ids the request is sent for
+   *   (`topicIncarnationsOf`)
    * @returns {object}
    */
-  const plainRequestOf = (topics) => {
+  const plainRequestOf = (topics, incarnations) => {
     const isTransactional = eosManager.isTransactional()
-    let topicIds
-    let maxVersion = PRODUCE_TOPIC_NAMES_MAX_VERSION
-
-    if (!isTransactional) {
-      topicIds = topicIdsOf(cluster, topics)
-      maxVersion = topicIds === undefined ? PRODUCE_TOPIC_NAMES_MAX_VERSION : undefined
-    }
+    topicIncarnationsOf(cluster, topics, incarnations)
+    const topicIds = isTransactional ? undefined : topicIdsOf(incarnations, topics.length)
 
     return {
       transactionalId: isTransactional ? eosManager.getTransactionalId() : undefined,
       producerId: eosManager.getProducerId(),
       producerEpoch: eosManager.getProducerEpoch(),
       topicIds,
-      maxVersion,
+      maxVersion: topicIds === undefined ? PRODUCE_TOPIC_NAMES_MAX_VERSION : undefined,
     }
   }
 
@@ -2213,16 +2241,7 @@ const createSendMessages = ({
         cluster.removeBroker({ host: error.host, port: error.port, source: failureSourceOf(error) })
       if (error.currentLeader) {
         await Promise.resolve(
-          cluster.applyLeaderHint(
-            {
-              topic: error.topic,
-              partition: error.partition,
-              leaderId: error.currentLeader.leaderId,
-              leaderEpoch: error.currentLeader.leaderEpoch,
-              nodeEndpoints: error.nodeEndpoints,
-            },
-            ...fenceArgs(generation)
-          )
+          cluster.applyLeaderHint(leaderHintOf(error), ...fenceArgs(generation))
         ).catch(() => {})
       }
       if (!generation?.closed && refreshesMetadata(error))
@@ -2234,12 +2253,16 @@ const createSendMessages = ({
      * ended nothing of this call holds its topic data, which lists the batches' records.
      * @param {object[]} sent
      * @param {ProduceAttempt} attempt
+     * @param {Map<string, string>} incarnations filled with the topic ids the request is sent for
      * @returns {object}
      */
-    const requestOf = (sent, attempt) => {
+    const requestOf = (sent, attempt, incarnations) => {
       const topicData = topicDataOf(sent)
       return {
-        ...plainRequestOf(topicData.map(({ topic }) => topic)),
+        ...plainRequestOf(
+          topicData.map(({ topic }) => topic),
+          incarnations
+        ),
         acks,
         timeout,
         compression,
@@ -2386,10 +2409,12 @@ const createSendMessages = ({
         delivery.carried = true
       })
       let results
+      const incarnations = new Map()
       try {
-        results = await broker.produce(requestOf(sent, attempt))
+        results = await broker.produce(requestOf(sent, attempt, incarnations))
       } catch (error) {
         const refused = error instanceof ProduceAttemptRefused
+        bindHintIncarnation(error, incarnations)
         if (!refused) attachFailingRecords(error, topicDataOf(sent))
         ended()
         if (generation?.closed) return null
@@ -2418,6 +2443,7 @@ const createSendMessages = ({
           result === undefined
             ? new KafkaJSError(`No result for ${batch.topic} partition ${batch.partition}`)
             : result.error
+        if (error) bindHintIncarnation(error, incarnations)
         if (!unsettled.has(batch)) {
           if (error) await sideChannels(error)
           continue

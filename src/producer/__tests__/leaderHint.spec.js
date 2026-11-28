@@ -310,6 +310,57 @@ describe('Producer > KIP-951 leader hint', () => {
     expect(cluster.findLeaderForPartitions('test-topic', [0])).toEqual({ 1: [0] })
   })
 
+  test('a hint carries the topic id the request was sent for, so a recreation while its endpoint pool is built refuses it', async () => {
+    const ID_A = '01020304-0506-0708-090a-0b0c0d0e0f10'
+    const ID_B = '11121314-1516-1718-191a-1b1c1d1e1f20'
+    /** One topic, one partition, under `topicId`; also what the stub brokers answer from now on. */
+    const metadataWithId = ({ leaderEpoch, topicId }) => {
+      const response = metadataResponse({ leader: 1, leaderEpoch })
+      response.topicMetadata[0].topicId = topicId
+      return response
+    }
+    const { cluster, brokers } = createHintCluster({
+      initialMetadata: metadataWithId({ leaderEpoch: 5, topicId: ID_A }),
+      answer: async ({ request, attempt }) => {
+        if (attempt === 1) {
+          throw await notLeaderWithHint({
+            leaderId: 2,
+            leaderEpoch: 6,
+            nodeEndpoints: [{ nodeId: 2, host: '10.0.0.9', port: 9094, rack: null }],
+          })
+        }
+        return acceptAll({ request })
+      },
+    })
+    const built = createPool({ host: '10.0.0.9', port: 9094, rack: null })
+    const building = {}
+    cluster.brokerPool.buildConnectionPool = jest.fn(
+      () => new Promise((resolve) => (building.finish = () => resolve(built)))
+    )
+    const applied = jest.spyOn(cluster, 'applyLeaderHint')
+
+    const sending = createSend({ cluster })({ acks: -1, timeout: 30000, topicMessages })
+    for (let turn = 0; turn < 100 && !building.finish; turn++) {
+      await new Promise(setImmediate)
+    }
+    expect(building.finish).toBeDefined()
+    const recreated = metadataWithId({ leaderEpoch: 0, topicId: ID_B })
+    cluster.metadataCache.update(recreated)
+    cluster.brokerPool.metadata = recreated
+    building.finish()
+    await sending
+
+    expect(applied.mock.calls[0][0]).toMatchObject({ leaderId: 2, leaderEpoch: 6, topicId: ID_A })
+    await expect(applied.mock.results[0].value).resolves.toBe(false)
+    expect(cluster.brokerPool.brokers[2]).toBe(brokers[2])
+    expect(built.destroy).toHaveBeenCalledTimes(1)
+    expect(cluster.topicId('test-topic')).toEqual(ID_B)
+    expect([
+      cluster.metadataCache.leader('test-topic', 0),
+      cluster.metadataCache.leaderEpoch('test-topic', 0),
+    ]).toEqual([1, 0])
+  })
+
   test('applyNodeEndpoints replaces a broker whose host/port/rack moved, and preserves the blackout', async () => {
     const { cluster, brokers } = createHintCluster({ answer: acceptAll })
     const pool = cluster.brokerPool

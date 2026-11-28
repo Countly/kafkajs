@@ -1116,6 +1116,56 @@ describe('Cluster > MetadataCache', () => {
       expect(cluster.metadataCache.leaderEpoch('test-topic', 0)).toBe(8)
     })
 
+    test('Cluster#applyLeaderHint overtaken, in the turn its endpoint pool is built, by an endpoint-free hint at a newer epoch keeps the old endpoint, and only the newer hint reports success', async () => {
+      const { cluster, previous, previousPool, builds } = hintedEndpoint()
+      const older = cluster.applyLeaderHint(HINT)
+      let newer
+      builds[0].finish()
+      // Starts between the pool build's return and the install step of the older hint.
+      queueMicrotask(() => {
+        newer = cluster.applyLeaderHint({ ...HINT, leaderEpoch: 8, nodeEndpoints: undefined })
+      })
+
+      await expect(older).resolves.toBe(false)
+      await expect(newer).resolves.toBe(true)
+      expect(cluster.brokerPool.brokers[2]).toBe(previous)
+      expect(previous.connectionPool).toBe(previousPool)
+      expect(previous.retire).not.toHaveBeenCalled()
+      expect(cluster.brokerPool.createBroker).not.toHaveBeenCalled()
+      expect(builds[0].pool.destroy).toHaveBeenCalledTimes(1)
+      expect([
+        cluster.metadataCache.leader('test-topic', 0),
+        cluster.metadataCache.leaderEpoch('test-topic', 0),
+      ]).toEqual([2, 8])
+    })
+
+    test('Cluster#applyLeaderHint whose leader a Metadata response removes while a later endpoint pool is built installs neither endpoint, moves no route and reports the refusal', async () => {
+      const { cluster, previous, builds } = hintedEndpoint()
+      const hint = cluster.applyLeaderHint({
+        ...HINT,
+        nodeEndpoints: [
+          ...HINT.nodeEndpoints,
+          { nodeId: 3, host: '10.0.0.10', port: 9095, rack: null },
+        ],
+      })
+
+      builds[0].finish()
+      await until(() => builds.length === 2)
+      // What a Metadata response that no longer lists node 2 does to the table.
+      cluster.brokerPool.closeObsolete(previous)
+      builds[1].finish()
+
+      await expect(hint).resolves.toBe(false)
+      expect(cluster.brokerPool.brokers[2]).toBeUndefined()
+      expect(cluster.brokerPool.brokers[3]).toBeUndefined()
+      expect(cluster.brokerPool.createBroker).not.toHaveBeenCalled()
+      expect(builds.map(({ pool }) => pool.destroy.mock.calls.length)).toEqual([1, 1])
+      expect([
+        cluster.metadataCache.leader('test-topic', 0),
+        cluster.metadataCache.leaderEpoch('test-topic', 0),
+      ]).toEqual([1, 5])
+    })
+
     test('Cluster#applyLeaderHint that nothing overtook installs the endpoint, retires the old broker and moves the route', async () => {
       const { cluster, previous, builds } = hintedEndpoint()
 

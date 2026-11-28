@@ -1157,7 +1157,8 @@ class ShareFetchLoop {
   /**
    * Applies a usable leader hint, else refreshes metadata, then reports the move. The fence of
    * the original open goes into the provider, so a reset that happens while it awaits keeps it
-   * from installing anything, and every await is followed by a check of that same fence.
+   * from installing anything, and every await is followed by a check of that same fence. The hint
+   * carries the topic id the answer named, so the cluster refuses it for a topic recreated since.
    * @private
    * @param {OpenFence} fence The original open's fence.
    * @param {string} topicId Topic UUID.
@@ -1185,6 +1186,7 @@ class ShareFetchLoop {
             leaderId: leader.leaderId,
             leaderEpoch: leader.leaderEpoch,
             nodeEndpoints: nodeEndpoints?.length ? nodeEndpoints : undefined,
+            topicId,
           },
           { fence }
         )

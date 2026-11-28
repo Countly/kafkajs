@@ -1252,6 +1252,58 @@ describe('share node socket integration', () => {
         await round
       }
     })
+
+    test('a hint whose topic is recreated while its endpoint pool is built is refused by the real cluster, which keeps the new incarnation and the old endpoint', async () => {
+      h = await harness({ nodes: 3 })
+      const [n0] = h.members
+      n0.want = [A0]
+      const real = await h.realCluster(served())
+      h.scriptNodes('ShareFetch', {
+        0: [
+          fetchAnswer([part({ partition: 0 })]),
+          fetchAnswer([part({ partition: 0, code: 6, leader: hint(2, 8) })], {
+            nodeEndpoints: [{ nodeId: 2, host: 'moved2', port: 9092, rack: null }],
+          }),
+        ],
+      })
+      await n0.loop.poll()
+      const pool = real.cluster.brokerPool
+      const build = pool.buildConnectionPool.bind(pool)
+      const entered = deferred()
+      const release = deferred()
+      jest.spyOn(pool, 'buildConnectionPool').mockImplementationOnce(async (...args) => {
+        entered.resolve()
+        await release.promise
+        return build(...args)
+      })
+      const round = settled(n0.loop.poll())
+      try {
+        await entered.promise
+        real.table.set('topic-a', {
+          topicId: B,
+          partitions: [
+            { leader: 1, epoch: 0 },
+            { leader: 1, epoch: 0 },
+          ],
+        })
+        await real.cluster.refreshMetadata()
+        expect(real.cluster.topicId('topic-a')).toBe(B)
+        release.resolve()
+        await round
+
+        expect([
+          real.cluster.cachedLeader('topic-a', 0),
+          real.cluster.leaderEpoch('topic-a', 0),
+        ]).toEqual([1, 0])
+        expect(pool.brokers[2].connectionPool).toMatchObject({ host: 'node2', port: 9092 })
+        expect(n0.moves).toEqual([
+          { topic: 'topic-a', topicId: A, partition: 0, leaderId: 1, reason: 'leader-moved' },
+        ])
+      } finally {
+        release.resolve()
+        await round
+      }
+    })
   })
 
   describe('topic identity and retriable partition errors', () => {

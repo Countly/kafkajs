@@ -541,11 +541,17 @@ module.exports = class BrokerPool {
    *   re-checked before writing; on a mismatch the freshly built pool - never handed to a
    *   `Broker` - is retired instead of overwriting whatever is there now.
    *
-   * Installation is staged: every replacement pool is built first, and only then, in one
-   * synchronous step, is each endpoint installed, after the lifecycle, the deadline and `admits`
-   * are checked once more. When any of them refuses, every built pool is retired and nothing in
-   * the table changes. `admits` is the caller's own authority for the endpoints, such as a leader
-   * hint the metadata cache would still accept (`Cluster#applyLeaderHint`).
+   * Installation is all or none. Every replacement pool is built first. Then one synchronous step,
+   * which calls no application code, checks again the lifecycle, the deadline, `admits`,
+   * `required` and what each endpoint was staged against: the same table, the same broker for its
+   * node (or still none) with the same connection pool, and the seed it swaps or adopts. When any
+   * of them refuses, or a pool build was refused, every built pool is retired, nothing changes and
+   * `commit` is not called. Otherwise every endpoint is written into the table and `commit` runs
+   * in that same step; only after it are the replaced brokers and pools retired and the telemetry
+   * bound, which can reach application code. `admits` and `commit` are the caller's own authority
+   * and its own write, such as a leader hint the metadata cache would still accept and its route
+   * (`Cluster#applyLeaderHint`). An endpoint whose node id an earlier endpoint of the same call
+   * named is ignored.
    *
    * Adding an unknown node id is allowed; removing one is not - only a metadata response may
    * shrink the broker table.
@@ -557,54 +563,51 @@ module.exports = class BrokerPool {
    * @param {import('../producer/generation')} [options.fence] captured producer lifecycle; a pool
    *   completed after its close is retired unused and changes no routing state
    * @param {() => boolean} [options.admits] whether the endpoints may still be installed; asked
-   *   before each pool's setup is published and again at the install
+   *   before each pool's setup is published and again at the commit
+   * @param {number} [options.required] a node the table must hold once the endpoints are written;
+   *   the whole call is refused otherwise
+   * @param {() => void} [options.commit] the caller's own write, made in the same synchronous step
+   *   as the table's, and only when the endpoints are written
    * @returns {Promise<void>}
    * @throws {Error} the lifecycle's close error
    */
-  async applyNodeEndpoints(nodeEndpoints, { fence, admits } = {}) {
+  async applyNodeEndpoints(nodeEndpoints, { fence, admits, required, commit } = {}) {
     fence?.check()
     checked(null)
-    if (!nodeEndpoints || nodeEndpoints.length === 0) {
-      return
-    }
-
+    const table = this.brokers
     const staged = []
     const discard = () => {
       for (const { connectionPool } of staged) if (connectionPool) this.closePool(connectionPool)
+      staged.length = 0
+    }
+    const refuse = () => {
+      discard()
+      fence?.check()
+      checked(null)
     }
     try {
-      for (const { nodeId, host, port, rack } of nodeEndpoints) {
+      for (const { nodeId, host, port, rack } of nodeEndpoints || []) {
         if (
           !Number.isInteger(nodeId) ||
           nodeId < 0 ||
           !host ||
           !Number.isInteger(port) ||
-          port <= 0
+          port <= 0 ||
+          staged.some((other) => other.nodeId === nodeId)
         ) {
           continue
         }
 
-        const broker = this.brokers[nodeId]
-        const isSeed = broker !== undefined && broker === this.seedBroker
-        const endpoint = { nodeId, host, port, rack, broker, isSeed, connectionPool: null }
-        if (!this.endpointNeedsPool(broker, endpoint)) {
-          staged.push(endpoint)
-          continue
-        }
+        const endpoint = this.stageEndpoint(table, { nodeId, host, port, rack }, staged)
+        staged.push(endpoint)
+        if (!endpoint.needsPool) continue
 
-        const isCurrent = () =>
-          this.brokers[nodeId] === broker &&
-          (!isSeed || this.seedBroker === broker) &&
-          (!admits || admits())
         endpoint.connectionPool = await this.buildConnectionPool(
           { host, port, rack },
-          { fence, isCurrent }
+          { fence, isCurrent: () => this.endpointHolds(table, endpoint) && (!admits || admits()) }
         )
-        if (endpoint.connectionPool) staged.push(endpoint)
-        if (fence?.closed || currentDeadline()?.guard()) {
-          discard()
-          fence?.check()
-          checked(null)
+        if (!endpoint.connectionPool || fence?.closed || currentDeadline()?.guard()) {
+          refuse()
           return
         }
       }
@@ -613,75 +616,124 @@ module.exports = class BrokerPool {
       throw error
     }
 
-    if (fence?.closed || currentDeadline()?.guard() || (admits && !admits())) {
-      discard()
-      fence?.check()
-      checked(null)
+    if (
+      fence?.closed ||
+      currentDeadline()?.guard() ||
+      (admits && !admits()) ||
+      !staged.every((endpoint) => this.endpointHolds(table, endpoint)) ||
+      (required !== undefined &&
+        table[required] === undefined &&
+        !staged.some(({ nodeId }) => nodeId === required))
+    ) {
+      refuse()
       return
     }
-    for (const endpoint of staged) this.installEndpoint(endpoint)
+
+    const retirements = staged.map((endpoint) => this.installEndpoint(endpoint))
+    try {
+      commit?.()
+    } finally {
+      for (const retire of retirements) retire?.()
+    }
   }
 
   /**
-   * Whether installing an endpoint needs a new connection pool: not for a broker already at that
-   * address (only its rack is written) and not for an unknown node id at the address of a seed the
-   * table does not hold yet (the seed is adopted).
+   * What installing one endpoint will depend on, read now: the broker the table holds for its node
+   * and that broker's connection pool, whether that broker is the seed (whose pool is swapped in
+   * place), and, for an unknown node at the address of a seed the table does not hold yet and no
+   * earlier endpoint of the call adopts, the seed it adopts. Any other new address needs a pool.
    * @private
-   * @param {import('../broker')|undefined} broker the broker the table holds for the node id
-   * @param {{ host: string, port: number }} address
+   * @param {object} table the broker table the call started with
+   * @param {{ nodeId: number, host: string, port: number, rack: string|null }} address
+   * @param {object[]} staged the endpoints of the call staged before this one
+   * @returns {{ nodeId: number, host: string, port: number, rack: string|null,
+   *   broker: import('../broker')|undefined,
+   *   pool: import('../network/connectionPool')|undefined, isSeed: boolean,
+   *   seed: import('../broker')|undefined, needsPool: boolean,
+   *   connectionPool: import('../network/connectionPool')|null }}
+   */
+  stageEndpoint(table, address, staged) {
+    const broker = table[address.nodeId]
+    const seed =
+      broker === undefined &&
+      this.seedBroker &&
+      !values(table).includes(this.seedBroker) &&
+      !hasBrokerMoved(this.seedBroker, address) &&
+      !staged.some((other) => other.seed !== undefined)
+        ? this.seedBroker
+        : undefined
+    return {
+      ...address,
+      broker,
+      pool: broker?.connectionPool,
+      isSeed: broker !== undefined && broker === this.seedBroker,
+      seed,
+      needsPool: broker ? hasBrokerMoved(broker, address) : seed === undefined,
+      connectionPool: null,
+    }
+  }
+
+  /**
+   * Whether the table still holds what an endpoint was staged against (`stageEndpoint`): the same
+   * table, the same broker for its node, or still none, with the same connection pool; for the seed
+   * it swaps, the same seed, not retired; for the seed it adopts, the same seed, still outside the
+   * table.
+   * @private
+   * @param {object} table the broker table the call started with
+   * @param {ReturnType<BrokerPool['stageEndpoint']>} endpoint
    * @returns {boolean}
    */
-  endpointNeedsPool(broker, address) {
-    if (broker) return hasBrokerMoved(broker, address)
-    return !(
-      this.seedBroker &&
-      !values(this.brokers).includes(this.seedBroker) &&
-      !hasBrokerMoved(this.seedBroker, address)
-    )
+  endpointHolds(table, { nodeId, broker, pool, isSeed, seed }) {
+    if (this.brokers !== table || table[nodeId] !== broker) return false
+    if (broker !== undefined) {
+      return (
+        broker.connectionPool === pool &&
+        (!isSeed || (this.seedBroker === broker && !broker.retired))
+      )
+    }
+    return seed === undefined || (this.seedBroker === seed && !values(table).includes(seed))
   }
 
   /**
-   * Installs one staged endpoint, synchronously, if the table still holds the broker it was staged
-   * against (and, for the seed, the seed is unchanged); otherwise its built pool is retired.
+   * Writes one staged endpoint into the table, synchronously, calling no application code; the
+   * caller has checked that it still holds (`endpointHolds`). The retirement of what it replaced,
+   * and the telemetry binding of an adopted seed, are returned, for the caller to run once every
+   * write of its step is done.
    * @private
-   * @param {{ nodeId: number, host: string, port: number, rack: string|null,
-   *   broker: import('../broker')|undefined, isSeed: boolean,
-   *   connectionPool: import('../network/connectionPool')|null }} endpoint
-   * @returns {void}
+   * @param {ReturnType<BrokerPool['stageEndpoint']>} endpoint
+   * @returns {(() => void)|null} the deferred work, if any
    */
-  installEndpoint({ nodeId, host, port, rack, broker, isSeed, connectionPool }) {
-    const current = this.brokers[nodeId] === broker && (!isSeed || this.seedBroker === broker)
+  installEndpoint({ nodeId, host, port, rack, broker, isSeed, seed, connectionPool }) {
     if (!connectionPool) {
-      if (!current || this.endpointNeedsPool(broker, { host, port })) return
       if (broker) {
         broker.connectionPool.rack = rack
-        return
+        return null
       }
-      this.seedBroker.nodeId = nodeId
-      this.bindTelemetryNode(this.seedBroker)
-      this.seedBroker.connectionPool.rack = rack
-      this.brokers[nodeId] = this.seedBroker
-      return
+      seed.nodeId = nodeId
+      seed.connectionPool.rack = rack
+      this.brokers[nodeId] = seed
+      return () => this.bindTelemetryNode(seed)
     }
 
-    if (!current) {
-      this.closePool(connectionPool)
-      return
-    }
-
-    if (isSeed) {
-      this.replacePool(broker, connectionPool)
-    } else {
-      this.brokers[nodeId] = this.createBroker({
-        logger: this.rootLogger,
-        versions: this.versions,
-        connectionPool,
-        nodeId,
-      })
-      this.closeObsolete(broker)
-    }
     this.setupMetadataEndpoints.set(String(nodeId), `${host}:${port}`)
     this.retainSetupEndpoints()
+    if (isSeed) {
+      const previous = broker.connectionPool
+      if (!broker.replaceConnectionPool(connectionPool)) return null
+      return () => {
+        this.closePool(previous)
+        this.bindTelemetryNode(broker)
+      }
+    }
+
+    this.brokers[nodeId] = this.createBroker({
+      logger: this.rootLogger,
+      versions: this.versions,
+      connectionPool,
+      nodeId,
+    })
+    this.detachObsolete(broker)
+    return () => this.closeObsolete(broker)
   }
 
   /**
@@ -694,15 +746,27 @@ module.exports = class BrokerPool {
    */
   closeObsolete(broker) {
     if (!broker || broker === this.seedBroker) return
-    for (const nodeId of keys(this.brokers)) {
-      if (this.brokers[nodeId] === broker) delete this.brokers[nodeId]
-    }
+    this.detachObsolete(broker)
     if (this.retiredBrokers.has(broker)) return
     this.retiredBrokers.add(broker)
     this.retireTelemetryNode(broker.connectionPool)
     const complete = this.reserveDrain(broker)
     const drain = complete((async () => broker.retire({ drainTimeout: this.drainTimeout }))())
     this.closeInBackground(drain)
+  }
+
+  /**
+   * Removes every alias of an obsolete broker from the table, synchronously and calling no
+   * application code; the active seed stays.
+   * @private
+   * @param {import('../broker')|undefined} broker replaced broker
+   * @returns {void}
+   */
+  detachObsolete(broker) {
+    if (!broker || broker === this.seedBroker) return
+    for (const nodeId of keys(this.brokers)) {
+      if (this.brokers[nodeId] === broker) delete this.brokers[nodeId]
+    }
   }
 
   /**

@@ -875,20 +875,38 @@ describe('a closed producer lifecycle and an endpoint pool that finishes late', 
     }
   })
 
-  it('a hint whose lifecycle closes as the endpoint work ends does not update the cached epoch', async () => {
-    const { cluster, generation } = await lateCluster()
+  it('a hint whose lifecycle closes just after its commit keeps the broker and the epoch it committed together, and reports the close', async () => {
+    const { cluster, pool, generation, release } = await lateCluster()
     const apply = cluster.brokerPool.applyNodeEndpoints.bind(cluster.brokerPool)
     cluster.brokerPool.applyNodeEndpoints = async (...args) => {
       await apply(...args)
       generation.close(closed)
     }
     try {
+      const hint = outcome(cluster.applyLeaderHint(HINT, { fence: generation }))
+      await settled()
+      release()
+
+      expect((await hint).error).toBe(closed)
+      expect(cluster.leaderEpoch('t', 0)).toBe(2)
+      expect(cluster.brokerPool.brokers[42].connectionPool).toBe(pool)
+      expect(pool.retire).not.toHaveBeenCalled()
+    } finally {
+      await cluster.disconnect({ drainTimeout: 0 })
+    }
+  })
+
+  it('an endpoint-free hint naming a node the broker table does not hold changes nothing and reports the refusal', async () => {
+    const { cluster, generation } = await lateCluster()
+    try {
       const hint = await outcome(
         cluster.applyLeaderHint({ ...HINT, nodeEndpoints: [] }, { fence: generation })
       )
 
+      expect(hint).toEqual({ value: false })
       expect(cluster.leaderEpoch('t', 0)).toBe(1)
-      expect(hint.error).toBe(closed)
+      expect(cluster.brokerPool.brokers[42]).toBeUndefined()
+      expect(cluster.brokerPool.buildConnectionPool).not.toHaveBeenCalled()
     } finally {
       await cluster.disconnect({ drainTimeout: 0 })
     }

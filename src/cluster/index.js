@@ -1597,18 +1597,18 @@ module.exports = class Cluster {
    * The endpoint work runs **before** the cache write, because the cache write is synchronous and
    * immediately visible to routing: writing it first would publish a node id for which no broker
    * object exists yet, and a concurrent send would take the broker-not-found path and force a
-   * metadata refresh - the exact latency this hint exists to avoid. That ordering only closes the
-   * window when the hint actually carries an endpoint for `leaderId`; a hint with no
-   * `nodeEndpoints` (the broker believes the client already knows the node) can still publish a
-   * node id the broker table has never heard of, which takes the broker-not-found path regardless
-   * of ordering here.
+   * metadata refresh - the exact latency this hint exists to avoid.
    *
    * The cache's own rule (`MetadataCache#admitsLeaderHint`: a named leader, a cached partition, the
-   * hint's topic incarnation, an advancing epoch) is asked three times: before any endpoint work,
-   * so a hint it would refuse costs nothing; again at the endpoint install, after the replacement
-   * pools are built (`BrokerPool#applyNodeEndpoints`), so a hint a newer epoch or a recreation
-   * overtook while the pools were built installs no address and retires no connection; and last
-   * at the cache write itself.
+   * hint's topic incarnation, an advancing epoch) is asked before any endpoint work, so a hint it
+   * would refuse costs nothing, and again once the replacement pools are built. The endpoints and
+   * the route are then committed together, in one synchronous step with no await
+   * (`BrokerPool#applyNodeEndpoints`): the cache's routing listeners run once both are written,
+   * and the retirement of replaced brokers after that. A hint is applied whole or not at all: it is
+   * refused when a newer epoch or a recreation overtook it, when the table no longer holds a broker
+   * or a pool one of its endpoints was staged against, or when the leader would not be in the
+   * table, as the Java client refuses a leader missing from its node map. A refused hint installs
+   * no address and retires no connection, and the caller falls back to a metadata refresh.
    *
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-951%3A+Leader+discovery+optimisations+for+the+client
    * @public
@@ -1624,8 +1624,9 @@ module.exports = class Cluster {
    * @param {import('../producer/generation')} [options.fence] captured producer lifecycle; its
    *   close prevents endpoint installation and a later cache update
    * @returns {Promise<boolean>} `false` when the hint was rejected - a non-advancing epoch, a
-   *   `leaderId` of `-1` (no hint offered), an unknown topic/partition or another incarnation of
-   *   the topic - `true` when it was applied
+   *   `leaderId` of `-1` (no hint offered), an unknown topic/partition, another incarnation of the
+   *   topic, a leader the broker table would not hold, or endpoints whose staging no longer holds -
+   *   `true` when it was applied
    * @throws {Error} the lifecycle's close error
    */
   async applyLeaderHint(
@@ -1640,10 +1641,18 @@ module.exports = class Cluster {
       return false
     }
 
-    await this.brokerPool.applyNodeEndpoints(nodeEndpoints, { fence, admits })
+    let applied = false
+    await this.brokerPool.applyNodeEndpoints(nodeEndpoints, {
+      fence,
+      admits,
+      required: leaderId,
+      commit: () => {
+        applied = this.metadataCache.applyLeaderHint(topic, partition, hint)
+      },
+    })
     fence?.check()
     checked(null)
-    return this.metadataCache.applyLeaderHint(topic, partition, hint)
+    return applied
   }
 
   /**

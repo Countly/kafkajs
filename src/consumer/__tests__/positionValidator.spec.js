@@ -452,6 +452,24 @@ describe('Consumer > PositionValidator', () => {
       expect(at).toEqual([0, 0, 0, 1, 1, 2, 2, 2, 3])
     })
 
+    it('revision still changes on every revocation past the largest safe integer', () => {
+      const validator = create()
+      validator.revision = Number.MAX_SAFE_INTEGER - 1
+      const at = [validator.revision]
+      for (let i = 0; i < 3; i++) {
+        validator.markValidated(TOPIC, 0, 5)
+        validator.revoke(TOPIC, 0)
+        at.push(validator.revision)
+      }
+
+      expect(at).toEqual([
+        Number.MAX_SAFE_INTEGER - 1,
+        Number.MAX_SAFE_INTEGER,
+        Number.MIN_SAFE_INTEGER,
+        Number.MIN_SAFE_INTEGER + 1,
+      ])
+    })
+
     it('is true at the same epoch once revoke() dropped the entry, and request() then asks again', () => {
       const validator = create()
       validator.markValidated(TOPIC, 0, 5)

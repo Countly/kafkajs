@@ -59,14 +59,17 @@ module.exports = class PositionValidator {
   }
 
   /**
-   * Ends the admission of an entry that is being replaced or dropped.
+   * Ends the admission of an entry that is being replaced or dropped. The revision wraps from the
+   * largest safe integer to the smallest, so it changes on every revocation: `++` alone stops
+   * advancing at 2^53.
    * @param {{admitted: boolean}} entry
    * @returns {void}
    */
   #revokeEntry(entry) {
     if (!entry.admitted) return
     entry.admitted = false
-    this.revision++
+    this.revision =
+      this.revision === Number.MAX_SAFE_INTEGER ? Number.MIN_SAFE_INTEGER : this.revision + 1
   }
 
   /**

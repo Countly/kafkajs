@@ -4205,6 +4205,7 @@ module.exports = class ConsumerGroup {
   async validatePositions(topicPartitions, preparation) {
     let awaiting
     let unregister
+    let failure = null
     const manager = preparation ? preparation.manager : this.offsetManager
 
     // Outside the fail-open handling below: a cluster that cannot report routing changes must fail
@@ -4280,11 +4281,7 @@ module.exports = class ConsumerGroup {
     } catch (e) {
       const refusal = preparation?.guard()
       if (refusal) throw refusal
-      this.logger.warn('Position validation failed, fetching unvalidated', {
-        groupId: this.groupId,
-        memberId: this.memberId,
-        error: e.message,
-      })
+      failure = e
     } finally {
       // The invariant: no partition may be left awaiting with no request in flight. Carries the
       // generation each entry was requested under, so a sweep that runs after a rebalance cannot
@@ -4296,6 +4293,15 @@ module.exports = class ConsumerGroup {
       } else {
         for (const attempt of awaiting || []) this.settleUnanswered(attempt.topic, attempt, manager)
       }
+    }
+
+    // After the settlement: a log sink is application code and must find this round settled.
+    if (failure !== null) {
+      this.logger.warn('Position validation failed, fetching unvalidated', {
+        groupId: this.groupId,
+        memberId: this.memberId,
+        error: failure.message,
+      })
     }
   }
 
@@ -4377,6 +4383,7 @@ module.exports = class ConsumerGroup {
     )
 
     if (version == null) {
+      this.markAllValidated(topics, manager)
       if (!this.validationUnusableLogged.has(nodeId)) {
         this.validationUnusableLogged.add(nodeId)
         this.logger.info('Broker cannot validate positions, fetching unvalidated', {
@@ -4385,8 +4392,6 @@ module.exports = class ConsumerGroup {
           nodeId,
         })
       }
-
-      this.markAllValidated(topics, manager)
       return
     }
 
@@ -4426,13 +4431,6 @@ module.exports = class ConsumerGroup {
         throw e
       }
 
-      this.logger.warn('Position validation did not complete, fetching unvalidated', {
-        groupId: this.groupId,
-        memberId: this.memberId,
-        nodeId,
-        error: e.message,
-      })
-
       for (const { topic, entries } of pending) {
         for (const attempt of entries) {
           // The epoch is cleared and the offset left alone: the partition is fetched from where it
@@ -4444,6 +4442,13 @@ module.exports = class ConsumerGroup {
           }
         }
       }
+
+      this.logger.warn('Position validation did not complete, fetching unvalidated', {
+        groupId: this.groupId,
+        memberId: this.memberId,
+        nodeId,
+        error: e.message,
+      })
     }
   }
 
@@ -4567,26 +4572,28 @@ module.exports = class ConsumerGroup {
     // where the switch happens (`validationAttemptHolds`): a sibling's outcome may have been
     // awaited since it was classified, and a routing change, a rebalance, another attempt, a seek,
     // a reset or a new tracked epoch in that time took its authority away. Such an answer applies
-    // nothing and lets only its own attempt go; the next round asks again.
+    // nothing and lets only its own attempt go; the next round asks again. The checks, the switch
+    // and the settlement are one synchronous step that calls no application code: the warning
+    // goes out after it, so a seek its log sink makes finds the switch already made.
     let switchOff = false
     for (const attempt of fatal) {
       if (this.validationAttemptHolds(attempt.topic, attempt, manager)) switchOff = true
       else this.positionValidator.release([attempt])
     }
     if (switchOff) {
-      // Once per assignment, and only from the call that flips validation off: `disable()` makes
+      // Warned once per assignment, only by the call that flips validation off: `disable()` makes
       // `request()` answer without a reply from here on and `validateOnLeader` returns early for
       // every remaining leader of this round, but fetchers run one per node and two of them can
       // reach a non-retriable reply at the same moment.
-      if (!this.positionValidator.isDisabled()) {
+      const flipped = !this.positionValidator.isDisabled()
+      this.positionValidator.disable()
+      this.markAllValidated(pending, manager)
+      if (flipped) {
         this.logger.warn('Positions cannot be validated, continuing without validation', {
           groupId: this.groupId,
           memberId: this.memberId,
         })
-        this.positionValidator.disable()
       }
-
-      this.markAllValidated(pending, manager)
       return []
     }
 
