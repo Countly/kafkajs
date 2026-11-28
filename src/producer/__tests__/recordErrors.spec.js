@@ -1,3 +1,4 @@
+const { isNativeError } = require('util').types
 const setupPool = require('../../../testHelpers/setupPool')
 const Broker = require('../../broker')
 const Connection = require('../../network/connection')
@@ -5,6 +6,8 @@ const Encoder = require('../../protocol/encoder')
 const apiKeys = require('../../protocol/requests/apiKeys')
 const { responseHeaderVersion } = require('../../protocol/headers')
 const retry = require('../../retry')
+const Idempotence = require('../idempotence')
+const { CONNECTION_STATUS } = require('../../network/connectionStatus')
 const createSendMessages = require('../sendMessages')
 const createProducer = require('../index')
 const createEosManager = require('../eosManager')
@@ -188,6 +191,7 @@ describe('Producer > sendMessages > recordErrors (KIP-467, real codec over a fak
     expect(readRequestHeader(state.writes[1]).apiVersion).toEqual(9)
 
     expect(error).toBeInstanceOf(Error)
+    expect(isNativeError(error)).toBe(true)
     expect(error.recordErrors).toEqual([
       {
         batchIndex: 1,
@@ -377,6 +381,109 @@ const PATHS = [
   ['plain', false, { retries: 0 }],
 ]
 
+/**
+ * A send path over a real `Broker` and `Connection` that answers every Produce with the recorded
+ * v9 answer: INVALID_RECORD for partition 0, one rejected record at batch index 1.
+ * @param {boolean} idempotent the idempotent send loop with a real eosManager, or the plain path
+ * @returns {Promise<{ sender: ReturnType<typeof createSendMessages>, state: { writes: Buffer[] } }>}
+ */
+const createRealChainSender = async (idempotent) => {
+  const { broker, state } = createFakeBroker((header) =>
+    header.apiKey === apiKeys.ApiVersions
+      ? apiVersionsBody(9)
+      : Buffer.from(
+          require('../../protocol/requests/produce/fixtures/v9_response_record_errors.json')
+        )
+  )
+  await broker.connect()
+  const logger = newLogger()
+  const cluster = createCluster(broker, [{ partitionId: 0, leader: NODE_ID }])
+  if (!idempotent) {
+    const sender = createSendMessages({
+      logger,
+      cluster,
+      partitioner: partitionerByMessage,
+      eosManager: createEosManagerStub(),
+      retrier: retry({ retries: 0 }),
+    })
+    return { sender, state }
+  }
+  const coordinator = {
+    nodeId: 9,
+    initProducerId: async () => ({ producerId: '1000', producerEpoch: 0 }),
+  }
+  Object.assign(cluster, {
+    connect: async () => {},
+    findConnectedBroker: async () => coordinator,
+    findGroupCoordinator: async () => coordinator,
+    removeBroker: () => {},
+    applyLeaderHint: async () => true,
+  })
+  const eosManager = createEosManager({
+    logger,
+    cluster,
+    transactional: false,
+    retry: ONE_RETRY,
+  })
+  await eosManager.initProducerId()
+  const sender = createSendMessages({
+    logger,
+    cluster,
+    retrier: retry(ONE_RETRY),
+    partitioner: partitionerByMessage,
+    eosManager,
+    idempotence: new Idempotence({ enabled: true, explicit: false, logger }),
+    retry: ONE_RETRY,
+    getConnectionStatus: () => CONNECTION_STATUS.CONNECTED,
+  })
+  return { sender, state }
+}
+
+describe.each(PATHS)(
+  'Producer > two sends of one batch, a real request and response chain, %s',
+  (_, idempotent) => {
+    test('the owner of the rejected record gets it, the other gets the same frozen raw entry, each its own native Error', async () => {
+      const { sender, state } = await createRealChainSender(idempotent)
+      const accumulator = new Accumulator({
+        linger: 1000,
+        batchSize: 16384,
+        partition: (pending) => sender.partition(pending),
+        sendPartitioned: (request) => sender.sendPartitioned(request),
+      })
+      const sends = ['a', 'b'].map((name) =>
+        accumulator
+          .append({
+            acks: -1,
+            timeout: 30000,
+            topicMessages: Accumulator.snapshot([{ topic: TOPIC, messages: [message(name)] }]),
+          })
+          .catch((error) => error)
+      )
+      await flushAll()
+      accumulator.flush()
+      const [a, b] = await Promise.all(sends)
+
+      expect(state.writes).toHaveLength(2)
+      expect(readRequestHeader(state.writes[1]).apiVersion).toEqual(9)
+      for (const error of [a, b]) {
+        expect(error).toBeInstanceOf(KafkaJSProtocolError)
+        expect(isNativeError(error)).toBe(true)
+        expect(error).toMatchObject({ code: INVALID_RECORD, topic: TOPIC, partition: 0 })
+      }
+      expect(a).not.toBe(b)
+      expect(a.recordErrors).toEqual([{ batchIndex: 1, errorMessage: 'record too large' }])
+      expect(Object.isFrozen(a.recordErrors[0])).toBe(true)
+      expect(b.recordErrors).toEqual([
+        { batchIndex: 1, errorMessage: 'record too large', record: recordOf('b') },
+      ])
+      expect(Object.isFrozen(b.recordErrors[0])).toBe(false)
+      expect(a.recordErrors).not.toBe(b.recordErrors)
+      expect(new KafkaJSNonRetriableError('write failed', { cause: b }).category).toBe(b.category)
+      if (idempotent) expect(b.category).toBe('invalidConfiguration')
+    })
+  }
+)
+
 describe('Producer > the record errors of a shared batch', () => {
   const producers = []
 
@@ -451,6 +558,25 @@ describe('Producer > the record errors of a shared batch', () => {
       expect(b.value.recordErrors[0]).toBe(answer.recordErrors[0])
       expect(b.value.recordErrors).not.toBe(answer.recordErrors)
       expectRaw(answer)
+    })
+
+    test('each send gets a native Error that keeps the answer category when a caller wraps it as a cause', async () => {
+      const { producer, cluster } = await start({ idempotent, retry })
+      const answer = answerError(INVALID_RECORD, [0])
+      cluster.broker.produce.mockImplementation(async (request) =>
+        resultsOf(request, { 0: answer })
+      )
+
+      const [a, b] = await sendAll(producer, [message('a'), message('b')])
+
+      if (idempotent) expect(answer.category).toBe('invalidConfiguration')
+      for (const { value } of [a, b]) {
+        expect(value).not.toBe(answer)
+        expect(isNativeError(value)).toBe(true)
+        expect(value.category).toBe(answer.category)
+        const wrapped = new KafkaJSNonRetriableError('write failed', { cause: value })
+        expect(wrapped.category).toBe(answer.category)
+      }
     })
 
     test('one error object answering two partitions of a response is ambiguous: both sends get it raw', async () => {
@@ -1256,6 +1382,17 @@ describe('Accumulator.projectionsFor', () => {
       configurable: false,
     })
     timeout[tag] = 'timeout'
+    for (const [error, text] of [
+      [answer, 'answer stack'],
+      [timeout, 'timeout stack'],
+    ]) {
+      Object.defineProperty(error, 'stack', {
+        value: text,
+        writable: false,
+        enumerable: false,
+        configurable: false,
+      })
+    }
 
     const projected = await settleWith(batch, timeout, occurrenceFor(answer, batch))
 
@@ -1270,10 +1407,10 @@ describe('Accumulator.projectionsFor', () => {
       [second.cause, answer],
     ]) {
       expect(copy).not.toBe(source)
+      expect(isNativeError(copy)).toBe(true)
       expect(Object.getPrototypeOf(copy)).toBe(Object.getPrototypeOf(source))
-      expect(copy.stack).toBe(source.stack)
       for (const key of Reflect.ownKeys(source)) {
-        if (key === 'cause' || key === 'recordErrors' || key === 'stack') continue
+        if (key === 'cause' || key === 'recordErrors') continue
         expect(Object.getOwnPropertyDescriptor(copy, key)).toEqual(
           Object.getOwnPropertyDescriptor(source, key)
         )
@@ -1299,6 +1436,33 @@ describe('Accumulator.projectionsFor', () => {
     expect(first.cause.cause).toBe(answer.cause)
     expect(timeout.cause).toBe(answer)
     expect(answer.recordErrors).toBe(entries)
+  })
+
+  test('an error whose stack is an accessor is copied without calling it, and each copy carries the accessor', async () => {
+    const { batch, sends } = await sharedBatch()
+    const answer = answerError(INVALID_RECORD, [0])
+    const getter = jest.fn(() => {
+      throw new Error('a stack formatter ran')
+    })
+    const setter = jest.fn()
+    Object.defineProperty(answer, 'stack', { get: getter, set: setter, configurable: true })
+
+    const projected = await settleWith(batch, answer, occurrenceFor(answer, batch))
+
+    expect(projected.size).toBe(2)
+    expect(getter).not.toHaveBeenCalled()
+    expect(setter).not.toHaveBeenCalled()
+    for (const { value } of sends) {
+      expect(isNativeError(value)).toBe(true)
+      expect(value).not.toBe(answer)
+      expect(Object.getOwnPropertyDescriptor(value, 'stack')).toEqual({
+        get: getter,
+        set: setter,
+        enumerable: false,
+        configurable: true,
+      })
+    }
+    expect(sends[0].value.recordErrors[0].record).toEqual(recordOf('a'))
   })
 
   test.each([

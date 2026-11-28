@@ -82,10 +82,14 @@ const linksTo = (delivered, answer) => {
 }
 
 /**
- * A copy of an error with its prototype and every own property descriptor, string and symbol
- * keys, with `substitutes` put in place of their values before the copy is created. `stack` is the
- * source's stack text as a data property, since an engine-installed stack accessor reads its
- * receiver.
+ * A copy of an error that is a native `Error`, as the source is: `util.types.isNativeError` holds,
+ * so a caller that wraps the copy as a `cause` keeps its category (see `initialCategory`). The
+ * copy has the source's prototype and every own property descriptor, string and symbol keys,
+ * attributes included, with `substitutes` put in place of their values first. A getter or setter
+ * is carried over, never called, and the source's `stack` is never read: a data `stack` is copied
+ * with its attributes, an accessor `stack` is carried over uncalled and runs, on the copy, only
+ * when a caller reads it, and a source with no own `stack` leaves the copy the trace captured when
+ * it was made.
  * @param {Error} link
  * @param {{ cause?: Error, recordErrors?: object[] }} substitutes
  * @returns {Error}
@@ -95,8 +99,8 @@ const copyLink = (link, substitutes) => {
   for (const [key, value] of Object.entries(substitutes)) {
     descriptors[key] = { ...descriptors[key], value }
   }
-  descriptors.stack = { value: link.stack, writable: true, enumerable: false, configurable: true }
-  return Object.create(Object.getPrototypeOf(link), descriptors)
+  const copy = Object.setPrototypeOf(new Error(), Object.getPrototypeOf(link))
+  return Object.defineProperties(copy, descriptors)
 }
 
 /**

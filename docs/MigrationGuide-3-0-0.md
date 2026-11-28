@@ -101,15 +101,19 @@ notice and what, if anything, to do.
   now carries `topic`, `partition`, the broker's own `errorMessage`, and, when the broker rejected
   individual records rather than the whole partition, `recordErrors`: an array of
   `{ batchIndex, errorMessage }`, where `batchIndex` is the record's position in the rejected
-  batch, not an index into your `messages`. Sends gathered into one batch each get their own error
-  object, and only an entry for a record of your own send also carries `record`: a copy of that
-  record as written (`key`, `value` and header values as `Buffer`s in a store of its own, and
-  `timestamp` as a decimal string when you gave one), never the message object you passed in and
-  never another send's record. Record details come only from a broker's answer for that batch,
-  or a delivery timeout built around that answer; an error thrown for a whole request, one that
-  ran out of retries, and a delivery timeout on a non-idempotent producer carry the broker's
-  entries without `record`. The position of the record in your `messages` is not given yet.
-  `type`, `code` and `retriable` are unchanged. Which
+  batch, not an index into your `messages`. When the broker's answer for a batch is delivered
+  to the sends gathered into it (on an idempotent producer, also a delivery timeout built around
+  that answer), each send gets an error object of its own: a native `Error` of the same class, with
+  the same properties and `category`, so wrapping it as a `cause` keeps its category. Only an
+  entry for a record of your own send also carries `record`: a copy of that record as written
+  (`key`, `value` and header values as `Buffer`s in a store of its own, and `timestamp` as a
+  decimal string when you gave a number, string, `bigint`, `Date` or `Long`; none for any other
+  value), never the message object you passed in and never another send's record. The other
+  entries are the broker's own, shared and frozen. In every other case (an error thrown for a
+  whole request, one that ran out of retries, a delivery timeout on a non-idempotent producer, an
+  error object the broker's answers reuse) every send of the batch gets the broker's one error
+  object, whose entries have no `record`; do not change it. The position of the record in your
+  `messages` is not given yet. `type`, `code` and `retriable` are unchanged. Which
   failure is reported is also unchanged — the first failing partition in the response, exactly as
   before — and there is still no automatic re-batching: a batch containing one rejected record
   fails as a whole, as it always did.

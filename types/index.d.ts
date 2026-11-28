@@ -1795,7 +1795,8 @@ type Sender = {
    * Sends a produce request for one topic's messages. Rejects with a `KafkaJSProtocolError`
    * (`topic`, `partition`, `errorMessage` set) when the broker fails the whole batch; when it
    * rejected individual records (KIP-467), the error also carries
-   * `recordErrors: ProduceRecordError[]`, on an error of this send's own.
+   * `recordErrors: readonly ProduceRecordError[]`. Sends that shared a batch each get an error of
+   * their own, unless the broker's answer is delivered as it is (see `ProduceRecordError`).
    */
   send(record: ProducerRecord): Promise<RecordMetadata[]>
   sendBatch(batch: ProducerBatch): Promise<RecordMetadata[]>
@@ -2941,7 +2942,7 @@ export class KafkaJSProtocolError extends KafkaJSError {
   /** The broker's own message for this error, when it sent one */
   readonly errorMessage?: string | null
   /** The records the broker rejected individually out of a failed produce batch (KIP-467) */
-  readonly recordErrors?: ProduceRecordError[]
+  readonly recordErrors?: readonly ProduceRecordError[]
   /**
    * Set on what `admin.deleteTopics` and `admin.createPartitions` throw: every topic the broker
    * failed, where the error itself names the first one's code.
@@ -2957,27 +2958,31 @@ export class KafkaJSProtocolError extends KafkaJSError {
 
 /**
  * A single record the broker rejected out of an otherwise-failed produce batch (KIP-467).
- * Several sends can share one batch: each send whose records the broker rejected gets its own
- * error, and only its own entries carry `record`; an entry for another send's record has
- * `batchIndex` and `errorMessage` alone. There is no index into your `messages` yet.
+ * Several sends can share one batch. When the broker's answer for the batch is delivered to its
+ * sends, each of them gets an error of its own (a native `Error` of the same class, with the same
+ * properties and category), and only its own entries carry `record`; an entry for another send's
+ * record has `batchIndex` and `errorMessage` alone. In every other case (an error thrown for a
+ * whole request, one that ran out of retries, a delivery timeout on a non-idempotent producer, an
+ * error object the broker's answers reuse) the sends of the batch get the broker's one error
+ * object, whose entries have no `record`. The error and its entries must not be changed. There is
+ * no index into your `messages` yet.
  */
 export type ProduceRecordError = {
   /** Position of the record inside the rejected batch, not an index into your `messages`. */
-  batchIndex: number
+  readonly batchIndex: number
   /**
    * A copy of the record as the producer wrote it, in a store of its own: `key`, `value` and the
    * header values as `Buffer`s (strings UTF-8 encoded), none of your other fields. `timestamp` is
-   * the decimal string of the timestamp you gave; absent when you gave none (the send time was
-   * written) or gave an object other than a `Date` or a `Long`. Set only on your own records of a broker
-   * answer, never on an error thrown for a whole request.
+   * the decimal string of the timestamp you gave as a number, string, `bigint`, `Date` or `Long`;
+   * absent when you gave none (the send time was written) or gave any other object.
    */
-  record?: {
-    key: Buffer | null
-    value: Buffer | null
-    headers: { [key: string]: Buffer | Buffer[] }
-    timestamp?: string
+  readonly record?: {
+    readonly key: Buffer | null
+    readonly value: Buffer | null
+    readonly headers: { readonly [key: string]: Buffer | readonly Buffer[] }
+    readonly timestamp?: string
   }
-  errorMessage: string | null
+  readonly errorMessage: string | null
 }
 
 export class KafkaJSAggregateError extends Error {
