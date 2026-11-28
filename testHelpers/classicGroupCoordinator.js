@@ -17,6 +17,7 @@ const leaveGroupV5 = require('./wire/leaveGroupV5')
 
 /** Kafka error codes the classic group handlers answer with. */
 const CODES = Object.freeze({
+  UNKNOWN_SERVER_ERROR: -1,
   NONE: 0,
   NOT_COORDINATOR: 16,
   ILLEGAL_GENERATION: 22,
@@ -72,6 +73,13 @@ const syncAnswer = (fields) => ({
   ...fields,
 })
 
+/**
+ * @param {{ name: string, metadata: Buffer }[]} protocols
+ * @returns {{ name: string, metadata: Buffer }[]} the same protocols over copies of their bytes
+ */
+const copyProtocols = (protocols) =>
+  protocols.map(({ name, metadata }) => ({ name, metadata: Buffer.from(metadata) }))
+
 /** @returns {{ promise: Promise<*>, resolve: Function }} */
 const deferred = () => {
   let resolve
@@ -109,8 +117,10 @@ const readRequest = (apiKey, body) => {
  * - JoinGroup: MEMBER_ID_REQUIRED (79) for a new dynamic member, which joins as a pending member;
  *   INCONSISTENT_GROUP_PROTOCOL (23) when no offered protocol is supported by every member; the
  *   join barrier (every member, and no pending member, must have joined, or the rebalance timeout
- *   passes and the dynamic members that did not rejoin are removed); the initial rebalance delay;
- *   a leader rejoining a stable group or a member with changed metadata starts a rebalance; a
+ *   passes and the dynamic members that did not rejoin are removed); the initial rebalance delay,
+ *   extended while members keep arriving by at most what is left of the rebalance timeout after the
+ *   first delay; a pending member id presented with an instance id, answered as an unexpected error
+ *   (-1) that changes nothing; a leader rejoining a stable group or a member with changed metadata starts a rebalance; a
  *   follower rejoining unchanged gets the current generation; a static member joining with an
  *   empty member id takes a new id and fences the old one's parked JoinGroup and SyncGroup (82).
  * - SyncGroup: member and instance checks (25, 82), generation check (22), protocol check (23),
@@ -128,12 +138,19 @@ const readRequest = (apiKey, body) => {
  * iterates a hash map). A request it cannot read, or for another group, closes its connection
  * with an error and is listed in `failures`.
  *
- * Each `connect()` gives a production `Broker` over its own connection and scripted socket, at
- * JoinGroup v8, SyncGroup v5, Heartbeat v4 and LeaveGroup v5. Every request goes through three
+ * Each `connect()` gives a production `Broker` over its own production `Connection` (real request
+ * framing and response decoding) and scripted socket. The broker's API versions are preloaded
+ * (JoinGroup v8, SyncGroup v5, Heartbeat v4, LeaveGroup v5) behind a minimal test pool, so
+ * ApiVersions negotiation, connection pooling and coordinator lookup are not exercised, and no
+ * other version of these APIs is served: a codec at another version, such as LeaveGroup v3, needs
+ * its own test through a `Broker` and `Connection`. Every request goes through three
  * steps: the client writes it, the coordinator accepts it (its effect on the group happens here),
  * and the reply is released. A test can hold a step (`hold`), so a client that gives up after
  * acceptance never undoes what the coordinator did. As Kafka does, one connection is served one
  * request at a time: a parked JoinGroup or SyncGroup holds back what was written after it.
+ * The coordinator owns the bytes it stores: it copies a request's protocol metadata and
+ * assignments when it takes them, and every answer, `describe()` snapshot and recorded request
+ * holds copies, so a test that edits one in place cannot change what the group later answers.
  * `faultNextReply` changes one delivered reply without touching what the group stored.
  * `unload()` answers everything parked with NOT_COORDINATOR (16), as Kafka does when the
  * coordinator moves; `close()` also closes every connection. A spec calls `close()` after each
@@ -375,7 +392,7 @@ class ClassicGroupCoordinator {
       members: Array.from(this.members.values(), ({ memberId, groupInstanceId, assignment }) => ({
         memberId,
         groupInstanceId,
-        assignment,
+        assignment: Buffer.from(assignment),
       })),
       pending: Array.from(this.pendingJoin),
       awaitingJoin: Array.from(this.members.values())
@@ -510,6 +527,9 @@ class ClassicGroupCoordinator {
     }
 
     if (this.pendingJoin.has(memberId)) {
+      // Kafka throws an IllegalStateException here, which the coordinator service answers as an
+      // unexpected error; the pending member stays pending and no instance is registered.
+      if (groupInstanceId !== null) return answer({ errorCode: CODES.UNKNOWN_SERVER_ERROR })
       this.addMember(request, memberId, reply)
       return reply.promise
     }
@@ -567,7 +587,10 @@ class ClassicGroupCoordinator {
     this.pendingSync.delete(memberId)
     if (memberId === this.leaderId) {
       const plan = new Map(
-        request.groupAssignment.map(({ memberId: id, memberAssignment }) => [id, memberAssignment])
+        request.groupAssignment.map(({ memberId: id, memberAssignment }) => [
+          id,
+          Buffer.from(memberAssignment),
+        ])
       )
       for (const each of this.members.values()) {
         each.assignment = plan.get(each.memberId) ?? EMPTY_ASSIGNMENT
@@ -705,7 +728,7 @@ class ClassicGroupCoordinator {
     const member = {
       memberId,
       groupInstanceId: request.groupInstanceId,
-      protocols: request.groupProtocols,
+      protocols: copyProtocols(request.groupProtocols),
       rebalanceTimeout: request.rebalanceTimeout,
       assignment: EMPTY_ASSIGNMENT,
       isNew: true,
@@ -731,7 +754,7 @@ class ClassicGroupCoordinator {
    * @returns {void}
    */
   updateMember(member, request, reply) {
-    member.protocols = request.groupProtocols
+    member.protocols = copyProtocols(request.groupProtocols)
     member.rebalanceTimeout = request.rebalanceTimeout
     if (member.join) this.orphans.set(member.join, joinAnswer)
     member.join = reply
@@ -851,7 +874,10 @@ class ClassicGroupCoordinator {
     const initial = this.state === STATES.EMPTY
     this.transitionTo(STATES.PREPARING)
     if (initial) {
-      this.scheduleInitialRebalance(this.initialRebalanceDelay, this.rebalanceTimeout())
+      this.scheduleInitialRebalance(
+        this.initialRebalanceDelay,
+        Math.max(this.rebalanceTimeout() - this.initialRebalanceDelay, 0)
+      )
     } else if (this.allJoined()) {
       this.completeJoin()
     } else {
@@ -861,8 +887,8 @@ class ClassicGroupCoordinator {
 
   /**
    * @private
-   * @param {number} delay
-   * @param {number} remaining
+   * @param {number} delay how long until the join phase ends or is extended
+   * @param {number} remaining how much of the rebalance timeout is left to extend by
    * @returns {void}
    */
   scheduleInitialRebalance(delay, remaining) {
@@ -995,7 +1021,9 @@ class ClassicGroupCoordinator {
         ? Array.from(this.members.values(), ({ memberId, groupInstanceId, protocols }) => ({
             memberId,
             groupInstanceId,
-            memberMetadata: protocols.find(({ name }) => name === this.protocolName).metadata,
+            memberMetadata: Buffer.from(
+              protocols.find(({ name }) => name === this.protocolName).metadata
+            ),
           }))
         : [],
     })
@@ -1010,7 +1038,7 @@ class ClassicGroupCoordinator {
     return syncAnswer({
       protocolType: this.protocolType,
       protocolName: this.protocolName,
-      memberAssignment: member.assignment,
+      memberAssignment: Buffer.from(member.assignment),
     })
   }
 

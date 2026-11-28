@@ -569,7 +569,15 @@ export type GroupMember = {
 
 export type GroupMemberAssignment = { memberId: string; memberAssignment: Buffer }
 
-export type GroupState = { name: string; metadata: Buffer }
+export type GroupState = {
+  /**
+   * The protocol name JoinGroup offers. The coordinator answers with the one it selects, and the
+   * leader runs the assigner that offered it. Two assigners must not offer different names that
+   * are written as the same bytes (a lone surrogate is written as U+FFFD).
+   */
+  name: string
+  metadata: Buffer
+}
 
 export type Assigner = {
   name: string

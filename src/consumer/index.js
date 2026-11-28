@@ -39,6 +39,7 @@ const {
   stampOwnership,
 } = require('./rebalanceErrorContract')
 const { roundRobin } = require('./assigners')
+const AssignerOffers = require('./groupProtocol/assignerOffers')
 const {
   EARLIEST_OFFSET,
   LATEST_OFFSET,
@@ -102,29 +103,6 @@ const specialOffsets = [
  * several reads the same way theirs does.
  */
 const CLASSIC_ONLY_KEYS = ['partitionAssigners', 'heartbeatInterval', 'sessionTimeout']
-
-/**
- * Refuses two assigners whose different names JoinGroup writes as the same bytes (UTF-8 writes
- * each lone surrogate as U+FFFD): the coordinator's choice could not name one of them. The same
- * name listed twice is accepted, as before.
- * @param {{ name: string }[]} assigners
- * @returns {void}
- * @throws {KafkaJSNonRetriableError} naming both and what they are sent as
- */
-const assertAssignerNamesApart = (assigners) => {
-  const nameSentAs = new Map()
-  for (const { name } of assigners) {
-    if (typeof name !== 'string') continue
-    const sent = Buffer.from(name, 'utf8').toString('utf8')
-    const earlier = nameSentAs.get(sent)
-    if (earlier !== undefined && earlier !== name) {
-      throw new KafkaJSNonRetriableError(
-        `The partition assigners "${earlier}" and "${name}" are both sent as "${sent}", so the group cannot tell them apart`
-      )
-    }
-    nameSentAs.set(sent, name)
-  }
-}
 
 /**
  * Whether the user actually set this option.
@@ -352,7 +330,9 @@ module.exports = (params) => {
     : partitionAssigners.map((createAssigner) =>
         createAssigner({ groupId, logger, cluster, rackAware: rackAwareAssignment })
       )
-  assertAssignerNamesApart(assigners)
+  // The names the assigners declare must already be apart; what each one offers at join is
+  // checked again where JoinGroup is written.
+  AssignerOffers.declared(assigners)
 
   /** @type {Record<string, { fromBeginning?: boolean, resetPolicy?: object }>} */
   const topics = dictionary()

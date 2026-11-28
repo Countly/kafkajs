@@ -55,6 +55,14 @@ describe('Protocol > Requests > JoinGroup answer check', () => {
       answer({ ...LEADER, members: [{ memberId: 'member-1' }, { memberId: 'member-2' }] }),
     ],
     ['the echo of an offered name with a lone surrogate', answer({ groupProtocol: 'planner-�' })],
+    [
+      'an answer with no leader id and no members, as a consumer group answers a classic join',
+      answer({ leaderId: '' }),
+    ],
+    [
+      'the answer to a rekeyed static member, naming the leader before it and no members',
+      answer({ leaderId: 'member-0' }),
+    ],
   ])('accepts %s', (_, decoded) => {
     expect(() => assertJoinAnswer(decoded, OFFERED)).not.toThrow()
   })

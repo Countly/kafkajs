@@ -13,6 +13,7 @@ const {
   events: { HEARTBEAT },
 } = require('../instrumentationEvents')
 const { EAGER, COOPERATIVE } = require('./interface')
+const AssignerOffers = require('./assignerOffers')
 const LeaderUnionWatch = require('../leaderUnionWatch')
 const CoordinatorLookup = require('../coordinatorLookup')
 const {
@@ -133,6 +134,8 @@ module.exports = class ClassicGroupProtocol {
     this.membershipRevision = 0
     this.members = null
     this.groupProtocol = null
+    /** @type {AssignerOffers|null} the offers of the JoinGroup that joined the current membership */
+    this.offers = null
     this.protocolType = null
     this.lastRequest = Date.now()
     this.staticMembershipInactiveWarned = false
@@ -428,7 +431,9 @@ module.exports = class ClassicGroupProtocol {
    * @param {{ topicsSubscribed: string[], round?: object }} context
    * @returns {Promise<void>}
    * @throws {KafkaJSNonRetriableError} for a session timeout refused by the broker, naming
-   *   the client option and broker settings; other failures retain their original identity.
+   *   the client option and broker settings, and, before anything is written, for two assigners
+   *   whose different offered names are written as the same bytes; other failures retain their
+   *   original identity.
    */
   async join({ topicsSubscribed, round }) {
     const { groupId, sessionTimeout, rebalanceTimeout, groupInstanceId, membershipRevision } = this
@@ -440,6 +445,7 @@ module.exports = class ClassicGroupProtocol {
     }
 
     let groupData
+    let offers
 
     /** @returns {Error|null} the round's refusal, else the join-deadline error of a retired membership */
     const joinRefusal = () =>
@@ -460,6 +466,11 @@ module.exports = class ClassicGroupProtocol {
         this.heartbeatManager.disable()
       }
 
+      const groupProtocols = this.assigners.map((assigner) =>
+        this.subscriptionFor(assigner, topicsSubscribed)
+      )
+      offers = new AssignerOffers(this.assigners, groupProtocols)
+
       groupData = await this.coordinator.joinGroup(
         {
           groupId,
@@ -468,9 +479,7 @@ module.exports = class ClassicGroupProtocol {
           memberId: this.memberId || this.pendingMemberId || '',
           groupInstanceId,
           protocolType: PROTOCOL_TYPE,
-          groupProtocols: this.assigners.map((assigner) =>
-            this.subscriptionFor(assigner, topicsSubscribed)
-          ),
+          groupProtocols,
         },
         {
           guard: joinRefusal,
@@ -504,6 +513,7 @@ module.exports = class ClassicGroupProtocol {
     this.leaderId = groupData.leaderId
     this.members = groupData.members
     this.groupProtocol = groupData.groupProtocol
+    this.offers = offers
     this.protocolType = groupData.protocolType
     // JoinGroup v5's response carries no group_instance_id for this member: it only appears
     // per-entry in `members`, populated for the leader. `this.groupInstanceId` is the value the
@@ -640,7 +650,9 @@ module.exports = class ClassicGroupProtocol {
         memberId,
         topics,
       })
-      const assigner = this.assigners.find(({ name }) => name === groupProtocol)
+      const assigner = (this.offers ?? AssignerOffers.declared(this.assigners)).assignerFor(
+        groupProtocol
+      )
 
       if (!assigner) {
         throw new KafkaJSNonRetriableError(

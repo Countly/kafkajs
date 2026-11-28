@@ -14,7 +14,7 @@ const {
 const { newLogger } = require('testHelpers')
 const Generation = require('../../producer/generation')
 const GroupOwnership = require('../groupOwnership')
-const { KafkaJSConnectionError } = require('../../errors')
+const { KafkaJSConnectionError, KafkaJSNonRetriableError } = require('../../errors')
 const { createErrorFromCode } = require('../../protocol/error')
 const sleep = require('../../utils/sleep')
 
@@ -54,12 +54,12 @@ const MEMBER_ASSIGNMENT = MemberAssignment.encode({
   assignment: { 'golden-topic-a': [0, 1], 'golden-topic-b': [0] },
 })
 
-const joinGroupResponse = () =>
+const joinGroupResponse = (protocolName = 'RoundRobinAssigner') =>
   new Encoder()
     .writeInt32(0)
     .writeInt16(0)
     .writeInt32(GENERATION_ID)
-    .writeString('RoundRobinAssigner')
+    .writeString(protocolName)
     .writeString(MEMBER_ID)
     .writeString(MEMBER_ID)
     .writeArray([
@@ -910,5 +910,112 @@ describe('Consumer > classic group protocol > the idle heartbeat probe', () => {
 
     expect(forward(Object.create(ConsumerProtocol.prototype))).toBe(false)
     expect(forward({ heartbeatIdle: (interval) => interval === INTERVAL })).toBe(true)
+  })
+})
+
+describe('Consumer > classic group protocol > the protocols a join offers', () => {
+  /** @returns {jest.Mock} an `assign` that gives the one member its golden assignment */
+  const assigns = () =>
+    jest.fn(async () => [{ memberId: MEMBER_ID, memberAssignment: MEMBER_ASSIGNMENT }])
+
+  /**
+   * @param {string} declared the assigner's own `name`
+   * @param {string} offered the name its `protocol()` returns
+   * @param {jest.Mock} [assign]
+   * @returns {object} an assigner whose declared and offered names can differ
+   */
+  const assigner = (declared, offered, assign = assigns()) => ({
+    name: declared,
+    protocol: () => ({ name: offered, metadata: PROTOCOL_METADATA }),
+    assign,
+  })
+
+  /**
+   * One classic round, over a real broker and socket, against a coordinator that selects `selected`.
+   * @param {object[]} assigners
+   * @param {string} selected the protocol name the JoinGroup answer carries
+   * @returns {Promise<{ outcome: Promise<object>, bodyOf: Function }>} the round's result and the
+   *   reader of the frames written
+   */
+  const roundSelecting = async (assigners, selected) => {
+    const { broker, bodyOf } = await createFakeCoordinator((header) =>
+      header.apiKey === apiKeys.JoinGroup ? joinGroupResponse(selected) : answer(header)
+    )
+    const protocol = new ClassicGroupProtocol({
+      cluster: {
+        findGroupCoordinator: async () => broker,
+        refreshMetadata: async () => {},
+        findTopicPartitionMetadata: () => [],
+      },
+      groupId: GROUP_ID,
+      groupInstanceId: null,
+      sessionTimeout: SESSION_TIMEOUT,
+      rebalanceTimeout: REBALANCE_TIMEOUT,
+      assigners,
+      instrumentationEmitter: new InstrumentationEventEmitter(),
+      logger: newLogger(),
+    })
+    const outcome = protocol.rebalance({
+      topics: TOPICS,
+      topicsSubscribed: TOPICS,
+      beforeSync: () => {},
+      round: realRound(),
+    })
+    outcome.catch(() => {})
+    return { outcome, bodyOf }
+  }
+
+  it('refuses two assigners whose offered names, not their declared ones, are written as the same bytes, and writes no JoinGroup', async () => {
+    const first = assigner('first', 'planner-\uD800')
+    const second = assigner('second', 'planner-\uDBFF')
+
+    const { outcome, bodyOf } = await roundSelecting([first, second], 'planner-�')
+
+    await expect(outcome).rejects.toBeInstanceOf(KafkaJSNonRetriableError)
+    await expect(outcome).rejects.toThrow(
+      'The partition assigners "planner-\uD800" and "planner-\uDBFF" are both sent as "planner-�", so the group cannot tell them apart'
+    )
+    expect(() => bodyOf(apiKeys.JoinGroup)).toThrow('no request written')
+    expect(first.assign).not.toHaveBeenCalled()
+    expect(second.assign).not.toHaveBeenCalled()
+  })
+
+  it('hands the round to the assigner that offered the name the coordinator selected, whatever it declares', async () => {
+    const chosen = assigner('declared-name', 'offered-name')
+    const other = assigner('other-declared', 'other-offered')
+
+    const { outcome } = await roundSelecting([other, chosen], 'offered-name')
+
+    await expect(outcome).resolves.toMatchObject({ assignment: expect.any(Object) })
+    expect(chosen.assign).toHaveBeenCalledTimes(1)
+    expect(other.assign).not.toHaveBeenCalled()
+  })
+
+  it('finds the one assigner whose offered name holds a lone surrogate when the coordinator selects the name as it was written', async () => {
+    const lone = assigner('planner-\uD800', 'planner-\uD800')
+
+    const { outcome } = await roundSelecting([lone], 'planner-�')
+
+    await expect(outcome).resolves.toMatchObject({ assignment: expect.any(Object) })
+    expect(lone.assign).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the first of two assigners that offer the same name', async () => {
+    const first = assigner('twin', 'twin')
+    const second = assigner('twin', 'twin')
+
+    const { outcome } = await roundSelecting([first, second], 'twin')
+
+    await outcome
+    expect(first.assign).toHaveBeenCalledTimes(1)
+    expect(second.assign).not.toHaveBeenCalled()
+  })
+
+  it('refuses a selected name no assigner offered, as the assigner list did before', async () => {
+    const { outcome } = await roundSelecting([assigner('known', 'known')], 'unknown')
+
+    await expect(outcome).rejects.toThrow(
+      'Unsupported partition assigner "unknown", the assigner wasn\'t found in the assigners list'
+    )
   })
 })

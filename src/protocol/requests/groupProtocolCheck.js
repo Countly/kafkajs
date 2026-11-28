@@ -44,7 +44,9 @@ const isMalformedGroupAnswer = (error) => error?.type === MALFORMED_GROUP_ANSWER
  * Refuses a successful JoinGroup answer no Kafka 4.x coordinator sends: it always names a member
  * id, a generation of 0 or more and one of the protocols the member offered, as the request wrote
  * its name, and gives the leader every member, itself included, once each. Followers get no member
- * list, so theirs is not read.
+ * list, so theirs is not read. A leader id other than the member's own, or none (a coordinator
+ * that hosts a consumer-protocol group names no leader to a classic member that joins it), marks a
+ * follower answer, which is accepted: both are answers a correct 4.0 to 4.4 coordinator sends.
  * @see https://github.com/apache/kafka/blob/4.4.0/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupMetadataManager.java
  * @param {{ memberId: string|null, generationId: number, groupProtocol: string|null,
  *   leaderId: string|null, members: { memberId: string|null }[] }} answer the decoded answer

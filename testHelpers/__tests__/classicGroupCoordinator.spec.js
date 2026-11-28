@@ -281,6 +281,62 @@ describe('ClassicGroupCoordinator', () => {
       expect(successor).toMatchObject({ generationId: 3, leaderId: a.memberId })
       expect(successor.memberId).not.toBe(b.memberId)
     })
+
+    test('the initial rebalance is extended only by what is left of the rebalance timeout after the first delay: members arriving in later windows are answered when it runs out', async () => {
+      jest.useFakeTimers({ now: 0, doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] })
+      try {
+        coordinator = new ClassicGroupCoordinator({ groupId: GROUP, initialRebalanceDelay: 1000 })
+        const joinInstance = async (groupInstanceId) => {
+          const watched = watch(join(client(), { groupInstanceId, rebalanceTimeout: 1500 }))
+          await coordinator.whenAccepted(
+            'JoinGroup',
+            (request) => request.groupInstanceId === groupInstanceId
+          )
+          return watched
+        }
+
+        const a = await joinInstance('a')
+        jest.advanceTimersByTime(500)
+        const b = await joinInstance('b')
+        jest.advanceTimersByTime(700)
+        const c = await joinInstance('c')
+        jest.advanceTimersByTime(299)
+        expect(coordinator.describe().state).toBe(STATES.PREPARING)
+        expect(c.settled()).toBe(false)
+
+        jest.advanceTimersByTime(1)
+        expect(coordinator.describe()).toMatchObject({ state: STATES.COMPLETING, generationId: 1 })
+        const answers = await Promise.all([a.promise, b.promise, c.promise])
+        expect(answers.map(({ generationId }) => generationId)).toEqual([1, 1, 1])
+      } finally {
+        jest.useRealTimers()
+      }
+    })
+
+    test('a pending dynamic member id presented with an instance id is answered -1 and changes nothing: the pending member still joins', async () => {
+      const first = coordinator.hold('JoinGroup', 'acceptance')
+      const second = coordinator.hold('JoinGroup', 'acceptance')
+      const dynamicJoin = watch(join(client()))
+      await first.reached
+      first.release()
+      const { memberId: pendingId } = await second.reached
+      expect(coordinator.describe().pending).toEqual([pendingId])
+
+      await expect(
+        join(client(), { memberId: pendingId, groupInstanceId: 'x' })
+      ).rejects.toMatchObject({ code: -1 })
+
+      expect(coordinator.describe()).toMatchObject({ members: [], pending: [pendingId] })
+      second.release()
+      await expect(dynamicJoin.promise).resolves.toMatchObject({
+        memberId: pendingId,
+        generationId: 1,
+      })
+      expect(coordinator.describe()).toMatchObject({
+        pending: [],
+        members: [{ memberId: pendingId, groupInstanceId: null }],
+      })
+    })
   })
 
   describe('SyncGroup, as GroupMetadataManager 4.4.0 lines 8273-8359 and 8436-8466', () => {
@@ -563,6 +619,65 @@ describe('ClassicGroupCoordinator', () => {
         memberAssignment: Buffer.from([0]),
       })
       await expect(sync(a.broker, fields)).resolves.toMatchObject({ memberAssignment: PLAN_A })
+    })
+
+    test('a SyncGroup reply edited in place leaves the stored plan alone: the next SyncGroup of the member gets the stored bytes', async () => {
+      const a = await stableLeader()
+      coordinator.faultNextReply(
+        'SyncGroup',
+        (answer) => {
+          answer.memberAssignment[0] ^= 0xff
+          return answer
+        },
+        { memberId: a.memberId }
+      )
+
+      const fields = { memberId: a.memberId, generationId: 1, groupInstanceId: 'a' }
+      const faulted = await sync(a.broker, fields)
+
+      expect(faulted.memberAssignment).not.toEqual(PLAN_A)
+      await expect(sync(a.broker, fields)).resolves.toMatchObject({ memberAssignment: PLAN_A })
+      expect(coordinator.describe().members[0].assignment).toEqual(PLAN_A)
+    })
+
+    test("a JoinGroup reply edited in place leaves the member's stored metadata alone: the leader's next answer still carries the bytes it offered", async () => {
+      const broker = client()
+      coordinator.faultNextReply('JoinGroup', (answer) => {
+        answer.members[0].memberMetadata.fill(0)
+        return answer
+      })
+
+      const faulted = await join(broker, { groupInstanceId: 'a' })
+      expect(faulted.members[0].memberMetadata).not.toEqual(METADATA)
+
+      const again = await join(broker, { memberId: faulted.memberId, groupInstanceId: 'a' })
+      expect(again.members[0].memberMetadata).toEqual(METADATA)
+      expect(again.generationId).toBe(faulted.generationId)
+    })
+  })
+
+  describe('what the coordinator hands out is a copy', () => {
+    test('a describe() snapshot edited in place leaves the stored plan alone', async () => {
+      const a = await stableLeader()
+
+      coordinator.describe().members[0].assignment.fill(0)
+
+      await expect(
+        sync(a.broker, { memberId: a.memberId, generationId: 1, groupInstanceId: 'a' })
+      ).resolves.toMatchObject({ memberAssignment: PLAN_A })
+      expect(coordinator.describe().members[0].assignment).toEqual(PLAN_A)
+    })
+
+    test('a recorded request edited in place leaves the stored plan alone', async () => {
+      const a = await stableLeader()
+
+      for (const { request } of coordinator.requests) {
+        for (const { memberAssignment } of request.groupAssignment ?? []) memberAssignment.fill(0)
+      }
+
+      await expect(
+        sync(a.broker, { memberId: a.memberId, generationId: 1, groupInstanceId: 'a' })
+      ).resolves.toMatchObject({ memberAssignment: PLAN_A })
     })
   })
 

@@ -64,18 +64,25 @@ module.exports = class Encoder {
   }
 
   /**
+   * The string a broker reads back from what `writeString` and `writeUVarIntString` wrote for
+   * `name`. UTF-8 writes each lone surrogate as U+FFFD, so a broker's echo of such a name differs
+   * from `name`. A well-formed name is returned as it is.
+   * @param {string|null|undefined} name
+   * @returns {string|null|undefined} `name`, with each lone surrogate replaced by U+FFFD
+   */
+  static sentForm(name) {
+    return typeof name === 'string' ? name.toWellFormed() : name
+  }
+
+  /**
    * Whether `echoed` is the string a broker reads back from what `writeString` and
-   * `writeUVarIntString` wrote for `sent`. UTF-8 writes each lone surrogate as U+FFFD, so a
-   * broker's echo of such a string differs from `sent`.
+   * `writeUVarIntString` wrote for `sent`.
    * @param {string|null} echoed
    * @param {string} sent
    * @returns {boolean}
    */
   static isEchoOf(echoed, sent) {
-    return (
-      echoed === sent ||
-      (typeof sent === 'string' && echoed === Buffer.from(sent, 'utf8').toString('utf8'))
-    )
+    return echoed === sent || echoed === Encoder.sentForm(sent)
   }
 
   /**
