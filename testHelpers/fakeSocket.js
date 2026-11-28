@@ -1,5 +1,7 @@
 const { EventEmitter } = require('events')
 const Encoder = require('../src/protocol/encoder')
+const Decoder = require('../src/protocol/decoder')
+const { requestHeaderVersion, REQUEST_HEADER_V2 } = require('../src/protocol/headers')
 
 /**
  * A socket that records everything written and lets a test push response frames back. It matches
@@ -11,7 +13,8 @@ const Encoder = require('../src/protocol/encoder')
  * every socket's writes in one list, `state.sockets` every socket ever built, oldest first, and
  * `state.socket` the newest (null in bounded mode once it has closed). `destroy()` behaves as `net.Socket#destroy` does, minus the kernel: it
  * marks the socket `destroyed` at once and emits `error` (when given one) and `close` a microtask
- * later, once. A write after that is still recorded, so a test can see it.
+ * later, once; a socket destroyed before it connected never calls `onConnect`. A write after that
+ * is still recorded, so a test can see it.
  *
  * Scalar counters are kept in both modes: `state.issued`, `state.closed`, `state.writeCount`,
  * `state.writeBytes`, `state.writesAfterClose` and the per-endpoint `state.issuedByEndpoint`.
@@ -66,6 +69,8 @@ const createFakeSocketFactory = ({ bounded = null } = {}) => {
       throw error
     }
     const socket = new EventEmitter()
+    const destroyCallbacks = new Set()
+    let connecting = null
     socket.endpoint = { host, port }
     socket.destroyed = false
     socket.writes = []
@@ -84,9 +89,33 @@ const createFakeSocketFactory = ({ bounded = null } = {}) => {
     }
     socket.end = () => {}
     socket.unref = () => {}
+    /**
+     * Emits a single data chunk on a live socket.
+     * @param {Buffer} chunk
+     * @returns {boolean} whether the socket is still live after dispatch
+     */
+    socket.deliver = (chunk) => {
+      if (socket.destroyed) return false
+      socket.emit('data', chunk)
+      return !socket.destroyed
+    }
+    /**
+     * Registers synchronous cleanup for a live socket.
+     * @param {() => void} callback
+     * @returns {void}
+     */
+    socket.onDestroy = (callback) => {
+      if (!socket.destroyed) destroyCallbacks.add(callback)
+    }
     socket.destroy = (error) => {
       if (!socket.destroyed) {
         socket.destroyed = true
+        if (connecting) {
+          clearImmediate(connecting)
+          connecting = null
+        }
+        for (const callback of destroyCallbacks) callback()
+        destroyCallbacks.clear()
         queueMicrotask(() => {
           if (error) {
             socket.emit('error', error)
@@ -103,7 +132,11 @@ const createFakeSocketFactory = ({ bounded = null } = {}) => {
     state.issuedByEndpoint.set(key, (state.issuedByEndpoint.get(key) ?? 0) + 1)
     state.socket = socket
     state.sockets.push(socket)
-    setImmediate(onConnect)
+    // Held only until it runs: an Immediate keeps the async context it was created in.
+    connecting = setImmediate(() => {
+      connecting = null
+      onConnect()
+    })
     return socket
   }
 
@@ -130,21 +163,34 @@ const socketCounts = ({ sockets, issued, closed, bounded }) =>
 /**
  * Frames a response the way a broker does: size, correlation id, optional header tag buffer,
  * then the body.
- * @param {{ socket: EventEmitter }} state
  * @param {number} correlationId
  * @param {0|1} headerVersion 0 = classic, 1 = flexible (ApiVersions is always 0)
  * @param {Buffer} body
  * @param {{ tag: number, value: Buffer }[]} [headerTags] tagged fields to put in a flexible
  *        response header; omit for the empty section every real broker sends today
+ * @returns {Buffer} the complete response frame
  */
-const respondWithFrame = (state, correlationId, headerVersion, body, headerTags) => {
+const encodeResponseFrame = (correlationId, headerVersion, body, headerTags) => {
   const header = new Encoder().writeInt32(correlationId)
   if (headerVersion === 1) {
     header.writeTaggedFields(headerTags)
   }
 
   const framed = new Encoder().writeEncoder(header).writeBuffer(body)
-  state.socket.emit('data', new Encoder().writeInt32(framed.size()).writeEncoder(framed).buffer)
+  return new Encoder().writeInt32(framed.size()).writeEncoder(framed).buffer
+}
+
+/**
+ * Emits a complete broker response frame.
+ * @param {{ socket: EventEmitter }} state
+ * @param {number} correlationId
+ * @param {0|1} headerVersion
+ * @param {Buffer} body
+ * @param {{ tag: number, value: Buffer }[]} [headerTags]
+ * @returns {void}
+ */
+const respondWithFrame = (state, correlationId, headerVersion, body, headerTags) => {
+  state.socket.emit('data', encodeResponseFrame(correlationId, headerVersion, body, headerTags))
 }
 
 /**
@@ -160,8 +206,6 @@ const respondWithFrame = (state, correlationId, headerVersion, body, headerTags)
  *   byteLength: number }}
  */
 const readRequestHeader = (frame) => {
-  const Decoder = require('../src/protocol/decoder')
-  const { requestHeaderVersion, REQUEST_HEADER_V2 } = require('../src/protocol/headers')
   const decoder = new Decoder(frame)
   decoder.readInt32()
   const apiKey = decoder.readInt16()
@@ -176,4 +220,10 @@ const readRequestHeader = (frame) => {
   return { apiKey, apiVersion, correlationId, clientId, byteLength: decoder.offset }
 }
 
-module.exports = { createFakeSocketFactory, socketCounts, respondWithFrame, readRequestHeader }
+module.exports = {
+  createFakeSocketFactory,
+  socketCounts,
+  encodeResponseFrame,
+  respondWithFrame,
+  readRequestHeader,
+}
