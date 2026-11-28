@@ -758,85 +758,7 @@
       "namedOnly": true
     },
     {
-      "name": "compare-produce-throughput-linger0",
-      "adapter": "clientCompare",
-      "command": [
-        "scripts/benchmarks/clientCompare.js",
-        "--client",
-        "{client}",
-        "--package",
-        "{package}",
-        "--workload",
-        "produce-throughput",
-        "--duration-ms",
-        "30000",
-        "--fork-linger",
-        "0"
-      ],
-      "broker": true,
-      "metrics": [
-        { "key": "messagesPerSecond", "unit": "msg/s" },
-        { "key": "cpuMicrosPerMessage", "unit": "us" },
-        { "key": "elapsedMs", "unit": "ms" }
-      ],
-      "diagnostic": {
-        "args": ["--probe", "on"],
-        "metrics": [
-          { "key": "sendCallMicrosP50", "unit": "us" },
-          { "key": "sendCallMicrosP99", "unit": "us" },
-          { "key": "peakRssBytes", "unit": "bytes" },
-          { "key": "peakArrayBuffers", "unit": "bytes" },
-          { "key": "gcCountPer10kMessages", "unit": "collections" },
-          { "key": "gcPauseMsPer10kMessages", "unit": "ms" },
-          { "key": "produceRequestsPerRoundP50", "unit": "requests" },
-          { "key": "produceRequestsPerRoundMax", "unit": "requests" }
-        ]
-      },
-      "arms": ["fork", "kafkajs@2.2.4"],
-      "namedOnly": true
-    },
-    {
-      "name": "compare-produce-throughput-12p-linger0",
-      "adapter": "clientCompare",
-      "command": [
-        "scripts/benchmarks/clientCompare.js",
-        "--client",
-        "{client}",
-        "--package",
-        "{package}",
-        "--workload",
-        "produce-throughput",
-        "--duration-ms",
-        "30000",
-        "--partitions",
-        "12",
-        "--fork-linger",
-        "0"
-      ],
-      "broker": true,
-      "metrics": [
-        { "key": "messagesPerSecond", "unit": "msg/s" },
-        { "key": "cpuMicrosPerMessage", "unit": "us" },
-        { "key": "elapsedMs", "unit": "ms" }
-      ],
-      "diagnostic": {
-        "args": ["--probe", "on"],
-        "metrics": [
-          { "key": "sendCallMicrosP50", "unit": "us" },
-          { "key": "sendCallMicrosP99", "unit": "us" },
-          { "key": "peakRssBytes", "unit": "bytes" },
-          { "key": "peakArrayBuffers", "unit": "bytes" },
-          { "key": "gcCountPer10kMessages", "unit": "collections" },
-          { "key": "gcPauseMsPer10kMessages", "unit": "ms" },
-          { "key": "produceRequestsPerRoundP50", "unit": "requests" },
-          { "key": "produceRequestsPerRoundMax", "unit": "requests" }
-        ]
-      },
-      "arms": ["fork", "kafkajs@2.2.4"],
-      "namedOnly": true
-    },
-    {
-      "name": "compare-produce-throughput-12p-keyed-linger0",
+      "name": "compare-produce-throughput-12p-keyed-idempotent-off",
       "adapter": "clientCompare",
       "command": [
         "scripts/benchmarks/clientCompare.js",
@@ -852,178 +774,6 @@
         "12",
         "--keys",
         "index",
-        "--fork-linger",
-        "0"
-      ],
-      "broker": true,
-      "metrics": [
-        { "key": "messagesPerSecond", "unit": "msg/s" },
-        { "key": "cpuMicrosPerMessage", "unit": "us" },
-        { "key": "elapsedMs", "unit": "ms" }
-      ],
-      "diagnostic": {
-        "args": ["--probe", "on"],
-        "metrics": [
-          { "key": "sendCallMicrosP50", "unit": "us" },
-          { "key": "sendCallMicrosP99", "unit": "us" },
-          { "key": "peakRssBytes", "unit": "bytes" },
-          { "key": "peakArrayBuffers", "unit": "bytes" },
-          { "key": "gcCountPer10kMessages", "unit": "collections" },
-          { "key": "gcPauseMsPer10kMessages", "unit": "ms" },
-          { "key": "produceRequestsPerRoundP50", "unit": "requests" },
-          { "key": "produceRequestsPerRoundMax", "unit": "requests" }
-        ]
-      },
-      "arms": ["fork", "kafkajs@2.2.4"],
-      "namedOnly": true
-    },
-    {
-      "name": "compare-produce-throughput-fanout-100p-linger0",
-      "adapter": "clientCompare",
-      "command": [
-        "scripts/benchmarks/clientCompare.js",
-        "--client",
-        "{client}",
-        "--package",
-        "{package}",
-        "--workload",
-        "produce-throughput",
-        "--duration-ms",
-        "30000",
-        "--size",
-        "50",
-        "--partitions",
-        "100",
-        "--keys",
-        "index",
-        "--fork-linger",
-        "0"
-      ],
-      "broker": true,
-      "metrics": [
-        { "key": "messagesPerSecond", "unit": "msg/s" },
-        { "key": "cpuMicrosPerMessage", "unit": "us" },
-        { "key": "elapsedMs", "unit": "ms" }
-      ],
-      "diagnostic": {
-        "args": ["--probe", "on"],
-        "metrics": [
-          { "key": "sendCallMicrosP50", "unit": "us" },
-          { "key": "sendCallMicrosP99", "unit": "us" },
-          { "key": "peakRssBytes", "unit": "bytes" },
-          { "key": "peakArrayBuffers", "unit": "bytes" },
-          { "key": "gcCountPer10kMessages", "unit": "collections" },
-          { "key": "gcPauseMsPer10kMessages", "unit": "ms" },
-          { "key": "produceRequestsPerRoundP50", "unit": "requests" },
-          { "key": "produceRequestsPerRoundMax", "unit": "requests" }
-        ]
-      },
-      "arms": ["fork", "kafkajs@2.2.4"],
-      "namedOnly": true
-    },
-    {
-      "name": "compare-produce-throughput-custom-linger0",
-      "adapter": "clientCompare",
-      "command": [
-        "scripts/benchmarks/clientCompare.js",
-        "--client",
-        "{client}",
-        "--package",
-        "{package}",
-        "--workload",
-        "produce-throughput",
-        "--duration-ms",
-        "30000",
-        "--partitions",
-        "12",
-        "--partitioner",
-        "custom",
-        "--fork-linger",
-        "0"
-      ],
-      "broker": true,
-      "metrics": [
-        { "key": "messagesPerSecond", "unit": "msg/s" },
-        { "key": "cpuMicrosPerMessage", "unit": "us" },
-        { "key": "elapsedMs", "unit": "ms" }
-      ],
-      "diagnostic": {
-        "args": ["--probe", "on"],
-        "metrics": [
-          { "key": "sendCallMicrosP50", "unit": "us" },
-          { "key": "sendCallMicrosP99", "unit": "us" },
-          { "key": "peakRssBytes", "unit": "bytes" },
-          { "key": "peakArrayBuffers", "unit": "bytes" },
-          { "key": "gcCountPer10kMessages", "unit": "collections" },
-          { "key": "gcPauseMsPer10kMessages", "unit": "ms" },
-          { "key": "produceRequestsPerRoundP50", "unit": "requests" },
-          { "key": "produceRequestsPerRoundMax", "unit": "requests" }
-        ]
-      },
-      "arms": ["fork", "kafkajs@2.2.4"],
-      "namedOnly": true
-    },
-    {
-      "name": "compare-produce-throughput-coalesced-linger0",
-      "adapter": "clientCompare",
-      "command": [
-        "scripts/benchmarks/clientCompare.js",
-        "--client",
-        "{client}",
-        "--package",
-        "{package}",
-        "--workload",
-        "produce-throughput",
-        "--duration-ms",
-        "30000",
-        "--partitions",
-        "1",
-        "--unawaited",
-        "100",
-        "--fork-linger",
-        "0"
-      ],
-      "broker": true,
-      "metrics": [
-        { "key": "messagesPerSecond", "unit": "msg/s" },
-        { "key": "cpuMicrosPerMessage", "unit": "us" },
-        { "key": "elapsedMs", "unit": "ms" }
-      ],
-      "diagnostic": {
-        "args": ["--probe", "on"],
-        "metrics": [
-          { "key": "sendCallMicrosP50", "unit": "us" },
-          { "key": "sendCallMicrosP99", "unit": "us" },
-          { "key": "peakRssBytes", "unit": "bytes" },
-          { "key": "peakArrayBuffers", "unit": "bytes" },
-          { "key": "gcCountPer10kMessages", "unit": "collections" },
-          { "key": "gcPauseMsPer10kMessages", "unit": "ms" },
-          { "key": "produceRequestsPerRoundP50", "unit": "requests" },
-          { "key": "produceRequestsPerRoundMax", "unit": "requests" }
-        ]
-      },
-      "arms": ["fork", "kafkajs@2.2.4"],
-      "namedOnly": true
-    },
-    {
-      "name": "compare-produce-throughput-12p-keyed-linger0-plain",
-      "adapter": "clientCompare",
-      "command": [
-        "scripts/benchmarks/clientCompare.js",
-        "--client",
-        "{client}",
-        "--package",
-        "{package}",
-        "--workload",
-        "produce-throughput",
-        "--duration-ms",
-        "30000",
-        "--partitions",
-        "12",
-        "--keys",
-        "index",
-        "--fork-linger",
-        "0",
         "--fork-idempotent",
         "false"
       ],
@@ -1050,7 +800,7 @@
       "namedOnly": true
     },
     {
-      "name": "compare-produce-throughput-fanout-100p-linger0-plain",
+      "name": "compare-produce-throughput-fanout-100p-idempotent-off",
       "adapter": "clientCompare",
       "command": [
         "scripts/benchmarks/clientCompare.js",
@@ -1068,8 +818,6 @@
         "100",
         "--keys",
         "index",
-        "--fork-linger",
-        "0",
         "--fork-idempotent",
         "false"
       ],
@@ -1096,7 +844,7 @@
       "namedOnly": true
     },
     {
-      "name": "compare-produce-throughput-custom-linger0-plain",
+      "name": "compare-produce-throughput-custom-idempotent-off",
       "adapter": "clientCompare",
       "command": [
         "scripts/benchmarks/clientCompare.js",
@@ -1112,8 +860,6 @@
         "12",
         "--partitioner",
         "custom",
-        "--fork-linger",
-        "0",
         "--fork-idempotent",
         "false"
       ],

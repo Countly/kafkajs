@@ -1,4 +1,7 @@
 const { RoutingSeam, EPOCH, WAKE_MS } = require('./fixtures/routingSeam')
+const { trackFixtures } = require('./fixtures/fetchHarness')
+
+trackFixtures()
 
 describe('Consumer > accepted metadata install wake', () => {
   let seam

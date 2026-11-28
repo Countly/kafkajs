@@ -103,8 +103,9 @@ const notesOf = (output, workload) => {
     )
   } else if (output.settings) {
     const defaults = output.settings.defaults
+    const custom = output.shape?.partitioner === 'custom'
     notes.push(
-      `${client} settings in force (this package's defaults): ${defaults ? pairs(defaults) : 'unknown package'}`
+      `${client} settings in force (this package's defaults${custom ? ', except the partitioner, which is the custom one' : ''}): ${defaults ? pairs(defaults) : 'unknown package'}`
     )
   }
   if (output.settings?.overrides) {

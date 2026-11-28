@@ -106,15 +106,9 @@ describe('Benchmark report clientCompare adapter', () => {
         'compare-produce-throughput-fanout-100p': produce('50', 'none', '100'),
         'compare-produce-throughput-custom': produce('200', 'none', '12'),
         'compare-produce-throughput-headers': produce('200'),
-        'compare-produce-throughput-linger0': produce('200'),
-        'compare-produce-throughput-12p-linger0': produce('200', 'none', '12'),
-        'compare-produce-throughput-12p-keyed-linger0': produce('200', 'none', '12'),
-        'compare-produce-throughput-fanout-100p-linger0': produce('50', 'none', '100'),
-        'compare-produce-throughput-custom-linger0': produce('200', 'none', '12'),
-        'compare-produce-throughput-coalesced-linger0': produce('200', 'none', '1'),
-        'compare-produce-throughput-12p-keyed-linger0-plain': produce('200', 'none', '12'),
-        'compare-produce-throughput-fanout-100p-linger0-plain': produce('50', 'none', '100'),
-        'compare-produce-throughput-custom-linger0-plain': produce('200', 'none', '12'),
+        'compare-produce-throughput-12p-keyed-idempotent-off': produce('200', 'none', '12'),
+        'compare-produce-throughput-fanout-100p-idempotent-off': produce('50', 'none', '100'),
+        'compare-produce-throughput-custom-idempotent-off': produce('200', 'none', '12'),
         'compare-consume-throughput': ['consume-throughput', '200', 'none', '3', 'defaults'],
         'compare-consume-throughput-same': ['consume-throughput', '200', 'none', '3', 'same'],
         'compare-consume-throughput-1k': ['consume-throughput', '1024', 'none', '3', 'defaults'],
@@ -202,23 +196,33 @@ describe('Benchmark report clientCompare adapter', () => {
         'compare-produce-throughput-fanout-100p': { '--keys': 'index' },
         'compare-produce-throughput-custom': { '--partitioner': 'custom' },
         'compare-produce-throughput-headers': { '--headers': '20' },
-        'compare-produce-throughput-linger0': {},
-        'compare-produce-throughput-12p-linger0': {},
-        'compare-produce-throughput-12p-keyed-linger0': { '--keys': 'index' },
-        'compare-produce-throughput-fanout-100p-linger0': { '--keys': 'index' },
-        'compare-produce-throughput-custom-linger0': { '--partitioner': 'custom' },
-        'compare-produce-throughput-coalesced-linger0': { '--unawaited': '100' },
-        'compare-produce-throughput-12p-keyed-linger0-plain': { '--keys': 'index' },
-        'compare-produce-throughput-fanout-100p-linger0-plain': { '--keys': 'index' },
-        'compare-produce-throughput-custom-linger0-plain': { '--partitioner': 'custom' },
+        'compare-produce-throughput-12p-keyed-idempotent-off': { '--keys': 'index' },
+        'compare-produce-throughput-fanout-100p-idempotent-off': { '--keys': 'index' },
+        'compare-produce-throughput-custom-idempotent-off': { '--partitioner': 'custom' },
       })
     })
 
-    test("a send of every produce-throughput row, with records at their real encoded size at the longest key and all their headers, fits one request under the producer's request budget (framing, topic name, a batch header and partition framing for every partition it can reach, the built-in codec's worst case) at the default 1 MiB limit", () => {
+    test('the fork built-in gzip and lz4 bounds of a split of bytes over batches never exceed the bound of the whole plus the empty batch and one block of rounding per extra batch', () => {
+      const edges = [0, 1, 4095, 4096, 16383, 16384, 65535, 65536, 65537, 131072, 819360, 1048576]
+      const rounding = (codec) => (codec === Types.LZ4 ? 8 : 0)
+
+      for (const codec of [Types.GZIP, Types.LZ4]) {
+        for (const a of edges) {
+          for (const b of edges) {
+            const split = encodedBound(codec, a) + encodedBound(codec, b)
+            const whole = encodedBound(codec, a + b) + encodedBound(codec, 0) + rounding(codec)
+            expect([codec, a, b, split <= whole]).toEqual([codec, a, b, true])
+          }
+        }
+      }
+    })
+
+    test("a send of every produce-throughput row, with records at their real encoded size at the longest key and all their headers, fits one request under the producer's request budget for every split of its records over the partitions it can reach (framing, topic name, a batch header and partition framing per partition, the fork's built-in codec bound for any split) at the default 1 MiB limit", () => {
       const produceRows = compareRows.filter(
         (row) => valueOf(row.command, '--workload') === 'produce-throughput'
       )
       const codecs = { lz4: Types.LZ4, gzip: Types.GZIP }
+      const rounding = (codec) => (codec === Types.LZ4 ? 8 : 0)
       const budget = new RequestBudget({
         maxRequestSize: 1048576,
         clientId: 'bench-compare-produce-throughput',
@@ -246,11 +250,20 @@ describe('Benchmark report clientCompare adapter', () => {
           value: Buffer.alloc(size, 0x78),
           headers,
         })
-        const spread = Math.min(partitions, perSend)
-        const wire = Math.ceil(perSend / spread) * record.buffer.length
+        // However the records split, they make at most `batches` non-empty batches, and the wire
+        // bytes of all of them together are the same. Per batch the plan adds a fixed amount and
+        // the codec's bound; the bounds of the parts sum to at most the bound of the whole plus
+        // the empty batch's bound and the codec's rounding for each part after the first.
+        const batches = Math.min(partitions, perSend)
+        const wire = perSend * record.buffer.length
         const compression = codecs[valueOf(row.command, '--compression')]
-        const batch = budget.batchBytes({ compression, messages: [], wire })
-        planned[row.name] = budget.topicBytes(topic) + spread * batch <= budget.maxRequestBytes
+        const empty = budget.batchBytes({ compression, messages: [], wire: 0 })
+        const worst =
+          batches * empty +
+          encodedBound(compression, wire) -
+          encodedBound(compression, 0) +
+          (batches - 1) * rounding(compression)
+        planned[row.name] = budget.topicBytes(topic) + worst <= budget.maxRequestBytes
       }
 
       expect(planned).toEqual(Object.fromEntries(produceRows.map(({ name }) => [name, true])))
@@ -369,83 +382,49 @@ describe('Benchmark report clientCompare adapter', () => {
         'compare-produce-throughput-fanout-100p',
         'compare-produce-throughput-custom',
         'compare-produce-throughput-headers',
-        'compare-produce-throughput-linger0',
-        'compare-produce-throughput-12p-linger0',
-        'compare-produce-throughput-12p-keyed-linger0',
-        'compare-produce-throughput-fanout-100p-linger0',
-        'compare-produce-throughput-custom-linger0',
-        'compare-produce-throughput-coalesced-linger0',
-        'compare-produce-throughput-12p-keyed-linger0-plain',
-        'compare-produce-throughput-fanout-100p-linger0-plain',
-        'compare-produce-throughput-custom-linger0-plain',
+        'compare-produce-throughput-12p-keyed-idempotent-off',
+        'compare-produce-throughput-fanout-100p-idempotent-off',
+        'compare-produce-throughput-custom-idempotent-off',
       ])
       expect(compareRows.filter((row) => 'namedOnly' in row && row.namedOnly !== true)).toEqual([])
     })
 
-    test('each -linger0 row is its twin row with --fork-linger 0 added and run only when named, nothing else changed, and each -plain row is the -linger0 row with --fork-idempotent false added', () => {
+    test('each -idempotent-off row is its base row with --fork-idempotent false added and run only when named, nothing else changed', () => {
       const byName = (name) => compareRows.find((row) => row.name === name)
-      const lingerTwins = {
-        'compare-produce-throughput-linger0': 'compare-produce-throughput',
-        'compare-produce-throughput-12p-linger0': 'compare-produce-throughput-12p',
-        'compare-produce-throughput-12p-keyed-linger0': 'compare-produce-throughput-12p-keyed',
-        'compare-produce-throughput-fanout-100p-linger0': 'compare-produce-throughput-fanout-100p',
-        'compare-produce-throughput-custom-linger0': 'compare-produce-throughput-custom',
-        'compare-produce-throughput-coalesced-linger0': 'compare-produce-throughput-coalesced',
-      }
-      const plainTwins = {
-        'compare-produce-throughput-12p-keyed-linger0-plain':
-          'compare-produce-throughput-12p-keyed-linger0',
-        'compare-produce-throughput-fanout-100p-linger0-plain':
-          'compare-produce-throughput-fanout-100p-linger0',
-        'compare-produce-throughput-custom-linger0-plain':
-          'compare-produce-throughput-custom-linger0',
+      const twins = {
+        'compare-produce-throughput-12p-keyed-idempotent-off':
+          'compare-produce-throughput-12p-keyed',
+        'compare-produce-throughput-fanout-100p-idempotent-off':
+          'compare-produce-throughput-fanout-100p',
+        'compare-produce-throughput-custom-idempotent-off': 'compare-produce-throughput-custom',
       }
 
-      for (const [name, twin] of Object.entries(lingerTwins)) {
+      for (const [name, twin] of Object.entries(twins)) {
         const original = byName(twin)
         expect([name, byName(name)]).toEqual([
           name,
           {
             ...original,
             name,
-            command: [...original.command, '--fork-linger', '0'],
+            command: [...original.command, '--fork-idempotent', 'false'],
             namedOnly: true,
           },
         ])
       }
-      for (const [name, twin] of Object.entries(plainTwins)) {
-        const original = byName(twin)
-        expect([name, byName(name)]).toEqual([
-          name,
-          { ...original, name, command: [...original.command, '--fork-idempotent', 'false'] },
-        ])
-      }
     })
 
-    test('only the nine twin rows set the fork-only flags: --fork-linger 0 on all nine, --fork-idempotent false on the three -plain rows', () => {
+    test('only the three -idempotent-off rows set a fork-only flag, --fork-idempotent false, and no row sets --fork-linger', () => {
       const withFlag = (flag) =>
         compareRows
           .filter((row) => row.command.includes(flag))
           .map((row) => [row.name, valueOf(row.command, flag)])
 
-      expect(withFlag('--fork-linger')).toEqual(
-        [
-          'compare-produce-throughput-linger0',
-          'compare-produce-throughput-12p-linger0',
-          'compare-produce-throughput-12p-keyed-linger0',
-          'compare-produce-throughput-fanout-100p-linger0',
-          'compare-produce-throughput-custom-linger0',
-          'compare-produce-throughput-coalesced-linger0',
-          'compare-produce-throughput-12p-keyed-linger0-plain',
-          'compare-produce-throughput-fanout-100p-linger0-plain',
-          'compare-produce-throughput-custom-linger0-plain',
-        ].map((name) => [name, '0'])
-      )
+      expect(withFlag('--fork-linger')).toEqual([])
       expect(withFlag('--fork-idempotent')).toEqual(
         [
-          'compare-produce-throughput-12p-keyed-linger0-plain',
-          'compare-produce-throughput-fanout-100p-linger0-plain',
-          'compare-produce-throughput-custom-linger0-plain',
+          'compare-produce-throughput-12p-keyed-idempotent-off',
+          'compare-produce-throughput-fanout-100p-idempotent-off',
+          'compare-produce-throughput-custom-idempotent-off',
         ].map((name) => [name, 'false'])
       )
     })
@@ -485,7 +464,7 @@ describe('Benchmark report clientCompare adapter', () => {
         rows.reduce((sum, row) => sum + adapter.plannedSeconds(row), 0) / 60
       const limit = workflow.jobs.bench['timeout-minutes']
 
-      expect(Math.round(minutesOf(compareRows.filter((row) => row.namedOnly)))).toBe(163)
+      expect(Math.round(minutesOf(compareRows.filter((row) => row.namedOnly)))).toBe(118)
       expect(minutesOf(compareRows.filter((row) => row.namedOnly)) + 20).toBeLessThanOrEqual(limit)
       expect(minutesOf(compareRows) + 20).toBeGreaterThan(limit)
     })
@@ -803,8 +782,8 @@ describe('Benchmark report clientCompare adapter', () => {
         ...entry,
         command: ['scripts/benchmarks/clientCompare.js', '--workload', 'produce-throughput'],
       }
-      const overrides = { linger: 0, idempotent: false }
-      const forked = output(1, 30000, { settings: { defaults: { linger: 5 }, overrides } })
+      const overrides = { linger: 5, idempotent: false }
+      const forked = output(1, 30000, { settings: { defaults: { linger: 0 }, overrides } })
       const baseline = output(1, 30000, {
         settings: { defaults: { linger: 'none' }, ignoredOverrides: overrides },
       })
@@ -813,13 +792,35 @@ describe('Benchmark report clientCompare adapter', () => {
       const old = adapter.rows(produce, 'kafkajs@2.2.4', { outputs: [baseline] }, 1)
 
       expect(fork.detail.notes.slice(1)).toEqual([
-        "producer settings in force (this package's defaults): linger=5",
-        'producer overrides in force on this arm only, each replacing the default of the same name: linger=0, idempotent=false',
+        "producer settings in force (this package's defaults): linger=0",
+        'producer overrides in force on this arm only, each replacing the default of the same name: linger=5, idempotent=false',
       ])
       expect(old.detail.notes.slice(1)).toEqual([
         'producer settings in force (this package\'s defaults): linger="none"',
-        "this arm ran with its own defaults: the row's fork-only overrides (linger=0, idempotent=false) do not apply to it",
+        "this arm ran with its own defaults: the row's fork-only overrides (linger=5, idempotent=false) do not apply to it",
       ])
+    })
+
+    test('an arm with the custom partitioner says its partitioner is the custom one and the rest are the package defaults, and an arm without says only the package defaults', () => {
+      const produce = {
+        ...entry,
+        command: ['scripts/benchmarks/clientCompare.js', '--workload', 'produce-throughput'],
+      }
+      const noteOf = (extra) =>
+        adapter.rows(produce, 'fork', { outputs: [output(1, 30000, extra)] }, 1).detail.notes[1]
+
+      const custom = noteOf({
+        settings: { defaults: { linger: 0, partitioner: 'custom (record n)' } },
+        shape: { partitioner: 'custom' },
+      })
+      const plain = noteOf({ settings: { defaults: { linger: 0, partitioner: 'Default' } } })
+
+      expect(custom).toBe(
+        'producer settings in force (this package\'s defaults, except the partitioner, which is the custom one): linger=0, partitioner="custom (record n)"'
+      )
+      expect(plain).toBe(
+        'producer settings in force (this package\'s defaults): linger=0, partitioner="Default"'
+      )
     })
 
     test('a consume arm notes its corpus layout', () => {
