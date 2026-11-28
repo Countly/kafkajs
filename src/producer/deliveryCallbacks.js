@@ -1,72 +1,97 @@
 const { AsyncLocalStorage } = require('node:async_hooks')
-const Generation = require('./generation')
+const { types } = require('node:util')
+const { KafkaJSNonRetriableError } = require('../errors')
+const { ownedBuffer } = require('./state/recordSize')
 
-/** Fences caller callbacks that run after a send has been admitted. */
+/** Preserves codec errors and gives non-error throws the ordinary encoding-failure path. */
+const codecError = (error) =>
+  error instanceof Error
+    ? error
+    : new Error('A custom codec threw a non-Error value', { cause: error })
+
+/** Copies the Buffer view while keeping its shared bytes. */
+const routingValue = (value) => (Buffer.isBuffer(value) ? ownedBuffer(value) : value)
+
+/** Isolates a custom partitioner's record, including repeated header values. */
+const routingRecord = (message) => {
+  const { headers } = message
+  const copy = { ...message }
+  if (Buffer.isBuffer(copy.key)) copy.key = ownedBuffer(copy.key)
+  if (Buffer.isBuffer(copy.value)) copy.value = ownedBuffer(copy.value)
+  if (headers != null) {
+    const headerCopy = { ...headers }
+    for (const name of Object.keys(headerCopy)) {
+      const header = headerCopy[name]
+      headerCopy[name] = Array.isArray(header)
+        ? Object.freeze(header.map(routingValue))
+        : routingValue(header)
+    }
+    copy.headers = Object.freeze(headerCopy)
+  }
+  return Object.freeze(copy)
+}
+
+/** Tracks custom delivery code for one producer, including its transactions. */
 class DeliveryCallbacks {
-  #active = new Set()
-  #execution = new AsyncLocalStorage()
-  #blocked = null
+  #partitionerDepth = 0
+  #codec = new AsyncLocalStorage()
 
-  /**
-   * Revokes one reentrant callback or all active ones. A graceful close still drains work
-   * admitted before it, including callbacks that did not start the close.
-   * @param {Error} error
-   * @param {{ reentrant?: boolean, block?: boolean }} [options]
-   * @returns {void}
-   */
-  interrupt(error, { reentrant = false, block = false } = {}) {
-    if (block) this.#blocked = error
-    if (reentrant) {
-      const execution = this.#execution.getStore()
-      if (this.#active.has(execution)) execution.close(error)
-      return
+  /** Throws before a public producer or transaction operation can do work. */
+  check = () => {
+    if (this.#partitionerDepth !== 0 || this.#codec.getStore()?.active) {
+      throw new KafkaJSNonRetriableError(
+        'A custom partitioner or compression codec cannot call its own producer or transaction'
+      )
     }
-    for (const execution of this.#active) execution.close(error)
-  }
-
-  /** Reopens extension delivery for a new transaction. @returns {void} */
-  reset() {
-    this.#blocked = null
-  }
-
-  /** @returns {Error|null} the refusal shared by delivery attempts in an aborting transaction */
-  refusal() {
-    return this.#blocked
   }
 
   /**
-   * Checks the delivery's authority after caller code runs, even if it threw. A pending Promise
-   * must also be interruptible because a compressor can await the abort or close it started.
-   * @param {() => *} invoke
-   * @param {() => ?Error} guard
-   * @param {boolean} [asynchronous]
-   * @returns {*}
+   * Gives the partitioner private routing inputs and refuses reentry while it runs.
+   * @param {Function} partitioner
+   * @returns {Function}
    */
-  run(invoke, guard, asynchronous = false) {
-    const execution = new Generation()
-    const check = () => {
-      const error = guard() ?? execution.guard() ?? this.#blocked
-      if (error) throw error
+  partitioner(partitioner) {
+    return (routing) => {
+      routing.message = routingRecord(routing.message)
+      this.#partitionerDepth += 1
+      try {
+        const partition = partitioner(routing)
+        if (types.isPromise(partition)) partition.catch(() => {})
+        return partition
+      } finally {
+        this.#partitionerDepth -= 1
+      }
     }
-    check()
-    this.#active.add(execution)
-    let value
+  }
+
+  /**
+   * Runs a custom codec factory and compressor with the same per-batch context.
+   * @param {Function} factory
+   * @param {object} receiver
+   * @returns {{ compress: Function }}
+   */
+  codec(factory, receiver) {
+    const context = { active: true }
+    let implementation
     try {
-      value = this.#execution.run(execution, invoke)
+      implementation = this.#codec.run(context, () => Reflect.apply(factory, receiver, []))
     } catch (error) {
-      this.#active.delete(execution)
-      check()
-      throw error
+      throw codecError(error)
+    } finally {
+      context.active = false
     }
-    if (!asynchronous) {
-      this.#active.delete(execution)
-      check()
-      return value
+    return {
+      compress: async (...args) => {
+        context.active = true
+        try {
+          return await this.#codec.run(context, async () => implementation.compress(...args))
+        } catch (error) {
+          throw codecError(error)
+        } finally {
+          context.active = false
+        }
+      },
     }
-    return execution.wait(value).finally(() => {
-      this.#active.delete(execution)
-      check()
-    })
   }
 }
 

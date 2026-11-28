@@ -19,7 +19,8 @@ const lz4 = require('../../protocol/message/compression/lz4')
 const zstd = require('../../protocol/message/compression/zstd')
 const { Admission } = require('../state/admission')
 const Accumulator = require('../state/accumulator')
-const { RequestBudget } = require('../state/recordSize')
+const { BATCH_DEBIT, RequestBudget, chargeOf } = require('../state/recordSize')
+const DeliveryCallbacks = require('../deliveryCallbacks')
 const { readRequestHeader } = require('../../../testHelpers/fakeSocket')
 const { createScriptedCluster, producerScript } = require('../../../testHelpers/scriptedCluster')
 const { TOPIC } = require('../../consumer/__tests__/fixtures/fetchHarness')
@@ -81,7 +82,8 @@ const producedBy = (cluster) =>
       const acks = decoder.readInt16()
       const timeout = decoder.readInt32()
       const partitions = decoder.readUVarIntArray((topic) => {
-        topic.readUuid()
+        if (frame.readInt16BE(6) >= 13) topic.readUuid()
+        else topic.readUVarIntString()
         const entries = topic.readUVarIntArray((entry) => {
           const partition = entry.readInt32()
           const records = entry.readUVarIntBytes()
@@ -496,6 +498,7 @@ describe('Producer > send options', () => {
       if (rig) await rig.close()
     } finally {
       rig = null
+      jest.useRealTimers()
       jest.restoreAllMocks()
       for (const key of Reflect.ownKeys(CompressionCodecs)) {
         if (!(key in ORIGINAL_CODECS)) delete CompressionCodecs[key]
@@ -1574,56 +1577,500 @@ describe('Producer > send options', () => {
       }
     )
 
+    /** Waits for a transport turn without advancing fake time. */
+    const waitFor = async (predicate) => {
+      for (let turn = 0; turn < 2000 && !predicate(); turn += 1) await tick()
+      expect(predicate()).toBe(true)
+    }
+
+    /** Asserts that the admission owner has retired every hold and debit. */
+    const expectReleased = async () => {
+      const [admission] = acquire.mock.contexts
+      expect(admission).toBeDefined()
+      await waitFor(
+        () => admission.reserved === 0 && admission.waitingBytes === 0 && admission.debts === 0
+      )
+    }
+
+    /** Counts real Produce writes for both named and topic-ID request versions. */
+    const produceRequests = () => rig.cluster.requests().filter(({ api }) => api === 'Produce')
+
+    /** Parks one custom compressor until the test releases it. */
+    const holdCodec = () => {
+      let release
+      let finish
+      const pending = new Promise((resolve) => {
+        release = resolve
+      })
+      const finished = new Promise((resolve) => {
+        finish = resolve
+      })
+      const compress = jest.fn(async (encoder) => {
+        await pending
+        try {
+          return await gzip.compress(encoder)
+        } finally {
+          finish()
+        }
+      })
+      CompressionCodecs[CompressionTypes.GZIP] = () => ({ ...gzip, compress })
+      return { compress, release, finished }
+    }
+
+    const compressed = compression(CompressionTypes.GZIP)()
+    const externalActions = ['abort', 'force-close', 'commit', 'graceful close']
+
+    /** Starts the operation as an independent caller while one of its sends waits. */
+    const endFromOutside = (transaction, action) => {
+      if (action === 'abort') return transaction.abort()
+      if (action === 'commit') return transaction.commit()
+      return rig.producer.disconnect(action === 'force-close' ? { timeout: 0 } : undefined)
+    }
+
+    /** @returns {boolean} whether the end drops an unwritten send */
+    const dropsUnwritten = (action) => action === 'abort' || action === 'force-close'
+
     test.each([
-      ['partitioner', 'abort'],
-      ['partitioner', 'force-close'],
-      ['partitioner', 'graceful close'],
-      ['codec', 'abort'],
-      ['codec', 'force-close'],
-      ['codec', 'graceful close'],
-    ])('a custom %s that starts %s cannot write its delivery', async (extension, action) => {
-      let ended
-      /** @returns {Promise<void>} the end started by the delivery callback */
-      const stop = () =>
-        (ended ??=
-          action === 'abort'
-            ? transaction.abort()
-            : rig.producer.disconnect(action === 'force-close' ? { timeout: 0 } : undefined))
-      const createPartitioner =
-        extension === 'partitioner'
-          ? () => () => {
-              stop()
+      ['explicit plain', { idempotent: false }, -1, false],
+      ['downgraded', {}, 1, false],
+      ['idempotent', {}, -1, true],
+    ])(
+      'writes valid uncompressed and custom-compressed Produce on the %s path',
+      async (_, options, acks, idempotent) => {
+        rig = await Rig.start(options)
+        const compress = jest.fn((encoder) => gzip.compress(encoder))
+        CompressionCodecs[CompressionTypes.GZIP] = () => ({ ...gzip, compress })
+        await expect(
+          rig.producer.send({ topic: TOPIC, messages: MESSAGES, acks })
+        ).resolves.toHaveLength(1)
+        expect(rig.producer.isIdempotent()).toBe(idempotent)
+        await expect(
+          rig.producer.send({ topic: TOPIC, messages: MESSAGES, ...compressed })
+        ).resolves.toHaveLength(1)
+
+        const batches = rig.produced().flatMap(({ partitions }) => partitions)
+        expect(batches.map(({ codec, count }) => [codec, count])).toEqual([
+          [0, 1],
+          [1, 1],
+        ])
+        for (const { codec, body } of batches) expect(await carriesValue(body, codec)).toBe(true)
+        expect(compress).toHaveBeenCalledTimes(1)
+        await expectReleased()
+      }
+    )
+
+    test.each([
+      ['send', 'callable'],
+      ['send', 'class instance'],
+      ['sendBatch', 'callable'],
+      ['sendBatch', 'Proxy'],
+    ])('%s captures each field of a %s record before admission', async (method, shape) => {
+      rig = await Rig.start({ transactionalId: 'record-shapes' }, { profile: 'tv2' })
+      const transaction = await rig.producer.transaction()
+      let reads = 0
+      let entryReads = 0
+      let nestedAbort
+      const value = () => {
+        if (++reads > 1) nestedAbort = transaction.abort()
+        return VALUE
+      }
+      class Record {
+        get value() {
+          return value()
+        }
+      }
+      const message =
+        shape === 'callable'
+          ? Object.defineProperty(() => {}, 'value', { get: value })
+          : shape === 'Proxy'
+            ? new Proxy(new Record(), {})
+            : new Record()
+      const entry = Object.defineProperties(() => {}, {
+        topic: { get: () => TOPIC },
+        messages: {
+          get() {
+            ++entryReads
+            return [message]
+          },
+        },
+      })
+      const request =
+        method === 'send' ? requestWith(method, [message]) : { topicMessages: [entry] }
+
+      await expect(transaction[method](request)).resolves.toHaveLength(1)
+      expect(reads).toBe(1)
+      expect(entryReads).toBe(method === 'send' ? 0 : 1)
+      expect(nestedAbort).toBeUndefined()
+      await transaction.commit()
+      expect(produceRequests()).toHaveLength(1)
+      await expectReleased()
+    })
+
+    test('keeps the partitioner view private and encodes the charged records in order', async () => {
+      const views = []
+      const wrap = jest.spyOn(DeliveryCallbacks.prototype, 'partitioner')
+      rig = await Rig.start({
+        createPartitioner:
+          () =>
+          ({ message }) => {
+            views.push(message)
+            Reflect.set(message, 'value', 'changed')
+            Reflect.set(message.headers, 'marker', 'changed')
+            Reflect.set(message.headers.marker, 0, 'changed')
+            return 0
+          },
+      })
+      const messages = [
+        { value: 'first-record', headers: { marker: ['first-header'] }, timestamp: 1000 },
+        { value: 'second-record', headers: { marker: ['second-header'] }, timestamp: 1000 },
+      ]
+      await expect(rig.producer.send({ topic: TOPIC, messages })).resolves.toHaveLength(1)
+      expect(views).toHaveLength(2)
+      expect(views.every((view) => Object.isFrozen(view) && Object.isFrozen(view.headers))).toBe(
+        true
+      )
+      expect(Reflect.set(views[0], 'value', 'late change')).toBe(false)
+      expect(views[1].value).toBe('second-record')
+      const [{ body, count }] = rig.produced().flatMap(({ partitions }) => partitions)
+      expect(count).toBe(2)
+      const text = body.toString()
+      expect(text.indexOf('first-record')).toBeGreaterThanOrEqual(0)
+      expect(text.indexOf('second-record')).toBeGreaterThan(text.indexOf('first-record'))
+      expect(text).toContain('first-header')
+      expect(text).toContain('second-header')
+      expect(text).not.toContain('changed')
+      expect(debit).toHaveBeenCalledWith(BATCH_DEBIT)
+      expect(acquire.mock.calls[0][0]).toBe(
+        chargeOf([{ topic: TOPIC, messages }], acquire.mock.contexts[0].capacity).total
+      )
+      await expectReleased()
+      await rig.close()
+
+      wrap.mockClear()
+      rig = await Rig.start()
+      await expect(rig.producer.send({ topic: TOPIC, messages })).resolves.toHaveLength(1)
+      expect(wrap).not.toHaveBeenCalled()
+      await expectReleased()
+    })
+
+    test.each(['partitioner throw', 'partitioner rejection', 'codec throw', 'codec rejection'])(
+      'isolates a %s between successful sends to the same partition',
+      async (failure) => {
+        const error = new KafkaJSNonRetriableError('extension failed')
+        const options = { idempotent: false, maxInFlightRequests: 1, batchSize: 1 }
+        const partitionerFailure = failure.startsWith('partitioner')
+        if (partitionerFailure) {
+          options.createPartitioner =
+            () =>
+            ({ message }) => {
+              if (message.value === 'bad') {
+                if (failure === 'partitioner throw') throw error
+                return Promise.reject(error)
+              }
               return 0
             }
-          : undefined
-      if (extension === 'codec') {
-        CompressionCodecs[CompressionTypes.GZIP] = () => ({
-          async compress(encoder) {
-            await stop()
-            return gzip.compress(encoder)
-          },
-        })
+        } else {
+          CompressionCodecs[CompressionTypes.GZIP] = () => ({
+            ...gzip,
+            compress() {
+              if (failure === 'codec throw') throw error
+              return Promise.reject(error)
+            },
+          })
+        }
+        rig = await Rig.start(options)
+        const send = (value, extra = {}) =>
+          rig.producer.send({ topic: TOPIC, messages: [{ value, partition: 0 }], ...extra })
+        const first = send('first')
+        const failed = send('bad', partitionerFailure ? {} : compressed)
+        const last = send('last')
+        await expect(failed).rejects.toThrow(
+          failure === 'partitioner rejection' ? 'Invalid partition' : 'extension failed'
+        )
+        await expect(Promise.all([first, last])).resolves.toHaveLength(2)
+        const batches = rig.produced().flatMap(({ partitions }) => partitions)
+        expect(batches.map(({ count }) => count)).toEqual([1, 1])
+        expect(batches[0].body.toString()).toContain('first')
+        expect(batches[1].body.toString()).toContain('last')
+        await expectReleased()
       }
-      rig = await Rig.start({ transactionalId: 'callback', createPartitioner }, { profile: 'tv2' })
-      const transaction = await rig.producer.transaction()
+    )
 
-      const sent = await outcome(
-        transaction.send({
-          topic: TOPIC,
-          messages: MESSAGES,
-          compression: extension === 'codec' ? CompressionTypes.GZIP : CompressionTypes.None,
+    test.each(PATHS)(
+      'on %s expires a held codec, releases its debit and delivers again before it resolves',
+      async (_, options) => {
+        jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
+        const held = holdCodec()
+        rig = await Rig.start({ ...options, deliveryTimeout: 1000, linger: 0 })
+        const send = (extra) =>
+          rig.producer.send({ topic: TOPIC, messages: [{ value: VALUE, partition: 0 }], ...extra })
+        const expired = send(compressed).catch((error) => error)
+        try {
+          await waitFor(() => held.compress.mock.calls.length === 1)
+          expect(acquire.mock.contexts[0].debts).toBeGreaterThan(0)
+          await jest.advanceTimersByTimeAsync(1000)
+          expect(await expired).toMatchObject({ name: 'KafkaJSDeliveryTimeout', outcome: 'unsent' })
+          expect(rig.produced()).toEqual([])
+          await expectReleased()
+          await expect(send()).resolves.toHaveLength(1)
+          expect(rig.produced()).toHaveLength(1)
+          held.release()
+          await held.finished
+          await tick()
+          expect(rig.produced()).toHaveLength(1)
+          expect(jest.getTimerCount()).toBe(0)
+        } finally {
+          held.release()
+        }
+      }
+    )
+
+    test.each(['partitioner', 'codec factory', 'compressor'])(
+      'refuses nested producer and transaction calls from a %s',
+      async (extension) => {
+        jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
+        let results
+        let entered = false
+        let continueCodec
+        const continuation = new Promise((resolve) => {
+          continueCodec = resolve
         })
-      )
-      expect(ended).toBeDefined()
-      expect(sent.status).toBe('rejected')
-      expect(await outcome(ended)).toEqual({ status: 'fulfilled', value: undefined })
-      expect(rig.produced()).toEqual([])
-      const [admission] = acquire.mock.contexts
-      expect(admission.reserved).toBe(0)
-      expect(admission.waitingBytes).toBe(0)
-      expect(admission.debts).toBe(0)
-      if (action !== 'abort') await rig.producer.connect()
-      await expect(rig.producer.send({ topic: TOPIC, messages: MESSAGES })).resolves.toHaveLength(1)
+        const createPartitioner =
+          extension === 'partitioner'
+            ? () =>
+                ({ message }) => {
+                  if (message.value === VALUE) results = nested()
+                  return 0
+                }
+            : undefined
+        if (extension !== 'partitioner') {
+          CompressionCodecs[CompressionTypes.GZIP] = () => {
+            if (extension === 'codec factory') results = nested()
+            return {
+              ...gzip,
+              async compress(encoder) {
+                if (extension === 'compressor') {
+                  entered = true
+                  await continuation
+                  results = nested()
+                  await results
+                }
+                return gzip.compress(encoder)
+              },
+            }
+          }
+        }
+        rig = await Rig.start(
+          {
+            transactionalId: 'callback',
+            createPartitioner,
+            deliveryTimeout: 10000,
+            linger: 0,
+          },
+          { profile: 'tv2' }
+        )
+        const { producer } = rig
+        const transaction = await producer.transaction()
+        const request = { topic: TOPIC, messages: MESSAGES }
+        const nested = () =>
+          Promise.allSettled([
+            producer.send(request),
+            producer.sendBatch({ topicMessages: [request] }),
+            producer.flush(),
+            producer.disconnect({ timeout: 0 }),
+            producer.connect(),
+            producer.transaction(),
+            transaction.send(request),
+            transaction.sendBatch({ topicMessages: [request] }),
+            transaction.sendOffsets({}),
+            transaction.commit(),
+            transaction.abort(),
+          ])
+        const sent = transaction.send(
+          extension === 'partitioner' ? request : { ...request, ...compressed }
+        )
+        const committed = transaction.commit()
+        if (extension === 'compressor') {
+          await waitFor(() => entered)
+          expect(await outcome(committed, 5)).toEqual({ status: 'pending' })
+        }
+        const own = producer.send({ topic: TOPIC, messages: [{ value: 'independent' }] })
+        continueCodec()
+
+        const deliveries = await outcome(Promise.all([sent, committed, own]))
+        expect(deliveries.status).toBe('fulfilled')
+        const refusals = await results
+        expect(refusals).toHaveLength(11)
+        for (const result of refusals) {
+          expect(result.status).toBe('rejected')
+          expect(result.reason).toBeInstanceOf(KafkaJSNonRetriableError)
+          expect(result.reason.message).toMatch(/cannot call its own producer or transaction/)
+        }
+        expect(produceRequests()).toHaveLength(2)
+        expect(acquire).toHaveBeenCalledTimes(2)
+        await expectReleased()
+      }
+    )
+
+    test('an ended abort leaves the next transaction to flush its own batch', async () => {
+      jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
+      rig = await Rig.start({ transactionalId: 'old-abort', linger: 60000 }, { profile: 'tv2' })
+      const first = await rig.producer.transaction()
+      await first.abort()
+      const next = await rig.producer.transaction()
+      const sent = next.send({ topic: TOPIC, messages: MESSAGES })
+      await waitFor(() => debit.mock.calls.length === 1)
+      const timerCount = jest.getTimerCount()
+      expect(timerCount).toBeGreaterThan(0)
+      const flush = jest.spyOn(Accumulator.prototype, 'flush')
+
+      await expect(first.abort()).rejects.toThrow('transaction once ended')
+      expect(flush).not.toHaveBeenCalled()
+      expect(jest.getTimerCount()).toBe(timerCount)
+      expect(produceRequests()).toEqual([])
+      await next.commit()
+      await expect(sent).resolves.toHaveLength(1)
+      expect(produceRequests()).toHaveLength(1)
+      await expectReleased()
     })
+
+    test('freezes public built-in codecs while keeping replacement registration', async () => {
+      for (const type of [1, 2, 3, 4].filter(runs)) {
+        const codec = CompressionCodecs[type]()
+        const original = codec.compress
+        expect(Object.isFrozen(codec)).toBe(true)
+        expect(Reflect.set(codec, 'compress', jest.fn())).toBe(false)
+        expect(codec.compress).toBe(original)
+      }
+      const compress = jest.fn((encoder) => gzip.compress(encoder))
+      CompressionCodecs[CompressionTypes.GZIP] = () => ({ ...gzip, compress })
+      rig = await Rig.start()
+      await expect(
+        rig.producer.send({ topic: TOPIC, messages: MESSAGES, ...compressed })
+      ).resolves.toHaveLength(1)
+      expect(compress).toHaveBeenCalledTimes(1)
+      await expectReleased()
+    })
+
+    test.each(externalActions)(
+      'an independent %s owns the outcome of a pending codec',
+      async (action) => {
+        jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
+        const held = holdCodec()
+        rig = await Rig.start({ transactionalId: 'external-end', linger: 0 }, { profile: 'tv2' })
+        const { producer } = rig
+        const transaction = await producer.transaction()
+        const sent = transaction.send({ topic: TOPIC, messages: MESSAGES, ...compressed })
+        const delivery = sent.catch((error) => error)
+        try {
+          await waitFor(() => held.compress.mock.calls.length === 1)
+          const ending = endFromOutside(transaction, action)
+
+          if (dropsUnwritten(action)) {
+            expect(await outcome(ending)).toEqual({ status: 'fulfilled', value: undefined })
+            expect(await delivery).toBeInstanceOf(Error)
+            await expectReleased()
+            expect(produceRequests()).toEqual([])
+            held.release()
+            await held.finished
+            await tick()
+            expect(produceRequests()).toEqual([])
+          } else {
+            expect(await outcome(ending, 5)).toEqual({ status: 'pending' })
+            expect(produceRequests()).toEqual([])
+            held.release()
+            await ending
+            expect(await delivery).toHaveLength(1)
+            expect(produceRequests()).toHaveLength(1)
+            await expectReleased()
+          }
+          expect(jest.getTimerCount()).toBe(0)
+        } finally {
+          held.release()
+        }
+      }
+    )
+
+    test.each(externalActions)(
+      'an independent %s drains or cancels a transaction waiting for admission',
+      async (action) => {
+        jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
+        rig = await Rig.start(
+          { transactionalId: 'admission-end', linger: 60000, bufferMemory: 4096 },
+          { profile: 'tv2' }
+        )
+        const transaction = await rig.producer.transaction()
+        const send = (marker) =>
+          transaction
+            .send({ topic: TOPIC, messages: [{ value: marker.repeat(1500), partition: 0 }] })
+            .catch((error) => error)
+        const first = send('x')
+        await waitFor(() => debit.mock.calls.length === 1)
+        const [admission] = acquire.mock.contexts
+        const second = send('y')
+        expect(admission.waitingBytes).toBeGreaterThan(0)
+        expect(produceRequests()).toEqual([])
+
+        await endFromOutside(transaction, action)
+        if (dropsUnwritten(action)) {
+          expect(await first).toBeInstanceOf(Error)
+          expect(await second).toBeInstanceOf(Error)
+          expect(produceRequests()).toEqual([])
+        } else {
+          expect(await first).toHaveLength(1)
+          expect(await second).toHaveLength(1)
+          const records = rig.produced().flatMap(({ partitions }) => partitions)
+          expect(records.map(({ count }) => count)).toEqual([1, 1])
+          expect(records[0].body.includes(Buffer.from('x'.repeat(1500)))).toBe(true)
+          expect(records[1].body.includes(Buffer.from('y'.repeat(1500)))).toBe(true)
+        }
+        await expectReleased()
+        expect(jest.getTimerCount()).toBe(0)
+      }
+    )
+
+    test.each(externalActions)(
+      'an independent %s drains or cancels a transaction waiting to route',
+      async (action) => {
+        jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
+        rig = await Rig.start({ transactionalId: 'routing-end', linger: 0 }, { profile: 'tv2' })
+        const transaction = await rig.producer.transaction()
+        let release
+        let entered = false
+        const route = new Promise((resolve) => {
+          release = resolve
+        })
+        const refresh = Cluster.prototype.refreshMetadataIfNecessary
+        jest
+          .spyOn(Cluster.prototype, 'refreshMetadataIfNecessary')
+          .mockImplementationOnce(async function (...args) {
+            entered = true
+            await route
+            return refresh.apply(this, args)
+          })
+        const delivery = transaction
+          .send({ topic: TOPIC, messages: MESSAGES })
+          .catch((error) => error)
+        try {
+          await waitFor(() => entered)
+          expect(acquire.mock.contexts[0].reserved).toBeGreaterThan(0)
+          expect(produceRequests()).toEqual([])
+          const ending = endFromOutside(transaction, action)
+          release()
+          await ending
+          if (dropsUnwritten(action)) {
+            expect(await delivery).toBeInstanceOf(Error)
+            expect(produceRequests()).toEqual([])
+          } else {
+            expect(await delivery).toHaveLength(1)
+            expect(produceRequests()).toHaveLength(1)
+          }
+          await expectReleased()
+          expect(jest.getTimerCount()).toBe(0)
+        } finally {
+          release()
+        }
+      }
+    )
   })
 })

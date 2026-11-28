@@ -5,7 +5,6 @@ const { CONNECTION_STATUS } = require('../network/connectionStatus')
 const { KafkaJSNonRetriableError, KafkaJSInvalidConfigurationError } = require('../errors')
 const sharedPromiseTo = require('../utils/sharedPromiseTo')
 const { classifyAcks, classifyTimeout, classifyCompression } = require('./sendOptions')
-const DeliveryCallbacks = require('./deliveryCallbacks')
 
 /**
  * `send()`/`sendBatch()` over one eosManager: validation, the `acks` rule of an idempotent
@@ -35,6 +34,8 @@ const DeliveryCallbacks = require('./deliveryCallbacks')
  * @param {string} options.INITIALIZED
  * @param {() => import('./generation')|undefined} [options.getGeneration] current producer lifecycle
  * @param {() => ?Error} [options.fatalRefusal] the producer-wide armed fatal error
+ * @param {import('./deliveryCallbacks')} [options.callbacks] the producer's callback context
+ * @param {() => ?Error} [options.abortRefusal] refusal of unwritten work in an aborting transaction
  * @returns {{ send: Function, sendBatch: Function, sendersWith: Function,
  *   ensureInitialized: Function, flush: Function, close: Function, unsettled: () => Promise<void>[], forceClose: (surfaced?: Error) => void,
  *   depthOf: (topic: string, partition: number) => number }} `depthOf` counts the batches
@@ -60,8 +61,9 @@ module.exports = ({
   INITIALIZED,
   getGeneration = () => undefined,
   fatalRefusal,
+  callbacks,
+  abortRefusal,
 }) => {
-  const callbacks = new DeliveryCallbacks()
   const idempotentSend = createSendMessages({
     logger,
     cluster,
@@ -76,6 +78,7 @@ module.exports = ({
     budget,
     getGeneration,
     callbacks,
+    abortRefusal,
   })
   let plainSend = null
   /** How many `flush(until)` calls are waiting for their `until`: batches linger only at 0. */
@@ -193,8 +196,6 @@ module.exports = ({
    * @returns {void}
    */
   const forceClose = (surfaced) => {
-    const error = surfaced ?? getGeneration()?.guard()
-    if (error) callbacks.interrupt(error)
     accumulator.forceClose(surfaced)
     idempotentSend.forceClose(surfaced)
     plainSend?.forceClose(surfaced)
@@ -457,8 +458,7 @@ module.exports = ({
     close,
     unsettled,
     forceClose,
-    interruptCallbacks: (error, options) => callbacks.interrupt(error, options),
-    resetCallbacks: () => callbacks.reset(),
+    abortUnwritten: idempotentSend.abortUnwritten,
     depthOf: (topic, partition) => accumulator.depthOf(topic, partition),
   }
 }

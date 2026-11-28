@@ -290,6 +290,25 @@ const consumerGroupOf = ({ consumerGroupId, consumerGroupMetadata }) => {
 }
 
 /**
+ * Reads the caller's membership and offset fields before eligibility or a ledger lookup.
+ * @param {object} request
+ * @returns {object} the normalized membership and copied topic offsets
+ */
+const captureOffsets = (request) => {
+  const { consumerGroupId, consumerGroupMetadata, topics } = request
+  const group = consumerGroupOf({ consumerGroupId, consumerGroupMetadata })
+  const { generationId = -1 } = group
+  const membership = {
+    groupId: text(group.groupId),
+    generationId: int32(generationId),
+    memberId: text(group.memberId),
+    groupInstanceId: text(group.groupInstanceId),
+  }
+  assert(topics, 'Missing offset topics')
+  return { ...membership, copied: TransactionOffsets.copy(topics) }
+}
+
+/**
  * @typedef {Object} EosManager
  */
 
@@ -1263,24 +1282,21 @@ const createEosManager = ({
     async sendOffsets(request = {}, refusalOf = NOT_REFUSED, track = (operation) => operation) {
       const generation = getGeneration()
       if (refusalOf === NOT_REFUSED) stateManager.transaction.guard('sendOffsets')
-      const { consumerGroupId, consumerGroupMetadata, topics } = request
-      const group = consumerGroupOf({
-        consumerGroupId,
-        consumerGroupMetadata,
-      })
-      const { generationId: memberGeneration = -1 } = group
-      const groupId = text(group.groupId)
-      const generationId = int32(memberGeneration)
-      const memberId = text(group.memberId)
-      const groupInstanceId = text(group.groupInstanceId)
-      assert(topics, 'Missing offset topics')
-      const copied = TransactionOffsets.copy(topics)
+      let input
+      let captureError
+      try {
+        input = captureOffsets(request)
+      } catch (error) {
+        captureError = error
+      }
       // The caller's values are all read: what they did to the producer or the transaction while
       // being read is checked once, before the call changes any state.
       const refused = generation?.guard() ?? refusalOf()
       if (refused) {
         throw refused
       }
+      if (!input) throw captureError
+      const { groupId, generationId, memberId, groupInstanceId, copied } = input
       const snapshot = stateManager.offsets.hold(
         cluster.offsetOperations({ groupId }),
         groupId,

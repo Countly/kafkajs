@@ -285,6 +285,10 @@ class BatchTracker {
 /** The fields of a record the producer reads, beside its own enumerable ones. */
 const RECORD_FIELDS = ['key', 'value', 'headers', 'timestamp', 'partition']
 
+/** @returns {boolean} whether the value can supply record or batch entry properties */
+const hasProperties = (value) =>
+  value !== null && (typeof value === 'object' || typeof value === 'function')
+
 /**
  * Captures an object timestamp as an exact decimal string. This keeps object zero as the
  * literal epoch. A failed conversion is reported by the record's encodability check.
@@ -357,14 +361,14 @@ const ownedList = (list, own) => {
  * custom partitioner still sees them, and the fields the producer reads, also when they come from
  * a prototype. A header container, a header-value array, a `Date` and a `Long` are copied, so
  * changing them after the call changes nothing; each Buffer is put in the copy as it is and noted
- * in `copies`, which copies those that pin a large store. Anything that is not an object is kept,
- * so validation fails it as before.
+ * in `copies`, which copies those that pin a large store. Primitive values keep their existing
+ * validation behavior.
  * @param {*} message
  * @param {SendCopy} copies
  * @returns {*}
  */
 const ownedRecord = (message, copies) => {
-  if (message === null || typeof message !== 'object') {
+  if (!hasProperties(message)) {
     return message
   }
 
@@ -1106,7 +1110,7 @@ class Accumulator {
    * changes nothing. A record's own enumerable fields are kept beside the fields the producer
    * reads; the bytes of its Buffers are shared, as in 2.2.4, except a small view of a large backing
    * store: all of those in the send are copied into one store of their own (`SendCopy`). Entries
-   * and records that are not objects are kept as they are, and so is a `messages` that is not an
+   * and records that are primitives are kept as they are, and so is a `messages` that is not an
    * array, so validation refuses them as before.
    * @param {{ topic: string, messages: object[] }[]} topicMessages
    * @returns {{ topic: string, messages: object[] }[]}
@@ -1114,7 +1118,7 @@ class Accumulator {
   static snapshot(topicMessages, captureError) {
     const copies = new SendCopy()
     const snapshot = ownedList(topicMessages, (entry) => {
-      if (entry === null || typeof entry !== 'object') {
+      if (!hasProperties(entry)) {
         return entry
       }
       const { topic, messages } = entry
