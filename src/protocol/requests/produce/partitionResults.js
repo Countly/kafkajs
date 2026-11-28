@@ -20,8 +20,8 @@ const { failure, createErrorFromCode } = require('../../error')
  * record it rejected (KIP-467); from v10 the leader hint on a leadership error (KIP-951).
  *
  * `recordErrors[].batchIndex` indexes the records as grouped for that partition, not the caller's
- * flat message list. The array and its entries are frozen: the producer gives each send that owns
- * a reported record its own copy of the error, and never changes this one. `currentLeader` and
+ * flat message list. The array and its entries are frozen: the producer constructs a fresh error
+ * for each send of an eligible batch and leaves this error's record details intact. `currentLeader` and
  * `nodeEndpoints` are internal: they let the producer route its next attempt to the new leader
  * without waiting for a metadata refresh, and are not part of the error's documented surface.
  * @param {{ nodeEndpoints?: object[] }} data the decoded response

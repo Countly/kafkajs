@@ -220,6 +220,19 @@ const resolveBatch = (batch, metadata) => {
 }
 
 /**
+ * Rejects one settler with the batch's error and, for its owner, detached failure data.
+ * @param {{ reject: Function }} settler
+ * @param {Error} error
+ * @param {Map<object, object>|null} [projected]
+ * @returns {void}
+ */
+const rejectSettler = (settler, error, projected) => {
+  const failure = projected?.get(settler)
+  if (failure === undefined) settler.reject(error)
+  else settler.reject(error, failure)
+}
+
+/**
  * Settles every caller of a batch with `error`, once, as `resolveBatch` does. Only a settlement
  * given the answer occurrence it settles with can give each accumulator send its own error,
  * carrying the records that send owns (see `Accumulator.projectionsFor`); every other settler, and
@@ -236,7 +249,7 @@ const rejectBatch = (batch, error, occurrence = null) => {
   const projected =
     occurrence === null ? null : Accumulator.projectionsFor(batch, error, occurrence)
   for (const settler of batch.settlers) {
-    settler.reject(projected?.get(settler) ?? error)
+    rejectSettler(settler, error, projected)
   }
 }
 
@@ -2171,9 +2184,7 @@ const createSendMessages = ({
       if (error !== undefined) failure = failure || error
       else if (value !== undefined) metadata.push(value)
       batch.settlers?.forEach((settler) =>
-        error === undefined
-          ? settler.resolve(value)
-          : settler.reject(projected?.get(settler) ?? error)
+        error === undefined ? settler.resolve(value) : rejectSettler(settler, error, projected)
       )
       finish()
     }

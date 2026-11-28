@@ -1,5 +1,6 @@
+const { isNativeError, isProxy } = require('util').types
 const Long = require('../../utils/long')
-const { KafkaJSDeliveryTimeout } = require('../../errors')
+const { KafkaJSDeliveryTimeout, KafkaJSProtocolError } = require('../../errors')
 const eosManager = require('../eosManager')
 
 /** Error objects a Produce answer reported for a partition. */
@@ -44,8 +45,9 @@ const answerOccurrence = (error, batch) => {
  * @returns {object[]|null} the error's own `recordErrors` array; an accessor is never called
  */
 const rawEntriesOf = (error) => {
+  if (isProxy(error)) return null
   const entries = Object.getOwnPropertyDescriptor(error, 'recordErrors')?.value
-  return Array.isArray(entries) ? entries : null
+  return Array.isArray(entries) && !isProxy(entries) ? entries : null
 }
 
 /**
@@ -60,89 +62,169 @@ const resolves = (index, count) => Number.isInteger(index) && index >= 0 && inde
  * @param {number} count the record count of the batch it answers
  * @returns {*[]} the reported indices that name no record of that batch
  */
-const unresolvedIndices = (error, count) =>
-  (rawEntriesOf(error) ?? [])
-    .map(({ batchIndex }) => batchIndex)
-    .filter((batchIndex) => !resolves(batchIndex, count))
+const unresolvedIndices = (error, count) => {
+  const entries = rawEntriesOf(error)
+  const unresolved = []
+  for (let at = 0; at < (entries?.length ?? 0); at++) {
+    const entry = Object.getOwnPropertyDescriptor(entries, at)?.value
+    if (entry === null || typeof entry !== 'object' || isProxy(entry)) continue
+    const index = Object.getOwnPropertyDescriptor(entry, 'batchIndex')
+    if (index !== undefined && Object.hasOwn(index, 'value') && !resolves(index.value, count)) {
+      unresolved.push(index.value)
+    }
+  }
+  return unresolved
+}
+
+/** Identifies a resolved send result that must be delivered as a rejection. */
+const RECORD_FAILURE = Symbol('record failure')
+
+const commonFields = {
+  name: 'string',
+  message: 'string',
+  retriable: 'boolean',
+  category: 'string',
+  helpUrl: 'string|undefined',
+}
+const protocolFields = {
+  ...commonFields,
+  type: 'string',
+  code: 'number',
+  topic: 'string|null',
+  partition: 'number',
+}
+const responseFields = { errorMessage: 'string|null' }
+const timeoutFields = { type: 'string', code: 'number', outcome: 'string' }
 
 /**
- * The links a projection copies, from the delivered error down to the answer: the answer itself,
- * or a delivery timeout whose own `cause` data property is the answer. No getter runs.
+ * Reads only known own data fields. Returns null if reconstructing the error would discard an
+ * unknown property or carry an object from the source. The native stack is never inspected.
+ * @param {Error} error
+ * @param {object} required field names and their allowed value types
+ * @param {object} optional field names and their allowed value types
+ * @param {string[]} ignored keys handled separately or omitted from the public error
+ * @returns {object|null}
+ */
+const detachedFields = (error, required, optional, ignored) => {
+  for (const key of Reflect.ownKeys(error)) {
+    if (!Object.hasOwn(required, key) && !Object.hasOwn(optional, key) && !ignored.includes(key)) {
+      return null
+    }
+  }
+
+  const fields = {}
+  for (const [key, types] of Object.entries({ ...required, ...optional })) {
+    const descriptor = Object.getOwnPropertyDescriptor(error, key)
+    if (descriptor === undefined && Object.hasOwn(optional, key)) continue
+    if (descriptor === undefined || !Object.hasOwn(descriptor, 'value')) return null
+    const { value } = descriptor
+    const kind = value === null ? 'null' : typeof value
+    if (!types.split('|').includes(kind)) return null
+    fields[key] = value
+  }
+  return fields
+}
+
+/**
+ * Checks for an exact native instance before inspecting its own properties.
+ * @param {Error} error
+ * @param {Function} constructor
+ * @returns {boolean}
+ */
+const isExactError = (error, constructor) =>
+  isNativeError(error) && Object.getPrototypeOf(error) === constructor.prototype
+
+/**
+ * Detaches the public fields of an exact protocol answer and its optional delivery timeout.
  * @param {Error} delivered
  * @param {Error} answer
- * @returns {Error[]|null}
+ * @returns {{ protocol: object, timeout: object|null }|null}
  */
-const linksTo = (delivered, answer) => {
-  if (delivered === answer) return [answer]
-  const cause =
-    delivered instanceof KafkaJSDeliveryTimeout
-      ? Object.getOwnPropertyDescriptor(delivered, 'cause')
-      : undefined
-  return cause?.value === answer ? [delivered, answer] : null
+const failureFields = (delivered, answer) => {
+  if (!isExactError(answer, KafkaJSProtocolError) || eosManager.isExhaustedLookup(answer)) {
+    return null
+  }
+  const cause = Object.getOwnPropertyDescriptor(answer, 'cause')
+  if (cause === undefined || !Object.hasOwn(cause, 'value') || cause.value !== undefined)
+    return null
+  const protocol = detachedFields(answer, protocolFields, responseFields, [
+    'stack',
+    'cause',
+    'recordErrors',
+    'currentLeader',
+    'nodeEndpoints',
+  ])
+  if (protocol === null || protocol.message === '') return null
+
+  if (delivered === answer) return { protocol, timeout: null }
+  if (
+    !isExactError(delivered, KafkaJSDeliveryTimeout) ||
+    eosManager.isExhaustedLookup(delivered) ||
+    Object.getOwnPropertyDescriptor(delivered, 'cause')?.value !== answer
+  ) {
+    return null
+  }
+  const timeout = detachedFields(delivered, commonFields, timeoutFields, ['stack', 'cause'])
+  if (
+    timeout === null ||
+    timeout.type !== protocol.type ||
+    timeout.code !== protocol.code ||
+    (timeout.outcome !== undefined && !['unsent', 'unknown'].includes(timeout.outcome))
+  ) {
+    return null
+  }
+  return { protocol, timeout }
 }
 
 /**
- * The `stack` property of a copy whose source has an accessor `stack`. V8 backs an error's own
- * `stack` accessor with the trace stored on the error it was captured for, and formats that trace
- * (running `Error.prepareStackTrace`) when the accessor runs. The same accessor on another object
- * would format that object's trace: the frames of the copy, not of the failure. This one applies
- * the source's getter to the source, so the copy shows where the source was made, and only when a
- * caller reads it: no formatter runs while a batch settles, or ever if nobody reads the stack. The
- * first value read is kept and the source is released. A write replaces the value for the copy
- * alone; the source's setter never runs. A getter or setter the source lacks is lacking here, and
- * `enumerable` and `configurable` are the source's.
- * @param {Error} source
- * @param {{ get?: Function, set?: Function, enumerable?: boolean, configurable?: boolean }} accessor
- *   the source's own `stack` descriptor
+ * An enumerable property that materializes an ordinary array only when first read.
+ * @param {object[]} entries the frozen raw entries in broker order
+ * @param {Map<number, object>|null} records this send's detached culprit records
  * @returns {PropertyDescriptor}
  */
-const stackAccessor = (source, { get, set, enumerable, configurable }) => {
-  let from = source
+const recordErrorsProperty = (entries, records) => {
   let value
-  const keep = (next) => {
-    value = next
-    from = null
-  }
   return {
-    enumerable,
-    configurable,
-    get:
-      get &&
-      (() => {
-        if (from !== null) keep(Reflect.apply(get, from, []))
-        return value
-      }),
-    set: set && keep,
+    configurable: true,
+    enumerable: true,
+    get() {
+      value ??= entries.map((entry) => {
+        const record = records?.get(entry.batchIndex)
+        return record === undefined ? entry : { ...entry, record }
+      })
+      return value
+    },
   }
 }
 
 /**
- * A copy of an error that is a native `Error`, as the source is: `util.types.isNativeError` holds,
- * so a caller that wraps the copy as a `cause` keeps its category (see `initialCategory`). The
- * copy has the source's prototype and every own property descriptor, string and symbol keys,
- * attributes included, with `substitutes` put in place of their values first. A getter or setter
- * is carried over, never called. `stack` is the one exception to identical descriptors, and is
- * always the source's trace, never one of the copy:
- * - a data `stack` is copied with its value and attributes;
- * - an accessor `stack` (what V8 gives every `KafkaJSError`) becomes `stackAccessor`, which reads
- *   the source's trace when first read, so the copy's descriptor is not the source's;
- * - a source with no own `stack` leaves the copy none either, so any `stack` comes from its
- *   prototype chain, as the source's does.
- * Nothing reads the source's `stack` here.
- * @param {Error} link
- * @param {{ cause?: Error, recordErrors?: object[] }} substitutes
- * @returns {Error}
+ * The append promise's fulfillment reaction. Only this send's detached data enters the stack
+ * captured by the constructors; successes pass through and raw rejections bypass the reaction.
+ * @param {object[]|object} result metadata or a tagged record failure
+ * @returns {object[]} the send's metadata
+ * @throws {KafkaJSProtocolError|KafkaJSDeliveryTimeout} the send's native record failure
  */
-const copyLink = (link, substitutes) => {
-  const descriptors = Object.getOwnPropertyDescriptors(link)
-  for (const [key, value] of Object.entries(substitutes)) {
-    descriptors[key] = { ...descriptors[key], value }
+const deliverRecords = (result) => {
+  if (Array.isArray(result) || result.kind !== RECORD_FAILURE) return result
+
+  const { protocol, timeout, entries, records, mixedOutcome } = result
+  const error = new KafkaJSProtocolError(protocol)
+  Object.assign(error, protocol)
+  Object.defineProperty(error, 'recordErrors', recordErrorsProperty(entries, records))
+  if (timeout === null) throw error
+
+  const expired = new KafkaJSDeliveryTimeout(timeout.message, {
+    cause: error,
+    outcome: timeout.outcome,
+  })
+  Object.assign(expired, timeout)
+  if (mixedOutcome) {
+    throw new KafkaJSDeliveryTimeout(
+      `Some records of this send may have been written: ${expired.message}`,
+      { cause: expired, outcome: 'unknown' }
+    )
   }
-  const { stack } = descriptors
-  if (stack !== undefined && 'get' in stack) descriptors.stack = stackAccessor(link, stack)
-  const copy = Object.setPrototypeOf(new Error(), Object.getPrototypeOf(link))
-  if (stack === undefined) Reflect.deleteProperty(copy, 'stack')
-  return Object.defineProperties(copy, descriptors)
+  throw expired
 }
 
 /**
@@ -245,60 +327,77 @@ const ownerOf = (owners, index) => {
 }
 
 /**
- * Each owner's own error. Every owner gets its own copy of each link, the answer's copy carrying
- * its own `recordErrors` array: a fresh entry with `record` for each index it owns, the shared
- * raw entry for every other.
+ * Builds only the caller-specific data needed at the send's delivery boundary.
  * @param {object[]} messages
- * @param {Error[]} links
- * @param {object[]} entries the answer's raw entries
+ * @param {{ protocol: object, timeout: object|null }} fields
+ * @param {object[]} entries the answer's frozen raw entries
  * @param {{ index: number }[]} owners
- * @returns {Map<object, Error>|null} null when no entry names a record
+ * @returns {Map<object, object>|null} null when no entry names a record
  */
-const projectEntries = (messages, links, entries, owners) => {
+const projectEntries = (messages, fields, entries, owners) => {
   /** @type {Map<number, Set<number>>} owner position to the indices it owns */
   const owned = new Map()
-  for (const { batchIndex } of entries) {
-    if (!resolves(batchIndex, messages.length)) continue
-    const at = ownerOf(owners, batchIndex)
-    if (!owned.has(at)) owned.set(at, new Set())
-    owned.get(at).add(batchIndex)
+  for (let at = 0; at < entries.length; at++) {
+    const entry = Object.getOwnPropertyDescriptor(entries, at)?.value
+    if (
+      entry === null ||
+      typeof entry !== 'object' ||
+      isProxy(entry) ||
+      Object.getPrototypeOf(entry) !== Object.prototype ||
+      !Object.isFrozen(entry) ||
+      Reflect.ownKeys(entry).length !== 2
+    ) {
+      return null
+    }
+    const index = Object.getOwnPropertyDescriptor(entry, 'batchIndex')?.value
+    const message = Object.getOwnPropertyDescriptor(entry, 'errorMessage')?.value
+    if (typeof index !== 'number' || (message !== null && typeof message !== 'string')) return null
+    if (!resolves(index, messages.length)) continue
+    const owner = ownerOf(owners, index)
+    if (!owned.has(owner)) owned.set(owner, new Set())
+    owned.get(owner).add(index)
   }
   if (owned.size === 0) return null
 
   const projections = new Map()
   owners.forEach((owner, at) => {
     const indices = owned.get(at)
-    const records = indices === undefined ? null : materialiseRecords(messages, indices)
-    const recordErrors = entries.map((entry) =>
-      records?.has(entry.batchIndex) ? { ...entry, record: records.get(entry.batchIndex) } : entry
-    )
-    const answer = copyLink(links[links.length - 1], { recordErrors })
-    projections.set(owner, links.length === 1 ? answer : copyLink(links[0], { cause: answer }))
+    projections.set(owner, {
+      kind: RECORD_FAILURE,
+      ...fields,
+      entries,
+      records: indices === undefined ? null : materialiseRecords(messages, indices),
+      outcome: fields.timeout?.outcome,
+      mixedOutcome: false,
+    })
   })
   return projections
 }
 
 /**
- * Each owning send's own error for a batch that fails with `delivered`, made from the answer
- * occurrence its settlement received. Nothing is projected, and every caller gets `delivered`
- * itself, when the answer was reported more than once, the batch was cut since the answer, the
- * delivered error is neither the answer nor a delivery timeout built around it, a link to copy is
- * a coordinator lookup tracked by identity, the answer names no record of the batch, the batch has
- * no accumulator owner, or copying the records fails.
+ * Each owning send's detached failure for a matched, unambiguous answer to this batch. The
+ * caller keeps the original error if provenance, error shape or record data is unsuitable.
  * @param {{ token?: object|null, messages: object[] }} batch
  * @param {Error} delivered
  * @param {{ error: Error, token: object }} occurrence
  * @param {{ index: number }[]} owners the batch's accumulator settlers, in batch order
- * @returns {Map<object, Error>|null}
+ * @returns {Map<object, object>|null}
  */
 const projectionsOf = (batch, delivered, occurrence, owners) => {
   const { error: answer, token } = occurrence
   if (owners.length === 0 || ambiguous.has(answer) || token !== batch.token) return null
-  const links = linksTo(delivered, answer)
-  const entries = rawEntriesOf(answer)
-  if (links === null || links.some(eosManager.isExhaustedLookup) || entries === null) return null
   try {
-    return projectEntries(batch.messages, links, entries, owners)
+    const fields = failureFields(delivered, answer)
+    const entries = fields === null ? null : rawEntriesOf(answer)
+    if (
+      entries === null ||
+      Object.getPrototypeOf(entries) !== Array.prototype ||
+      !Object.isFrozen(entries) ||
+      Reflect.ownKeys(entries).length !== entries.length + 1
+    ) {
+      return null
+    }
+    return projectEntries(batch.messages, fields, entries, owners)
   } catch {
     return null
   }
@@ -309,4 +408,5 @@ module.exports = {
   answerOccurrence,
   unresolvedIndices,
   projectionsOf,
+  deliverRecords,
 }

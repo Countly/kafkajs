@@ -97,31 +97,32 @@ notice and what, if anything, to do.
   *What to do:* nothing, unless you relied on unbounded pipelining; `maxInFlightRequests: null`
   restores it (and turns idempotence off for a producer — see the producer items).
 
-- **Produce errors carry per-record detail.** The error thrown by a failed `send()`/`sendBatch()`
-  now carries `topic`, `partition`, the broker's own `errorMessage`, and, when the broker rejected
-  individual records rather than the whole partition, `recordErrors`: an array of
-  `{ batchIndex, errorMessage }`, where `batchIndex` is the record's position in the rejected
-  batch, not an index into your `messages`. When the broker's answer for a batch is delivered
-  to the sends gathered into it (on an idempotent producer, also a delivery timeout built around
-  that answer), each send gets an error object of its own: a native `Error` of the same class, with
-  the same properties and `category`, so wrapping it as a `cause` keeps its category. Its `stack`
-  is the stack of the error it was copied from, where the broker's answer or the delivery
-  timeout was made, not of the copy. Only an
-  entry for a record of your own send also carries `record`: a copy of that record as written
-  (`key`, `value` and header values as `Buffer`s in a store of its own, never the message object
-  you passed in and never another send's record). Its `timestamp`, a decimal string, is set when
-  the timestamp you gave was a non-zero number, a non-empty string, a non-zero `bigint`, a `Date`
-  or a `Long` (a `Date` or `Long` of 0 gives `'0'`); it is absent when you gave none, `0`, `0n`, an
-  empty string or any other object, and the send time was written instead. The other
-  entries are the broker's own, shared and frozen. In every other case (an error thrown for a
-  whole request, one that ran out of retries, a delivery timeout on a non-idempotent producer, an
-  error object the broker's answers reuse) every send of the batch gets the one error the
-  producer already built, without a copy: the broker's error, or the retry or deadline error
-  around it. Its entries have no `record`; do not change it. The position of the record in your
-  `messages` is not given yet. `type`, `code` and `retriable` are unchanged. Which
-  failure is reported is also unchanged — the first failing partition in the response, exactly as
-  before — and there is still no automatic re-batching: a batch containing one rejected record
-  fails as a whole, as it always did.
+- **Produce errors carry per-record detail.** When a matched broker answer identifies at least
+  one record of a failed batch, each participating `send()` or `sendBatch()` gets a fresh native
+  `KafkaJSProtocolError`. An idempotent delivery timeout around that answer gives each send a
+  fresh `KafkaJSDeliveryTimeout` with its own protocol error as the cause. The errors preserve
+  `name`, `message`, `type`, `code`, `retriable`, and `category`. The protocol error also
+  preserves `topic`, `partition` and the broker's `errorMessage`, including null versus absent.
+  The timeout preserves its delivery `outcome`. A cause wrap with matching retriability preserves
+  the category. Routing hints stay on the producer's internal error.
+
+  The protocol error has its own `recordErrors` array, created and cached on first read.
+  `batchIndex` identifies a position in the batch sent to Kafka. The array follows broker order,
+  including duplicate and unresolved indices. Only entries for records owned by this send gain
+  `record`, with detached key, value and header bytes as `Buffer`s. The other entries are shared
+  and frozen. `record.timestamp` is the decimal string of a truthy supported snapshot timestamp.
+  The snapshot normalizes a `Date` or an object with a bigint `value` to a string, so epoch zero
+  in either form is `'0'`. Numeric zero, `0n`, an empty string, an omitted timestamp and other
+  timestamp objects omit `record.timestamp`.
+
+  Whole-request failures, exhausted retries, plain-producer delivery timeouts, ambiguous answers
+  and other failures that cannot be attributed keep the existing error or retry/deadline wrapper
+  and raw entries. The transaction's armed error also keeps its identity. Failure selection and
+  the scope of the failed batch stay the same.
+
+  *What to do:* Treat `stack` as lazily formatted diagnostic text with unspecified frames.
+  If you match stack text, switch to the error class, `type`, `code` or `category`. Each fresh
+  error has its own construction stack.
 
 - **The producer follows leader hints.** When a produce request fails with a leadership error, a
   Kafka 4.x broker also names the node that now leads the partition and, where the client may not

@@ -15,11 +15,16 @@ const ProducerStateManager = require('../state')
 const Accumulator = require('../state/accumulator')
 const { partitionResults } = require('../../protocol/requests/produce/partitionResults')
 const { protocol: produceProtocol } = require('../../protocol/requests/produce')
-const { createErrorFromCode } = require('../../protocol/error')
 const { Codecs, Types } = require('../../protocol/message/compression')
 const { createLogger, LEVELS } = require('../../loggers')
 const { createFakeCluster } = require('./fixtures/fakeCluster')
-const { deferred, flushAll, transactionalProducer, watch } = require('./fixtures/bufferHarness')
+const {
+  collect,
+  deferred,
+  flushAll,
+  transactionalProducer,
+  watch,
+} = require('./fixtures/bufferHarness')
 const {
   KafkaJSBrokerNotFound,
   KafkaJSDeliveryTimeout,
@@ -269,7 +274,7 @@ const recordOf = (name) => ({
  * @param {number} [partition=0]
  * @returns {KafkaJSProtocolError}
  */
-const answerError = (code, indices, partition = 0) =>
+const answerError = (code, indices, partition = 0, errorMessage = 'refused') =>
   partitionResults({
     topics: [
       {
@@ -278,7 +283,7 @@ const answerError = (code, indices, partition = 0) =>
           {
             partition,
             errorCode: code,
-            errorMessage: 'refused',
+            errorMessage,
             baseOffset: '-1',
             logAppendTime: '-1',
             logStartOffset: '0',
@@ -340,6 +345,25 @@ const chainOf = (error) => {
 }
 
 /** @type {WeakMap<object, number[][]>} per fake cluster, what `countRecords` noted */
+/**
+ * Compares the producer's native protocol error with the decoder's public own fields, including
+ * their presence. Routing hints are tested separately.
+ * @param {KafkaJSProtocolError} error
+ * @param {KafkaJSProtocolError} answer
+ * @returns {void}
+ */
+const expectProtocolParity = (error, answer) => {
+  expect(error).not.toBe(answer)
+  expect(error).toBeInstanceOf(KafkaJSProtocolError)
+  expect(Object.getPrototypeOf(error)).toBe(KafkaJSProtocolError.prototype)
+  expect(isNativeError(error)).toBe(true)
+  const keys = (value) =>
+    Reflect.ownKeys(value).filter((key) => key !== 'stack' && key !== 'recordErrors')
+  expect(new Set(keys(error))).toEqual(new Set(keys(answer)))
+  for (const key of keys(answer)) expect(error[key]).toBe(answer[key])
+  expect(error.cause).toBeUndefined()
+}
+
 const noted = new WeakMap()
 
 /**
@@ -382,18 +406,18 @@ const PATHS = [
 ]
 
 /**
- * A send path over a real `Broker` and `Connection` that answers every Produce with the recorded
- * v9 answer: INVALID_RECORD for partition 0, one rejected record at batch index 1.
- * @param {boolean} idempotent the idempotent send loop with a real eosManager, or the plain path
- * @returns {Promise<{ sender: ReturnType<typeof createSendMessages>, state: { writes: Buffer[] } }>}
+ * A real Broker and Connection that also expose the errors made by the response decoder.
+ * @param {Buffer} [body] the Produce v9 response, by default one rejected record at index 1
+ * @returns {Promise<object>} the broker, transport state and decoder errors
  */
-const createRealChainSender = async (idempotent) => {
+const createObservedBroker = async (body) => {
   const { broker, state } = createFakeBroker((header) =>
     header.apiKey === apiKeys.ApiVersions
       ? apiVersionsBody(9)
-      : Buffer.from(
+      : (body ??
+        Buffer.from(
           require('../../protocol/requests/produce/fixtures/v9_response_record_errors.json')
-        )
+        ))
   )
   await broker.connect()
   const answers = []
@@ -403,6 +427,20 @@ const createRealChainSender = async (idempotent) => {
     if (Array.isArray(results)) answers.push(...results.flatMap(({ error }) => error ?? []))
     return results
   }
+  return { broker, state, answers }
+}
+
+/**
+ * A send path over the real broker, with a real producer state manager when idempotent.
+ * @param {boolean} idempotent
+ * @param {{body?: Buffer, deliveryTimeout?: number, retry?: object}} [options]
+ * @returns {Promise<object>} the send path, transport and observed decoder errors
+ */
+const createRealChainSender = async (
+  idempotent,
+  { body, deliveryTimeout, retry: retryOptions = ONE_RETRY } = {}
+) => {
+  const { broker, state, answers } = await createObservedBroker(body)
   const logger = newLogger()
   const cluster = createCluster(broker, [{ partitionId: 0, leader: NODE_ID }])
   if (!idempotent) {
@@ -413,7 +451,7 @@ const createRealChainSender = async (idempotent) => {
       eosManager: createEosManagerStub(),
       retrier: retry({ retries: 0 }),
     })
-    return { sender, state, answers }
+    return { sender, state, answers, broker }
   }
   const coordinator = {
     nodeId: 9,
@@ -430,36 +468,36 @@ const createRealChainSender = async (idempotent) => {
     logger,
     cluster,
     transactional: false,
-    retry: ONE_RETRY,
+    retry: retryOptions,
   })
   await eosManager.initProducerId()
   const sender = createSendMessages({
     logger,
     cluster,
-    retrier: retry(ONE_RETRY),
+    retrier: retry(retryOptions),
     partitioner: partitionerByMessage,
     eosManager,
     idempotence: new Idempotence({ enabled: true, explicit: false, logger }),
-    retry: ONE_RETRY,
+    retry: retryOptions,
+    deliveryTimeout,
     getConnectionStatus: () => CONNECTION_STATUS.CONNECTED,
   })
-  return { sender, state, answers }
+  return { sender, state, answers, broker }
 }
 
 /**
  * Runs `body` with a scoped `Error.prepareStackTrace` that notes each error V8 formats the stack
- * of and answers `format(error, count)`, `count` being how many formats ran so far including this
- * one, then restores the previous hook.
- * @param {(error: Error, count: number) => string} format
+ * of, passes the native call sites to `format`, then restores the previous hook.
+ * @param {(error: Error, frames: object[]) => string|undefined} format
  * @param {(formatted: Error[]) => Promise<void>} body given the errors formatted so far, live
  * @returns {Promise<void>}
  */
 const withStackHook = async (format, body) => {
   const previous = Error.prepareStackTrace
   const formatted = []
-  Error.prepareStackTrace = (error) => {
+  Error.prepareStackTrace = (error, frames) => {
     formatted.push(error)
-    return format(error, formatted.length)
+    return format(error, frames)
   }
   try {
     await body(formatted)
@@ -477,6 +515,161 @@ const stackOrThrown = (error) => {
   }
 }
 
+/**
+ * A flexible response with a reported record for each owner.
+ * @param {number} code partition error code
+ * @returns {Buffer} the Produce v9 response body
+ */
+const failureBody = (code) =>
+  new Encoder()
+    .writeUVarIntArray([
+      new Encoder()
+        .writeUVarIntString(TOPIC)
+        .writeUVarIntArray([
+          new Encoder()
+            .writeInt32(0)
+            .writeInt16(code)
+            .writeInt64(-1)
+            .writeInt64(-1)
+            .writeInt64(0)
+            .writeUVarIntArray(
+              [0, 1].map((index) =>
+                new Encoder().writeInt32(index).writeUVarIntString(null).writeTaggedFields()
+              )
+            )
+            .writeUVarIntString(null)
+            .writeTaggedFields(),
+        ])
+        .writeTaggedFields(),
+    ])
+    .writeInt32(0)
+    .writeTaggedFields().buffer
+
+/**
+ * Keeps one real send rejection and weak references to everything it should release. The
+ * socket and send path, promises, requests and retained source answers live only in this frame.
+ * @param {boolean} idempotent
+ * @param {boolean} timeout whether the broker answer is retriable and the retry times out
+ * @param {boolean} readStacks whether to format all stacks on the retained chain
+ * @returns {Promise<{kept: Error, refs: Map<string, WeakRef<object>>}>}
+ */
+const retainOneRejection = async (idempotent, timeout, readStacks) => {
+  const code = timeout ? NOT_ENOUGH_REPLICAS : INVALID_RECORD
+  const { sender, broker, state, answers } = await createRealChainSender(idempotent, {
+    body: failureBody(code),
+    deliveryTimeout: 150,
+    retry: { retries: 5, initialRetryTime: 1000, maxRetryTime: 1000, factor: 0 },
+  })
+  jest.useFakeTimers({ now: 0, doNotFake: ['queueMicrotask', 'nextTick', 'setImmediate'] })
+  const refs = new Map()
+  const accumulator = new Accumulator({
+    linger: 20,
+    batchSize: 16384,
+    deadline: 150,
+    partition: (pending) => sender.partition(pending),
+    sendPartitioned: (request) => {
+      const [batch] = request.batches
+      refs.set('batch', new WeakRef(batch))
+      for (const [index, { value }] of batch.messages.entries()) {
+        refs.set(`snapshot backing store ${index}`, new WeakRef(value.buffer))
+      }
+      return sender.sendPartitioned(request)
+    },
+  })
+  let originalTimeout
+  const project = Accumulator.projectionsFor
+  Accumulator.projectionsFor = (batch, delivered, occurrence) => {
+    refs.set('settled batch', new WeakRef(batch))
+    return project(batch, delivered, occurrence)
+  }
+  const capture = Error.captureStackTrace
+  if (timeout) {
+    Error.captureStackTrace = (target, constructor) => {
+      if (originalTimeout === undefined && target instanceof KafkaJSDeliveryTimeout) {
+        originalTimeout = target
+      }
+      capture(target, constructor)
+    }
+  }
+
+  try {
+    const sends = [0, 1].map((index) => {
+      const value = Buffer.allocUnsafeSlow(12).fill(index + 1)
+      refs.set(`caller backing store ${index}`, new WeakRef(value.buffer))
+      return accumulator
+        .append({
+          acks: -1,
+          timeout: 30000,
+          topicMessages: Accumulator.snapshot([
+            { topic: TOPIC, messages: [{ value, partition: 0 }] },
+          ]),
+        })
+        .catch((error) => error)
+    })
+    await flushAll()
+    await jest.advanceTimersByTimeAsync(20)
+    await flushAll()
+    if (timeout) await jest.advanceTimersByTimeAsync(130)
+    const [kept, sibling] = await Promise.all(sends)
+    expect(state.writes).toHaveLength(2)
+    expect(answers).toHaveLength(1)
+    const [answer] = answers
+    refs.set('broker protocol error', new WeakRef(answer))
+    refs.set('sibling rejection', new WeakRef(sibling))
+    const protocol = timeout ? kept.cause : kept
+    const siblingProtocol = timeout ? sibling.cause : sibling
+    expectProtocolParity(protocol, answer)
+    expectProtocolParity(siblingProtocol, answer)
+    expect(kept).not.toBe(sibling)
+    expect(protocol.errorMessage).toBeNull()
+    expect(protocol.recordErrors[0].record.value).toEqual(Buffer.alloc(12, 1))
+    refs.set(
+      'sibling backing store',
+      new WeakRef(siblingProtocol.recordErrors[1].record.value.buffer)
+    )
+    if (timeout) {
+      expect(kept).toBeInstanceOf(KafkaJSDeliveryTimeout)
+      expect(kept.outcome).toBe('unknown')
+      expect(originalTimeout.cause).toBe(answer)
+      expect(new Set(Reflect.ownKeys(kept))).toEqual(new Set(Reflect.ownKeys(originalTimeout)))
+      for (const key of Reflect.ownKeys(originalTimeout)) {
+        if (key !== 'stack' && key !== 'cause') expect(kept[key]).toBe(originalTimeout[key])
+      }
+      refs.set('original timeout', new WeakRef(originalTimeout))
+      refs.set('sibling protocol error', new WeakRef(siblingProtocol))
+    }
+    if (readStacks) {
+      expect(typeof kept.stack).toBe('string')
+      if (timeout) expect(typeof protocol.stack).toBe('string')
+    }
+    return { kept, refs }
+  } finally {
+    Accumulator.projectionsFor = project
+    Error.captureStackTrace = capture
+    await broker.disconnect()
+    jest.useRealTimers()
+  }
+}
+
+test.each([
+  ['plain failure, stack unread', false, false, false],
+  ['plain failure, stack read', false, false, true],
+  ['idempotent failure, stack unread', true, false, false],
+  ['idempotent failure, stack read', true, false, true],
+  ['idempotent timeout, stacks unread', true, true, false],
+  ['idempotent timeout, stacks read', true, true, true],
+])(
+  '%s releases the batch, source errors and sibling records',
+  async (_, idempotent, timeout, readStacks) => {
+    const { kept, refs } = await retainOneRejection(idempotent, timeout, readStacks)
+    await collect()
+    const alive = Array.from(refs, ([name, ref]) => (ref.deref() === undefined ? null : name))
+    expect(alive.filter(Boolean)).toEqual([])
+    const protocol = timeout ? kept.cause : kept
+    expect(protocol.recordErrors[0].record.value).toEqual(Buffer.alloc(12, 1))
+  }
+)
+
 describe.each(PATHS)(
   'Producer > two sends of one batch, a real request and response chain, %s',
   (_, idempotent) => {
@@ -485,89 +678,62 @@ describe.each(PATHS)(
     })
 
     test('the owner of the rejected record gets it, the other gets the same frozen raw entry, each its own native Error', async () => {
-      const { sender, state, answers } = await createRealChainSender(idempotent)
+      const { broker, state, answers } = await createObservedBroker()
       jest.useFakeTimers({ now: 0, doNotFake: ['queueMicrotask', 'nextTick', 'setImmediate'] })
-      const accumulator = new Accumulator({
+      const cluster = createFakeCluster()
+      cluster.findBroker = async () => broker
+      const producer = createProducer({
+        cluster,
+        logger: newLogger(),
+        createPartitioner: () => partitionerByMessage,
+        idempotent,
         linger: 1000,
-        batchSize: 16384,
-        partition: (pending) => sender.partition(pending),
-        sendPartitioned: (request) => sender.sendPartitioned(request),
+        retry: idempotent ? ONE_RETRY : { retries: 0 },
       })
-      const sends = ['a', 'b'].map((name) =>
-        accumulator
-          .append({
-            acks: -1,
-            timeout: 30000,
-            topicMessages: Accumulator.snapshot([{ topic: TOPIC, messages: [message(name)] }]),
-          })
-          .catch((error) => error)
-      )
-      await flushAll()
-      await jest.advanceTimersByTimeAsync(1000)
-      const [a, b] = await Promise.all(sends)
+      try {
+        await producer.connect()
+        await withStackHook(
+          (_, frames) => frames[0]?.getFunctionName(),
+          async (formatted) => {
+            const sends = [
+              producer.send({ topic: TOPIC, messages: [message('a')] }),
+              producer.sendBatch({ topicMessages: [{ topic: TOPIC, messages: [message('b')] }] }),
+            ].map((sent) => sent.catch((error) => error))
+            await flushAll()
+            await jest.advanceTimersByTimeAsync(1000)
+            const [a, b] = await Promise.all(sends)
 
-      expect(state.writes).toHaveLength(2)
-      expect(readRequestHeader(state.writes[1]).apiVersion).toEqual(9)
-      expect(answers).toHaveLength(1)
-      const [answer] = answers
-      for (const error of [a, b]) {
-        expect(error).toBeInstanceOf(KafkaJSProtocolError)
-        expect(isNativeError(error)).toBe(true)
-        expect(error).toMatchObject({ code: INVALID_RECORD, topic: TOPIC, partition: 0 })
-        expect(error).not.toBe(answer)
-      }
-      expect(a).not.toBe(b)
-      expectRaw(answer)
-      expect(a.recordErrors).toEqual([{ batchIndex: 1, errorMessage: 'record too large' }])
-      expect(a.recordErrors[0]).toBe(answer.recordErrors[0])
-      expect(Object.isFrozen(a.recordErrors[0])).toBe(true)
-      expect(b.recordErrors).toEqual([
-        { batchIndex: 1, errorMessage: 'record too large', record: recordOf('b') },
-      ])
-      expect(b.recordErrors[0]).not.toBe(answer.recordErrors[0])
-      expect(Object.isFrozen(b.recordErrors[0])).toBe(false)
-      expect(a.recordErrors).not.toBe(b.recordErrors)
-      expect(new KafkaJSNonRetriableError('write failed', { cause: b }).category).toBe(b.category)
-      if (idempotent) expect(b.category).toBe('invalidConfiguration')
-    })
-
-    test('each owner’s error shows the stack of the broker’s answer, formatted only when read', async () => {
-      const { sender, answers } = await createRealChainSender(idempotent)
-      jest.useFakeTimers({ now: 0, doNotFake: ['queueMicrotask', 'nextTick', 'setImmediate'] })
-      const accumulator = new Accumulator({
-        linger: 1000,
-        batchSize: 16384,
-        partition: (pending) => sender.partition(pending),
-        sendPartitioned: (request) => sender.sendPartitioned(request),
-      })
-
-      await withStackHook(
-        (error, count) => `trace ${count}`,
-        async (formattedErrors) => {
-          const sends = ['a', 'b'].map((name) =>
-            accumulator
-              .append({
-                acks: -1,
-                timeout: 30000,
-                topicMessages: Accumulator.snapshot([{ topic: TOPIC, messages: [message(name)] }]),
-              })
-              .catch((error) => error)
-          )
-          await flushAll()
-          await jest.advanceTimersByTimeAsync(1000)
-          const owners = await Promise.all(sends)
-          const [answer] = answers
-          expect(answers).toHaveLength(1)
-
-          expect(formattedErrors.filter((error) => [answer, ...owners].includes(error))).toEqual([])
-          for (const owner of owners) {
-            expect(owner).not.toBe(answer)
-            expect(owner.stack).toBe(answer.stack)
+            expect(state.writes).toHaveLength(2)
+            expect(readRequestHeader(state.writes[1]).apiVersion).toEqual(9)
+            expect(answers).toHaveLength(1)
+            const [answer] = answers
+            for (const error of [a, b]) {
+              expectProtocolParity(error, answer)
+              expect(error).toMatchObject({ code: INVALID_RECORD, topic: TOPIC, partition: 0 })
+            }
+            expect(a).not.toBe(b)
+            expectRaw(answer)
+            expect(a.recordErrors).toEqual([{ batchIndex: 1, errorMessage: 'record too large' }])
+            expect(a.recordErrors[0]).toBe(answer.recordErrors[0])
+            expect(Object.isFrozen(a.recordErrors[0])).toBe(true)
+            expect(b.recordErrors).toEqual([
+              { batchIndex: 1, errorMessage: 'record too large', record: recordOf('b') },
+            ])
+            expect(b.recordErrors[0]).not.toBe(answer.recordErrors[0])
+            expect(Object.isFrozen(b.recordErrors[0])).toBe(false)
+            expect(a.recordErrors).not.toBe(b.recordErrors)
+            expect(new KafkaJSNonRetriableError('write failed', { cause: b }).category).toBe(
+              b.category
+            )
+            if (idempotent) expect(b.category).toBe('invalidConfiguration')
+            expect(formatted.filter((error) => [a, b, answer].includes(error))).toEqual([])
+            for (const error of [a, b]) expect(error.stack).toBe('deliverRecords')
           }
-          expect(formattedErrors).toContain(answer)
-          expect(formattedErrors.filter((error) => owners.includes(error))).toEqual([])
-        }
-      )
+        )
+      } finally {
+        await producer.disconnect()
+        await broker.disconnect()
+      }
     })
   }
 )
@@ -628,7 +794,12 @@ describe('Producer > the record errors of a shared batch', () => {
         resultsOf(request, { 0: answer })
       )
 
-      const [a, b] = await sendAll(producer, [message('a'), message('b')])
+      const a = watch(producer.send({ topic: TOPIC, messages: [message('a')] }))
+      const b = watch(
+        producer.sendBatch({ topicMessages: [{ topic: TOPIC, messages: [message('b')] }] })
+      )
+      await jest.advanceTimersByTimeAsync(20)
+      await flushAll()
 
       expect(recordCounts(cluster)).toEqual([[2]])
       expect(a.state).toBe('rejected')
@@ -636,7 +807,8 @@ describe('Producer > the record errors of a shared batch', () => {
       expect(a.value).not.toBe(b.value)
       expect(a.value).not.toBe(answer)
       expect(b.value).not.toBe(answer)
-      expect(a.value).toBeInstanceOf(KafkaJSProtocolError)
+      expectProtocolParity(a.value, answer)
+      expectProtocolParity(b.value, answer)
       expect(a.value).toMatchObject({ code: INVALID_RECORD, topic: TOPIC, partition: 0 })
       expect(a.value.recordErrors).toEqual([
         { batchIndex: 0, errorMessage: 'bad 0', record: recordOf('a') },
@@ -665,6 +837,38 @@ describe('Producer > the record errors of a shared batch', () => {
         const wrapped = new KafkaJSNonRetriableError('write failed', { cause: value })
         expect(wrapped.category).toBe(answer.category)
       }
+    })
+
+    test('a multi-partition sendBatch keeps its first failure and both sends settle before flush', async () => {
+      const { producer, cluster } = await start({ idempotent, retry, partitions: 2 })
+      const first = answerError(INVALID_RECORD, [0])
+      const second = answerError(INVALID_RECORD, [0], 1)
+      cluster.broker.produce.mockImplementation(async (request) =>
+        resultsOf(request, { 0: first, 1: second })
+      )
+      const order = []
+      const batched = producer
+        .sendBatch({
+          topicMessages: [{ topic: TOPIC, messages: [message('a'), message('c', 1)] }],
+        })
+        .catch((error) => {
+          order.push('batch')
+          return error
+        })
+      const single = producer.send({ topic: TOPIC, messages: [message('b')] }).catch((error) => {
+        order.push('send')
+        return error
+      })
+      const flushed = producer.flush().then(() => order.push('flush'))
+      await flushAll()
+      await flushed
+
+      expect(order).toEqual(['batch', 'send', 'flush'])
+      const [a, b] = await Promise.all([batched, single])
+      expectProtocolParity(a, first)
+      expectProtocolParity(b, first)
+      expect(a.recordErrors[0].record).toEqual(recordOf('a'))
+      expect(b.recordErrors[0]).toBe(first.recordErrors[0])
     })
 
     test('one error object answering two partitions of a response is ambiguous: both sends get it raw', async () => {
@@ -712,7 +916,7 @@ describe('Producer > the record errors of a shared batch', () => {
   test('a projected record carries its fields as Buffers of one exact store, its timestamp as a string, and no custom timestamp', async () => {
     const { producer, cluster } = await start({ idempotent: false })
     const valueOf = jest.fn(() => 1700000000002)
-    const answer = answerError(INVALID_RECORD, [0, 1, 2])
+    const answer = answerError(INVALID_RECORD, [0, 1, 2, 3, 4, 5, 6, 7])
     let readsAtAnswer
     cluster.broker.produce.mockImplementation(async (request) => {
       readsAtAnswer = valueOf.mock.calls.length
@@ -731,6 +935,11 @@ describe('Producer > the record errors of a shared batch', () => {
             headers: { a: 'x', b: ['y', Buffer.from('z')] },
             timestamp: { valueOf },
           },
+          { value: null, timestamp: 0 },
+          { value: null, timestamp: 0n },
+          { value: null, timestamp: '' },
+          { value: null, timestamp: new Date(0) },
+          { value: null, timestamp: { value: 7n } },
         ],
       })
     )
@@ -746,6 +955,11 @@ describe('Producer > the record errors of a shared batch', () => {
         value: Buffer.from('v2'),
         headers: { a: Buffer.from('x'), b: [Buffer.from('y'), Buffer.from('z')] },
       },
+      { key: null, value: null, headers: {} },
+      { key: null, value: null, headers: {} },
+      { key: null, value: null, headers: {} },
+      { key: null, value: null, headers: {}, timestamp: '0' },
+      { key: null, value: null, headers: {}, timestamp: '7' },
     ])
     expect(records[2]).not.toHaveProperty('timestamp')
     const store = records[0].value.buffer
@@ -818,35 +1032,60 @@ describe('Producer > the record errors of a shared batch', () => {
     expectRaw(answer)
   })
 
-  test('S = 50 coalesced sends and R = 50 reported indices make 50 owned entries and share 50 raw ones', async () => {
+  test('a failure burst copies each distinct owned record once and allocates owner arrays on demand', async () => {
     const { producer, cluster } = await start({ idempotent: false })
     const count = 50
     const indices = Array.from({ length: count }, (_, i) => i)
-    const answer = answerError(INVALID_RECORD, indices)
+    const reported = [...indices, 0, 0, count]
+    const answer = answerError(INVALID_RECORD, reported)
     cluster.broker.produce.mockImplementation(async (request) => resultsOf(request, { 0: answer }))
-
+    const allocate = jest.spyOn(Buffer, 'allocUnsafeSlow')
+    const raw = answer.recordErrors
+    const originalMap = Array.prototype.map
+    let arrays = 0
+    const map = jest.spyOn(Array.prototype, 'map').mockImplementation(function (mapper, receiver) {
+      if (this === raw) arrays += 1
+      return Reflect.apply(originalMap, this, [mapper, receiver])
+    })
     const sends = await sendAll(
       producer,
       indices.map((i) => message(i))
     )
+    const lengths = allocate.mock.calls.map(([length]) => length)
+    allocate.mockRestore()
 
     expect(recordCounts(cluster)).toEqual([[count]])
+    expect(lengths).toEqual(indices.map((i) => Buffer.byteLength(`key-${i}value-${i}`)))
     const errors = sends.map(({ value }) => value)
     expect(new Set(errors).size).toBe(count)
-    expect(new Set(errors.map(({ recordErrors }) => recordErrors)).size).toBe(count)
-    const entries = new Set()
-    const stores = new Set()
-    errors.forEach(({ recordErrors }, i) => {
-      expect(recordErrors).toHaveLength(count)
-      recordErrors.forEach((entry, j) => {
-        entries.add(entry)
-        if (j !== i) expect(entry).toBe(answer.recordErrors[j])
-      })
-      expect(recordErrors[i].record).toEqual(recordOf(i))
-      stores.add(recordErrors[i].record.value.buffer)
-    })
-    expect(entries.size).toBe(2 * count)
-    expect(stores.size).toBe(count)
+    for (const error of errors) {
+      expect(Object.getOwnPropertyDescriptor(error, 'recordErrors').get).toEqual(
+        expect.any(Function)
+      )
+    }
+    expect(arrays).toBe(0)
+    const first = errors[0].recordErrors
+    expect(errors[0].recordErrors).toBe(first)
+    expect(arrays).toBe(1)
+    const second = errors[1].recordErrors
+    expect(JSON.parse(JSON.stringify(errors[1])).recordErrors).toHaveLength(reported.length)
+    expect(arrays).toBe(2)
+    map.mockRestore()
+    expect(first).not.toBe(second)
+    expect(first.map(({ batchIndex }) => batchIndex)).toEqual(reported)
+    expect(first[0].record).toEqual(recordOf(0))
+    expect(first[count].record).toBe(first[0].record)
+    expect(first[count + 1].record).toBe(first[0].record)
+    expect(first[1]).toBe(answer.recordErrors[1])
+    expect(first[count + 2]).toBe(answer.recordErrors[count + 2])
+    expect(second[1].record).toEqual(recordOf(1))
+    expect(second[0]).toBe(answer.recordErrors[0])
+    for (const unread of errors.slice(2)) {
+      expect(Object.getOwnPropertyDescriptor(unread, 'recordErrors').get).toEqual(
+        expect.any(Function)
+      )
+    }
+    expectRaw(answer)
   })
 
   test.each([[-1], [2], [1.5]])(
@@ -890,7 +1129,7 @@ describe('Producer > the record errors of a shared batch', () => {
     expectRaw(answer)
   })
 
-  test('a lookup error tracked by identity is never copied; one below the answer stays the same object in each copy', async () => {
+  test('lookup errors and answers with an unexpected cause keep their identity', async () => {
     const { producer, cluster } = await start({ idempotent: false })
     const entries = Object.freeze([Object.freeze({ batchIndex: 0, errorMessage: 'bad' })])
     const marked = createEosManager.markLookupFailure(
@@ -914,8 +1153,8 @@ describe('Producer > the record errors of a shared batch', () => {
     expect(b.value).toBe(marked)
     expect(createEosManager.isDiscoveryExhausted(a.value)).toBe(true)
     expect(marked.recordErrors).toBe(entries)
-    expect(c.value).not.toBe(answer)
-    expect(c.value.recordErrors[0].record).toEqual(recordOf('c'))
+    expect(c.value).toBe(answer)
+    expect(d.value).toBe(answer)
     expect(c.value.cause).toBe(below)
     expect(d.value.cause).toBe(below)
     expect(createEosManager.isDiscoveryExhausted(c.value)).toBe(true)
@@ -1256,7 +1495,7 @@ describe('Producer > the record errors of a shared batch', () => {
       }
     })
 
-    test("a retriable answer, then the deadline: the owner's timeout copy carries its record; the other partition's timeout is raw", async () => {
+    test("a retriable answer, then the deadline: the owner's timeout cause carries its record; the other partition's timeout is raw", async () => {
       const { producer, cluster } = await start({
         idempotent: true,
         partitions: 2,
@@ -1277,8 +1516,29 @@ describe('Producer > the record errors of a shared batch', () => {
       expect(a.value).toBeInstanceOf(KafkaJSDeliveryTimeout)
       expect(b.value).toBeInstanceOf(KafkaJSDeliveryTimeout)
       expect(a.value).not.toBe(b.value)
-      expect(a.value.cause).not.toBe(answer)
-      expect(a.value.cause).toBeInstanceOf(KafkaJSProtocolError)
+      expectProtocolParity(a.value.cause, answer)
+      expectProtocolParity(b.value.cause, answer)
+      expect(a.value.cause).not.toBe(b.value.cause)
+      expect(a.value.cause.recordErrors).not.toBe(b.value.cause.recordErrors)
+      for (const { value } of [a, b]) {
+        expect(isNativeError(value)).toBe(true)
+        expect(value).toMatchObject({
+          name: 'KafkaJSDeliveryTimeout',
+          retriable: false,
+          category: 'abortable',
+          type: answer.type,
+          code: answer.code,
+        })
+        expect(new KafkaJSNonRetriableError('write failed', { cause: value }).category).toBe(
+          'abortable'
+        )
+        expect(new KafkaJSNonRetriableError('write failed', { cause: value.cause }).category).toBe(
+          'applicationRecoverable'
+        )
+        expect(new KafkaJSError('write failed', { cause: value.cause }).category).toBe(
+          answer.category
+        )
+      }
       expect(a.value.cause.recordErrors).toEqual([
         { batchIndex: 0, errorMessage: 'bad 0', record: recordOf('a') },
       ])
@@ -1380,12 +1640,15 @@ describe('Producer > the record errors of a shared batch', () => {
     cluster.broker.produce.mockImplementation(async (request) => resultsOf(request, { 0: answer }))
 
     const a = watch(transaction.send({ topic: TOPIC, messages: [message('a')] }))
-    const b = watch(transaction.send({ topic: TOPIC, messages: [message('b')] }))
+    const b = watch(
+      transaction.sendBatch({ topicMessages: [{ topic: TOPIC, messages: [message('b')] }] })
+    )
     await jest.advanceTimersByTimeAsync(20)
     await flushAll()
 
     expect(recordCounts(cluster)).toEqual([[2]])
-    expect(a.value).not.toBe(answer)
+    expectProtocolParity(a.value, answer)
+    expectProtocolParity(b.value, answer)
     expect(a.value).not.toBe(b.value)
     expect(a.value.recordErrors[0].record).toEqual(recordOf('a'))
     expect(b.value.recordErrors[0]).toBe(answer.recordErrors[0])
@@ -1399,6 +1662,50 @@ describe('Producer > the record errors of a shared batch', () => {
     expectRaw(later, answer)
     await transaction.abort()
   })
+
+  test('a transaction delivery timeout gives each send its own cause before flush and arms the original timeout', async () => {
+    const { producer, cluster, transaction } = await transactionalProducer({
+      linger: 20,
+      deliveryTimeout: 150,
+      retry: { retries: 5, initialRetryTime: 1000, maxRetryTime: 1000, factor: 0 },
+    })
+    producers.push(producer)
+    const answer = answerError(NOT_ENOUGH_REPLICAS, [0])
+    const order = []
+    cluster.broker.produce.mockImplementation(async (request) => {
+      const refusal = request.guard(128)
+      if (refusal) throw refusal
+      return resultsOf(request, { 0: answer })
+    })
+    const sends = ['a', 'b'].map((name) =>
+      transaction.send({ topic: TOPIC, messages: [message(name)] }).catch((error) => {
+        order.push(name)
+        return error
+      })
+    )
+    const flushed = producer.flush().then(() => order.push('flush'))
+    await jest.advanceTimersByTimeAsync(150)
+    await flushed
+
+    expect(order).toEqual(['a', 'b', 'flush'])
+    const [a, b] = await Promise.all(sends)
+    for (const timeout of [a, b]) {
+      expect(timeout).toBeInstanceOf(KafkaJSDeliveryTimeout)
+      expect(isNativeError(timeout)).toBe(true)
+      expect(timeout.outcome).toBe('unknown')
+      expectProtocolParity(timeout.cause, answer)
+    }
+    expect(a).not.toBe(b)
+    expect(a.cause).not.toBe(b.cause)
+    expect(a.cause.recordErrors[0].record).toEqual(recordOf('a'))
+    expect(b.cause.recordErrors[0]).toBe(answer.recordErrors[0])
+    const armed = await transaction.commit().catch((error) => error)
+    expect(armed).toBeInstanceOf(KafkaJSDeliveryTimeout)
+    expect(armed).not.toBe(a)
+    expect(armed).not.toBe(b)
+    expect(armed.cause).toBe(answer)
+    await transaction.abort()
+  })
 })
 
 describe('Accumulator.projectionsFor', () => {
@@ -1407,13 +1714,15 @@ describe('Accumulator.projectionsFor', () => {
    * keeps the batch and settles nothing.
    * @returns {Promise<{ batch: object, sends: { state: string, value: unknown }[] }>}
    */
-  const sharedBatch = async () => {
+  const sharedBatch = async (held) => {
     const batches = []
     const accumulator = new Accumulator({
       linger: 1000,
       batchSize: 16384,
-      partition: async ({ records }) =>
-        records.map(({ topic, messages }) => ({ topic, partition: 0, messages })),
+      partition: async ({ records }) => {
+        if (records[0].topic === 'held') return held.promise
+        return records.map(({ topic, messages }) => ({ topic, partition: 0, messages }))
+      },
       sendPartitioned: (request) => {
         batches.push(...request.batches)
         return new Promise(() => {})
@@ -1431,13 +1740,13 @@ describe('Accumulator.projectionsFor', () => {
     accumulator.flush()
     await flushAll()
     expect(batches).toHaveLength(1)
-    return { batch: batches[0], sends }
+    return { accumulator, batch: batches[0], sends }
   }
 
   /** Settles every settler of `batch` as the send path does, and returns the projections. */
   const settleWith = async (batch, delivered, occurrence) => {
     const projected = Accumulator.projectionsFor(batch, delivered, occurrence)
-    for (const settler of batch.settlers) settler.reject(projected?.get(settler) ?? delivered)
+    for (const settler of batch.settlers) settler.reject(delivered, projected?.get(settler))
     await flushAll()
     return projected
   }
@@ -1449,275 +1758,113 @@ describe('Accumulator.projectionsFor', () => {
     return answerOccurrence(answer, batch)
   }
 
-  test('a timeout with a locked cause around an answer with locked record errors: both copied with prototypes, symbols and attributes', async () => {
-    const { batch, sends } = await sharedBatch()
-    class CustomAnswer extends KafkaJSProtocolError {}
-    const tag = Symbol('tag')
-    const answer = new CustomAnswer(createErrorFromCode(INVALID_RECORD))
-    const entries = Object.freeze([Object.freeze({ batchIndex: 0, errorMessage: 'bad' })])
-    Object.defineProperty(answer, 'recordErrors', {
-      value: entries,
-      writable: false,
-      enumerable: true,
-      configurable: false,
-    })
-    answer[tag] = 'answer'
-    const timeout = new KafkaJSDeliveryTimeout('late', { cause: answer, outcome: 'unknown' })
-    Object.defineProperty(timeout, 'cause', {
-      value: answer,
-      writable: false,
-      enumerable: false,
-      configurable: false,
-    })
-    timeout[tag] = 'timeout'
-    for (const [error, text] of [
-      [answer, 'answer stack'],
-      [timeout, 'timeout stack'],
-    ]) {
-      Object.defineProperty(error, 'stack', {
-        value: text,
-        writable: false,
-        enumerable: false,
-        configurable: false,
+  test('held and joined failures keep their microtask order ahead of the flush snapshot', async () => {
+    const held = deferred()
+    const { accumulator, batch, sends } = await sharedBatch(held)
+    const refusing = watch(
+      accumulator.append({
+        acks: -1,
+        topicMessages: Accumulator.snapshot([{ topic: 'held', messages: [message('held')] }]),
       })
-    }
+    )
+    await flushAll()
+    const [snapshot] = accumulator.unsettled()
+    const order = []
+    const states = () => [refusing.state, ...sends.map(({ state }) => state)]
+    const end = snapshot.then(() => order.push(['flush', ...states()]))
+    const answer = answerError(INVALID_RECORD, [0])
+    const occurrence = occurrenceFor(answer, batch)
+    const projected = Accumulator.projectionsFor(batch, answer, occurrence)
+    const refusal = new KafkaJSError('closed')
+    queueMicrotask(() => queueMicrotask(() => queueMicrotask(() => order.push(states()))))
+    const first = batch.settlers[0]
+    first.reject(answer, projected.get(first))
+    for (const settler of batch.settlers.slice(1)) settler.reject(answer)
+    accumulator.forceClose(refusal)
+    held.resolve([])
+    await end
 
-    const projected = await settleWith(batch, timeout, occurrenceFor(answer, batch))
-
-    const [first, second] = sends.map(({ value }) => value)
-    expect(projected.size).toBe(2)
-    expect(first).not.toBe(timeout)
-    expect(second).not.toBe(first)
-    for (const [copy, source] of [
-      [first, timeout],
-      [first.cause, answer],
-      [second, timeout],
-      [second.cause, answer],
-    ]) {
-      expect(copy).not.toBe(source)
-      expect(isNativeError(copy)).toBe(true)
-      expect(Object.getPrototypeOf(copy)).toBe(Object.getPrototypeOf(source))
-      for (const key of Reflect.ownKeys(source)) {
-        if (key === 'cause' || key === 'recordErrors') continue
-        expect(Object.getOwnPropertyDescriptor(copy, key)).toEqual(
-          Object.getOwnPropertyDescriptor(source, key)
-        )
-      }
-    }
-    expect(first[tag]).toBe('timeout')
-    expect(first.cause[tag]).toBe('answer')
-    expect(Object.getOwnPropertyDescriptor(first, 'cause')).toEqual({
-      value: first.cause,
-      writable: false,
-      enumerable: false,
-      configurable: false,
-    })
-    expect(Object.getOwnPropertyDescriptor(first.cause, 'recordErrors')).toEqual({
-      value: [{ batchIndex: 0, errorMessage: 'bad', record: recordOf('a') }],
-      writable: false,
-      enumerable: true,
-      configurable: false,
-    })
-    expect(second.cause.recordErrors).toEqual([entries[0]])
-    expect(second.cause.recordErrors[0]).toBe(entries[0])
-    expect(second.cause.recordErrors).not.toBe(entries)
-    expect(first.cause.cause).toBe(answer.cause)
-    expect(timeout.cause).toBe(answer)
-    expect(answer.recordErrors).toBe(entries)
+    expect(order).toEqual([
+      ['rejected', 'pending', 'pending'],
+      ['flush', 'rejected', 'rejected', 'rejected'],
+    ])
+    expect(refusing.value).toBe(refusal)
+    expectProtocolParity(sends[0].value, answer)
+    expect(sends[1].value).toBe(answer)
   })
 
-  describe('the stack of a projected error', () => {
-    /** An answer and a delivery timeout around it, both with V8's own `stack` accessor. */
-    const answerAndTimeout = () => {
-      const answer = answerError(INVALID_RECORD, [0])
-      return { answer, timeout: new KafkaJSDeliveryTimeout('late', { cause: answer }) }
+  test('an absent broker message stays absent and internal routing hints stay on the answer', async () => {
+    const { batch, sends } = await sharedBatch()
+    const answer = answerError(INVALID_RECORD, [0])
+    delete answer.errorMessage
+    answer.currentLeader = { leaderId: 1, leaderEpoch: 2 }
+    answer.nodeEndpoints = [{ nodeId: 1 }]
+    await settleWith(batch, answer, occurrenceFor(answer, batch))
+    for (const { value } of sends) {
+      expect(value).toBeInstanceOf(KafkaJSProtocolError)
+      expect(value).not.toBe(answer)
+      expect(Object.hasOwn(value, 'errorMessage')).toBe(false)
+      expect(Object.hasOwn(value, 'currentLeader')).toBe(false)
+      expect(Object.hasOwn(value, 'nodeEndpoints')).toBe(false)
     }
+    expect(answer.currentLeader).toEqual({ leaderId: 1, leaderEpoch: 2 })
+  })
 
-    test('an accessor stack is not called while settling; each copy runs it on the source when first read, and a write stays on that copy', async () => {
-      const { batch, sends } = await sharedBatch()
-      const answer = answerError(INVALID_RECORD, [0])
-      const receivers = []
-      const getter = jest.fn(function read() {
-        receivers.push(this)
-        return 'source trace'
-      })
-      const setter = jest.fn()
-      Object.defineProperty(answer, 'stack', { get: getter, set: setter, configurable: true })
+  test.each([
+    [
+      'a protocol subclass',
+      (answer) => {
+        class CustomAnswer extends KafkaJSProtocolError {}
+        return Object.assign(new CustomAnswer(answer), answer)
+      },
+    ],
+    [
+      'a timeout subclass',
+      (answer) => {
+        class CustomTimeout extends KafkaJSDeliveryTimeout {}
+        return new CustomTimeout('late', { cause: answer })
+      },
+    ],
+    ['an unexpected own field', (answer) => Object.assign(answer, { extra: {} })],
+  ])('%s is delivered unchanged', async (_, change) => {
+    const { batch, sends } = await sharedBatch()
+    const answer = answerError(INVALID_RECORD, [0])
+    const delivered = change(answer)
+    const source = delivered instanceof KafkaJSDeliveryTimeout ? answer : delivered
+    const projected = await settleWith(batch, delivered, occurrenceFor(source, batch))
+    expect(projected).toBeNull()
+    expect(sends.map(({ value }) => value)).toEqual([delivered, delivered])
+    for (const { value } of sends) expect(value).toBe(delivered)
+  })
 
-      const projected = await settleWith(batch, answer, occurrenceFor(answer, batch))
-
-      expect(projected.size).toBe(2)
-      expect(getter).not.toHaveBeenCalled()
-      const [first, second] = sends.map(({ value }) => value)
-      for (const copy of [first, second]) {
-        expect(isNativeError(copy)).toBe(true)
-        expect(copy).not.toBe(answer)
-        const descriptor = Object.getOwnPropertyDescriptor(copy, 'stack')
-        expect(descriptor).toEqual({
-          get: expect.any(Function),
-          set: expect.any(Function),
-          enumerable: false,
-          configurable: true,
-        })
-        expect(descriptor.get).not.toBe(getter)
-      }
-      expect(first.stack).toBe('source trace')
-      expect(first.stack).toBe('source trace')
-      expect(receivers).toHaveLength(1)
-      expect(receivers[0]).toBe(answer)
-
-      first.stack = 'rewritten'
-      expect(first.stack).toBe('rewritten')
-      expect(second.stack).toBe('source trace')
-      expect(receivers).toHaveLength(2)
-      expect(setter).not.toHaveBeenCalled()
-      expect(Object.getOwnPropertyDescriptor(answer, 'stack').get).toBe(getter)
-      expect(sends[0].value.recordErrors[0].record).toEqual(recordOf('a'))
-    })
-
-    test.each([
-      ['no setter', { get: () => 'trace' }, { get: expect.any(Function), set: undefined }],
-      ['no getter', { set: () => {} }, { get: undefined, set: expect.any(Function) }],
-    ])(
-      'an accessor stack with %s keeps what it lacks, and its attributes',
-      async (_, accessor, expected) => {
-        const { batch, sends } = await sharedBatch()
-        const answer = answerError(INVALID_RECORD, [0])
-        Object.defineProperty(answer, 'stack', {
-          ...accessor,
-          enumerable: true,
-          configurable: true,
-        })
-
-        await settleWith(batch, answer, occurrenceFor(answer, batch))
-
-        for (const { value } of sends) {
-          expect(Object.getOwnPropertyDescriptor(value, 'stack')).toEqual({
-            ...expected,
-            enumerable: true,
-            configurable: true,
-          })
-        }
+  test('a timeout and its cause format their own stacks on demand and propagate formatter exceptions', async () => {
+    const { batch, sends } = await sharedBatch()
+    const answer = answerError(NOT_ENOUGH_REPLICAS, [0])
+    const timeout = new KafkaJSDeliveryTimeout('late', { cause: answer, outcome: 'unknown' })
+    const sourceStack = jest.fn()
+    for (const source of [answer, timeout]) {
+      Object.defineProperty(source, 'stack', { configurable: true, get: sourceStack })
+    }
+    const thrown = new Error('format failed')
+    await withStackHook(
+      (error, frames) => {
+        if (error === sends[1].value || error === sends[1].value?.cause) throw thrown
+        return frames[0]?.getFunctionName()
+      },
+      async (formatted) => {
+        await settleWith(batch, timeout, occurrenceFor(answer, batch))
+        const [first, second] = sends.map(({ value }) => value)
+        expect(
+          formatted.filter((error) => [first, second, first.cause, second.cause].includes(error))
+        ).toEqual([])
+        expect(sourceStack).not.toHaveBeenCalled()
+        for (const error of [first, first.cause]) expect(error.stack).toBe('deliverRecords')
+        for (const error of [second, second.cause]) expect(stackOrThrown(error)).toBe(thrown)
+        expect(sourceStack).not.toHaveBeenCalled()
+        for (const error of [first, first.cause, second, second.cause])
+          expect(formatted).toContain(error)
       }
     )
-
-    test('a locked accessor stack stays locked on the copy and still reads the source', async () => {
-      const { batch, sends } = await sharedBatch()
-      const answer = answerError(INVALID_RECORD, [0])
-      Object.defineProperty(answer, 'stack', {
-        get: () => 'source trace',
-        set: () => {},
-        enumerable: false,
-        configurable: false,
-      })
-
-      await settleWith(batch, answer, occurrenceFor(answer, batch))
-
-      for (const { value } of sends) {
-        expect(Object.getOwnPropertyDescriptor(value, 'stack').configurable).toBe(false)
-        expect(value.stack).toBe('source trace')
-        value.stack = 'rewritten'
-        expect(value.stack).toBe('rewritten')
-      }
-    })
-
-    test('a data stack is copied with its attributes, and a write to a copy leaves the source and the other copy alone', async () => {
-      const { batch, sends } = await sharedBatch()
-      const answer = answerError(INVALID_RECORD, [0])
-      Object.defineProperty(answer, 'stack', {
-        value: 'source trace',
-        writable: true,
-        enumerable: true,
-        configurable: true,
-      })
-
-      await settleWith(batch, answer, occurrenceFor(answer, batch))
-
-      const [first, second] = sends.map(({ value }) => value)
-      for (const copy of [first, second]) {
-        expect(Object.getOwnPropertyDescriptor(copy, 'stack')).toEqual(
-          Object.getOwnPropertyDescriptor(answer, 'stack')
-        )
-      }
-      first.stack = 'rewritten'
-      expect(second.stack).toBe('source trace')
-      expect(answer.stack).toBe('source trace')
-    })
-
-    test('an error with no own stack gives each copy none either', async () => {
-      const { batch, sends } = await sharedBatch()
-      const answer = answerError(INVALID_RECORD, [0])
-      delete answer.stack
-      expect(Object.hasOwn(answer, 'stack')).toBe(false)
-
-      await settleWith(batch, answer, occurrenceFor(answer, batch))
-
-      for (const { value } of sends) {
-        expect(isNativeError(value)).toBe(true)
-        expect(Object.hasOwn(value, 'stack')).toBe(false)
-        expect(value.stack).toBe(answer.stack)
-      }
-    })
-
-    test('V8’s own stack accessor: a projected timeout and its cause show the stack of the errors they copy, formatted only when read', async () => {
-      const { batch, sends } = await sharedBatch()
-      const { answer, timeout } = answerAndTimeout()
-
-      await withStackHook(
-        (error, count) => `trace ${count}`,
-        async (formatted) => {
-          const projected = await settleWith(batch, timeout, occurrenceFor(answer, batch))
-
-          expect(projected.size).toBe(2)
-          const [first, second] = sends.map(({ value }) => value)
-          const pairs = [
-            [first, timeout],
-            [first.cause, answer],
-            [second, timeout],
-            [second.cause, answer],
-          ]
-          const sources = [answer, timeout]
-          const copies = pairs.map(([copy]) => copy)
-          expect(formatted.filter((error) => [...sources, ...copies].includes(error))).toEqual([])
-          for (const [copy, source] of pairs) {
-            expect(copy).not.toBe(source)
-            expect(copy.stack).toBe(source.stack)
-          }
-          expect(formatted).toContain(answer)
-          expect(formatted).toContain(timeout)
-          expect(formatted.filter((error) => copies.includes(error))).toEqual([])
-        }
-      )
-    })
-
-    test('a stack formatter that throws is not run while settling, and runs on the source when a copy’s stack is read', async () => {
-      const { batch, sends } = await sharedBatch()
-      const { answer, timeout } = answerAndTimeout()
-      const refusal = new Error('a stack formatter ran')
-
-      await withStackHook(
-        () => {
-          throw refusal
-        },
-        async (formatted) => {
-          const projected = await settleWith(batch, timeout, occurrenceFor(answer, batch))
-
-          expect(projected.size).toBe(2)
-          const [first] = sends.map(({ value }) => value)
-          expect(first).toBeInstanceOf(KafkaJSDeliveryTimeout)
-          expect(first.cause).toBeInstanceOf(KafkaJSProtocolError)
-          expect(first.cause.recordErrors[0].record).toEqual(recordOf('a'))
-          expect(formatted).toEqual([])
-
-          stackOrThrown(first)
-          stackOrThrown(first.cause)
-
-          expect(formatted[0]).toBe(timeout)
-          expect(formatted).toContain(answer)
-          expect(formatted.every((error) => error === timeout || error === answer)).toBe(true)
-        }
-      )
-    })
   })
 
   test.each([
