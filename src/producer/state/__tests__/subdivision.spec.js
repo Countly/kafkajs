@@ -1,6 +1,7 @@
 const Accumulator = require('../accumulator')
 const PartitionSequencer = require('../partitionSequencer')
 const { Admission } = require('../admission')
+const { owned, takeSent } = require('../../__tests__/fixtures/bufferHarness')
 
 const TOPIC = 'cut-topic'
 const record = (i) => ({ value: `${i}`.padEnd(100, 'x') })
@@ -43,9 +44,9 @@ describe('Producer > Accumulator.cut', () => {
       }
     }
 
-    test('is divided with its records, and each callback runs once both halves have called it', () => {
+    test('is divided with its records, and each callback runs once both halves have called it', async () => {
       const calls = []
-      const messages = [record(0), record(1), record(2)]
+      const messages = owned([record(0), record(1), record(2)])
       const [head, tail] = Accumulator.cut(
         {
           messages,
@@ -56,7 +57,8 @@ describe('Producer > Accumulator.cut', () => {
         1
       )
 
-      expect([head.messages.length, tail.messages.length]).toEqual([1, 2])
+      const halves = takeSent({ batches: [head, tail] })
+      expect(halves.batches.map(({ count }) => count)).toEqual([1, 2])
       expect([head.recordCount, tail.recordCount]).toEqual([1, 2])
       expect(messages).toHaveLength(0)
       head.detach()
@@ -71,10 +73,14 @@ describe('Producer > Accumulator.cut', () => {
       expect(calls).toEqual(['detach'])
       tail.retire()
       expect(calls).toEqual(['detach', 'retire'])
+      expect((await halves.read()).map(({ records }) => records.length)).toEqual([1, 2])
     })
 
     test('is divided without callbacks', () => {
-      const [head, tail] = Accumulator.cut({ messages: [record(0), record(1)], settlers: [] }, 1)
+      const [head, tail] = Accumulator.cut(
+        { messages: owned([record(0), record(1)]), settlers: [] },
+        1
+      )
 
       expect(() => {
         head.detach()
@@ -88,7 +94,7 @@ describe('Producer > Accumulator.cut', () => {
     test('settles an outside settler with the first half’s value once both halves have, and ignores a half’s second answer', () => {
       const { seen, settler } = outside()
       const [head, tail] = Accumulator.cut(
-        { messages: [record(0), record(1)], settlers: [settler] },
+        { messages: owned([record(0), record(1)]), settlers: [settler] },
         1
       )
       const first = { topicName: TOPIC, partition: 0, baseOffset: '10' }
@@ -106,7 +112,7 @@ describe('Producer > Accumulator.cut', () => {
     test('rejects an outside settler with the first error either half was given', () => {
       const { seen, settler } = outside()
       const [head, tail] = Accumulator.cut(
-        { messages: [record(0), record(1)], settlers: [settler] },
+        { messages: owned([record(0), record(1)]), settlers: [settler] },
         1
       )
       const failure = new Error('head failed')
@@ -147,7 +153,8 @@ describe('Producer > Accumulator.cut', () => {
 
       const [head, tail] = Accumulator.cut(batch, 2)
 
-      expect([head.messages.length, tail.messages.length]).toEqual([2, 2])
+      const halves = takeSent({ batches: [head, tail] })
+      expect(halves.batches.map(({ count }) => count)).toEqual([2, 2])
       expect(head.settlers.map((settler) => settler.index)).toEqual([0, undefined])
       expect(tail.settlers.map((settler) => settler.index)).toEqual([0, undefined])
       head.settlers.forEach((settler) =>
@@ -167,6 +174,11 @@ describe('Producer > Accumulator.cut', () => {
       tail.retire()
       batch.retire()
       expect([admission.reserved, admission.debts]).toEqual([0, 0])
+      const read = await halves.read()
+      expect(read.map(({ records }) => records.map(({ value }) => value.toString()))).toEqual([
+        [record(0).value, record(1).value],
+        [record(2).value, record(3).value],
+      ])
     })
 
     test('a settler made without an origin reports the send’s first record at its own position', async () => {
@@ -217,7 +229,7 @@ describe('Producer > a batch emptied in place', () => {
     const child = {
       topic: TOPIC,
       partition: 0,
-      messages: [record(0), record(1)],
+      messages: owned([record(0), record(1)]),
       recordCount: 2,
       acks: -1,
       timeout: 30000,
