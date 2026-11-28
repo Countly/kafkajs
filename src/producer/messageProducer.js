@@ -33,7 +33,8 @@ const sharedPromiseTo = require('../utils/sharedPromiseTo')
  * @param {string} options.INITIALIZED
  * @param {() => import('./generation')|undefined} [options.getGeneration] current producer lifecycle
  * @returns {{ send: Function, sendBatch: Function, ensureInitialized: Function, flush: Function,
- *   close: Function, unsettled: () => Promise<void>[], forceClose: (surfaced?: Error) => void,
+ *   close: Function, abortJoins: (error: Error) => void, unsettled: () => Promise<void>[],
+ *   forceClose: (surfaced?: Error) => void,
  *   depthOf: (topic: string, partition: number) => number }} `depthOf` counts the batches
  *   waiting for a partition (see `Accumulator#depthOf`)
  */
@@ -170,6 +171,14 @@ module.exports = ({
    * @returns {Promise<void>} never rejects
    */
   const close = () => accumulator.close()
+
+  /**
+   * Refuses with `error` every send whose join is under way and not published yet (see
+   * `Accumulator#abortJoins`): a transaction's abort calls it before it drops the queued batches.
+   * @param {Error} error
+   * @returns {void}
+   */
+  const abortJoins = (error) => accumulator.abortJoins(error)
 
   /**
    * The sends begun so far that have not settled, as the snapshot a `flush` waits for.
@@ -335,6 +344,7 @@ module.exports = ({
     ensureInitialized,
     flush,
     close,
+    abortJoins,
     unsettled,
     forceClose,
     depthOf: (topic, partition) => accumulator.depthOf(topic, partition),
