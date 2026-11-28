@@ -713,16 +713,35 @@ class DrainLoop {
   }
 
   /**
-   * Stops dispatched requests that have yet to write when their transaction aborts.
+   * Revokes the dispatched requests not yet written when their transaction aborts, waking a custom
+   * codec still compressing one, and settles their batches at once, as the abort settles its
+   * queued ones (`abortQueued`): their callers reject with `error` and the transaction is not
+   * armed, since the abort owns their outcome. The abort never waits for such a codec. A batch no
+   * attempt wrote gives its sequences back; one an earlier attempt wrote has spent them. The
+   * revoked attempt's own failure, when its encoder returns, only retires the batch and releases
+   * its debit.
    * @param {Error} error
-   * @returns {void}
+   * @returns {import('./state/partitionSequencer').PartitionBatch[]} the settled batches whose
+   *   sequences an earlier attempt spent
    */
   abortUnwritten(error) {
-    for (const send of this.#sends) {
-      for (const delivery of send.deliveries) {
-        if (delivery.dispatched && !delivery.settled) delivery.currentAttempt?.revoke(error)
+    const { sequencer } = this.#eosManager.stateManager
+    const spent = []
+    for (const send of [...this.#sends]) {
+      for (const delivery of [...send.deliveries]) {
+        const attempt = delivery.currentAttempt
+        if (!delivery.dispatched || delivery.settled || !attempt || attempt.written) continue
+        attempt.revoke(error)
+        if (delivery.everWritten) {
+          sequencer.fail(delivery.batch)
+          spent.push(delivery.batch)
+        } else {
+          sequencer.rebase(delivery.batch)
+        }
+        rejectBatch(delivery.batch, error)
       }
     }
+    return spent
   }
 
   /**
@@ -2689,7 +2708,7 @@ const createSendMessages = ({
     partition,
     inTransaction,
     forceClose,
-    abortUnwritten: (error) => loop?.abortUnwritten(error),
+    abortUnwritten: (error) => loop?.abortUnwritten(error) ?? [],
   }
 }
 

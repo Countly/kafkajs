@@ -203,7 +203,7 @@ A custom partitioner receives a frozen shallow copy of the record and its header
 
 Custom partitioners and compression codecs cannot call the producer or any of its transactions while they run. Calls such as `send()`, `sendBatch()`, `sendOffsets()`, `commit()`, `abort()`, `flush()` and `disconnect()` reject with a non-retriable error. Built-in codec objects are frozen. Register a replacement with `CompressionCodecs[type] = factory`. Patching other library objects and using Proxy traps to change the order of input reads are unsupported.
 
-A delivery deadline releases the producer's resources for an unwritten attempt even if its custom compressor is still pending. External abort and forced disconnect also revoke unwritten attempts. A transaction's send that has not reached a request yet, still waiting for buffer memory or for its partitions, is delivered before `abort()` ends the transaction, as before. A compressor that resolves after revocation cannot write the request.
+A delivery deadline releases the producer's resources for an unwritten attempt even if its custom compressor is still pending. External abort and forced disconnect also revoke unwritten attempts; `abort()` rejects such a send at once with the error it gives its queued batches and never waits for the compressor. A transaction's send that has not reached a request yet, still waiting for buffer memory or for its partitions, is delivered before `abort()` ends the transaction, as before. A compressor that resolves after revocation cannot write the request.
 
 
 ### Message structure

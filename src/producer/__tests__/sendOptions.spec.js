@@ -1979,14 +1979,33 @@ describe('Producer > send options', () => {
           const ending = endFromOutside(transaction, action)
 
           if (dropsUnwritten(action)) {
+            // The end settles while the codec is still held: nothing waits for its promise.
             expect(await outcome(ending)).toEqual({ status: 'fulfilled', value: undefined })
-            expect(await delivery).toBeInstanceOf(Error)
+            expect(held.compress.mock.calls).toHaveLength(1)
+            const error = await delivery
+            expect(error).toBeInstanceOf(Error)
+            if (action === 'abort') {
+              expect(error).toMatchObject({
+                name: 'KafkaJSTransactionAbortableError',
+                message: 'The transaction was aborted while this batch was waiting to be sent',
+              })
+              expect(transaction.isActive()).toBe(false)
+            }
             await expectReleased()
             expect(produceRequests()).toEqual([])
+            // A late resolution of the codec writes nothing and holds no debit.
             held.release()
             await held.finished
             await tick()
             expect(produceRequests()).toEqual([])
+            await expectReleased()
+            if (action === 'abort') {
+              const next = await producer.transaction()
+              await expect(next.send({ topic: TOPIC, messages: MESSAGES })).resolves.toHaveLength(1)
+              await next.commit()
+              expect(produceRequests()).toHaveLength(1)
+              await expectReleased()
+            }
           } else {
             expect(await outcome(ending, 5)).toEqual({ status: 'pending' })
             expect(produceRequests()).toEqual([])

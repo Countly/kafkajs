@@ -676,12 +676,13 @@ const createProducer = ({
     }
 
     /**
-     * Abort the ongoing transaction: revokes the requests not yet written (a custom codec still
-     * compressing one is no longer waited for) and rejects the batches still queued - accumulated
-     * ones included - then waits for the rest of the transaction's operations, so a send not yet
-     * queued is delivered as before, then aborts it. It ends the
-     * transaction even when the abort fails, unless the producer is unusable. A rejected batch
-     * that was already sent once leaves its sequence spent, so the abort then moves the producer
+     * Abort the ongoing transaction: revokes the requests not yet written and rejects their
+     * batches at once (a custom codec still compressing one is never waited for), rejects the
+     * batches still queued - accumulated ones included - then waits for the rest of the
+     * transaction's operations, so a send not yet queued is delivered as before, then aborts it.
+     * It ends the transaction even when the abort fails, unless the producer is unusable. A
+     * rejected batch that was already sent once leaves its sequence spent, so the abort then moves
+     * the producer
      * to a new epoch (see `abort()` on the eosManager). Called while a `commit()` of the
      * transaction is under way, it rejects no batch and waits for the commit: the commit keeps
      * every record, and the abort is refused if the commit ended the transaction. `disconnect()`
@@ -697,16 +698,18 @@ const createProducer = ({
       const droppedError = new KafkaJSTransactionAbortableError(
         'The transaction was aborted while this batch was waiting to be sent'
       )
-      if (ending === null && stateManager.state() === IN_TRANSACTION) {
-        transactionalMessageProducer.abortUnwritten(droppedError)
-      }
+      const revoked =
+        ending === null && stateManager.state() === IN_TRANSACTION
+          ? transactionalMessageProducer.abortUnwritten(droppedError)
+          : []
       // The accumulated batches join the queue, so the abort rejects them with the rest.
       transactionalMessageProducer.flush()
       const dropped =
         ending === null && stateManager.state() === IN_TRANSACTION
           ? stateManager.sequencer.abortQueued(droppedError)
           : []
-      const droppedSequences = dropped.some(({ firstSequence }) => firstSequence !== null)
+      const droppedSequences =
+        revoked.length > 0 || dropped.some(({ firstSequence }) => firstSequence !== null)
       const ended = endWith(() => transactionalEosManager.abort({ droppedSequences }))
       transactionalMessageProducer.flush(ended)
       return ended
