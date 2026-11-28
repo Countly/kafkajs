@@ -70,24 +70,22 @@ describe('Consumer > fetch error contract', () => {
 
   describe('fetchedPartitionDropReason', () => {
     test('returns null when nothing drops the partition', () => {
-      expect(fetchedPartitionDropReason(false, false, false)).toBeNull()
+      expect(fetchedPartitionDropReason(false, false)).toBeNull()
     })
 
     test.each([
-      [[true, false, false], 'seeked'],
-      [[false, true, false], 'paused'],
-      [[false, false, true], 'awaiting-validation'],
-    ])('%o drops for %s', ([seeked, paused, awaitingValidation], reason) => {
-      expect(fetchedPartitionDropReason(seeked, paused, awaitingValidation)).toEqual(reason)
+      [[true, false], 'seeked'],
+      [[false, true], 'paused'],
+    ])('%o drops for %s', ([seeked, paused], reason) => {
+      expect(fetchedPartitionDropReason(seeked, paused)).toEqual(reason)
     })
 
-    test('the precedence is seeked, then paused, then awaiting validation', () => {
-      expect(fetchedPartitionDropReason(true, true, true)).toEqual('seeked')
-      expect(fetchedPartitionDropReason(false, true, true)).toEqual('paused')
+    test('the precedence is seeked, then paused', () => {
+      expect(fetchedPartitionDropReason(true, true)).toEqual('seeked')
     })
 
-    test('takes its three flags positionally, so a fetched partition costs no argument object', () => {
-      expect(fetchedPartitionDropReason.length).toEqual(3)
+    test('takes its two flags positionally, so a fetched partition costs no argument object', () => {
+      expect(fetchedPartitionDropReason.length).toEqual(2)
     })
   })
 

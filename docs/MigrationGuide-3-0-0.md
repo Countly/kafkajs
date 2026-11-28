@@ -622,7 +622,10 @@ says so, `groupProtocol: 'consumer'`.
 - **A leader move during consumption is handled by a hint instead of a rebalance.** When the broker
   tells the client which node now leads a partition (KIP-951), the consumer routes the next fetch
   there directly; consumption of the other partitions is not interrupted and no group rebalance
-  happens. Where the broker also sends the new leader's address, the client uses it. If the hint
+  happens. Where the broker also sends the new leader's address, the client uses it, but only while
+  its cached metadata would still accept the hint (for a producer hint as well): a newer leader
+  epoch or a recreation of the topic learned while the connection to that address is prepared
+  keeps the existing broker and its connection. If the hint
   names a broker the client has never heard of and carries no address for it, the client ignores the
   hint and refreshes metadata instead — a hint is never trusted far enough to invent a connection.
 

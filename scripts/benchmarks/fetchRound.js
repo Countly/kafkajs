@@ -81,6 +81,8 @@ class FetchRoundDriver {
       // A topic without an id is never fetched.
       topicId: () => '01020304-0506-0708-090a-0b0c0d0e0f10',
       leaderEpoch: () => -1,
+      // As a Cluster whose cached routing never changes: subscribed, never notified.
+      onPartitionRouted: () => () => {},
       refreshMetadataIfNecessary: async () => {},
       refreshMetadata: async () => {},
       findTopicPartitionMetadata: () => metadata,

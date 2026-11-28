@@ -102,22 +102,20 @@ const validationPartitionAction = (errorCode) => {
 /**
  * Why a fetched partition is being dropped instead of delivered, or `null` when it is not.
  *
- * The three checks are evaluated in this order, which is the precedence the drop log reports: a
- * queued seek is the newest user intent, a pause is standing user intent, and a partition awaiting
- * position validation should not have been in the request at all (that check is defensive).
+ * The two checks are evaluated in this order, which is the precedence the drop log reports: a
+ * queued seek is the newest user intent, and a pause is standing user intent. A row the position
+ * validation rule no longer admits is dropped before this, by `ConsumerGroup#handleFetchedPartition`.
  *
  * Positional rather than named, because it is called once per fetched partition per round and a
  * named-argument object would be one allocation per call on the consume hot path.
  *
  * @param {boolean} seeked a `seek()` is queued for this partition
  * @param {boolean} paused the partition is paused
- * @param {boolean} awaitingValidation the partition's position is being validated
- * @returns {'seeked'|'paused'|'awaiting-validation'|null}
+ * @returns {'seeked'|'paused'|null}
  */
-const fetchedPartitionDropReason = (seeked, paused, awaitingValidation) => {
+const fetchedPartitionDropReason = (seeked, paused) => {
   if (seeked) return 'seeked'
   if (paused) return 'paused'
-  if (awaitingValidation) return 'awaiting-validation'
   return null
 }
 

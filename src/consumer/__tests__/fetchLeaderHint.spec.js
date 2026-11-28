@@ -44,6 +44,7 @@ describe('Consumer > KIP-951 leader hints on fetch', () => {
         leaderId: 2,
         leaderEpoch: 9,
         nodeEndpoints: [{ nodeId: 2, host: 'kafka2', port: 9095, rack: null }],
+        topicId: TOPIC_ID,
       },
       { fence: group.idleWait.fence }
     )

@@ -203,6 +203,35 @@ describe('Protocol > Requests > Produce > partition results', () => {
     })
   })
 
+  test('a leader hint of an answer that keys its topic by id carries that id, and one of an answer by name carries none', async () => {
+    const TOPIC_ID = '01020304-0506-0708-090a-0b0c0d0e0f10'
+    const answer = (topic) => ({
+      nodeEndpoints: [],
+      topics: [
+        {
+          ...topic,
+          partitions: [
+            {
+              partition: 0,
+              errorCode: 6,
+              baseOffset: '-1',
+              logAppendTime: '-1',
+              logStartOffset: '-1',
+              currentLeader: { leaderId: 2, leaderEpoch: 7 },
+            },
+          ],
+        },
+      ],
+    })
+    const byId = answer({ topicName: 'test-topic', topicId: TOPIC_ID })
+    const byName = answer({ topicName: 'test-topic' })
+
+    expect(partitionResults(byId)[0].error.topicId).toEqual(TOPIC_ID)
+    expect((await parse(byId).catch((e) => e)).topicId).toEqual(TOPIC_ID)
+    expect(partitionResults(byName)[0].error.topicId).toBeUndefined()
+    expect((await parse(byName).catch((e) => e)).topicId).toBeUndefined()
+  })
+
   test('below v5 there is no log start offset: the result reads -1, the field default', async () => {
     expect(partitionResults(await decodeV3(fixture('v3_response')))).toEqual([
       {

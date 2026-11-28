@@ -11,6 +11,9 @@ const epochOf = (message) => {
   return typeof epoch === 'number' ? epoch : -1
 }
 
+/** The strings `Long.fromString` reads as 0 although they are not offsets. */
+const NOT_FINITE = new Set(['NaN', 'Infinity', '+Infinity', '-Infinity'])
+
 /**
  * A batch collects messages returned from a single fetch call.
  *
@@ -20,6 +23,8 @@ module.exports = class Batch {
   #nextBatchOffset
   #nextBatchLeaderEpoch
   #advances
+  #fetchEpoch
+  #admittedUnder
 
   /**
    * @param {string} topic
@@ -28,8 +33,14 @@ module.exports = class Batch {
    *   `nextBatchLeaderEpoch` (the offset after the last complete record batch and that batch's
    *   leader epoch) let a batch with no record at or after `fetchedOffset` move the position to the
    *   end of that record batch
+   * @param {number} [fetchEpoch] the leader epoch the Fetch was built at; absent for a batch built
+   *   outside a fetch
+   * @param {object} [admittedUnder] the validation entry the Fetch was admitted under
+   *   (`ConsumerGroup#admissionEntry`)
    */
-  constructor(topic, fetchedOffset, partitionData) {
+  constructor(topic, fetchedOffset, partitionData, fetchEpoch, admittedUnder) {
+    this.#fetchEpoch = fetchEpoch
+    this.#admittedUnder = admittedUnder
     this.fetchedOffset = fetchedOffset
     const longFetchedOffset = Long.fromValue(this.fetchedOffset)
     const { abortedTransactions, messages } = partitionData
@@ -72,6 +83,19 @@ module.exports = class Batch {
   }
 
   /**
+   * The validation entry the Fetch that produced `batch` was admitted under. Kept off the batch's
+   * own properties, so the `eachBatch` payload does not show it.
+   * @param {object} batch
+   * @returns {object|null|undefined} the entry; `null` for a fetched batch that names none, which
+   *   no entry admits; `undefined` for a batch built outside a fetch (it has no fetch epoch),
+   *   including an object that is not a `Batch`
+   */
+  static admissionOf(batch) {
+    if (!(#fetchEpoch in batch) || batch.#fetchEpoch === undefined) return undefined
+    return batch.#admittedUnder ?? null
+  }
+
+  /**
    * The leader epoch of the record at `offset`, or `-1` when no record in this batch carries it.
    *
    * Searches `messagesWithinOffset` rather than `messages`, because `messages` excludes control
@@ -83,18 +107,40 @@ module.exports = class Batch {
    * batch), and an index is built lazily only for a lookup that is not the last entry, so a
    * handler resolving many offsets is linear overall rather than quadratic.
    *
-   * @param {string} offset The offset exactly as the decoder produced it. Offsets are compared as
-   *   strings, so a numeric or `Long` offset answers -1 rather than the epoch it carries; that
-   *   degrades safely (unknown disables validation, it never reports a stale epoch).
+   * @param {string|number|import('../utils/long')} offset compared by value: the decimal string
+   *   the decoder produces is looked up as it is, and any other spelling (a number, a `Long`, a
+   *   string with leading zeros) is turned into that string once when the first lookup misses. A
+   *   value that is not an offset answers -1, including `NaN`, `Infinity` and their strings, which
+   *   `Long.fromValue` would read as 0.
    * @returns {number}
    */
   leaderEpochAt(offset) {
+    const epoch = this.#epochAt(offset)
+    if (epoch !== undefined) return epoch
+
+    if (typeof offset === 'number' ? !Number.isFinite(offset) : NOT_FINITE.has(offset)) return -1
+
+    let canonical
+    try {
+      canonical = Long.fromValue(offset).toString()
+    } catch {
+      return -1
+    }
+    return canonical === offset ? -1 : (this.#epochAt(canonical) ?? -1)
+  }
+
+  /**
+   * @param {unknown} offset an offset in the decoder's decimal spelling, matched exactly
+   * @returns {number|undefined} the epoch of that record (-1 when it carries none), or `undefined`
+   *   when no record of this batch has that spelling
+   */
+  #epochAt(offset) {
     const messages = this.messagesWithinOffset
 
     if (messages.length === 0) {
       return this.#advances && offset === this.lastOffset()
         ? (this.#nextBatchLeaderEpoch ?? -1)
-        : -1
+        : undefined
     }
 
     const last = messages[messages.length - 1]
@@ -109,8 +155,7 @@ module.exports = class Batch {
       }
     }
 
-    const epoch = this.leaderEpochIndex.get(offset)
-    return epoch === undefined ? -1 : epoch
+    return this.leaderEpochIndex.get(offset)
   }
 
   isEmpty() {

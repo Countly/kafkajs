@@ -178,6 +178,7 @@ describe('Non-idempotent producer delivery expiry', () => {
           wire.timeline().filter(({ api, kind }) => api === 'Metadata' && kind === 'response')
             .length > responsesBefore
       )
+      // The hint carries the id of the topic the request was sent for.
       expect(applied).toHaveBeenCalledWith(
         {
           topic: TOPIC,
@@ -185,6 +186,7 @@ describe('Non-idempotent producer delivery expiry', () => {
           leaderId: 1,
           leaderEpoch: 2,
           nodeEndpoints: [{ nodeId: 1, host: 'node1', port: 9093, rack: null }],
+          topicId: '01020304-0506-0708-090a-0b0c0d0e0f10',
         },
         { fence: expect.any(Generation) }
       )

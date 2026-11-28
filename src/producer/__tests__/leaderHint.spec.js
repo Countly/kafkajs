@@ -11,6 +11,7 @@ const {
 const v10NotLeaderFixture = require('../../protocol/requests/produce/fixtures/v10_response_not_leader.json')
 const { partitionResults } = require('../../protocol/requests/produce/partitionResults')
 const { newLogger, connectionOpts } = require('../../../testHelpers')
+const { createScriptedCluster } = require('../../../testHelpers/scriptedCluster')
 
 const BROKERS_METADATA = [
   { nodeId: 1, host: '127.0.0.1', port: 9091, rack: null },
@@ -310,6 +311,134 @@ describe('Producer > KIP-951 leader hint', () => {
     expect(cluster.findLeaderForPartitions('test-topic', [0])).toEqual({ 1: [0] })
   })
 
+  test.each([11, 13])(
+    'a Produce v%i hint is refused when Metadata recreates its topic during the endpoint build',
+    async (version) => {
+      const originalId = '01020304-0506-0708-090a-0b0c0d0e0f10'
+      const recreatedId = '11121314-1516-1718-191a-1b1c1d1e1f20'
+      const destination = { nodeId: 2, host: '10.0.0.9', port: 9094, rack: null }
+      const wire = createScriptedCluster({
+        nodes: BROKERS_METADATA.map(({ nodeId, host, port }) => ({ id: nodeId, host, port })),
+        advertise: { Produce: [version, version] },
+      })
+      let topicId = originalId
+      wire.answer('Metadata', () => ({
+        brokers: BROKERS_METADATA,
+        controllerId: 1,
+        topics: [
+          {
+            errorCode: 0,
+            name: 'test-topic',
+            topicId,
+            isInternal: false,
+            topicAuthorizedOperations: -2147483648,
+            partitions: [
+              {
+                errorCode: 0,
+                partitionIndex: 0,
+                leaderId: 1,
+                leaderEpoch: topicId === originalId ? 5 : 0,
+                replicas: [1, 2],
+                isr: [1, 2],
+                offlineReplicas: [],
+              },
+            ],
+          },
+        ],
+      }))
+      let first = true
+      wire.answer('Produce', ({ topics }) => {
+        const stale = first
+        first = false
+        return {
+          responses: topics.map(({ partitions, ...key }) => ({
+            ...key,
+            partitions: partitions.map(({ partition }) => ({
+              partition,
+              errorCode: stale ? 6 : 0,
+              leader: stale ? { leaderId: 2, leaderEpoch: 6 } : null,
+              baseOffset: stale ? '-1' : '0',
+              logAppendTime: '-1',
+              logStartOffset: '0',
+            })),
+          })),
+          nodeEndpoints: stale ? [destination] : [],
+        }
+      })
+      const cluster = new Cluster({ ...wire.kafkaOptions(), logger: newLogger() })
+      const owner = cluster.brokerPool
+      const built = createPool(destination)
+      let finish
+      let sending
+      try {
+        await cluster.connect()
+        await cluster.addTargetTopic('test-topic')
+        const previous = owner.brokers[2]
+        const leader = owner.brokers[1]
+        const originalProduce = leader.produce.bind(leader)
+        const decodedHintIds = []
+        jest.spyOn(leader, 'produce').mockImplementation(async (request) => {
+          const answer = await originalProduce(request)
+          for (const { error } of answer) {
+            if (error?.currentLeader) decodedHintIds.push(error.topicId)
+          }
+          return answer
+        })
+        const builder = owner.connectionPoolBuilder
+        const originalBuild = builder.build.bind(builder)
+        jest
+          .spyOn(builder, 'build')
+          .mockImplementation((address) =>
+            address.host === destination.host
+              ? new Promise((resolve) => (finish = () => resolve(built)))
+              : originalBuild(address)
+          )
+        const applied = jest.spyOn(cluster, 'applyLeaderHint')
+        sending = createSend({ cluster })({ acks: -1, timeout: 30000, topicMessages })
+        sending.catch(() => {})
+        for (let turn = 0; turn < 100; turn++) {
+          if (finish) break
+          await new Promise(setImmediate)
+        }
+        expect(finish).toBeDefined()
+        expect(decodedHintIds).toEqual([version === 13 ? originalId : undefined])
+        expect(applied.mock.calls[0][0]).toMatchObject({
+          leaderId: 2,
+          leaderEpoch: 6,
+          topicId: originalId,
+        })
+
+        topicId = recreatedId
+        await cluster.refreshMetadata()
+        expect(cluster.topicId('test-topic')).toBe(recreatedId)
+        finish()
+
+        await expect(applied.mock.results[0].value).resolves.toBe(false)
+        await expect(sending).resolves.toEqual([expect.objectContaining({ errorCode: 0 })])
+        expect(owner.brokers[2]).toBe(previous)
+        expect(built.destroy).toHaveBeenCalledTimes(1)
+        expect(cluster.metadataCache.leader('test-topic', 0)).toBe(1)
+        expect(cluster.metadataCache.leaderEpoch('test-topic', 0)).toBe(0)
+        const produced = wire.requests().filter(({ api }) => api === 'Produce')
+        expect(produced.map(({ node, version }) => [node, version])).toEqual([
+          [1, version],
+          [1, version],
+        ])
+        if (version === 13) {
+          expect(produced.map(({ fields }) => fields.topics[0].topicId)).toEqual([
+            originalId,
+            recreatedId,
+          ])
+        }
+      } finally {
+        finish?.()
+        await cluster.disconnect()
+        await sending?.catch(() => {})
+      }
+      wire.assertClean()
+    }
+  )
+
   test('applyNodeEndpoints replaces a broker whose host/port/rack moved, and preserves the blackout', async () => {
     const { cluster, brokers } = createHintCluster({ answer: acceptAll })
     const pool = cluster.brokerPool
@@ -564,13 +693,10 @@ describe('Producer > KIP-951 leader hint', () => {
     expect(cluster.brokerPool.brokers[3]).toBeTruthy()
   })
 
-  test('a hint for a partition the cache does not know is rejected, but only after the endpoint work already ran', async () => {
-    // Cluster#applyLeaderHint's pre-check only sees the epoch, not whether the topic/partition is
-    // known at all - that check lives inside MetadataCache#applyLeaderHint, which runs *after* the
-    // endpoint work. A hint for an unknown partition therefore still pays for `applyNodeEndpoints`
-    // even though it is ultimately rejected - the opposite of "a rejected hint costs nothing",
-    // true only for the epoch-rejection case.
-    const { cluster } = createHintCluster({ answer: acceptAll })
+  test('a hint for a partition the cache does not know is rejected before any endpoint work', async () => {
+    // Cluster#applyLeaderHint asks the cache's own rule first, which also knows whether the topic
+    // and partition are cached at all.
+    const { cluster, brokers } = createHintCluster({ answer: acceptAll })
 
     await expect(
       cluster.applyLeaderHint({
@@ -582,7 +708,8 @@ describe('Producer > KIP-951 leader hint', () => {
       })
     ).resolves.toBe(false)
 
-    expect(cluster.brokerPool.buildConnectionPool).toHaveBeenCalled()
+    expect(cluster.brokerPool.buildConnectionPool).not.toHaveBeenCalled()
+    expect(cluster.brokerPool.brokers[2]).toBe(brokers[2])
   })
 
   test.each([[undefined], [[]]])(
