@@ -1125,16 +1125,17 @@ describe('Test harness > fetch group teardown', () => {
       validationBrokers: true,
     })
     holdBrokerLookup(1)
-    const lookup = cluster.findBroker({ nodeId: 1 }).then(
-      () => 'found',
-      (error) => error.message
+    const outcome = jest.fn()
+    cluster.findBroker({ nodeId: 1 }).then(
+      () => outcome('found'),
+      (error) => outcome(error.message)
     )
 
     const ending = teardown()
     expect(() => holdBrokerLookup(1)).toThrow(new Error('fetch harness torn down'))
     await ending
 
-    expect(await lookup).toBe('fetch harness torn down')
+    expect(outcome.mock.calls).toEqual([['fetch harness torn down']])
     expect(socketsTo(1)).toEqual([])
   })
 
@@ -1487,15 +1488,16 @@ describe('Test harness > fixture tracking', () => {
       (error) => outcome(error.message)
     )
 
-    await expect(hooks.after()).rejects.toThrow(
+    const release = hooks.after().catch((error) => {
+      expect(outcome.mock.calls).toEqual([['fetch harness torn down']])
+      throw error
+    })
+    await expect(release).rejects.toThrow(
       new Error(
         'createFetchGroup: the test ended with work in flight, which its teardown abandoned: ' +
           'a broker lookup at node 1'
       )
     )
-    await nextTurn()
-
-    expect(outcome.mock.calls).toEqual([['fetch harness torn down']])
     expect(h.socketsTo(1)).toEqual([])
   })
 
@@ -1513,17 +1515,59 @@ describe('Test harness > fixture tracking', () => {
     )
     expect(state.sockets).toEqual([])
 
-    await expect(hooks.after()).rejects.toThrow(
+    const release = hooks.after().catch((error) => {
+      expect(outcome.mock.calls).toEqual([['KafkaJSConnectionError', 'The fake broker was closed']])
+      throw error
+    })
+    await expect(release).rejects.toThrow(
       new Error(
         'createFakeBroker: the test ended with work in flight, which its teardown abandoned: ' +
           'a broker connect at 127.0.0.1:9092'
       )
     )
-    await nextTurn()
-
-    expect(outcome.mock.calls).toEqual([['KafkaJSConnectionError', 'The fake broker was closed']])
     expect(state.sockets).toEqual([])
     expect(answer).not.toHaveBeenCalled()
+  })
+
+  test('a dropped broker connect rejected before setup surfaces as unhandled before teardown', () => {
+    const { execFileSync } = require('node:child_process')
+    const { resolve } = require('node:path')
+    // Run outside Jest so Node can report the unhandled rejection without failing this worker.
+    const script = `
+      const { createFakeBroker, trackFixtures } = require(process.argv[1])
+      let before
+      let after
+      trackFixtures({
+        beforeEach: (hook) => { before = hook },
+        afterEach: (hook) => { after = hook },
+      })
+      before()
+      const { broker, state } = createFakeBroker(() => Buffer.alloc(0))
+      const refusal = new Error('connect refused at entry')
+      const unhandled = []
+      process.on('unhandledRejection', (error) => unhandled.push(error === refusal))
+      broker.connect({ guard: () => refusal })
+      setImmediate(async () => {
+        const report = { unhandled: [...unhandled], sockets: state.sockets.length }
+        try {
+          await after()
+          process.stdout.write(JSON.stringify(report))
+        } catch (error) {
+          process.stderr.write(error.stack)
+          process.exitCode = 1
+        }
+      })
+    `
+    const report = execFileSync(
+      process.execPath,
+      ['--unhandled-rejections=throw', '-e', script, require.resolve('./fixtures/fetchHarness')],
+      {
+        env: { ...process.env, NODE_PATH: resolve(__dirname, '../../..') },
+        encoding: 'utf8',
+        timeout: 5000,
+      }
+    )
+    expect(JSON.parse(report)).toEqual({ unhandled: [true], sockets: 0 })
   })
 
   test('a fixture whose disconnect returns without closing its socket fails at teardown, naming what it still holds', async () => {

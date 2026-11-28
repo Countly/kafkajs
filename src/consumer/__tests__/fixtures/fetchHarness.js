@@ -1077,25 +1077,31 @@ const buildFakeBroker = (answer, chunks) => {
   const broker = new Broker({ connectionPool, logger: newLogger() })
 
   /**
-   * Every `broker.connect()` not yet settled, from its call on: before it holds the broker lock
-   * there is no connection setup or request to see it by.
+   * Completion signals for every `broker.connect()` still running, including calls that have
+   * yet to acquire the broker lock or start connection setup.
    * @type {Set<Promise<void>>}
    */
   const connects = new Set()
   const connect = broker.connect.bind(broker)
   /**
-   * The broker's own `connect`, accounted from its call until it settles.
+   * Tracks `connect` from entry through settlement. Close joins the private completion signal
+   * so a rejection of the caller's promise is reported normally if the caller drops it.
    * @param {...*} args what `Broker#connect` takes
-   * @returns {Promise<void>} the broker's own promise
+   * @returns {Promise<void>} the caller's connect outcome
    */
-  broker.connect = (...args) => {
-    const call = connect(...args)
-    const settled = call.then(
-      () => connects.delete(settled),
-      () => connects.delete(settled)
-    )
+  broker.connect = async (...args) => {
+    let complete
+    /** @type {Promise<void>} */
+    const settled = new Promise((resolve) => {
+      complete = resolve
+    })
     connects.add(settled)
-    return call
+    try {
+      return await connect(...args)
+    } finally {
+      connects.delete(settled)
+      complete()
+    }
   }
 
   /**
@@ -1167,7 +1173,7 @@ const trackFakeBroker = (creator, tracker, { close, inFlight, holds }) => {
  * the test ends. Needs `trackFixtures()` in the spec.
  * @param {(header: { apiKey: number, apiVersion: number, correlationId: number },
  *   frame: Buffer) => Buffer|PromiseLike<Buffer>} answer
- * @param {(frame: Buffer, header: object) => Buffer[]} [chunks] complete-frame transport chunks
+ * @param {(frame: Buffer, header: object) => Iterable<Buffer>} [chunks] complete-frame transport chunks
  * @returns {{ broker: Broker, state: { writes: Buffer[], sockets: object[] },
  *   close: () => Promise<void> }} `close` closes it earlier than the end of the test
  * @throws {Error} naming this creator when no tracked test is running

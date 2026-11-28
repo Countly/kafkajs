@@ -7730,6 +7730,7 @@
         "src/consumer/__tests__/scriptedEpochLog.spec.js › Test harness > fixture tracking the work each fixture left is read as the test ends, before a newer release can settle it, and a fixture a release creates is read as its own release begins",
         "src/consumer/__tests__/scriptedEpochLog.spec.js › Test harness > fixture tracking a fetch group whose test ends with a held broker lookup fails at teardown, naming the lookup and its node, once the lookup is rejected",
         "src/consumer/__tests__/scriptedEpochLog.spec.js › Test harness > fixture tracking a fake broker whose test ends right after a connect call, before any connection setup, fails at teardown naming the connect, once the connect is refused",
+        "src/consumer/__tests__/scriptedEpochLog.spec.js › Test harness > fixture tracking a dropped broker connect rejected before setup surfaces as unhandled before teardown",
         "src/consumer/__tests__/scriptedEpochLog.spec.js › Test harness > fetch group teardown once teardown has begun a broker lookup cannot be held again, so the lookup it woke still ends",
         "src/consumer/__tests__/scriptedEpochLog.spec.js \u203a Test harness > fake broker close close fails a request whose answer is withheld at once, answers no frame written before or after it, and ignores the withheld answer released after it",
         "src/consumer/__tests__/scriptedEpochLog.spec.js \u203a Test harness > fake broker close a closed fake broker refuses a later connect and request before it opens a socket or writes anything",
