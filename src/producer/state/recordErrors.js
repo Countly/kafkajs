@@ -82,14 +82,53 @@ const linksTo = (delivered, answer) => {
 }
 
 /**
+ * The `stack` property of a copy whose source has an accessor `stack`. V8 backs an error's own
+ * `stack` accessor with the trace stored on the error it was captured for, and formats that trace
+ * (running `Error.prepareStackTrace`) when the accessor runs. The same accessor on another object
+ * would format that object's trace: the frames of the copy, not of the failure. This one applies
+ * the source's getter to the source, so the copy shows where the source was made, and only when a
+ * caller reads it: no formatter runs while a batch settles, or ever if nobody reads the stack. The
+ * first value read is kept and the source is released. A write replaces the value for the copy
+ * alone; the source's setter never runs. A getter or setter the source lacks is lacking here, and
+ * `enumerable` and `configurable` are the source's.
+ * @param {Error} source
+ * @param {{ get?: Function, set?: Function, enumerable?: boolean, configurable?: boolean }} accessor
+ *   the source's own `stack` descriptor
+ * @returns {PropertyDescriptor}
+ */
+const stackAccessor = (source, { get, set, enumerable, configurable }) => {
+  let from = source
+  let value
+  const keep = (next) => {
+    value = next
+    from = null
+  }
+  return {
+    enumerable,
+    configurable,
+    get:
+      get &&
+      (() => {
+        if (from !== null) keep(Reflect.apply(get, from, []))
+        return value
+      }),
+    set: set && keep,
+  }
+}
+
+/**
  * A copy of an error that is a native `Error`, as the source is: `util.types.isNativeError` holds,
  * so a caller that wraps the copy as a `cause` keeps its category (see `initialCategory`). The
  * copy has the source's prototype and every own property descriptor, string and symbol keys,
  * attributes included, with `substitutes` put in place of their values first. A getter or setter
- * is carried over, never called, and the source's `stack` is never read: a data `stack` is copied
- * with its attributes, an accessor `stack` is carried over uncalled and runs, on the copy, only
- * when a caller reads it, and a source with no own `stack` leaves the copy the trace captured when
- * it was made.
+ * is carried over, never called. `stack` is the one exception to identical descriptors, and is
+ * always the source's trace, never one of the copy:
+ * - a data `stack` is copied with its value and attributes;
+ * - an accessor `stack` (what V8 gives every `KafkaJSError`) becomes `stackAccessor`, which reads
+ *   the source's trace when first read, so the copy's descriptor is not the source's;
+ * - a source with no own `stack` leaves the copy none either, so any `stack` comes from its
+ *   prototype chain, as the source's does.
+ * Nothing reads the source's `stack` here.
  * @param {Error} link
  * @param {{ cause?: Error, recordErrors?: object[] }} substitutes
  * @returns {Error}
@@ -99,7 +138,10 @@ const copyLink = (link, substitutes) => {
   for (const [key, value] of Object.entries(substitutes)) {
     descriptors[key] = { ...descriptors[key], value }
   }
+  const { stack } = descriptors
+  if (stack !== undefined && 'get' in stack) descriptors.stack = stackAccessor(link, stack)
   const copy = Object.setPrototypeOf(new Error(), Object.getPrototypeOf(link))
+  if (stack === undefined) Reflect.deleteProperty(copy, 'stack')
   return Object.defineProperties(copy, descriptors)
 }
 

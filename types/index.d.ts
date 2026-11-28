@@ -2960,12 +2960,13 @@ export class KafkaJSProtocolError extends KafkaJSError {
  * A single record the broker rejected out of an otherwise-failed produce batch (KIP-467).
  * Several sends can share one batch. When the broker's answer for the batch is delivered to its
  * sends, each of them gets an error of its own (a native `Error` of the same class, with the same
- * properties and category), and only its own entries carry `record`; an entry for another send's
- * record has `batchIndex` and `errorMessage` alone. In every other case (an error thrown for a
- * whole request, one that ran out of retries, a delivery timeout on a non-idempotent producer, an
- * error object the broker's answers reuse) the sends of the batch get the broker's one error
- * object, whose entries have no `record`. The error and its entries must not be changed. There is
- * no index into your `messages` yet.
+ * properties and category, and the `stack` of the error it was copied from), and only its own
+ * entries carry `record`; an entry for another send's record has `batchIndex` and `errorMessage`
+ * alone. In every other case (an error thrown for a whole request, one that ran out of retries, a
+ * delivery timeout on a non-idempotent producer, an error object the broker's answers reuse) the
+ * sends of the batch get the one error the producer already built, without a copy: the broker's
+ * error, or the retry or deadline error around it. Its entries have no `record`. The error and its
+ * entries must not be changed. There is no index into your `messages` yet.
  */
 export type ProduceRecordError = {
   /** Position of the record inside the rejected batch, not an index into your `messages`. */
@@ -2973,8 +2974,10 @@ export type ProduceRecordError = {
   /**
    * A copy of the record as the producer wrote it, in a store of its own: `key`, `value` and the
    * header values as `Buffer`s (strings UTF-8 encoded), none of your other fields. `timestamp` is
-   * the decimal string of the timestamp you gave as a number, string, `bigint`, `Date` or `Long`;
-   * absent when you gave none (the send time was written) or gave any other object.
+   * set, as a decimal string, when the timestamp you gave was a non-zero number, a non-empty
+   * string, a non-zero `bigint`, a `Date` or a `Long` (a `Date` or `Long` of 0 gives `'0'`); it is
+   * absent when you gave none, `0`, `0n`, an empty string or any other object (the send time was
+   * written).
    */
   readonly record?: {
     readonly key: Buffer | null
