@@ -13,6 +13,7 @@ const { createGroupApiBroker } = require('../../broker/__tests__/fixtures/groupA
 const {
   KafkaJSConnectionError,
   KafkaJSError,
+  KafkaJSNumberOfRetriesExceeded,
   KafkaJSRequestTimeoutError,
   KafkaJSTimeout,
 } = require('../../errors')
@@ -2172,6 +2173,22 @@ describe('Admin > describeGroups > two coordinators', () => {
     ])
   })
 
+  test('preserves retry exhaustion from coordinator discovery', async () => {
+    const exhausted = new KafkaJSNumberOfRetriesExceeded(createErrorFromCode(34), {
+      retryCount: 0,
+      retryTime: 10,
+    })
+    const cluster = {
+      findGroupCoordinator: jest.fn().mockRejectedValue(exhausted),
+      withCoordinatorBroker: jest.fn(),
+    }
+    const admin = createAdmin({ logger: newLogger(), retry: tenMsRetry, cluster })
+
+    await expect(admin.describeGroups(['a'])).rejects.toBe(exhausted)
+    expect(cluster.findGroupCoordinator).toHaveBeenCalledTimes(1)
+    expect(cluster.withCoordinatorBroker).not.toHaveBeenCalled()
+  })
+
   /**
    * A coordinator that describes through the chosen API. Classic rows carry the same versioned
    * error the internal result reader returns in the wire tests.
@@ -2650,5 +2667,99 @@ describe('Admin > describeGroups > a coordinator node that moved to another addr
     expect(outcome.error).toBeUndefined()
     expect(fixture.asked).toEqual(asked)
     expect(fixture.metadataRequests().length - before).toBe(0)
+  })
+})
+
+describe('Admin > describeGroups > coordinator reconnect', () => {
+  const { Kafka } = require('../../..')
+  const Broker = require('../../broker')
+  const Cluster = require('../../cluster')
+  const { createScriptedCluster } = require('../../../testHelpers/scriptedCluster')
+
+  beforeEach(() => {
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
+  })
+  afterEach(() => {
+    jest.restoreAllMocks()
+    jest.useRealTimers()
+  })
+
+  test.each([
+    ['ConsumerGroupDescribe', 0],
+    ['ConsumerGroupDescribe', 2],
+    ['DescribeGroups', 0],
+    ['DescribeGroups', 2],
+  ])('spends the %s budget of %i retries on failed coordinator setup', async (api, retries) => {
+    const coordinator = { id: 1, host: 'coordinator', port: 9092 }
+    const seed = { id: 0, host: 'seed', port: 9092 }
+    const native = api === 'ConsumerGroupDescribe'
+    const scripted = createScriptedCluster({
+      nodes: [coordinator, seed],
+      profile: 'sasl',
+      advertise: { DescribeGroups: [6, 6], ...(native && { ConsumerGroupDescribe: [1, 1] }) },
+    })
+    const apiTimeout = 200
+    const admin = new Kafka(
+      scripted.kafkaOptions({
+        brokers: [`${seed.host}:${seed.port}`],
+        retry: { ...tenMsRetry, retries: 4 },
+        sasl: { mechanism: 'plain', username: 'user', password: 'password' },
+      })
+    ).admin({ apiTimeout, retry: { retries } })
+    let broker
+    let reconnecting = false
+    const failedPools = []
+    scripted.answer('SaslHandshake', (_fields, { node }) => {
+      if (node !== coordinator.id || !reconnecting) return {}
+      failedPools.push(broker.connectionPool)
+      return { errorCode: 34, enabledMechanisms: [] }
+    })
+
+    const findGroupCoordinator = Cluster.prototype.findGroupCoordinator
+    jest.spyOn(Cluster.prototype, 'findGroupCoordinator').mockImplementation(async function (args) {
+      broker = await findGroupCoordinator.call(this, args)
+      if (native) {
+        await broker.disconnect()
+        reconnecting = true
+      }
+      return broker
+    })
+    const consumerGroupDescribe = Broker.prototype.consumerGroupDescribe
+    const askNative = jest.spyOn(Broker.prototype, 'consumerGroupDescribe')
+    if (!native) {
+      askNative.mockImplementation(async function (args) {
+        try {
+          return await consumerGroupDescribe.call(this, args)
+        } finally {
+          // The native API is unavailable. Drop the connection before classic dispatch.
+          await this.disconnect()
+          reconnecting = true
+        }
+      })
+    }
+    const askClassic = jest.spyOn(Broker.prototype, 'describeGroups')
+
+    try {
+      await admin.connect()
+      const started = Date.now()
+      const outcome = observe(admin.describeGroups(['g']))
+      await driveUntilSettled(outcome)
+
+      expect(outcome.error).toBeInstanceOf(KafkaJSNumberOfRetriesExceeded)
+      expect(outcome.error).toMatchObject({ retryCount: retries, cause: { code: 34 } })
+      expect(Date.now() - started).toBeLessThan(apiTimeout)
+      expect(failedPools).toHaveLength(retries + 1)
+      expect(new Set([...failedPools, broker.connectionPool]).size).toBe(retries + 2)
+      expect(askNative).toHaveBeenCalledTimes(native ? 0 : 1)
+      expect(askClassic).not.toHaveBeenCalled()
+      expect(
+        scripted
+          .requests()
+          .filter(({ api }) => /^(ConsumerGroupDescribe|DescribeGroups)$/.test(api))
+      ).toEqual([])
+    } finally {
+      await admin.disconnect()
+      scripted.assertClean()
+    }
   })
 })

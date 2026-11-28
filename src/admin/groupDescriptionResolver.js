@@ -1,4 +1,9 @@
-const { KafkaJSBrokerNotFound, KafkaJSNonRetriableError, isStaleCoordinator } = require('../errors')
+const {
+  KafkaJSBrokerNotFound,
+  KafkaJSNonRetriableError,
+  KafkaJSNumberOfRetriesExceeded,
+  isStaleCoordinator,
+} = require('../errors')
 const { isRetriable } = require('../retry')
 const { AdminDeadline, currentDeadline, endsCall, isAnsweredError } = require('./deadline')
 
@@ -210,7 +215,11 @@ class GroupDescriptionResolver {
    */
   #stopOnTerminal(error) {
     if (this.scope.guard()) return true
-    if (endsCall(error) || isAnsweredError(error)) {
+    if (
+      endsCall(error) ||
+      isAnsweredError(error) ||
+      error instanceof KafkaJSNumberOfRetriesExceeded
+    ) {
       this.scope.stop(error)
     } else if (error == null || !isRetriable(error)) {
       this.scope.stop(new KafkaJSNonRetriableError(error, { cause: error?.cause || error }))

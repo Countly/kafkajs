@@ -1709,7 +1709,8 @@ module.exports = class BrokerPool {
 
   /**
    * Starts work on the current incarnation of a coordinator node. A metadata refresh can replace
-   * its broker during connection setup, so check the table again before using the result.
+   * its broker during connection setup, so check the table again after successful setup. A setup
+   * failure goes to the caller's retrier even if the broker or pool changed while it ran.
    * @template T
    * @param {number} nodeId coordinator node id
    * @param {(broker: Broker) => Promise<T>} work request to start while the broker is current
@@ -1719,19 +1720,19 @@ module.exports = class BrokerPool {
    */
   async withCoordinatorBroker(nodeId, work, { fence } = {}) {
     for (;;) {
-      const current = this.brokers[nodeId]
-      const pool = current?.connectionPool
-      let broker
-      try {
-        broker = await this.findBroker({ nodeId, fence })
-      } catch (error) {
-        fence?.check()
-        checked(null)
-        if (this.brokers[nodeId] === current && current?.connectionPool === pool) throw error
-        continue
-      }
       fence?.check()
       checked(null)
+      const broker = this.brokers[nodeId]
+      if (!broker) {
+        throw new KafkaJSBrokerNotFound(`Broker ${nodeId} not found in the cached metadata`)
+      }
+      const pool = broker.connectionPool
+      try {
+        await this.connectBroker(broker, { fence, retry: false })
+      } finally {
+        fence?.check()
+        checked(null)
+      }
       if (this.brokers[nodeId] === broker && broker.connectionPool === pool) return work(broker)
     }
   }
@@ -1849,14 +1850,15 @@ module.exports = class BrokerPool {
    * @param {Broker} broker
    * @param {object} [options]
    * @param {import('../producer/generation')} [options.fence] see `findBroker`
-   * @returns {Promise<null>}
+   * @param {boolean} [options.retry=true] whether the pool owns retries for this connection
+   * @returns {Promise<void>}
    */
-  async connectBroker(broker, { fence } = {}) {
+  async connectBroker(broker, { fence, retry = true } = {}) {
     if (broker.isConnected()) {
       return
     }
 
-    return this.retryFor(fence)(async (bail, retryCount, retryTime) => {
+    const connect = async (bail, retryCount, retryTime) => {
       try {
         fence?.check()
         checked(null)
@@ -1929,7 +1931,16 @@ module.exports = class BrokerPool {
         } catch {}
         bail(e)
       }
-    })
+    }
+
+    if (retry) return this.retryFor(fence)(connect)
+    return connect(
+      (error) => {
+        throw error
+      },
+      0,
+      0
+    )
   }
 
   /**
