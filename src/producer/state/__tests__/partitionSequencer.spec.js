@@ -2,6 +2,7 @@ const PartitionSequencer = require('../partitionSequencer')
 const { KafkaJSInvariantViolation, KafkaJSTransactionAbortableError } = require('../../../errors')
 const { INT_32_MAX_VALUE } = require('../../../constants')
 const { newLogger } = require('testHelpers')
+const { owned } = require('../../__tests__/fixtures/bufferHarness')
 
 const TOPIC = 'topic-a'
 const OTHER = 'topic-b'
@@ -37,7 +38,7 @@ const createBatch = ({
   id: ids++,
   topic,
   partition,
-  messages: Array.from({ length: records }, (_, index) => ({ value: `record-${index}` })),
+  messages: owned(Array.from({ length: records }, (_, index) => ({ value: `record-${index}` }))),
   acks,
   timeout,
   compression,
