@@ -50,7 +50,7 @@ describe('Consumer > static membership (KIP-345)', () => {
         {
           name: 'a',
           protocol: () => ({ name: 'a', metadata: Buffer.alloc(0) }),
-          assign: async () => ({}),
+          assign: async () => [],
         },
       ],
       instrumentationEmitter: new InstrumentationEventEmitter(),
