@@ -369,7 +369,7 @@ The `compare-*` rows run the same workload through the public API of the fork an
 | `idempotent` | `true` | `false` | `false` |
 | `maxInFlightRequests` | 5 | unbounded (`null`) | `null` |
 | `retry.retries` | 2147483647, bounded by `deliveryTimeout` (120 s) | 5 | 5 |
-| `linger` | 5 ms | none: every `send()` is its own request | 0 |
+| `linger` | 0 | none: every `send()` is its own request | 0 |
 | `batchSize` | 16384 bytes per partition batch | none: a `send()` is one batch per partition | 1048576 (a 500-record send stays one batch per partition) |
 | partitioner (keyless records) | `UniformStickyPartitioner`, adaptive | `DefaultPartitioner` (round robin) | `DefaultPartitioner` |
 | `acks`, compression | -1, none | -1, none | the row's |

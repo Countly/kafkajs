@@ -229,8 +229,8 @@ const whereASendPathFailureGoes = ({ linger, batchSize }) => {
 
 /**
  * A producer over the fake cluster - one broker leading every partition, InitProducerId answered
- * with producer id 1000, transaction version `level` (2 unless given) - whose accumulator takes
- * its defaults unless `linger` or `batchSize` is given.
+ * with producer id 1000, transaction version `level` (2 unless given) - whose accumulator lingers
+ * `LINGER` ms unless `linger` is given; `linger: undefined` takes the producer's own default.
  */
 const createLingeringProducer = ({ produce, partitions = 2, level = 2, ...options } = {}) => {
   const cluster = createFakeCluster({
@@ -254,6 +254,7 @@ const createLingeringProducer = ({ produce, partitions = 2, level = 2, ...option
     logger: newLogger(),
     createPartitioner: () => () => 0,
     retry: { retries: 3, initialRetryTime: 10, maxRetryTime: 40, factor: 0 },
+    linger: LINGER,
     ...options,
   })
   /** What each Produce request carried. */
@@ -1868,28 +1869,42 @@ describe('Producer > the accumulator', () => {
       ['an idempotent producer', undefined],
       ['an idempotent: false producer', false],
     ])('%s', (_, idempotent) => {
-      test('without linger or batchSize, sends wait 5 ms and go out together, batches up to 16384 bytes', async () => {
-        const { producer, produced } = createLingeringProducer({ idempotent })
+      test('without linger or batchSize, sends made in one turn go out together at once with no timer, batches up to 16384 bytes', async () => {
+        jest.useFakeTimers({ now: 0, doNotFake: ['queueMicrotask'] })
+        const { producer, produced } = createLingeringProducer({ idempotent, linger: undefined })
         await producer.connect()
 
         const sends = ['a', 'b'].map((value) =>
           producer.send({ topic: TOPIC, messages: [{ value }] })
         )
-        await jest.advanceTimersByTimeAsync(4)
-        expect(produced()).toEqual([])
-        await settledWithin(Promise.all(sends), 1)
+        await microtasks()
         expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([['a', 'b']])
+        expect(jest.getTimerCount()).toBe(0)
+        await settledWithin(Promise.all(sends))
 
-        const full = producer.send({ topic: TOPIC, messages: [{ value: 'x'.repeat(16383) }] })
-        await jest.advanceTimersByTimeAsync(0)
-        expect(produced()).toHaveLength(1)
-        producer.send({ topic: TOPIC, messages: [{ value: 'y' }] })
-        await jest.advanceTimersByTimeAsync(0)
+        const full = ['x'.repeat(16383), 'y', 'z'].map((value) =>
+          producer.send({ topic: TOPIC, messages: [{ value }] })
+        )
+        await microtasks()
         expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([
           ['a', 'b'],
           ['x'.repeat(16383), 'y'],
+          ['z'],
         ])
-        await settledWithin(full)
+        await settledWithin(Promise.all(full))
+      })
+
+      test('without linger, a lone send goes out at once and nothing is scheduled', async () => {
+        jest.useFakeTimers({ now: 0, doNotFake: ['queueMicrotask'] })
+        const { producer, produced } = createLingeringProducer({ idempotent, linger: undefined })
+        await producer.connect()
+
+        const sent = producer.send({ topic: TOPIC, messages: [{ value: 'a' }] })
+        await microtasks()
+
+        expect(produced().map(({ partitions }) => partitions[0].values)).toEqual([['a']])
+        expect(jest.getTimerCount()).toBe(0)
+        await expect(sent).resolves.toEqual([expect.objectContaining({ partition: 0 })])
       })
 
       test('with linger: 0, a send goes out at once and nothing is scheduled', async () => {
