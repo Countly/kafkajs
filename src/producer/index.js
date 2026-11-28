@@ -312,6 +312,7 @@ const createProducer = ({
     admission,
     budget: requestBudget,
     getConnectionStatus: () => connectionStatus,
+    getFatalError: () => fatalError(),
     isClosing,
     instrumentationEmitter,
     INITIALIZED,
@@ -334,17 +335,25 @@ const createProducer = ({
   let beginning = null
 
   /**
+   * The producer's one authority over whether it is fatal: the error either identity was armed
+   * with, the idempotent one first. Fatal belongs to the producer, not to an identity, so public
+   * calls and the write of every request - whichever send path or identity drained it - read it.
+   * @returns {import('../errors').KafkaJSApplicationRecoverableError|null} null while neither is
+   */
+  const fatalError = () =>
+    idempotentEosManager.stateManager.fatalError() ??
+    transactionalEosManager?.stateManager.fatalError() ??
+    null
+
+  /**
    * Refuses work if either identity is fatal, preserving the armed object and its cause.
    * Cleanup and event observations remain usable; reconnect never resets fatal state.
    * @returns {void} when neither identity is fatal
    * @throws {import('../errors').KafkaJSApplicationRecoverableError} the armed fatal error
    */
   const throwIfFatal = () => {
-    for (const manager of [idempotentEosManager, transactionalEosManager]) {
-      if (manager?.stateManager.state() === 'FATAL_ERROR') {
-        throw manager.stateManager.transaction.armedError()
-      }
-    }
+    const fatal = fatalError()
+    if (fatal !== null) throw fatal
   }
 
   /**
@@ -502,6 +511,7 @@ const createProducer = ({
         eosManager: transactionalEosManager,
         idempotence,
         getConnectionStatus: () => connectionStatus,
+        getFatalError: () => fatalError(),
         isClosing,
         instrumentationEmitter,
         INITIALIZED,

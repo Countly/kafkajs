@@ -20,6 +20,7 @@ const Encoder = require('../../protocol/encoder')
 const { INT_32_MAX_VALUE } = require('../../constants')
 const { createGroupApiBroker } = require('../../broker/__tests__/fixtures/groupApiHarness')
 const { createFakeCluster } = require('./fixtures/fakeCluster')
+const { bufferedProducer, transactionalProducer } = require('./fixtures/bufferHarness')
 const {
   KafkaJSConnectionClosedError,
   KafkaJSDeliveryTimeout,
@@ -85,6 +86,19 @@ const deferred = () => {
 
 /** Lets every pending promise callback and queued microtask run. */
 const settle = () => new Promise((done) => setImmediate(done))
+
+/**
+ * Waits, a timer turn at a time, until `condition` holds.
+ * @param {() => boolean} condition
+ * @returns {Promise<void>}
+ * @throws {Error} when the condition never held
+ */
+const until = async (condition) => {
+  for (let turn = 0; turn < 500 && !condition(); turn += 1) {
+    await new Promise((done) => setTimeout(done, 2))
+  }
+  if (!condition()) throw new Error('The awaited condition never held')
+}
 
 /**
  * @param {Promise} promise
@@ -233,11 +247,15 @@ const seededRandom = (seed) => () => {
  * front of a partition log that checks sequences: what the broker processes is appended to `log`
  * in the order the requests were written.
  * @param {ReturnType<typeof createPartitionLog>} log
- * @returns {{ broker: Broker, answer: () => void, drop: () => void, destroy: () => Promise<void> }}
- *   `answer` processes and answers everything written so far; `drop` ends the socket, so nothing
- *   written so far is processed
+ * @param {object} [options]
+ * @param {number} [options.maxInFlightRequests] the connection's limit of unanswered requests: a
+ *   request above it waits in the connection's request queue until one is answered
+ * @returns {{ broker: Broker, answer: () => void, drop: () => void, destroy: () => Promise<void>,
+ *   written: () => number, waiting: () => number }} `answer` processes and answers everything
+ *   written so far; `drop` ends the socket, so nothing written so far is processed; `written` counts
+ *   the frames on the socket and `waiting` the requests held back in the request queue
  */
-const createDroppingBroker = (log) => {
+const createDroppingBroker = (log, { maxInFlightRequests } = {}) => {
   const { factory, state } = createFakeSocketFactory()
   const connection = new Connection({
     host: '127.0.0.1',
@@ -248,6 +266,7 @@ const createDroppingBroker = (log) => {
     connectionTimeout: 1000,
     requestTimeout: 1000,
     enforceRequestTimeout: false,
+    ...(maxInFlightRequests === undefined ? {} : { maxInFlightRequests }),
   })
   const versions = { [apiKeys.Produce]: { minVersion: 3, maxVersion: 7 } }
   const pool = {
@@ -311,6 +330,8 @@ const createDroppingBroker = (log) => {
       state.socket.emit('end')
     },
     destroy: () => connection.disconnect(),
+    written: () => state.writes.length,
+    waiting: () => connection.requestQueue.pending.length,
   }
 }
 
@@ -1141,6 +1162,82 @@ describe('Producer > the idempotent drain loop', () => {
         expect(harness.manager.sequencer.hasInFlight()).toBe(false)
       }
     )
+
+    test.each([
+      ['an idempotent producer', false],
+      ['a transactional producer', true],
+    ])(
+      'a batch refused at its write because the producer turned fatal rejects with the armed error at once, though its partition lost its leader meanwhile, %s',
+      async (_, transactional) => {
+        const lookup = deferred()
+        const harness = createHarness({
+          transactional,
+          layout: { [TOPIC]: { 0: 1, 1: 2 } },
+          answer: (request, nodeId) =>
+            respond(request, nodeId, { 'topic-a/0': INVALID_PRODUCER_ID_MAPPING }),
+        })
+        const findBroker = harness.cluster.findBroker.getMockImplementation()
+        harness.cluster.findBroker.mockImplementation(async (options) => {
+          if (Number(options.nodeId) === 2) await lookup.promise
+          return findBroker(options)
+        })
+        await harness.start()
+
+        const held = harness.send([{ topic: TOPIC, messages: records(1) }]).catch((e) => e)
+        const heldSettled = settledFlag(held)
+        await settle()
+        harness.send([{ topic: TOPIC, messages: records(0) }]).catch((e) => e)
+        await settle()
+
+        expect(harness.manager.state()).toEqual(FATAL_ERROR)
+        expect(heldSettled()).toBe(false)
+
+        delete harness.layout[TOPIC][1]
+        lookup.resolve()
+        await settle()
+
+        expect(heldSettled()).toBe(true)
+        expect(await held).toBe(harness.manager.transaction.armedError())
+        expect(harness.sent()).toEqual([{ nodeId: 1, epoch: 0, partitions: ['topic-a/0@0'] }])
+        expect(harness.manager.sequencer.hasInFlight()).toBe(false)
+      }
+    )
+
+    test('a request waiting in the real request queue when the producer turns fatal is refused at its write, nothing more is written, and its send rejects with the armed error though its partition lost its leader', async () => {
+      const log = createPartitionLog()
+      const connection = createDroppingBroker(log, { maxInFlightRequests: 1 })
+      const harness = createHarness({
+        layout: { [TOPIC]: { 0: 1, 1: 2, 2: 2 } },
+        answer: (request, nodeId) =>
+          respond(request, nodeId, { 'topic-a/0': INVALID_PRODUCER_ID_MAPPING }),
+      })
+      const findBroker = harness.cluster.findBroker.getMockImplementation()
+      harness.cluster.findBroker.mockImplementation(async (options) =>
+        Number(options.nodeId) === 2 ? connection.broker : findBroker(options)
+      )
+      await harness.start()
+
+      const written = harness.send([{ topic: TOPIC, messages: records(1) }])
+      await until(() => connection.written() === 1)
+      const waiting = harness.send([{ topic: TOPIC, messages: records(2) }]).catch((e) => e)
+      await until(() => connection.waiting() === 1)
+
+      expect(connection.written()).toBe(1)
+
+      harness.send([{ topic: TOPIC, messages: records(0) }]).catch((e) => e)
+      await until(() => harness.manager.state() === FATAL_ERROR)
+
+      delete harness.layout[TOPIC][2]
+      connection.answer()
+
+      await expect(written).resolves.toEqual([expect.objectContaining({ partition: 1 })])
+      expect(await waiting).toBe(harness.manager.transaction.armedError())
+      expect(connection.written()).toBe(1)
+      expect(connection.waiting()).toBe(0)
+      expect(log.written).toEqual(['topic-a/1:0@e0'])
+      expect(harness.manager.sequencer.hasInFlight()).toBe(false)
+      await connection.destroy()
+    })
 
     test('a re-send queued before the same answer armed an error state is rejected at once, not after its backoff', async () => {
       let calls = 0
@@ -2921,5 +3018,115 @@ describe('Producer > the idempotent drain loop', () => {
         expect(harness.manager.sequencer.hasInFlight()).toBe(false)
       }
     )
+  })
+
+  describe('a fatal producer writes nothing more, whichever identity or send path drained the request', () => {
+    test('a plain request held before its write, after idempotence was turned off, is refused once an idempotent request has made the producer fatal, and rejects with that error', async () => {
+      const { producer, cluster } = bufferedProducer()
+      const write = deferred()
+      const answer = deferred()
+      const written = []
+      let turn = 0
+      cluster.broker.produce.mockImplementation(async (request) => {
+        const mine = turn
+        turn += 1
+        if (mine === 2) await write.promise
+        const refusal = request.guard?.(100)
+        if (refusal) throw refusal
+        written.push(mine)
+        if (mine === 1) await answer.promise
+        return respond(request, 0, mine === 1 ? { 'topic-a/0': INVALID_PRODUCER_ID_MAPPING } : {})
+      })
+      try {
+        await producer.connect()
+        await producer.send({ topic: TOPIC, messages: [{ value: 'warm' }] })
+        const idempotent = producer
+          .send({ topic: TOPIC, messages: [{ value: 'idempotent' }] })
+          .catch((e) => e)
+        await until(() => written.length === 2)
+        const plain = producer
+          .send({ topic: TOPIC, acks: 1, messages: [{ value: 'plain' }] })
+          .catch((e) => e)
+        await until(() => turn === 3)
+
+        expect(producer.isIdempotent()).toBe(false)
+        expect(written).toEqual([0, 1])
+
+        answer.resolve()
+        const idempotentError = await idempotent
+        write.resolve()
+        const plainError = await plain
+        const armed = await producer
+          .send({ topic: TOPIC, messages: [{ value: 'later' }] })
+          .catch((e) => e)
+
+        expect(idempotentError).toMatchObject({ code: INVALID_PRODUCER_ID_MAPPING })
+        expect(plainError).toBe(armed)
+        expect(written).toEqual([0, 1])
+      } finally {
+        await producer.disconnect({ timeout: 0 })
+      }
+    })
+
+    test.each([
+      [
+        'a transactional request held before its write is refused once an ordinary request has made the producer fatal, and rejects with that error',
+        'transactional',
+        'ordinary',
+      ],
+      [
+        'an ordinary request held before its write is refused once a transactional request has made the producer fatal, and rejects with that error',
+        'ordinary',
+        'transactional',
+      ],
+    ])('%s', async (_, held, failing) => {
+      const { producer, cluster, transaction } = await transactionalProducer()
+      const write = deferred()
+      const answer = deferred()
+      const written = []
+      const entered = []
+      cluster.broker.produce.mockImplementation(async (request) => {
+        const kind = request.transactionalId === undefined ? 'ordinary' : 'transactional'
+        entered.push(kind)
+        if (kind === held) await write.promise
+        const refusal = request.guard?.(100)
+        if (refusal) throw refusal
+        written.push(kind)
+        if (kind === failing) await answer.promise
+        return respond(
+          request,
+          0,
+          kind === failing ? { 'topic-a/0': INVALID_PRODUCER_ID_MAPPING } : {}
+        )
+      })
+      const sends = {
+        transactional: () =>
+          transaction.send({ topic: TOPIC, messages: [{ value: 'transactional' }] }),
+        ordinary: () => producer.send({ topic: TOPIC, messages: [{ value: 'ordinary' }] }),
+      }
+      try {
+        const heldSend = sends[held]().catch((e) => e)
+        await until(() => entered.length === 1)
+        const failingSend = sends[failing]().catch((e) => e)
+        await until(() => written.length === 1)
+
+        expect(entered).toEqual([held, failing])
+        expect(written).toEqual([failing])
+
+        answer.resolve()
+        await failingSend
+        write.resolve()
+        const heldError = await heldSend
+        const armed = await producer
+          .send({ topic: TOPIC, messages: [{ value: 'later' }] })
+          .catch((e) => e)
+
+        expect(heldError).toBe(armed)
+        expect(armed).toBeInstanceOf(KafkaJSError)
+        expect(written).toEqual([failing])
+      } finally {
+        await producer.disconnect({ timeout: 0 })
+      }
+    })
   })
 })

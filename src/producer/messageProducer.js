@@ -27,6 +27,8 @@ const sharedPromiseTo = require('../utils/sharedPromiseTo')
  * @param {import('./state/recordSize').RequestBudget} options.budget the producer's request-size
  *   plan (`maxRequestSize`), shared the same way
  * @param {() => string} options.getConnectionStatus
+ * @param {() => (Error|null)} [options.getFatalError] the producer's authority over whether it is
+ *   fatal, shared by every send path of the producer, the plain path after a downgrade included
  * @param {() => boolean} options.isClosing whether the producer's `disconnect()` is delivering
  *   the accumulated batches: sends are refused and batches no longer linger
  * @param {object} options.instrumentationEmitter
@@ -52,6 +54,7 @@ module.exports = ({
   admission,
   budget,
   getConnectionStatus,
+  getFatalError,
   isClosing,
   instrumentationEmitter,
   INITIALIZED,
@@ -68,6 +71,7 @@ module.exports = ({
     deliveryTimeout,
     compressionLevels,
     getConnectionStatus,
+    getFatalError,
     budget,
     getGeneration,
   })
@@ -99,6 +103,7 @@ module.exports = ({
         partitioner,
         budget,
         getGeneration,
+        getFatalError,
         eosManager: createEosManager({ logger, cluster, transactional: false }),
       })
     return plainSend

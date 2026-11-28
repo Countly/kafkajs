@@ -5,6 +5,7 @@ const {
   KafkaJSNonRetriableError,
   KafkaJSProtocolError,
   KafkaJSRecordTooLargeError,
+  KafkaJSTransactionAbortableError,
 } = require('../../errors')
 const Broker = require('../../broker')
 const Connection = require('../../network/connection')
@@ -16,7 +17,7 @@ const { oracleRecordBatch } = require('../../protocol/requests/produce/fixtures/
 const Accumulator = require('../state/accumulator')
 const { Admission } = require('../state/admission')
 const PartitionSequencer = require('../state/partitionSequencer')
-const { countersOf, quiescent } = require('./fixtures/bufferHarness')
+const { countersOf, quiescent, watch } = require('./fixtures/bufferHarness')
 const { RequestBudget } = require('../state/recordSize')
 const { Schedule } = require('../../../testHelpers/schedule')
 const { createScriptedCluster, producerScript } = require('../../../testHelpers/scriptedCluster')
@@ -56,6 +57,24 @@ const oracleFrameLength = async (request, { apiVersion, clientId }) => {
   jest.dontMock(batchBuilder)
   const frame = await createRequest({ correlationId: 1, clientId, request: produce(request) })
   return frame.size()
+}
+
+/** The fake clock of the tests that wait for a linger or a backoff: real turns still run. */
+const FAKE_TIME = { now: 0, doNotFake: ['nextTick', 'setImmediate'] }
+
+/**
+ * Awaits `promise` under fake time: while it is pending, the clock moves on by one retry backoff
+ * and a real turn passes, so no test waits out a linger or a backoff in real time.
+ * @param {Promise<unknown>} promise
+ * @returns {Promise<unknown>} `promise`, once settled
+ */
+const withTime = async (promise) => {
+  const watched = watch(promise)
+  for (let step = 0; step < 200 && watched.state === 'pending'; step += 1) {
+    await jest.advanceTimersByTimeAsync(RETRY.initialRetryTime)
+    await tick()
+  }
+  return promise
 }
 
 /** Waits, a turn at a time, for `predicate`, and fails the test when it never holds. */
@@ -174,6 +193,7 @@ describe('Producer > a send larger than one request', () => {
   })
 
   afterEach(async () => {
+    jest.useRealTimers()
     if (producer) await producer.disconnect()
     if (cluster) cluster.assertClean()
     Object.assign(CompressionCodecs, saved)
@@ -508,6 +528,7 @@ describe('Producer > a send larger than one request', () => {
   test.each(PATHS)(
     'a send whose Buffer was transferred after the call fails alone: the send it was handed on with is written and acknowledged, the buffer is released, and the next send to its partition is accepted, %s',
     async (_, path) => {
+      jest.useFakeTimers(FAKE_TIME)
       const admissions = new Set()
       const acquire = Admission.prototype.acquire
       jest.spyOn(Admission.prototype, 'acquire').mockImplementation(function (...args) {
@@ -515,9 +536,11 @@ describe('Producer > a send larger than one request', () => {
         return acquire.apply(this, args)
       })
       const calls = attempts()
-      const { log } = await start(
-        { topics: [{ name: TOPIC, leaders: [0, 0] }] },
-        { ...path, linger: LINGER_UNTIL_FLUSHED }
+      const { log } = await withTime(
+        start(
+          { topics: [{ name: TOPIC, leaders: [0, 0] }] },
+          { ...path, linger: LINGER_UNTIL_FLUSHED }
+        )
       )
       const expected = new Map()
       log.verdict = ({ topic, partition, batch }) => {
@@ -541,8 +564,8 @@ describe('Producer > a send larger than one request', () => {
       structuredClone(store, { transfer: [store] })
       await tick()
       const flushed = producer.flush()
-      const [kept, refused] = await Promise.allSettled([bystander, offender])
-      await flushed
+      const [kept, refused] = await withTime(Promise.allSettled([bystander, offender]))
+      await withTime(flushed)
 
       expect(kept).toEqual({
         status: 'fulfilled',
@@ -562,8 +585,8 @@ describe('Producer > a send larger than one request', () => {
         messages: [{ value: 'next', partition: 1 }],
       })
       await tick()
-      await producer.flush()
-      const next = await following
+      await withTime(producer.flush())
+      const next = await withTime(following)
 
       expect(next).toEqual([expect.objectContaining({ partition: 1, errorCode: 0 })])
       expect(
@@ -590,9 +613,12 @@ describe('Producer > a send larger than one request', () => {
   ])(
     'a transaction send whose Buffer was transferred fails alone and leaves the transaction abortable: commit rejects, abort succeeds and the next transaction commits, %s, %s',
     async (profile, attempt) => {
-      const { log } = await start(
-        { topics: [{ name: TOPIC, leaders: [0, 0] }], profile },
-        { transactionalId: 'transferred-buffer', linger: LINGER_UNTIL_FLUSHED }
+      jest.useFakeTimers(FAKE_TIME)
+      const { log } = await withTime(
+        start(
+          { topics: [{ name: TOPIC, leaders: [0, 0] }], profile },
+          { transactionalId: 'transferred-buffer', linger: LINGER_UNTIL_FLUSHED }
+        )
       )
       const store = new ArrayBuffer(4)
       const value = new Uint8Array(store)
@@ -609,7 +635,7 @@ describe('Producer > a send larger than one request', () => {
         }
       }
 
-      const transaction = await producer.transaction()
+      const transaction = await withTime(producer.transaction())
       const sending = transaction.send({
         topic: TOPIC,
         messages: [
@@ -620,26 +646,25 @@ describe('Producer > a send larger than one request', () => {
       if (attempt === 'a first attempt') transfer()
       await tick()
       const flushed = producer.flush()
-      const refused = await sending.catch((error) => error)
-      await flushed
+      const refused = await withTime(sending.catch((error) => error))
+      await withTime(flushed)
 
       expect(refused).toMatchObject({
         name: 'KafkaJSInvalidConfigurationError',
         category: 'invalidConfiguration',
         message: 'A Buffer changed size while its send was being read',
       })
-      await expect(transaction.commit()).rejects.toMatchObject({
-        category: 'invalidConfiguration',
-        message: refused.message,
-      })
-      await transaction.abort()
+      const commit = await withTime(transaction.commit().catch((error) => error))
+      expect(commit).toBeInstanceOf(KafkaJSTransactionAbortableError)
+      expect(commit.cause).toBe(refused)
+      await withTime(transaction.abort())
 
-      const next = await producer.transaction()
+      const next = await withTime(producer.transaction())
       const following = next.send({ topic: TOPIC, messages: [{ value: 'next', partition: 1 }] })
       await tick()
-      await producer.flush()
-      await following
-      await next.commit()
+      await withTime(producer.flush())
+      await withTime(following)
+      await withTime(next.commit())
 
       const writes = log.written.map(({ partition, records: count, errorCode }) => [
         partition,

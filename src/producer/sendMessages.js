@@ -17,7 +17,7 @@ const { staleMetadata } = require('../protocol/error')
 const { RETRIABLE_CATEGORIES } = require('../protocol/errorCategories')
 const { CONNECTION_STATUS } = require('../network/connectionStatus')
 const { isConnectionFailure } = require('../network/connectionFailure')
-const { isArmed, FATAL_ERROR } = require('./eosManager/transactionStates')
+const { isArmed } = require('./eosManager/transactionStates')
 const { surfaceInTransaction } = require('./eosManager')
 const groupMessagesPerPartition = require('./groupMessagesPerPartition')
 const Fifo = require('../utils/fifo')
@@ -302,6 +302,18 @@ const rejectBatch = (batch, error) => {
 /** An internal, uncounted refusal of one request that has never been written. */
 class ProduceAttemptRefused extends Error {}
 
+/**
+ * The refusal of an attempt not yet written because the producer turned fatal. It carries the
+ * armed error, which the batches of the attempt fail with: they are neither requeued nor retried.
+ */
+class ProduceAttemptFatal extends ProduceAttemptRefused {
+  /** @param {Error} armed the error the producer was made fatal with */
+  constructor(armed) {
+    super('The producer turned fatal before the Produce attempt was written')
+    this.armed = armed
+  }
+}
+
 /** The refusal of a request whose encoded frame is above `maxRequestSize`; nothing was written. */
 class ProduceAttemptTooLarge extends ProduceAttemptRefused {
   /**
@@ -344,9 +356,9 @@ class ProduceAttempt {
    *   loop's also settles every other due delivery
    * @param {number} [maxRequestSize=Infinity] cap checked at transmission
    * @param {import('./generation')} [generation] captured lifecycle; never recaptured
-   * @param {() => boolean} [isFatal] whether the producer has turned fatal: nothing not yet written
-   *   may then be written, whatever the attempt was drained for. The plain path has no producer
-   *   state that can turn fatal and passes none.
+   * @param {() => (Error|null)} [getFatalError] the error the producer was made fatal with, or null
+   *   while it is not: nothing not yet written may then be written, whatever identity the attempt
+   *   was drained for
    */
   constructor(
     deliveries,
@@ -354,14 +366,14 @@ class ProduceAttempt {
     expire,
     maxRequestSize = Infinity,
     generation,
-    isFatal = () => false
+    getFatalError = () => null
   ) {
     this.deliveries = deliveries.slice()
     this.getConnectionStatus = getConnectionStatus
     this.expire = expire
     this.maxRequestSize = maxRequestSize
     this.generation = generation
-    this.isFatal = isFatal
+    this.getFatalError = getFatalError
     this.written = false
     this.revoked = false
     for (const delivery of this.deliveries) delivery.currentAttempt = this
@@ -375,14 +387,20 @@ class ProduceAttempt {
   /**
    * The one decision whether this attempt may still be written, taken at every step before the
    * frame leaves: a revoked attempt, or one drained before the producer turned fatal, is refused
-   * unwritten. At transmission a frame above `maxRequestSize` is refused, unwritten; a written
-   * attempt ends the size subdivision (`child`) of the batches it carries.
+   * unwritten (`ProduceAttemptFatal` for the fatal producer, which says what to fail with). At
+   * transmission a frame above `maxRequestSize` is refused, unwritten; a written attempt ends the
+   * size subdivision (`child`) of the batches it carries.
    * @param {number} [frameLength] supplied only at transmission; includes the prefix and header
    * @returns {Error|null} refusal before any write, or null
    */
   guard = (frameLength) => {
-    if (this.isFatal()) this.revoke()
-    if (this.revoked) return new ProduceAttemptRefused('The Produce attempt was revoked')
+    const fatal = this.getFatalError()
+    if (fatal !== null) this.revoke()
+    if (this.revoked) {
+      return fatal === null
+        ? new ProduceAttemptRefused('The Produce attempt was revoked')
+        : new ProduceAttemptFatal(fatal)
+    }
     const closed = this.generation?.guard()
     if (closed) return closed
     const statusError = connectionStatusError(this.getConnectionStatus())
@@ -618,6 +636,7 @@ class DrainLoop {
   #deadlineMs
   #compressionLevels
   #getConnectionStatus
+  #getFatalError
   #budget
   #generation
   /** @type {Set<Send>} */
@@ -653,6 +672,9 @@ class DrainLoop {
    * @param {number} [options.deliveryTimeout] ms from `send()` to a batch's last answer
    * @param {{ gzip?: number, zstd?: number }} [options.compressionLevels] per-codec levels
    * @param {() => string} options.getConnectionStatus
+   * @param {() => (Error|null)} options.getFatalError the producer's authority over whether it is
+   *   fatal, whichever identity turned it so: a request drained for any identity is refused its
+   *   write while it answers with an error
    * @param {RequestBudget} [options.budget] the request-size plan of each request it drains, and
    *   the `maxRequestSize` its frames are refused above
    * @param {import('./generation')} [options.generation] this loop's captured lifecycle
@@ -665,6 +687,7 @@ class DrainLoop {
     deliveryTimeout,
     compressionLevels,
     getConnectionStatus,
+    getFatalError,
     budget = new RequestBudget(),
     generation,
   }) {
@@ -676,6 +699,7 @@ class DrainLoop {
     this.#compressionLevels = compressionLevels
     this.#deadlineMs = deliveryTimeout ?? retry.maxTotalTime
     this.#getConnectionStatus = getConnectionStatus
+    this.#getFatalError = getFatalError
     this.#budget = budget
     this.#generation = generation
     this.#expiry = new ExpiryTimer(this.#expireDue)
@@ -1213,7 +1237,7 @@ class DrainLoop {
       () => this.#expireDue(Date.now()),
       this.#budget.maxRequestSize,
       this.#generation,
-      () => manager.state() === FATAL_ERROR
+      this.#getFatalError
     )
     for (const batch of batches) {
       deliveryOf(batch).dispatched = true
@@ -1357,7 +1381,9 @@ class DrainLoop {
   }
 
   /**
-   * Settles each batch of a request that failed as a whole.
+   * Settles each batch of a request that failed as a whole. A request refused unwritten because the
+   * producer turned fatal fails its batches with the armed error at once (`#refuseUnwritten`):
+   * nothing is requeued, so no routing, backoff or deadline stands between them and that error.
    * @param {string} nodeId
    * @param {import('./state/partitionSequencer').PartitionBatch[]} batches
    * @param {Error} error
@@ -1387,7 +1413,9 @@ class DrainLoop {
         delivery.retire()
         continue
       }
-      if (error instanceof ProduceAttemptTooLarge) {
+      if (error instanceof ProduceAttemptFatal) {
+        this.#refuseUnwritten(manager, batch, error.armed)
+      } else if (error instanceof ProduceAttemptTooLarge) {
         refused.push(batch)
       } else if (error instanceof ProduceAttemptRefused) {
         manager.sequencer.requeue(batch, 0, { counted: false })
@@ -1739,6 +1767,10 @@ class DrainLoop {
  * @param {{ gzip?: number, zstd?: number }} [options.compressionLevels] validated producer
  *   snapshot, selected by codec on both send paths and retained for retries
  * @param {() => string} [options.getConnectionStatus] the producer's connection status
+ * @param {() => (Error|null)} [options.getFatalError] the producer's authority over whether it is
+ *   fatal, the same one its public calls refuse by: both send paths refuse every request not yet
+ *   written once it answers with an error, whichever identity turned the producer fatal. Absent:
+ *   the idempotent path reads its `eosManager`'s own state and the plain path is never fatal
  * @param {RequestBudget} [options.budget] the producer's request-size plan: both send paths keep
  *   each request within it, and refuse a frame above its `maxRequestSize` before writing it
  * @param {() => import('./generation')|undefined} [options.getGeneration] current lifecycle
@@ -1756,6 +1788,7 @@ const createSendMessages = ({
   deliveryTimeout,
   compressionLevels,
   getConnectionStatus,
+  getFatalError,
   budget = new RequestBudget(),
   getGeneration = () => undefined,
 }) => {
@@ -2102,6 +2135,7 @@ const createSendMessages = ({
         deliveryTimeout,
         compressionLevels,
         getConnectionStatus,
+        getFatalError: getFatalError ?? (() => eosManager.stateManager.fatalError()),
         budget,
         generation,
       })
@@ -2449,7 +2483,8 @@ const createSendMessages = ({
         getConnectionStatus || (() => CONNECTION_STATUS.CONNECTED),
         expire,
         budget.maxRequestSize,
-        generation
+        generation,
+        getFatalError
       )
       /** The request ended: a batch that settled meanwhile detaches now. @returns {void} */
       const ended = () => {
@@ -2471,6 +2506,10 @@ const createSendMessages = ({
         if (!refused) attachFailingRecords(error, topicDataOf(sent))
         ended()
         if (generation?.closed) return null
+        if (error instanceof ProduceAttemptFatal) {
+          sent.forEach((batch) => settle(batch, undefined, error.armed))
+          return null
+        }
         if (error instanceof ProduceAttemptTooLarge) repartition(sent, error)
         if (refused) return error
         for (const delivery of carried) delivery.lastError = error

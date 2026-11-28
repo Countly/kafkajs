@@ -181,10 +181,9 @@ const produceCeiling = ({ transactionalId, transactionVersion, topicIds }) => {
  * @param {number} now
  * @returns {{ topic: string, partitions: { partition: number, firstSequence?: number,
  *   messages: import('../protocol/recordBatch/entries').RecordEntries }[] }[]}
- * @throws {import('../errors').KafkaJSInvalidConfigurationError} for a record field that cannot be
- *   written
- * @throws {import('../errors').KafkaJSNonRetriableError} for a record that is not an object, or a
- *   Buffer detached or out of bounds while it is read
+ * @throws {import('../errors').KafkaJSInvalidConfigurationError} (a `KafkaJSNonRetriableError`) for
+ *   a partition's `messages` that is not an array, a record that is missing or not an object, a
+ *   record field that cannot be written, or a Buffer detached or out of bounds while it is read
  */
 const captureTopicData = (topicData, now) => {
   const topics = []
