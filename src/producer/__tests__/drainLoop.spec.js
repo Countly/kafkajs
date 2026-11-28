@@ -2176,7 +2176,7 @@ describe('Producer > the idempotent drain loop', () => {
       expect(second.resolve).toHaveBeenCalledWith(expect.objectContaining({ partition: 1 }))
     })
 
-    test('a KIP-467 record error names the record of the batch it came from', async () => {
+    test('a KIP-467 record error reaches a send with no accumulator owners as the broker reported it', async () => {
       const harness = createHarness({
         layout: { [TOPIC]: { 0: 1 } },
         answer: (request, nodeId) => {
@@ -2194,9 +2194,10 @@ describe('Producer > the idempotent drain loop', () => {
       const error = await harness.send([{ topic: TOPIC, messages }]).catch((e) => e)
 
       expect(error.recordErrors).toEqual([
-        { batchIndex: 1, errorMessage: 'bad', record: messages[1] },
+        { batchIndex: 1, errorMessage: 'bad' },
         { batchIndex: 9 },
       ])
+      expect(error.recordErrors[0]).not.toHaveProperty('record')
     })
 
     test('without idempotence each entry settles with its own partition’s outcome: a request that fails rejects only its own entries', async () => {

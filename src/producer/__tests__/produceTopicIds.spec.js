@@ -211,7 +211,7 @@ describe('Producer > topic ids on the produce path', () => {
     expect(produceCalls[0].topicIds).toBeUndefined()
   })
 
-  test('a v13 produce failure carries its recordErrors, matched back to the records sent', async () => {
+  test('a v13 produce failure thrown for the whole request keeps its recordErrors as the broker reported them', async () => {
     const { send } = createProducerCluster({
       topicIds: { 'topic-a': TOPIC_A_ID },
       leaders: { 'topic-a': 1 },
@@ -225,9 +225,8 @@ describe('Producer > topic ids on the produce path', () => {
       topicMessages: [{ topic: 'topic-a', messages: [{ value: 'a' }, { value: 'b' }] }],
     }).catch((e) => e)
 
-    expect(error.recordErrors).toEqual([
-      { batchIndex: 1, batchIndexErrorMessage: 'bad', record: { value: 'b' } },
-    ])
+    expect(error.recordErrors).toEqual([{ batchIndex: 1, batchIndexErrorMessage: 'bad' }])
+    expect(error.recordErrors[0]).not.toHaveProperty('record')
   })
 
   test('an unknown topic id on the response takes the existing refresh-and-retry path', async () => {

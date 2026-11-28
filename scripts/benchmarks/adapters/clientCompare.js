@@ -4,10 +4,13 @@
  * alike. Each run excludes its own warm-up. An arm with a run whose measured window is shorter
  * than 30 seconds is `inconclusive`: a shorter window does not mean anything in either direction.
  * Beside the rows, each arm shows the median, minimum, maximum and spread of every metric, and,
- * from its first run, the producer or consumer settings in force, the LZ4 codec, the Fetch
- * version, the consume passes and the consume corpus layout, so a ratio can be read from the
- * report alone. A row with `profile` names each arm's CPU profile, taken in one extra run outside
- * the medians. A metric in `OPTIONAL_METRICS` is left out of an arm's rows, with a note, only when
+ * from its first run, the producer or consumer settings in force, the LZ4 or gzip codec, the
+ * workload shape, the Fetch version, the consume passes and the consume corpus layout, so a ratio
+ * can be read from the report alone. A row with `profile` names each arm's CPU profile, taken in
+ * one extra run outside the medians. A row with `diagnostic` reports its `diagnostic.metrics` from
+ * one extra run per arm outside the medians, with a window of at least 30 seconds like the
+ * others, so what they cost to measure never reaches the rate and CPU of the runs above. A metric
+ * in `OPTIONAL_METRICS` is left out of an arm's rows, with a note, only when
  * every run of the arm says its Node cannot measure it; a run that can but did not report it makes
  * the metric, and the arm, an error.
  */
@@ -62,12 +65,12 @@ const spreadOf = ({ median, min, max }) => (median ? ((max - min) / median) * 10
 /**
  * The wall-clock seconds a compare row is planned to take with both arms: a produce row by its
  * `--duration-ms`, a consume row by producing its corpus once and reading it `--passes` times at
- * the planning costs. A row with `profile` has one more run per arm.
- * @param {{ command: string[], arms: string[], profile?: boolean }} entry
+ * the planning costs. A row with `profile` or `diagnostic` has one more run per arm for each.
+ * @param {{ command: string[], arms: string[], profile?: boolean, diagnostic?: object }} entry
  * @param {number} [runs]
  * @returns {number}
  */
-const plannedSeconds = ({ command, arms, profile }, runs = RUNS) => {
+const plannedSeconds = ({ command, arms, profile, diagnostic }, runs = RUNS) => {
   const duration = Number(valueOf(command, '--duration-ms') ?? 0) / 1000
   const records = Number(valueOf(command, '--messages') ?? 0)
   const size = Number(valueOf(command, '--size') ?? 200)
@@ -77,14 +80,15 @@ const plannedSeconds = ({ command, arms, profile }, runs = RUNS) => {
     valueOf(command, '--workload') === 'consume-throughput'
       ? RUN_OVERHEAD_S + seconds(CORPUS_US, records) + seconds(CONSUME_US, records * passes)
       : RUN_OVERHEAD_S + WARMUP_S + duration
-  return perRun * (runs + (profile ? 1 : 0)) * arms.length
+  return perRun * (runs + (profile ? 1 : 0) + (diagnostic ? 1 : 0)) * arms.length
 }
 
 /**
  * @param {object} output one run's JSON line
  * @param {string} workload the row's `--workload`
- * @returns {string[]} what the arm ran with: producer or consumer settings, LZ4 codec, Fetch
- *   version, passes and corpus layout
+ * @returns {string[]} what the arm ran with: producer or consumer settings, LZ4 or gzip codec, the
+ *   workload's shape (records per send, unawaited sends, keys, headers, partitioner, value type),
+ *   Fetch version, passes and corpus layout
  */
 const notesOf = (output, workload) => {
   const pairs = (settings) =>
@@ -99,8 +103,9 @@ const notesOf = (output, workload) => {
     )
   } else if (output.settings) {
     const defaults = output.settings.defaults
+    const custom = output.shape?.partitioner === 'custom'
     notes.push(
-      `${client} settings in force (this package's defaults): ${defaults ? pairs(defaults) : 'unknown package'}`
+      `${client} settings in force (this package's defaults${custom ? ', except the partitioner, which is the custom one' : ''}): ${defaults ? pairs(defaults) : 'unknown package'}`
     )
   }
   if (output.codec) {
@@ -108,7 +113,12 @@ const notesOf = (output, workload) => {
       output.codec.codec === 'built-in'
         ? "the package's built-in codec"
         : 'a frame codec this benchmark registers through CompressionCodecs (2.2.4 has no built-in LZ4)'
-    notes.push(`lz4: ${output.codec.package}@${output.codec.version}, ${how}`)
+    notes.push(
+      `${output.codec.name ?? 'lz4'}: ${output.codec.package}@${output.codec.version}, ${how}`
+    )
+  }
+  if (output.shape) {
+    notes.push(`workload shape (the same on both arms): ${pairs(output.shape)}`)
   }
   if (output.fetchVersion !== undefined) notes.push(`Fetch version: ${output.fetchVersion}`)
   if (output.passes > 1) {
@@ -129,11 +139,37 @@ const notesOf = (output, workload) => {
  * @param {import('../report').ManifestEntry} entry
  * @param {string} arm
  * @param {import('../report').Outcome} outcome
+ * @returns {import('../report').Row[]} the rows of `entry.diagnostic.metrics` from the arm's one
+ *   diagnostic run (`runs` 1, median, minimum and maximum the one value): `error` rows with the
+ *   reason when that run or the arm failed, `inconclusive` when its window is under 30 s; none
+ *   for an entry without `diagnostic`
+ */
+const diagnosticRows = (entry, arm, { error, diagnostic }) => {
+  if (!entry.diagnostic) return []
+  const output = diagnostic?.output
+  const failure = output ? undefined : (diagnostic?.error ?? `no diagnostic run: ${error}`)
+  const result = rowsOf(
+    { ...entry, metrics: entry.diagnostic.metrics },
+    arm,
+    { outputs: output ? [output] : [], error: failure },
+    1
+  )
+  if (!output || output.elapsedMs >= MIN_WINDOW_MS) return result
+  const reason = `diagnostic window ${output.elapsedMs} ms is under ${MIN_WINDOW_MS} ms`
+  return result.map((row) =>
+    row.status === 'valid' ? { ...row, status: 'inconclusive', reason } : row
+  )
+}
+
+/**
+ * @param {import('../report').ManifestEntry} entry
+ * @param {string} arm
+ * @param {import('../report').Outcome} outcome
  * @param {number} runs
  * @returns {{ rows: import('../report').Row[], detail: import('../report').Detail }} the plain
- *   rows, `inconclusive` when a run's window is under 30 s, and the arm's spread table and notes;
- *   an optional metric that every run says it cannot measure has no row, and an error row makes
- *   the arm an error
+ *   rows, `inconclusive` when a run's window is under 30 s, then the diagnostic rows, and the arm's
+ *   spread table (of the plain rows) and notes; an optional metric that every run says it cannot
+ *   measure has no row, and an error row, a diagnostic one included, makes the arm an error
  */
 const rows = (entry, arm, outcome, runs) => {
   const absent = entry.metrics
@@ -163,7 +199,9 @@ const rows = (entry, arm, outcome, runs) => {
     row.status === 'valid' && reason ? { ...row, status: 'inconclusive', reason } : row
   )
   const numbered = result.filter((row) => row.median !== undefined)
-  const failed = outcome.error ?? result.find((row) => row.status === 'error')?.reason
+  const diagnostic = diagnosticRows(entry, arm, outcome)
+  const failed =
+    outcome.error ?? [...result, ...diagnostic].find((row) => row.status === 'error')?.reason
   const status = failed ? 'error' : reason ? 'inconclusive' : 'valid'
   const fmt = (n) => (n === undefined ? '-' : String(Number(n.toPrecision(4))))
   const detail = {
@@ -178,6 +216,11 @@ const rows = (entry, arm, outcome, runs) => {
       ...absent.map((key) => `${key}: not reported, ${OPTIONAL_METRICS[key].reason}`),
       ...(outcome.profile
         ? [`CPU profile (one extra run, not in the medians): ${outcome.profile}`]
+        : []),
+      ...(entry.diagnostic
+        ? [
+            `${entry.diagnostic.metrics.map(({ key }) => key).join(', ')}: from one extra run with ${entry.diagnostic.args.join(' ')}, not in the medians; the ${runs} runs above do not measure them`,
+          ]
         : []),
     ],
     ...(numbered.length && {
@@ -195,7 +238,7 @@ const rows = (entry, arm, outcome, runs) => {
       },
     }),
   }
-  return { rows: result, detail }
+  return { rows: [...result, ...diagnostic], detail }
 }
 
 module.exports = {

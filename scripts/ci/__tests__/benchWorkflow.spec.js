@@ -159,7 +159,7 @@ describe('bench.yml', () => {
     )
   })
 
-  test('runs only the rows named by the optional rows input, every row when it is empty', () => {
+  test('runs only the rows named by the optional rows input, every row not marked namedOnly when it is empty', () => {
     const plan = workflow.jobs.plan.steps.at(-1)
     const bench = stepIn(workflow.jobs.bench, 'report.js')
 
@@ -183,13 +183,41 @@ describe('bench.yml', () => {
     ])
     expect(bench.env.ROWS).toBe(expr('needs.plan.outputs.ordinary'))
     expect(runs(bench)).toMatch(/ --only "\$ROWS"(\s|$)/)
-    expect(benchJobs.plan('').selected.sort()).toEqual(names(manifest.entries).sort())
+    expect(benchJobs.plan('').selected.sort()).toEqual(
+      names(manifest.entries.filter((entry) => !entry.namedOnly)).sort()
+    )
     expect(benchJobs.plan('murmur2').selected).toEqual(['murmur2'])
+  })
+
+  test('a namedOnly row runs only when the dispatch names it, and an empty selection reports why it was left out', () => {
+    const namedOnly = names(manifest.entries.filter((entry) => entry.namedOnly))
+    const reports = tmp()
+
+    expect(namedOnly.length).toBeGreaterThan(0)
+    expect(benchJobs.plan('').ordinary).not.toEqual(expect.arrayContaining([namedOnly[0]]))
+    expect(benchJobs.plan(namedOnly.join(',')).ordinary).toEqual(namedOnly)
+    expect(benchJobs.plan(`murmur2,${namedOnly[1]}`).ordinary).toEqual([namedOnly[1], 'murmur2'])
+    const left = benchJobs
+      .collect(reports, { input: '' })
+      .rows.filter(({ benchmark }) => namedOnly.includes(benchmark))
+    expect(left.map(({ status, reason }) => [status, reason])).toEqual(
+      namedOnly.map(() => ['not selected', 'runs only when named in the rows input'])
+    )
+    const other = benchJobs
+      .collect(reports, { input: 'murmur2' })
+      .rows.find(({ benchmark }) => benchmark === namedOnly[0])
+    expect(other.reason).toBe('left out by the rows input')
+    expect(benchJobs.collect(reports, { input: '' }).meta.selection).toBe(
+      'every row not marked namedOnly'
+    )
+    expect(benchJobs.collect(reports, { input: ' murmur2 ' }).meta.selection).toBe('murmur2')
   })
 
   test('plans every selected row into exactly one owning job, and fails on an unknown row name', () => {
     const owners = Object.fromEntries(
-      manifest.entries.map((entry) => [entry.name, benchJobs.ownerOf(entry)])
+      manifest.entries
+        .filter((entry) => !entry.namedOnly)
+        .map((entry) => [entry.name, benchJobs.ownerOf(entry)])
     )
     const all = benchJobs.plan('')
     const once = all.units.filter(({ job }) => job !== 'share-rows').flatMap(({ rows }) => rows)

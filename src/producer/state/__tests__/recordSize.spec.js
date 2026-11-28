@@ -2,7 +2,7 @@ const { Kafka } = require('../../../../index')
 const Record = require('../../../protocol/recordBatch/record/v0')
 const buildRecordBatch = require('../../../protocol/requests/produce/buildRecordBatch')
 const Long = require('../../../utils/long')
-const { createErrorFromCode } = require('../../../protocol/error')
+const { partitionResults } = require('../../../protocol/requests/produce/partitionResults')
 const { mulberry32 } = require('../../../../testHelpers/schedule')
 const { wire, held, share, chargeOf, varintSize } = require('../recordSize')
 const Accumulator = require('../accumulator')
@@ -1067,13 +1067,25 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     await producer.disconnect()
   })
 
-  test('an error that names a failing record names the copy: equal in its fields, not the same object', async () => {
+  test("an error that names a failing record carries a copy of its bytes, not the caller's object", async () => {
     const { producer, cluster } = bufferedProducer()
-    cluster.broker.produce.mockImplementation(async () => {
-      const error = createErrorFromCode(87)
-      Object.assign(error, { topic: TOPIC, partition: 0, recordErrors: [{ batchIndex: 0 }] })
-      return [{ topicName: TOPIC, partition: 0, errorCode: 87, error, baseOffset: '-1' }]
-    })
+    cluster.broker.produce.mockImplementation(async () =>
+      partitionResults({
+        topics: [
+          {
+            topicName: TOPIC,
+            partitions: [
+              {
+                partition: 0,
+                errorCode: 87,
+                baseOffset: '-1',
+                recordErrors: [{ batchIndex: 0, batchIndexErrorMessage: null }],
+              },
+            ],
+          },
+        ],
+      })
+    )
     await producer.connect()
     const record = { key: 'k', value: 'refused' }
 
@@ -1082,7 +1094,11 @@ describe("Producer > the buffer > the producer's own copy of a send", () => {
     const error = sent.value
 
     expect(sent.state).toBe('rejected')
-    expect(error.recordErrors[0].record).toEqual(record)
+    expect(error.recordErrors[0].record).toEqual({
+      key: Buffer.from('k'),
+      value: Buffer.from('refused'),
+      headers: {},
+    })
     expect(error.recordErrors[0].record).not.toBe(record)
     await producer.disconnect()
   })
