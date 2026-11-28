@@ -11,6 +11,7 @@ const describeThrown = require('../network/describeThrown')
 const Broker = require('../broker')
 const { NodeSetupStates } = require('../network/connectionSetup')
 const MetadataCache = require('./metadataCache')
+const EndpointOrder = require('./endpointOrder')
 const createRetry = require('../retry')
 const shuffle = require('../utils/shuffle')
 const { CLUSTER_REBOOTSTRAP } = require('./instrumentationEvents')
@@ -273,11 +274,8 @@ module.exports = class BrokerPool {
     this.recoveries = 0
     /** Counts the responses published to `this.metadata`, so a refresh can tell it was superseded. */
     this.metadataPublications = 0
-    /**
-     * Advances with every published Metadata response and every learned endpoint installed, so an
-     * endpoint answer requested before either cannot move a known node back.
-     */
-    this.endpointRevision = 0
+    /** Orders every write of a node's endpoint into `this.brokers`; see `writeNodeEndpoint`. */
+    this.endpointOrder = new EndpointOrder()
     /** @type {import('../consumer/subscription')|null} default scope of a client-pattern consumer */
     this.consumerMetadataScope = null
     /** Advances when the default scope is registered or released, fencing earlier unscoped work. */
@@ -330,6 +328,7 @@ module.exports = class BrokerPool {
           throw new KafkaJSConnectionError('Recovery routing was superseded')
         }
         this.recoveries++
+        this.endpointOrder.supersedeAll()
         this.metadata = null
         this.metadataExpireAt = null
         for (const broker of values(table)) brokers.add(broker)
@@ -541,11 +540,13 @@ module.exports = class BrokerPool {
    *   names no node says -1).
    * - **A world that moved on underneath one `await`.** Between reading the current broker and the
    *   built replacement pool becoming ready, a concurrent rebootstrap/disconnect can empty
-   *   `this.brokers` or install another seed, or a second hint for the same node id can already
-   *   have written its own replacement. The table (and, for the seed, `this.seedBroker`) is
-   *   re-checked before writing; on a mismatch the freshly built pool - never handed to a
-   *   `Broker` - is retired instead of overwriting whatever is there now.
+   *   `this.brokers` or install another seed, or a newer Metadata response, hint or coordinator
+   *   answer can observe the same node. The table (and, for the seed, `this.seedBroker`) and the
+   *   node's newest observation are re-checked before writing; on a mismatch the freshly built
+   *   pool - never handed to a `Broker` - is retired instead of overwriting whatever is there now.
    *
+   * Each hint counts as observed when it is applied, so it is newer than every Metadata response
+   * published before it and older than every one published after it (see `writeNodeEndpoint`).
    * Adding an unknown node id is allowed; removing one is not - only a metadata response may
    * shrink the broker table.
    *
@@ -565,108 +566,161 @@ module.exports = class BrokerPool {
       return
     }
 
-    const options = { fence }
     for (const endpoint of nodeEndpoints) {
-      const replacing = this.applyNodeEndpoint(endpoint, options)
-      if (replacing) await replacing
+      const writing = this.applyNodeEndpoint(endpoint, { fence })
+      if (writing instanceof Promise) await writing
     }
   }
 
   /**
    * Reconciles one endpoint a response other than Metadata named for a node, whether or not the
-   * table holds that node, under the rules `applyNodeEndpoints` describes. An endpoint equal to the
-   * table's costs nothing but an in-place rack write, and returns synchronously.
-   *
-   * A known node moves only through a replacement whose in-flight requests drain in the
-   * background. With `since`, it moves only while `endpointRevision` still equals it, before and
-   * after the pool is built: a Metadata response published, or another learned endpoint installed,
-   * after the answer was requested is at least as new, so the table keeps it.
+   * table holds that node, under the rules `applyNodeEndpoints` describes, through
+   * `writeNodeEndpoint`. An endpoint equal to the table's costs nothing but an in-place rack write,
+   * and returns synchronously.
    * @public
    * @param {{ nodeId: number, host: string, port: number, rack?: string|null }} endpoint a
    *   missing `rack` (FindCoordinator carries none) keeps the rack the table holds
    * @param {object} [options]
    * @param {import('../producer/generation')} [options.fence] captured producer lifecycle; a pool
    *   completed after its close is retired unused and changes no routing state
-   * @param {number} [options.since] `endpointRevision` read before the answer was requested
-   * @returns {Promise<void>|undefined} a promise only while a replacement pool is built
+   * @param {number} [options.observedAt] `endpointStamp()` taken as the request that carried the
+   *   endpoint was sent; the endpoint counts as observed now when omitted
+   * @returns {boolean|Promise<boolean>} whether the table holds the node at this endpoint
+   *   afterwards; a promise only while a replacement pool is built. False when the endpoint is
+   *   unusable, or a newer observation of the node took its place.
    * @throws {Error} the lifecycle's close error
    */
-  applyNodeEndpoint({ nodeId, host, port, rack }, { fence, since } = {}) {
+  applyNodeEndpoint(endpoint, { fence, observedAt = this.endpointOrder.next() } = {}) {
+    const { nodeId, host, port } = endpoint
     if (!Number.isInteger(nodeId) || nodeId < 0 || !host || !Number.isInteger(port) || port <= 0) {
-      return
+      return false
     }
 
-    const broker = this.brokers[nodeId]
+    const previous = this.brokers[nodeId]
+    const adoptable =
+      previous === undefined && this.seedBroker && !values(this.brokers).includes(this.seedBroker)
+        ? this.seedBroker
+        : undefined
+    return this.writeNodeEndpoint(nodeId, previous, endpoint, { observedAt, fence, adoptable })
+  }
 
-    if (broker && !hasBrokerMoved(broker, { host, port })) {
-      if (rack !== undefined) broker.connectionPool.rack = rack
-      return
-    }
+  /**
+   * A stamp for an endpoint observation about to be requested: a FindCoordinator answer passes it
+   * to `applyNodeEndpoint`, so the answer is older than everything observed after its request left.
+   * @public
+   * @returns {number}
+   */
+  endpointStamp() {
+    return this.endpointOrder.next()
+  }
 
-    if (broker && since !== undefined && since !== this.endpointRevision) return
-
+  /**
+   * The one write of a node's endpoint into `this.brokers`, shared by Metadata responses, leader
+   * hints and FindCoordinator answers. It writes only while the table still holds `previous` for
+   * the node and `observedAt` is the node's newest observation (see `EndpointOrder`), and checks
+   * both again before it installs a pool it had to build, so an older observation never replaces a
+   * newer one, whichever finishes first. An equal address writes the rack in place; an address
+   * equal to `adoptable`'s adopts that seed; any other address goes to `replaceNodeEndpoint`.
+   * @private
+   * @param {number} nodeId the node
+   * @param {Broker|undefined} previous the table's broker for the node when the caller read it
+   * @param {{ host: string, port: number, rack?: string|null }} endpoint
+   * @param {object} options
+   * @param {number} options.observedAt the observation's stamp
+   * @param {import('../producer/generation')} [options.fence] captured producer lifecycle
+   * @param {() => boolean} [options.isCurrent] the caller's own authority, checked with the table's
+   * @param {Broker} [options.adoptable] the seed broker this node may adopt at the seed's address
+   * @param {boolean} [options.seedAddressTaken] another node of the same response holds the seed's
+   *   address, so a seed that moved off it keeps its pool and its node gets a new broker
+   * @returns {boolean|Promise<boolean>} whether the table holds the node at this endpoint
+   *   afterwards; a promise only while a replacement pool is built
+   * @throws {Error} the lifecycle's close error
+   */
+  writeNodeEndpoint(
+    nodeId,
+    previous,
+    { host, port, rack },
+    { observedAt, fence, isCurrent = () => true, adoptable, seedAddressTaken = false }
+  ) {
     if (
-      !broker &&
-      this.seedBroker &&
-      !values(this.brokers).includes(this.seedBroker) &&
-      !hasBrokerMoved(this.seedBroker, { host, port })
+      this.brokers[nodeId] !== previous ||
+      !isCurrent() ||
+      !this.endpointOrder.claim(nodeId, observedAt)
     ) {
-      this.seedBroker.nodeId = nodeId
-      this.bindTelemetryNode(this.seedBroker)
-      this.seedBroker.connectionPool.rack = rack ?? null
-      this.brokers[nodeId] = this.seedBroker
-      return
+      return this.holdsEndpoint(nodeId, { host, port })
     }
 
-    return this.replaceNodeEndpoint(nodeId, broker, {
+    if (previous && !hasBrokerMoved(previous, { host, port })) {
+      if (rack !== undefined) previous.connectionPool.rack = rack
+      return true
+    }
+
+    if (adoptable && !hasBrokerMoved(adoptable, { host, port })) {
+      adoptable.nodeId = nodeId
+      this.bindTelemetryNode(adoptable)
+      adoptable.connectionPool.rack = rack ?? null
+      this.brokers[nodeId] = adoptable
+      this.closeObsolete(previous)
+      return true
+    }
+
+    return this.replaceNodeEndpoint(nodeId, previous, {
       host,
       port,
-      rack: rack === undefined ? (broker?.connectionPool.rack ?? null) : rack,
+      rack: rack === undefined ? (previous?.connectionPool.rack ?? null) : rack,
+      observedAt,
       fence,
-      since: broker === undefined ? undefined : since,
+      isCurrent,
+      inPlace: previous !== undefined && previous === this.seedBroker && !seedAddressTaken,
     })
   }
 
   /**
    * Builds the pool for a node's new endpoint and installs it while the table still holds the
-   * broker it was built to replace, then retires that broker in the background.
+   * broker it was built to replace and no newer observation of the node arrived, then retires that
+   * broker, or for the seed the pool it replaced, in the background.
    * @private
    * @param {number} nodeId the node
-   * @param {Broker|undefined} broker the table's broker for the node, if any
+   * @param {Broker|undefined} previous the table's broker for the node, if any
    * @param {object} target
    * @param {string} target.host
    * @param {number} target.port
    * @param {string|null} target.rack
+   * @param {number} target.observedAt the observation's stamp
    * @param {import('../producer/generation')} [target.fence] captured producer lifecycle
-   * @param {number} [target.since] revision the table must still be at
-   * @returns {Promise<void>}
+   * @param {() => boolean} target.isCurrent the caller's own authority
+   * @param {boolean} target.inPlace `previous` is the seed, whose pool is swapped in place
+   * @returns {Promise<boolean>} whether the table holds the node at this endpoint afterwards
    * @throws {Error} the lifecycle's close error
    */
-  async replaceNodeEndpoint(nodeId, broker, { host, port, rack, fence, since }) {
-    const isSeed = broker !== undefined && broker === this.seedBroker
-    const isCurrent = () =>
-      this.brokers[nodeId] === broker &&
-      (!isSeed || this.seedBroker === broker) &&
-      (since === undefined || this.endpointRevision === since)
+  async replaceNodeEndpoint(
+    nodeId,
+    previous,
+    { host, port, rack, observedAt, fence, isCurrent, inPlace }
+  ) {
+    const owns = () =>
+      isCurrent() &&
+      this.brokers[nodeId] === previous &&
+      (!inPlace || this.seedBroker === previous) &&
+      this.endpointOrder.owns(nodeId, observedAt)
     const connectionPool = await this.buildConnectionPool(
       { host, port, rack },
-      { fence, isCurrent }
+      { fence, isCurrent: owns }
     )
-    if (!connectionPool) return
+    if (!connectionPool) return this.holdsEndpoint(nodeId, { host, port })
     if (fence?.closed || currentDeadline()?.guard()) {
       this.closePool(connectionPool)
       fence?.check()
       checked(null)
     }
 
-    if (!isCurrent()) {
+    if (!owns()) {
       this.closePool(connectionPool)
-      return
+      return this.holdsEndpoint(nodeId, { host, port })
     }
 
-    this.endpointRevision++
-    if (isSeed) {
-      this.replacePool(broker, connectionPool)
+    if (inPlace) {
+      this.replacePool(previous, connectionPool)
     } else {
       this.brokers[nodeId] = this.createBroker({
         logger: this.rootLogger,
@@ -674,10 +728,22 @@ module.exports = class BrokerPool {
         connectionPool,
         nodeId,
       })
-      this.closeObsolete(broker)
+      this.closeObsolete(previous)
     }
     this.setupMetadataEndpoints.set(String(nodeId), `${host}:${port}`)
     this.retainSetupEndpoints()
+    return this.holdsEndpoint(nodeId, { host, port })
+  }
+
+  /**
+   * @private
+   * @param {number|string} nodeId
+   * @param {{ host: string, port: number }} address
+   * @returns {boolean} whether the table holds the node at this address
+   */
+  holdsEndpoint(nodeId, address) {
+    const broker = this.brokers[nodeId]
+    return broker !== undefined && !hasBrokerMoved(broker, address)
   }
 
   /**
@@ -1037,6 +1103,7 @@ module.exports = class BrokerPool {
     if (this.seedBroker) brokers.add(this.seedBroker)
     this.disconnects++
     this.brokers = {}
+    this.endpointOrder.supersedeAll()
     this.metadata = null
     this.versions = null
     this.authenticationBlackout.clear()
@@ -1112,14 +1179,17 @@ module.exports = class BrokerPool {
    * Refreshes may overlap, and their replies may arrive in one read. Each response takes a
    * publication number when it is assigned to `this.metadata`, and a refresh stops reconciling the
    * broker table as soon as a newer response has been published: the topology last published is
-   * the one installed, and a pool built for an older one is closed unused.
+   * the one installed, and a pool built for an older one is closed unused. A published response is
+   * also the newest observation of every node, and each node is written through `writeNodeEndpoint`:
+   * a leader hint applied, or a FindCoordinator request sent, after the publication is newer for its
+   * node, so the response neither overwrites nor removes that node.
    *
-   * `findConnectedBroker()` and the seed host/port read happen **inside** the retry callback:
+   * `findConnectedBroker()` and the seed read happen **inside** the retry callback:
    * a rebootstrap partway through this method (trigger (c), fired from inside
    * `findConnectedBroker()`, or a concurrent direct `rebootstrap()` call) disconnects the broker
    * and rebuilds the seed, so re-resolving both on every iteration is what keeps an attempt from
    * calling a disconnected object or building a duplicate `Broker` for the seed's own node id via
-   * a stale `seedHost`/`seedPort` pair. A rebootstrap during the first selection lets the request
+   * a stale seed. A rebootstrap during the first selection lets the request
    * go to a current broker; once a request was sent, a rebootstrap stops the refresh, which
    * rejects as retriable instead of trying again. `findConnectedBroker()`'s own throw is `bail()`ed
    * immediately rather than left for the retrier to reclassify - the retrier's generic
@@ -1250,7 +1320,6 @@ module.exports = class BrokerPool {
         // state within one attempt.
         if (!applicable()) return
         const seedBroker = this.seedBroker
-        const { host: seedHost, port: seedPort } = seedBroker ? seedBroker.connectionPool : {}
 
         try {
           dispatched = true
@@ -1287,7 +1356,7 @@ module.exports = class BrokerPool {
           // unavailability. Everything below reads this local instead.
           const metadata = this.metadata
           const publication = ++this.metadataPublications
-          this.endpointRevision++
+          const observedAt = this.endpointOrder.supersedeAll()
           const isLatest = () =>
             applicable() &&
             this.metadataPublications === publication &&
@@ -1312,59 +1381,27 @@ module.exports = class BrokerPool {
           this.retainSetupEndpoints()
           const previousBrokers = { ...this.brokers }
           const freshBrokerIds = new Set(metadata.brokers.map(({ nodeId }) => String(nodeId)))
-          const seedAddressAdvertised = metadata.brokers.some(
-            ({ host, port }) => host === seedHost && port === seedPort
-          )
+          const seedAddressTaken =
+            Boolean(seedBroker) &&
+            metadata.brokers.some((endpoint) => !hasBrokerMoved(seedBroker, endpoint))
+          const ownsImage = () => isLatest() && this.seedBroker === seedBroker
           for (const { nodeId, host, port, rack } of metadata.brokers) {
-            const previous = previousBrokers[nodeId]
-            if (
-              !isLatest() ||
-              this.brokers[nodeId] !== previous ||
-              this.seedBroker !== seedBroker
-            ) {
-              continue
-            }
-            if (previous && !hasBrokerMoved(previous, { host, port })) {
-              previous.connectionPool.rack = rack
-              continue
-            }
-            if (seedBroker && host === seedHost && port === seedPort) {
-              seedBroker.nodeId = nodeId
-              this.bindTelemetryNode(seedBroker)
-              seedBroker.connectionPool.rack = rack
-              this.brokers[nodeId] = seedBroker
-              this.closeObsolete(previous)
-              continue
-            }
-            const ownsNode = () =>
-              isLatest() && this.brokers[nodeId] === previous && this.seedBroker === seedBroker
-            const connectionPool = await this.buildConnectionPool(
+            if (!ownsImage()) continue
+            const writing = this.writeNodeEndpoint(
+              nodeId,
+              previousBrokers[nodeId],
               { host, port, rack },
-              { fence, isCurrent: ownsNode }
+              { observedAt, fence, isCurrent: ownsImage, adoptable: seedBroker, seedAddressTaken }
             )
-            if (!connectionPool) continue
-            if (
-              !isLatest() ||
-              this.brokers[nodeId] !== previous ||
-              this.seedBroker !== seedBroker
-            ) {
-              this.closePool(connectionPool)
-              continue
-            }
-            if (previous && previous === seedBroker && !seedAddressAdvertised) {
-              this.replacePool(previous, connectionPool)
-            } else {
-              this.brokers[nodeId] = this.createBroker({
-                logger: this.rootLogger,
-                versions: this.versions,
-                connectionPool,
-                nodeId,
-              })
-              this.closeObsolete(previous)
-            }
+            if (writing instanceof Promise) await writing
           }
           for (const [nodeId, previous] of Object.entries(previousBrokers)) {
-            if (isLatest() && !freshBrokerIds.has(nodeId) && this.brokers[nodeId] === previous) {
+            if (
+              isLatest() &&
+              !freshBrokerIds.has(nodeId) &&
+              this.brokers[nodeId] === previous &&
+              this.endpointOrder.owns(nodeId, observedAt)
+            ) {
               if (previous === this.seedBroker) delete this.brokers[nodeId]
               else this.closeObsolete(previous)
             }

@@ -209,6 +209,11 @@ module.exports = class Cluster {
     this.logger = rootLogger.namespace('Cluster')
     this.retryOptions = { ...retry }
     this.retrier = (action) => retrierOf(this.retryOptions)(action)
+    /**
+     * Each FindCoordinator answer by the `BrokerPool#endpointStamp` taken as its request was sent.
+     * @type {WeakMap<object, number>}
+     */
+    this.coordinatorAnswerStamps = new WeakMap()
     this.connectionPoolBuilder = connectionPoolBuilder({
       telemetryMetrics,
       logger: rootLogger,
@@ -1703,10 +1708,15 @@ module.exports = class Cluster {
   /**
    * The broker coordinating a group or a transactional id, reached at the address FindCoordinator
    * answered with, as the Java client reaches it, so no Metadata response is needed first. The
-   * answer goes through `BrokerPool#applyNodeEndpoint`: a node the table does not hold is added,
-   * and a known node at another address is replaced (keeping its rack) unless a Metadata response
-   * or another learned endpoint changed the table after this lookup asked. A coordinator the table
-   * holds at that address is its cached broker.
+   * answer goes through `BrokerPool#applyNodeEndpoint`, stamped as its request was sent: a node the
+   * table does not hold is added, and a known node at another address is replaced (keeping its
+   * rack). A coordinator the table holds at that address is its cached broker.
+   *
+   * When a Metadata response published, a leader hint applied or another answer requested for the
+   * same node after this request left (or a disconnect or rebootstrap since) is newer, and the table
+   * does not hold the node at the answered address, the answer is not used: the lookup fails with a
+   * retriable `KafkaJSBrokerNotFound`, refreshes metadata and asks again within its retries.
+   * Observations of other nodes never affect the answer.
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
    * @public
    * @param {object} params
@@ -1720,8 +1730,9 @@ module.exports = class Cluster {
   async findGroupCoordinator({ groupId, coordinatorType = COORDINATOR_TYPES.GROUP, fence }) {
     return this.retryFor(fence)(async (bail, retryCount, retryTime) => {
       try {
-        const since = this.brokerPool.endpointRevision
-        const { coordinator } = await this.findGroupCoordinatorMetadata({
+        // Stands for the request's stamp when an overridden lookup returned an answer it never saw.
+        const lookupStamp = this.brokerPool.endpointStamp()
+        const answer = await this.findGroupCoordinatorMetadata({
           groupId,
           coordinatorType,
           fence,
@@ -1729,11 +1740,20 @@ module.exports = class Cluster {
         fence?.check()
         checked(null)
 
-        const installing = this.brokerPool.applyNodeEndpoint(coordinator, { fence, since })
-        if (installing) {
-          await installing
+        const { coordinator } = answer
+        let held = this.brokerPool.applyNodeEndpoint(coordinator, {
+          fence,
+          observedAt: this.coordinatorAnswerStamps.get(answer) ?? lookupStamp,
+        })
+        if (held instanceof Promise) {
+          held = await held
           fence?.check()
           checked(null)
+        }
+        if (!held) {
+          throw new KafkaJSBrokerNotFound(
+            `Coordinator ${coordinator.nodeId} answered at ${coordinator.host}:${coordinator.port} was superseded by a newer endpoint of that node`
+          )
         }
 
         return await this.findBroker({ nodeId: coordinator.nodeId, fence })
@@ -1791,6 +1811,7 @@ module.exports = class Cluster {
         try {
           fence?.check()
           checked(null)
+          const requestStamp = this.brokerPool.endpointStamp()
           const brokerMetadata = await broker.findGroupCoordinator({
             groupId,
             coordinatorType,
@@ -1802,6 +1823,7 @@ module.exports = class Cluster {
             broker: brokerMetadata.host,
             nodeId: brokerMetadata.coordinator.nodeId,
           })
+          this.coordinatorAnswerStamps.set(brokerMetadata, requestStamp)
           return brokerMetadata
         } catch (e) {
           fence?.check()

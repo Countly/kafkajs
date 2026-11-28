@@ -343,48 +343,77 @@ describe('Consumer > broker outages', () => {
     expect(events.crashes).toEqual([])
   })
 
-  it('a coordinator that keeps its node id and moves to a new address while the old one stays up is reached there, without a rejoin', async () => {
-    // The coordinator's new address; the scripted cluster names this endpoint node 2.
-    const moved = { id: 2, host: 'node1-moved', port: 9092 }
-    const [seed] = NODES
-    const { cluster, events } = scenario(
-      {},
-      { brokers: [`${seed.host}:${seed.port}`] },
-      { nodes: [...NODES, moved] }
-    )
-    const listed = cluster.answerers.get('Metadata')
-    cluster.answer('Metadata', (...args) => {
-      const answer = listed(...args)
-      return { ...answer, brokers: answer.brokers.filter(({ nodeId }) => nodeId !== moved.id) }
-    })
-    await start(events)
-    await until(() => events.records.length === 1, 'the first record')
+  it.each([
+    ['classic', 'Heartbeat'],
+    ['consumer', 'ConsumerGroupHeartbeat'],
+  ])(
+    'a %s member whose coordinator keeps its node id and moves to a new address while the old one stays up heartbeats there, without a rejoin',
+    async (groupProtocol, heartbeatApi) => {
+      const classic = groupProtocol === 'classic'
+      // The coordinator's new address; the scripted cluster names this endpoint node 2.
+      const moved = { id: 2, host: 'node1-moved', port: 9092 }
+      const [seed] = NODES
+      const script = classic ? groupScript : consumerProtocolScript
+      const cluster = script(
+        createScriptedCluster({
+          nodes: [...NODES, moved],
+          profile: classic ? 'default' : 'consumer',
+        }),
+        { coordinator: COORDINATOR, batches: 1 }
+      )
+      const listed = cluster.answerers.get('Metadata')
+      cluster.answer('Metadata', (...args) => {
+        const answer = listed(...args)
+        return { ...answer, brokers: answer.brokers.filter(({ nodeId }) => nodeId !== moved.id) }
+      })
+      consumer = new Kafka(
+        cluster.kafkaOptions({ retry: RETRY, brokers: [`${seed.host}:${seed.port}`] })
+      ).consumer({
+        groupId: 'outage-group',
+        groupProtocol,
+        ...(classic && { sessionTimeout: SESSION_TIMEOUT, heartbeatInterval: 100 }),
+        maxWaitTimeInMs: 20,
+        retry: RETRY,
+      })
+      const events = { crashes: [], records: [] }
+      consumer.on(consumer.events.CRASH, ({ payload }) => events.crashes.push(payload))
+      await start(events)
+      await until(() => events.records.length === 1, 'the first record')
+      const joins = () =>
+        classic
+          ? wire(cluster, 'JoinGroup')
+          : wire(cluster, heartbeatApi).filter(({ fields }) => fields.memberEpoch === 0)
+      expect(joins()).toHaveLength(1)
 
-    const movedAt = cluster.requests().length
-    cluster.answer('FindCoordinator', ({ coordinatorKeys }) => ({
-      coordinators: coordinatorKeys.map((key) => ({
-        key,
-        nodeId: COORDINATOR,
-        host: moved.host,
-        port: moved.port,
-        errorCode: 0,
-        errorMessage: null,
-      })),
-    }))
-    cluster.answer('Heartbeat', (_fields, { node }) =>
-      node === COORDINATOR ? { errorCode: NOT_COORDINATOR } : {}
-    )
-    await until(
-      () => wire(cluster, 'Heartbeat', movedAt).some(({ node }) => node === moved.id),
-      'a heartbeat to the moved address',
-      400
-    )
+      const movedAt = cluster.requests().length
+      cluster.answer('FindCoordinator', ({ coordinatorKeys }) => ({
+        coordinators: coordinatorKeys.map((key) => ({
+          key,
+          nodeId: COORDINATOR,
+          host: moved.host,
+          port: moved.port,
+          errorCode: 0,
+          errorMessage: null,
+        })),
+      }))
+      const answered = cluster.answerers.get(heartbeatApi)
+      cluster.answer(heartbeatApi, (fields, call) =>
+        call.node === COORDINATOR
+          ? { errorCode: NOT_COORDINATOR }
+          : (answered?.(fields, call) ?? {})
+      )
+      const reached = cluster.schedule.hold({ api: heartbeatApi, node: moved.id })
+      const beat = await reached.arrived()
+      reached.release()
 
-    expect(wire(cluster, 'Heartbeat', movedAt).some(({ node }) => node === COORDINATOR)).toBe(true)
-    expect(wire(cluster, 'JoinGroup')).toHaveLength(1)
-    expect(events.rebalancing).toEqual([])
-    expect(events.crashes).toEqual([])
-  })
+      expect(wire(cluster, heartbeatApi, movedAt).some(({ node }) => node === COORDINATOR)).toBe(
+        true
+      )
+      expect(beat.fields).toMatchObject(classic ? { groupGenerationId: 1 } : { memberEpoch: 1 })
+      expect(joins()).toHaveLength(1)
+      expect(events.crashes).toEqual([])
+    }
+  )
 
   it.each([
     ['an eager', {}],
