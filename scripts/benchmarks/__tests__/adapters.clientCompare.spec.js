@@ -3,6 +3,9 @@ const path = require('node:path')
 const yaml = require('js-yaml')
 const adapter = require('../adapters/clientCompare')
 const manifest = require('../manifest.json')
+const { RequestBudget, encodedBound } = require('../../../src/producer/state/recordSize')
+const { Types } = require('../../../src/protocol/message/compression')
+const Record = require('../../../src/protocol/recordBatch/record/v0')
 
 const ROOT = path.join(__dirname, '..', '..', '..')
 const ARMS = ['fork', 'kafkajs@2.2.4']
@@ -66,7 +69,14 @@ describe('Benchmark report clientCompare adapter', () => {
       }
     })
 
-    test('the compare rows cover 200-byte and 1 KiB records, lz4, 12 partitions and a same-settings consume row', () => {
+    test('the compare rows cover 50-byte to 1 MB records, 15 and 17 KiB, lz4, gzip, 1, 12 and 100 partitions and a same-settings consume row', () => {
+      const produce = (size, compression = 'none', partitions = '3') => [
+        'produce-throughput',
+        size,
+        compression,
+        partitions,
+        'defaults',
+      ]
       const shape = (row) => [
         valueOf(row.command, '--workload'),
         valueOf(row.command, '--size') ?? '200',
@@ -83,6 +93,19 @@ describe('Benchmark report clientCompare adapter', () => {
         'compare-produce-throughput-1k': ['produce-throughput', '1024', 'none', '3', 'defaults'],
         'compare-produce-throughput-lz4': ['produce-throughput', '200', 'lz4', '3', 'defaults'],
         'compare-produce-throughput-12p': ['produce-throughput', '200', 'none', '12', 'defaults'],
+        'compare-produce-throughput-100k': produce('102400'),
+        'compare-produce-throughput-1m': produce('1000000'),
+        'compare-produce-throughput-15k': produce('15360'),
+        'compare-produce-throughput-17k': produce('17408'),
+        'compare-produce-throughput-12p-keyed': produce('200', 'none', '12'),
+        'compare-produce-throughput-string-200': produce('200'),
+        'compare-produce-throughput-string-1k': produce('1024'),
+        'compare-produce-throughput-100k-gzip': produce('102400', 'gzip'),
+        'compare-produce-throughput-100k-lz4': produce('102400', 'lz4'),
+        'compare-produce-throughput-coalesced': produce('200', 'none', '1'),
+        'compare-produce-throughput-fanout-100p': produce('50', 'none', '100'),
+        'compare-produce-throughput-custom': produce('200', 'none', '12'),
+        'compare-produce-throughput-headers': produce('200'),
         'compare-consume-throughput': ['consume-throughput', '200', 'none', '3', 'defaults'],
         'compare-consume-throughput-same': ['consume-throughput', '200', 'none', '3', 'same'],
         'compare-consume-throughput-1k': ['consume-throughput', '1024', 'none', '3', 'defaults'],
@@ -130,6 +153,231 @@ describe('Benchmark report clientCompare adapter', () => {
       expect(compareRows.filter((row) => 'profile' in row && row.profile !== true)).toEqual([])
     })
 
+    test('the new produce rows set the flags their shape needs and no other', () => {
+      const shapeFlags = [
+        '--batch',
+        '--unawaited',
+        '--keys',
+        '--headers',
+        '--partitioner',
+        '--value-type',
+      ]
+      const extras = (name) => {
+        const row = compareRows.find((candidate) => candidate.name === name)
+        return Object.fromEntries(
+          shapeFlags
+            .filter((flag) => valueOf(row.command, flag) !== undefined)
+            .map((flag) => [flag, valueOf(row.command, flag)])
+        )
+      }
+      const names = compareRows
+        .map(({ name }) => name)
+        .filter((name) => name.startsWith('compare-produce-throughput'))
+
+      expect(Object.fromEntries(names.map((name) => [name, extras(name)]))).toEqual({
+        'compare-produce-throughput': {},
+        'compare-produce-throughput-same': {},
+        'compare-produce-throughput-1k': {},
+        'compare-produce-throughput-lz4': {},
+        'compare-produce-throughput-12p': {},
+        'compare-produce-throughput-100k': { '--batch': '8' },
+        'compare-produce-throughput-1m': { '--batch': '1' },
+        'compare-produce-throughput-15k': { '--batch': '32' },
+        'compare-produce-throughput-17k': { '--batch': '32' },
+        'compare-produce-throughput-12p-keyed': { '--keys': 'index' },
+        'compare-produce-throughput-string-200': { '--value-type': 'string' },
+        'compare-produce-throughput-string-1k': { '--value-type': 'string' },
+        'compare-produce-throughput-100k-gzip': { '--batch': '8' },
+        'compare-produce-throughput-100k-lz4': { '--batch': '8' },
+        'compare-produce-throughput-coalesced': { '--unawaited': '100' },
+        'compare-produce-throughput-fanout-100p': { '--keys': 'index' },
+        'compare-produce-throughput-custom': { '--partitioner': 'custom' },
+        'compare-produce-throughput-headers': { '--headers': '20' },
+      })
+    })
+
+    test('the fork built-in gzip and lz4 bounds of a split of bytes over batches never exceed the bound of the whole plus the empty batch and one block of rounding per extra batch', () => {
+      const edges = [0, 1, 4095, 4096, 16383, 16384, 65535, 65536, 65537, 131072, 819360, 1048576]
+      const rounding = (codec) => (codec === Types.LZ4 ? 8 : 0)
+
+      for (const codec of [Types.GZIP, Types.LZ4]) {
+        for (const a of edges) {
+          for (const b of edges) {
+            const split = encodedBound(codec, a) + encodedBound(codec, b)
+            const whole = encodedBound(codec, a + b) + encodedBound(codec, 0) + rounding(codec)
+            expect([codec, a, b, split <= whole]).toEqual([codec, a, b, true])
+          }
+        }
+      }
+    })
+
+    test("a send of every produce-throughput row, with records at their real encoded size at the longest key and all their headers, fits one request under the producer's request budget for every split of its records over the partitions it can reach (framing, topic name, a batch header and partition framing per partition, the fork's built-in codec bound for any split) at the default 1 MiB limit", () => {
+      const produceRows = compareRows.filter(
+        (row) => valueOf(row.command, '--workload') === 'produce-throughput'
+      )
+      const codecs = { lz4: Types.LZ4, gzip: Types.GZIP }
+      const rounding = (codec) => (codec === Types.LZ4 ? 8 : 0)
+      const budget = new RequestBudget({
+        maxRequestSize: 1048576,
+        clientId: 'bench-compare-produce-throughput',
+      })
+      const topic = `bench-compare-produce-throughput-${process.pid}-${Date.now()}`
+      const planned = {}
+
+      expect(produceRows.length).toBeGreaterThan(0)
+      expect(encodedBound(Types.GZIP, 1000)).toBeGreaterThan(1000)
+      expect(encodedBound(Types.LZ4, 1000)).toBeGreaterThan(1000)
+      for (const row of produceRows) {
+        const size = Number(valueOf(row.command, '--size') ?? 200)
+        const headerCount = Number(valueOf(row.command, '--headers') ?? 0)
+        const partitions = Number(valueOf(row.command, '--partitions') ?? 3)
+        const perSend = Number(
+          valueOf(row.command, '--unawaited') ?? valueOf(row.command, '--batch') ?? 500
+        )
+        const headers = Object.fromEntries(
+          Array.from({ length: headerCount }, (_, i) => [`h${i}`, `v${i}`])
+        )
+        const record = Record({
+          offsetDelta: perSend - 1,
+          timestampDelta: 1e9,
+          key: valueOf(row.command, '--keys') ? Buffer.from('9999999') : null,
+          value: Buffer.alloc(size, 0x78),
+          headers,
+        })
+        // However the records split, they make at most `batches` non-empty batches, and the wire
+        // bytes of all of them together are the same. Per batch the plan adds a fixed amount and
+        // the codec's bound; the bounds of the parts sum to at most the bound of the whole plus
+        // the empty batch's bound and the codec's rounding for each part after the first.
+        const batches = Math.min(partitions, perSend)
+        const wire = perSend * record.buffer.length
+        const compression = codecs[valueOf(row.command, '--compression')]
+        const empty = budget.batchBytes({ compression, messages: [], wire: 0 })
+        const worst =
+          batches * empty +
+          encodedBound(compression, wire) -
+          encodedBound(compression, 0) +
+          (batches - 1) * rounding(compression)
+        planned[row.name] = budget.topicBytes(topic) + worst <= budget.maxRequestBytes
+      }
+
+      expect(planned).toEqual(Object.fromEntries(produceRows.map(({ name }) => [name, true])))
+    })
+
+    test('the 15 KiB and 17 KiB rows put their values 1 KiB under and over 16 KiB', () => {
+      const sizeOf = (name) =>
+        Number(valueOf(compareRows.find((row) => row.name === name).command, '--size'))
+
+      expect(sizeOf('compare-produce-throughput-15k')).toBe(16384 - 1024)
+      expect(sizeOf('compare-produce-throughput-17k')).toBe(16384 + 1024)
+    })
+
+    test('every produce-throughput row measures rate, CPU and window in its five runs, and the send-call, memory and garbage-collection metrics in one extra run with --probe on that no command carries', () => {
+      const produceRows = compareRows.filter(
+        (row) => valueOf(row.command, '--workload') === 'produce-throughput'
+      )
+
+      expect(produceRows.length).toBeGreaterThan(0)
+      for (const row of produceRows) {
+        expect([row.name, row.metrics, row.command.includes('--probe')]).toEqual([
+          row.name,
+          [
+            { key: 'messagesPerSecond', unit: 'msg/s' },
+            { key: 'cpuMicrosPerMessage', unit: 'us' },
+            { key: 'elapsedMs', unit: 'ms' },
+          ],
+          false,
+        ])
+        expect([row.name, row.diagnostic]).toEqual([
+          row.name,
+          {
+            args: ['--probe', 'on'],
+            metrics: [
+              { key: 'sendCallMicrosP50', unit: 'us' },
+              { key: 'sendCallMicrosP99', unit: 'us' },
+              { key: 'peakRssBytes', unit: 'bytes' },
+              { key: 'peakArrayBuffers', unit: 'bytes' },
+              { key: 'gcCountPer10kMessages', unit: 'collections' },
+              { key: 'gcPauseMsPer10kMessages', unit: 'ms' },
+            ],
+          },
+        ])
+      }
+      for (const row of compareRows.filter((candidate) => !produceRows.includes(candidate))) {
+        expect([row.name, 'diagnostic' in row]).toEqual([row.name, false])
+      }
+    })
+
+    test('the five produce rows that ran before the record-handling rows keep their commands and their three metrics', () => {
+      const byName = (name) => compareRows.find((row) => row.name === name)
+      const base = ['scripts/benchmarks/clientCompare.js', '--client', '{client}', '--package']
+      const common = [...base, '{package}', '--workload', 'produce-throughput']
+
+      expect(byName('compare-produce-throughput').command).toEqual([
+        ...common,
+        '--duration-ms',
+        '30000',
+      ])
+      expect(byName('compare-produce-throughput-same').command).toEqual([
+        ...common,
+        '--duration-ms',
+        '30000',
+        '--settings',
+        'same',
+      ])
+      expect(byName('compare-produce-throughput-1k').command).toEqual([
+        ...common,
+        '--duration-ms',
+        '30000',
+        '--size',
+        '1024',
+      ])
+      expect(byName('compare-produce-throughput-lz4').command).toEqual([
+        ...common,
+        '--duration-ms',
+        '30000',
+        '--compression',
+        'lz4',
+      ])
+      expect(byName('compare-produce-throughput-12p').command).toEqual([
+        ...common,
+        '--duration-ms',
+        '30000',
+        '--partitions',
+        '12',
+      ])
+      for (const name of [
+        'compare-produce-throughput',
+        'compare-produce-throughput-same',
+        'compare-produce-throughput-1k',
+        'compare-produce-throughput-lz4',
+        'compare-produce-throughput-12p',
+      ]) {
+        expect([name, byName(name).metrics.map(({ key }) => key)]).toEqual([
+          name,
+          ['messagesPerSecond', 'cpuMicrosPerMessage', 'elapsedMs'],
+        ])
+      }
+    })
+
+    test('the rows that measure the producer record handling run only when named, and no other compare row does', () => {
+      expect(compareRows.filter((row) => row.namedOnly).map(({ name }) => name)).toEqual([
+        'compare-produce-throughput-100k',
+        'compare-produce-throughput-1m',
+        'compare-produce-throughput-15k',
+        'compare-produce-throughput-17k',
+        'compare-produce-throughput-12p-keyed',
+        'compare-produce-throughput-string-200',
+        'compare-produce-throughput-string-1k',
+        'compare-produce-throughput-100k-gzip',
+        'compare-produce-throughput-100k-lz4',
+        'compare-produce-throughput-coalesced',
+        'compare-produce-throughput-fanout-100p',
+        'compare-produce-throughput-custom',
+        'compare-produce-throughput-headers',
+      ])
+      expect(compareRows.filter((row) => 'namedOnly' in row && row.namedOnly !== true)).toEqual([])
+    })
+
     test('the 1 KiB same-settings consume row is the 1 KiB consume row with --settings same', () => {
       const byName = (name) => compareRows.find((row) => row.name === name)
       const defaults = byName('compare-consume-throughput-1k')
@@ -143,14 +391,31 @@ describe('Benchmark report clientCompare adapter', () => {
       expect(valueOf(defaults.command, '--settings')).toBeUndefined()
     })
 
-    test('the planned compare minutes fit the bench job timeout with 20 minutes left for setup', () => {
+    test('the planned compare minutes of the rows that run by default, the extra diagnostic runs included, leave a 20-minute planning allowance below the bench job timeout', () => {
+      // Planning headroom from the planning costs below, not a measurement of setup time.
       const workflow = yaml.load(
         fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'bench.yml'), 'utf8')
       )
-      const minutes = compareRows.reduce((sum, row) => sum + adapter.plannedSeconds(row), 0) / 60
+      const minutesOf = (rows) =>
+        rows.reduce((sum, row) => sum + adapter.plannedSeconds(row), 0) / 60
+      const limit = workflow.jobs.bench['timeout-minutes']
 
-      expect(Math.round(minutes)).toBe(208)
-      expect(minutes + 20).toBeLessThanOrEqual(workflow.jobs.bench['timeout-minutes'])
+      expect(Math.round(minutesOf(compareRows.filter((row) => !row.namedOnly)))).toBe(215)
+      expect(minutesOf(compareRows.filter((row) => !row.namedOnly)) + 20).toBeLessThanOrEqual(limit)
+    })
+
+    test('the named-only compare rows, the extra diagnostic runs included, leave a 20-minute planning allowance together, and with the default compare rows they would not', () => {
+      // Planning headroom from the planning costs below, not a measurement of setup time.
+      const workflow = yaml.load(
+        fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'bench.yml'), 'utf8')
+      )
+      const minutesOf = (rows) =>
+        rows.reduce((sum, row) => sum + adapter.plannedSeconds(row), 0) / 60
+      const limit = workflow.jobs.bench['timeout-minutes']
+
+      expect(Math.round(minutesOf(compareRows.filter((row) => row.namedOnly)))).toBe(96)
+      expect(minutesOf(compareRows.filter((row) => row.namedOnly)) + 20).toBeLessThanOrEqual(limit)
+      expect(minutesOf(compareRows) + 20).toBeGreaterThan(limit)
     })
   })
 
@@ -184,6 +449,141 @@ describe('Benchmark report clientCompare adapter', () => {
       expect(
         adapter.plannedSeconds({ command: ['--duration-ms', '30000'], arms: ARMS, profile: true })
       ).toBe(37 * 6 * 2)
+    })
+
+    test('counts one more run per arm for a diagnostic run, on top of a profile run', () => {
+      const command = ['--duration-ms', '30000']
+      const diagnostic = { args: ['--probe', 'on'], metrics: [] }
+
+      expect(adapter.plannedSeconds({ command, arms: ARMS, diagnostic })).toBe(37 * 6 * 2)
+      expect(adapter.plannedSeconds({ command, arms: ARMS, profile: true, diagnostic })).toBe(
+        37 * 7 * 2
+      )
+    })
+  })
+
+  describe('diagnostic rows', () => {
+    const probed = {
+      ...entry,
+      command: ['scripts/benchmarks/clientCompare.js', '--workload', 'produce-throughput'],
+      diagnostic: {
+        args: ['--probe', 'on'],
+        metrics: [
+          { key: 'sendCallMicrosP50', unit: 'us' },
+          { key: 'peakRssBytes', unit: 'bytes' },
+        ],
+      },
+    }
+    const outputs = [output(100, 30000), output(110, 31000), output(90, 32000)]
+    const probe = (elapsedMs = 30500, extra = { sendCallMicrosP50: 12.5, peakRssBytes: 4e8 }) =>
+      output(50, elapsedMs, extra)
+    const view = ({ rows }) =>
+      rows.map(({ metric, status, runs, median, min, max, reason }) => ({
+        metric,
+        status,
+        runs,
+        median,
+        min,
+        max,
+        reason,
+      }))
+    const single = (metric, value) => ({
+      metric,
+      status: 'valid',
+      runs: 1,
+      median: value,
+      min: value,
+      max: value,
+    })
+    const diagnosticOf = (result) =>
+      view(result)
+        .slice(2)
+        .map(({ metric, status, reason }) => [metric, status, reason])
+    const medianOf = (result) =>
+      view(result)
+        .slice(0, 2)
+        .map(({ status, median }) => [status, median])
+
+    test('an arm reports its diagnostic metrics from the one extra run beside the medians of its runs, keeps them out of the spread table and says where they come from', () => {
+      const result = adapter.rows(probed, 'fork', { outputs, diagnostic: { output: probe() } }, 3)
+
+      expect(view(result)).toEqual([
+        { metric: 'messagesPerSecond', status: 'valid', runs: 3, median: 100, min: 90, max: 110 },
+        { metric: 'elapsedMs', status: 'valid', runs: 3, median: 31000, min: 30000, max: 32000 },
+        single('sendCallMicrosP50', 12.5),
+        single('peakRssBytes', 4e8),
+      ])
+      expect(result.detail.status).toBe('valid')
+      expect(result.detail.table.rows.map(([metric]) => metric)).toEqual([
+        'messagesPerSecond',
+        'elapsedMs',
+      ])
+      expect(result.detail.notes).toContain(
+        'sendCallMicrosP50, peakRssBytes: from one extra run with --probe on, not in the medians; the 3 runs above do not measure them'
+      )
+    })
+
+    test('a diagnostic run that failed, reported nothing or measured under 30 seconds changes no median: its rows are error or inconclusive and the arm says so', () => {
+      const failed = adapter.rows(
+        probed,
+        'fork',
+        { outputs, diagnostic: { error: 'diagnostic run: exit 1: boom' } },
+        3
+      )
+      const silent = adapter.rows(
+        probed,
+        'fork',
+        { outputs, diagnostic: { output: probe(30500, { sendCallMicrosP50: 12.5 }) } },
+        3
+      )
+      const short = adapter.rows(
+        probed,
+        'fork',
+        { outputs, diagnostic: { output: probe(29000) } },
+        3
+      )
+      const arm = adapter.rows(
+        probed,
+        'fork',
+        { outputs: [output(100, 30000)], error: 'run 2 of 3: exit 1: boom' },
+        3
+      )
+
+      for (const result of [failed, silent, short]) {
+        expect(medianOf(result)).toEqual([
+          ['valid', 100],
+          ['valid', 31000],
+        ])
+      }
+      const boom = 'diagnostic run: exit 1: boom'
+      expect(diagnosticOf(failed)).toEqual([
+        ['sendCallMicrosP50', 'error', boom],
+        ['peakRssBytes', 'error', boom],
+      ])
+      expect(failed.detail).toMatchObject({ status: 'error', reason: boom })
+      expect(diagnosticOf(silent)).toEqual([
+        ['sendCallMicrosP50', 'valid', undefined],
+        ['peakRssBytes', 'error', 'run 1 of 1: peakRssBytes is not a finite number'],
+      ])
+      expect(silent.detail.status).toBe('error')
+      const window = 'diagnostic window 29000 ms is under 30000 ms'
+      expect(diagnosticOf(short)).toEqual([
+        ['sendCallMicrosP50', 'inconclusive', window],
+        ['peakRssBytes', 'inconclusive', window],
+      ])
+      expect(short.detail.status).toBe('valid')
+      const skipped = 'no diagnostic run: run 2 of 3: exit 1: boom'
+      expect(diagnosticOf(arm)).toEqual([
+        ['sendCallMicrosP50', 'error', skipped],
+        ['peakRssBytes', 'error', skipped],
+      ])
+    })
+
+    test('an entry without diagnostic has no diagnostic rows and no note about them', () => {
+      const { rows, detail } = adapter.rows(entry, 'fork', { outputs }, 3)
+
+      expect(rows.map(({ metric }) => metric)).toEqual(['messagesPerSecond', 'elapsedMs'])
+      expect(detail.notes.some((note) => note.includes('extra run'))).toBe(false)
     })
   })
 
@@ -300,6 +700,52 @@ describe('Benchmark report clientCompare adapter', () => {
       expect(consumed.detail.notes.slice(1)).toEqual([
         'the corpus is read 4 times: each partition is sought back to its first offset after its last record',
       ])
+    })
+
+    test('a produce arm notes its workload shape and a built-in gzip codec', () => {
+      const produce = {
+        ...entry,
+        command: ['scripts/benchmarks/clientCompare.js', '--workload', 'produce-throughput'],
+      }
+      const extra = {
+        codec: { name: 'gzip', codec: 'built-in', package: 'zlib', version: '1.3.1' },
+        shape: {
+          batch: 8,
+          keys: 'index',
+          headers: 20,
+          partitioner: 'custom',
+          valueType: 'string',
+        },
+      }
+
+      const { detail } = adapter.rows(produce, 'fork', { outputs: [output(1, 30000, extra)] }, 1)
+
+      expect(detail.notes.slice(1)).toEqual([
+        "gzip: zlib@1.3.1, the package's built-in codec",
+        'workload shape (the same on both arms): batch=8, keys="index", headers=20, partitioner="custom", valueType="string"',
+      ])
+    })
+
+    test('an arm with the custom partitioner says its partitioner is the custom one and the rest are the package defaults, and an arm without says only the package defaults', () => {
+      const produce = {
+        ...entry,
+        command: ['scripts/benchmarks/clientCompare.js', '--workload', 'produce-throughput'],
+      }
+      const noteOf = (extra) =>
+        adapter.rows(produce, 'fork', { outputs: [output(1, 30000, extra)] }, 1).detail.notes[1]
+
+      const custom = noteOf({
+        settings: { defaults: { linger: 5, partitioner: 'custom (record n)' } },
+        shape: { partitioner: 'custom' },
+      })
+      const plain = noteOf({ settings: { defaults: { linger: 5, partitioner: 'Default' } } })
+
+      expect(custom).toBe(
+        'producer settings in force (this package\'s defaults, except the partitioner, which is the custom one): linger=5, partitioner="custom (record n)"'
+      )
+      expect(plain).toBe(
+        'producer settings in force (this package\'s defaults): linger=5, partitioner="Default"'
+      )
     })
 
     test('a consume arm notes its corpus layout', () => {
