@@ -17,7 +17,7 @@ const { staleMetadata } = require('../protocol/error')
 const { RETRIABLE_CATEGORIES } = require('../protocol/errorCategories')
 const { CONNECTION_STATUS } = require('../network/connectionStatus')
 const { isConnectionFailure } = require('../network/connectionFailure')
-const { isArmed } = require('./eosManager/transactionStates')
+const { isArmed, FATAL_ERROR } = require('./eosManager/transactionStates')
 const { surfaceInTransaction } = require('./eosManager')
 const groupMessagesPerPartition = require('./groupMessagesPerPartition')
 const Fifo = require('../utils/fifo')
@@ -344,13 +344,24 @@ class ProduceAttempt {
    *   loop's also settles every other due delivery
    * @param {number} [maxRequestSize=Infinity] cap checked at transmission
    * @param {import('./generation')} [generation] captured lifecycle; never recaptured
+   * @param {() => boolean} [isFatal] whether the producer has turned fatal: nothing not yet written
+   *   may then be written, whatever the attempt was drained for. The plain path has no producer
+   *   state that can turn fatal and passes none.
    */
-  constructor(deliveries, getConnectionStatus, expire, maxRequestSize = Infinity, generation) {
+  constructor(
+    deliveries,
+    getConnectionStatus,
+    expire,
+    maxRequestSize = Infinity,
+    generation,
+    isFatal = () => false
+  ) {
     this.deliveries = deliveries.slice()
     this.getConnectionStatus = getConnectionStatus
     this.expire = expire
     this.maxRequestSize = maxRequestSize
     this.generation = generation
+    this.isFatal = isFatal
     this.written = false
     this.revoked = false
     for (const delivery of this.deliveries) delivery.currentAttempt = this
@@ -362,12 +373,15 @@ class ProduceAttempt {
   }
 
   /**
-   * At transmission a frame above `maxRequestSize` is refused, unwritten; a written attempt ends
-   * the size subdivision (`child`) of the batches it carries.
+   * The one decision whether this attempt may still be written, taken at every step before the
+   * frame leaves: a revoked attempt, or one drained before the producer turned fatal, is refused
+   * unwritten. At transmission a frame above `maxRequestSize` is refused, unwritten; a written
+   * attempt ends the size subdivision (`child`) of the batches it carries.
    * @param {number} [frameLength] supplied only at transmission; includes the prefix and header
    * @returns {Error|null} refusal before any write, or null
    */
   guard = (frameLength) => {
+    if (this.isFatal()) this.revoke()
     if (this.revoked) return new ProduceAttemptRefused('The Produce attempt was revoked')
     const closed = this.generation?.guard()
     if (closed) return closed
@@ -1198,7 +1212,8 @@ class DrainLoop {
       this.#getConnectionStatus,
       () => this.#expireDue(Date.now()),
       this.#budget.maxRequestSize,
-      this.#generation
+      this.#generation,
+      () => manager.state() === FATAL_ERROR
     )
     for (const batch of batches) {
       deliveryOf(batch).dispatched = true

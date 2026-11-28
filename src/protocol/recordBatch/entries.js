@@ -1,10 +1,6 @@
 const { isProxy } = require('util').types
 const Long = require('../../utils/long')
-const {
-  KafkaJSInvalidConfigurationError,
-  KafkaJSInvariantViolation,
-  KafkaJSNonRetriableError,
-} = require('../../errors')
+const { KafkaJSInvalidConfigurationError, KafkaJSInvariantViolation } = require('../../errors')
 const { uvarintSize, writeUVarint } = require('./varint')
 
 /**
@@ -60,14 +56,17 @@ const ENCODABLE = {
  * bounds of a resized store, empty or not, and never for a view over a shared store.
  * @param {Uint8Array} view a genuine typed array
  * @param {string} [message]
+ * @param {new (message: string) => Error} [ErrorClass] what a caller's Buffer that went bad is
+ *   refused with: an invalid record, which a transaction recovers from by aborting. A view the
+ *   library produced itself passes a class of its own.
  * @returns {void}
- * @throws {KafkaJSNonRetriableError} when the view cannot be read
+ * @throws {Error} an `ErrorClass` when the view cannot be read
  */
-const probe = (view, message = CHANGED) => {
+const probe = (view, message = CHANGED, ErrorClass = KafkaJSInvalidConfigurationError) => {
   try {
     at.call(view, Infinity)
   } catch {
-    throw new KafkaJSNonRetriableError(message)
+    throw new ErrorClass(message)
   }
 }
 
@@ -284,7 +283,7 @@ const addHeaders = (slots, headers, index) => {
  * @param {string|Uint8Array|null} item
  * @param {number} length
  * @returns {number} the cursor after it
- * @throws {KafkaJSNonRetriableError}
+ * @throws {KafkaJSInvalidConfigurationError} when a fixed view can no longer be read
  */
 const writeField = (store, cursor, item, length) => {
   if (item === null) {
@@ -483,15 +482,14 @@ class RecordEntries {
  * @param {object[]} messages
  * @param {{ now: number }} options `now` is the send time
  * @returns {RecordEntries}
- * @throws {KafkaJSNonRetriableError} when `messages` is not an array, for a hole or a record that
- *   is not an object, naming its index, and for a Buffer detached or out of bounds at its capture
- *   or its copy
- * @throws {KafkaJSInvalidConfigurationError} for a field that cannot be written, naming the index
- *   and the field, never its value
+ * @throws {KafkaJSInvalidConfigurationError} when `messages` is not an array, for a hole or a
+ *   record that is not an object, naming its index, for a field that cannot be written, naming
+ *   the index and the field, never its value, and for a Buffer detached or out of bounds at its
+ *   capture or its copy. All are invalid records, so a transaction they fail can be aborted.
  */
 const captureEntries = (messages, { now }) => {
   if (!Array.isArray(messages)) {
-    throw new KafkaJSNonRetriableError('Invalid messages: they must be an array')
+    throw new KafkaJSInvalidConfigurationError('Invalid messages: they must be an array')
   }
   const count = messages.length
   const slots = []
@@ -501,7 +499,9 @@ const captureEntries = (messages, { now }) => {
   for (let index = 0; index < count; index++) {
     const message = messages[index]
     if (message === null || typeof message !== 'object') {
-      throw new KafkaJSNonRetriableError(`Invalid message at index ${index}: it must be an object`)
+      throw new KafkaJSInvalidConfigurationError(
+        `Invalid message at index ${index}: it must be an object`
+      )
     }
     const own = { ...message }
     const base = slots.length

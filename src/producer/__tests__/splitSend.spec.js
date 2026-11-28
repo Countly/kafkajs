@@ -8,7 +8,9 @@ const {
 } = require('../../errors')
 const Broker = require('../../broker')
 const Connection = require('../../network/connection')
+const Decoder = require('../../protocol/decoder')
 const Encoder = require('../../protocol/encoder')
+const RecordBatchDecoder = require('../../protocol/recordBatch/v0/decoder')
 const createRequest = require('../../protocol/request')
 const { oracleRecordBatch } = require('../../protocol/requests/produce/fixtures/recordBatchOracle')
 const Accumulator = require('../state/accumulator')
@@ -23,6 +25,8 @@ const TOPIC = 'split-topic'
 const CAP = 1048576
 /** Short, fixed backoffs: a retried chunk waits 10 ms. */
 const RETRY = { retries: 10, initialRetryTime: 10, maxRetryTime: 10, factor: 0 }
+/** A `linger` no test waits out: the batches go on when the test calls `flush()`. */
+const LINGER_UNTIL_FLUSHED = 60000
 const PATHS = [
   ['the idempotent path', { idempotent: true }],
   ['the plain path', { idempotent: false }],
@@ -58,6 +62,24 @@ const oracleFrameLength = async (request, { apiVersion, clientId }) => {
 const until = async (predicate, turns = 2000) => {
   for (let i = 0; i < turns && !predicate(); i += 1) await tick()
   expect(predicate()).toBe(true)
+}
+
+/**
+ * The record values the batches the scripted broker received carried, decoded from the bytes of
+ * each batch as it was written, in the order the broker received them.
+ * @param {{ written: { partition: number, batch: { bytes: Buffer } }[] }} log the scripted broker's log
+ * @returns {Promise<Map<number, string[]>>} the values by partition
+ */
+const valuesWritten = async ({ written }) => {
+  const values = new Map()
+  for (const { partition, batch } of written) {
+    const { records } = await RecordBatchDecoder(new Decoder(batch.bytes))
+    values.set(partition, [
+      ...(values.get(partition) ?? []),
+      ...records.map(({ value }) => value.toString()),
+    ])
+  }
+  return values
 }
 
 /**
@@ -453,7 +475,7 @@ describe('Producer > a send larger than one request', () => {
       })
       CompressionCodecs[CompressionTypes.Snappy] = () => ({
         compress: async ({ buffer }) => Buffer.concat([buffer, Buffer.alloc(buffer.length)]),
-        decompress: async (buffer) => buffer,
+        decompress: async (buffer) => buffer.subarray(0, buffer.length / 2),
       })
       const { frames, log } = await start(
         { topics: [{ name: TOPIC, leaders: [0] }] },
@@ -479,6 +501,7 @@ describe('Producer > a send larger than one request', () => {
       expect(log.written.map(({ records: count }) => count).reduce((a, b) => a + b, 0)).toBe(4)
       expect(log.written.every(({ errorCode }) => errorCode === 0)).toBe(true)
       expect(metadata).toEqual([expect.objectContaining({ partition: 0, baseOffset: '0' })])
+      expect(await valuesWritten(log)).toEqual(new Map([[0, messages.map(({ value }) => value)]]))
     }
   )
 
@@ -494,7 +517,7 @@ describe('Producer > a send larger than one request', () => {
       const calls = attempts()
       const { log } = await start(
         { topics: [{ name: TOPIC, leaders: [0, 0] }] },
-        { ...path, linger: 100 }
+        { ...path, linger: LINGER_UNTIL_FLUSHED }
       )
       const expected = new Map()
       log.verdict = ({ topic, partition, batch }) => {
@@ -516,7 +539,10 @@ describe('Producer > a send larger than one request', () => {
       })
       const offender = producer.send({ topic: TOPIC, messages: [{ value, partition: 1 }] })
       structuredClone(store, { transfer: [store] })
+      await tick()
+      const flushed = producer.flush()
       const [kept, refused] = await Promise.allSettled([bystander, offender])
+      await flushed
 
       expect(kept).toEqual({
         status: 'fulfilled',
@@ -524,16 +550,20 @@ describe('Producer > a send larger than one request', () => {
       })
       expect(refused.status).toBe('rejected')
       expect(refused.reason).toBeInstanceOf(KafkaJSNonRetriableError)
+      expect(refused.reason.category).toBe('invalidConfiguration')
       expect(refused.reason.message).toBe('A Buffer changed size while its send was being read')
       expect(calls).toHaveLength(1)
       expect(
         log.written.map(({ partition, records: count, errorCode }) => [partition, count, errorCode])
       ).toEqual([[0, 1, 0]])
 
-      const next = await producer.send({
+      const following = producer.send({
         topic: TOPIC,
         messages: [{ value: 'next', partition: 1 }],
       })
+      await tick()
+      await producer.flush()
+      const next = await following
 
       expect(next).toEqual([expect.objectContaining({ partition: 1, errorCode: 0 })])
       expect(
@@ -549,6 +579,91 @@ describe('Producer > a send larger than one request', () => {
         () => JSON.stringify(countersOf(admission)) === JSON.stringify(quiescent(admission))
       )
       expect(countersOf(admission)).toEqual(quiescent(admission))
+    }
+  )
+
+  test.each([
+    ['tv1', 'a first attempt'],
+    ['tv2', 'a first attempt'],
+    ['tv1', 'a retry'],
+    ['tv2', 'a retry'],
+  ])(
+    'a transaction send whose Buffer was transferred fails alone and leaves the transaction abortable: commit rejects, abort succeeds and the next transaction commits, %s, %s',
+    async (profile, attempt) => {
+      const { log } = await start(
+        { topics: [{ name: TOPIC, leaders: [0, 0] }], profile },
+        { transactionalId: 'transferred-buffer', linger: LINGER_UNTIL_FLUSHED }
+      )
+      const store = new ArrayBuffer(4)
+      const value = new Uint8Array(store)
+      value.set([1, 2, 3, 4])
+      Object.setPrototypeOf(value, Buffer.prototype)
+      const transfer = () => structuredClone(store, { transfer: [store] })
+      if (attempt === 'a retry') {
+        let answered = false
+        log.verdict = ({ partition }) => {
+          if (partition !== 1 || answered) return 0
+          answered = true
+          transfer()
+          return 7
+        }
+      }
+
+      const transaction = await producer.transaction()
+      const sending = transaction.send({
+        topic: TOPIC,
+        messages: [
+          { value: 'kept', partition: 0 },
+          { value, partition: 1 },
+        ],
+      })
+      if (attempt === 'a first attempt') transfer()
+      await tick()
+      const flushed = producer.flush()
+      const refused = await sending.catch((error) => error)
+      await flushed
+
+      expect(refused).toMatchObject({
+        name: 'KafkaJSInvalidConfigurationError',
+        category: 'invalidConfiguration',
+        message: 'A Buffer changed size while its send was being read',
+      })
+      await expect(transaction.commit()).rejects.toMatchObject({
+        category: 'invalidConfiguration',
+        message: refused.message,
+      })
+      await transaction.abort()
+
+      const next = await producer.transaction()
+      const following = next.send({ topic: TOPIC, messages: [{ value: 'next', partition: 1 }] })
+      await tick()
+      await producer.flush()
+      await following
+      await next.commit()
+
+      const writes = log.written.map(({ partition, records: count, errorCode }) => [
+        partition,
+        count,
+        errorCode,
+      ])
+      expect(writes).toEqual(
+        attempt === 'a retry'
+          ? [
+              [0, 1, 0],
+              [1, 1, 7],
+              [1, 1, 0],
+            ]
+          : [
+              [0, 1, 0],
+              [1, 1, 0],
+            ]
+      )
+      expect(
+        cluster
+          .requests()
+          .filter(({ api }) => api === 'EndTxn')
+          .map(({ fields }) => fields.transactionResult)
+      ).toEqual([false, true])
     }
   )
 

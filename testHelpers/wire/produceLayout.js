@@ -45,7 +45,9 @@ const encodeEndpoint = ({ nodeId, host, port, rack }) =>
  * two timestamps (16), producer id (8), producer epoch (2), base sequence (4), record count (4).
  * @param {Buffer} records
  * @returns {Array<{ producerId: string, producerEpoch: number, baseSequence: number,
- *   recordCount: number, transactional: boolean, control: boolean, digest: string }>}
+ *   recordCount: number, transactional: boolean, control: boolean, digest: string }>} each row
+ *   also carries its batch's wire bytes as the non-enumerable `bytes`, for a test that decodes
+ *   the records
  * @throws {Error} when the bytes are not whole batches: a header cut short, or a length that is
  *   below a header or past the end
  */
@@ -68,15 +70,18 @@ const readBatches = (records) => {
     }
 
     const attributes = records.readInt16BE(start + 21)
-    batches.push({
+    const bytes = records.subarray(start, end)
+    const row = {
       producerId: records.readBigInt64BE(start + 43).toString(),
       producerEpoch: records.readInt16BE(start + 51),
       baseSequence: records.readInt32BE(start + 53),
       recordCount: records.readInt32BE(start + 57),
       transactional: (attributes & TRANSACTIONAL) !== 0,
       control: (attributes & CONTROL) !== 0,
-      digest: crypto.createHash('sha1').update(records.subarray(start, end)).digest('hex'),
-    })
+      digest: crypto.createHash('sha1').update(bytes).digest('hex'),
+    }
+    Object.defineProperty(row, 'bytes', { value: bytes })
+    batches.push(row)
     start = end
   }
 

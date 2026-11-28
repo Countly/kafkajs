@@ -231,7 +231,7 @@ describe('Protocol > RecordBatch > entries', () => {
   ])('%s in place of a record is refused, naming its index', (_, messages) => {
     const capturing = () => capture(messages)
 
-    expect(capturing).toThrow(KafkaJSNonRetriableError)
+    expect(capturing).toThrow(KafkaJSInvalidConfigurationError)
     expect(capturing).toThrow('Invalid message at index 1: it must be an object')
   })
 
@@ -243,7 +243,7 @@ describe('Protocol > RecordBatch > entries', () => {
   ])('%s in place of the records is refused', (_, records) => {
     const capturing = () => capture(records())
 
-    expect(capturing).toThrow(KafkaJSNonRetriableError)
+    expect(capturing).toThrow(KafkaJSInvalidConfigurationError)
     expect(capturing).toThrow('Invalid messages: they must be an array')
   })
 
@@ -277,6 +277,40 @@ describe('Protocol > RecordBatch > entries', () => {
 
     expect(() => probe(view, 'unreadable')).toThrow(new KafkaJSNonRetriableError('unreadable'))
     expect(probe(new Uint8Array(2))).toBeUndefined()
+  })
+
+  test('a caller Buffer that went bad is an invalid record a transaction can abort; a view the library made asks for a class of its own', () => {
+    const detached = () => {
+      const store = new ArrayBuffer(2)
+      const view = new Uint8Array(store)
+      structuredClone(store, { transfer: [store] })
+      return view
+    }
+    const thrownBy = (action) => {
+      try {
+        action()
+      } catch (error) {
+        return error
+      }
+      return undefined
+    }
+    const caller = thrownBy(() => probe(detached()))
+    const own = thrownBy(() => probe(detached(), 'own', KafkaJSNonRetriableError))
+
+    expect(caller).toBeInstanceOf(KafkaJSInvalidConfigurationError)
+    expect(caller.category).toBe('invalidConfiguration')
+    expect(own.constructor).toBe(KafkaJSNonRetriableError)
+    expect(own.category).not.toBe('invalidConfiguration')
+  })
+
+  test('a Buffer detached before its capture is refused as an invalid record', () => {
+    const store = new ArrayBuffer(4)
+    const value = Buffer.from(store)
+    structuredClone(store, { transfer: [store] })
+    const capturing = () => capture([{ value }])
+
+    expect(capturing).toThrow(KafkaJSInvalidConfigurationError)
+    expect(capturing).toThrow('A Buffer changed size while its send was being read')
   })
 
   test('a write that does not fill its buffer exactly is an invariant violation', () => {

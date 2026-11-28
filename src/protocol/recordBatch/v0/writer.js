@@ -110,7 +110,11 @@ const outputLength = (output) => {
   if (!isGenuineBuffer(output)) {
     throw new KafkaJSNonRetriableError('The compression codec did not return a Buffer')
   }
-  probe(output, 'The compression codec returned a Buffer that cannot be read')
+  probe(
+    output,
+    'The compression codec returned a Buffer that cannot be read',
+    KafkaJSNonRetriableError
+  )
   return lengthOf(output)
 }
 

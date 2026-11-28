@@ -34,6 +34,7 @@ const {
   IN_TRANSACTION,
   ABORTING,
   ABORTABLE_ERROR,
+  FATAL_ERROR,
 } = require('../eosManager/transactionStates')
 const {
   METADATA_ORDER_CASE,
@@ -60,6 +61,7 @@ const NOT_LEADER_OR_FOLLOWER = 6
 const REQUEST_TIMED_OUT = 7
 const OUT_OF_ORDER_SEQUENCE_NUMBER = 45
 const DUPLICATE_SEQUENCE_NUMBER = 46
+const INVALID_PRODUCER_ID_MAPPING = 49
 const INVALID_RECORD = 87
 
 /** The longest delay `setTimeout` honours, in ms. */
@@ -1099,6 +1101,46 @@ describe('Producer > the idempotent drain loop', () => {
       expect(secondError).toBe(harness.manager.transaction.armedError())
       expect(harness.sent()).toEqual([{ nodeId: 1, epoch: 0, partitions: ['topic-a/0@0'] }])
     })
+
+    test.each([
+      ['an idempotent producer', false],
+      ['a transactional producer', true],
+    ])(
+      'a request drained before the producer turned fatal is refused at its write, nothing of it is written, and its send rejects, %s',
+      async (_, transactional) => {
+        const lookup = deferred()
+        const harness = createHarness({
+          transactional,
+          layout: { [TOPIC]: { 0: 1, 1: 2 } },
+          answer: (request, nodeId) =>
+            respond(request, nodeId, { 'topic-a/0': INVALID_PRODUCER_ID_MAPPING }),
+        })
+        const findBroker = harness.cluster.findBroker.getMockImplementation()
+        harness.cluster.findBroker.mockImplementation(async (options) => {
+          if (Number(options.nodeId) === 2) await lookup.promise
+          return findBroker(options)
+        })
+        await harness.start()
+
+        const sending = harness
+          .send([{ topic: TOPIC, messages: [...records(0), ...records(1)] }])
+          .catch((e) => e)
+        const settled = settledFlag(sending)
+        await settle()
+
+        expect(harness.manager.state()).toEqual(FATAL_ERROR)
+        expect(settled()).toBe(false)
+        expect(harness.sent()).toEqual([{ nodeId: 1, epoch: 0, partitions: ['topic-a/0@0'] }])
+
+        lookup.resolve()
+        await settle()
+
+        expect(settled()).toBe(true)
+        expect(await sending).toMatchObject({ code: INVALID_PRODUCER_ID_MAPPING })
+        expect(harness.sent()).toEqual([{ nodeId: 1, epoch: 0, partitions: ['topic-a/0@0'] }])
+        expect(harness.manager.sequencer.hasInFlight()).toBe(false)
+      }
+    )
 
     test('a re-send queued before the same answer armed an error state is rejected at once, not after its backoff', async () => {
       let calls = 0
