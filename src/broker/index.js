@@ -1495,19 +1495,19 @@ module.exports = class Broker {
    * @param {import("../protocol/coordinatorTypes").CoordinatorType} request.coordinatorType The type of coordinator to find
    * @param {(frameLength?: number) => Error|null} [request.guard] a producer's private pre-write
    *   check; it never reaches the request
+   * @param {() => void} [request[ON_WRITE]] private hook at physical transmission
    * @returns {Promise<{ coordinator: { nodeId: number, host: string, port: number } }>} an answer
    *   with an error code is thrown as that error before the node is looked at
    * @throws {import('../errors').KafkaJSError} retriable, when a v4 or later answer is for another
    *   key, or a success names a node id below 0, no host or a port outside 1-65535: a broker names
    *   no node only with an error. The cluster then asks the next broker.
    */
-  async findGroupCoordinator({ groupId, coordinatorType, guard }) {
+  async findGroupCoordinator({ groupId, coordinatorType, guard, [ON_WRITE]: onWrite }) {
     this.throwIfRefused(guard)
     const findCoordinator = this.lookupRequest(apiKeys.GroupCoordinator, requests.GroupCoordinator)
-    const answer = await this[PRIVATE.SEND_REQUEST](
-      findCoordinator({ groupId, coordinatorType }),
-      guard
-    )
+    const request = findCoordinator({ groupId, coordinatorType })
+    if (onWrite) request.onWrite = onWrite
+    const answer = await this[PRIVATE.SEND_REQUEST](request, guard)
 
     const { nodeId, host, port } = answer.coordinator
     if (

@@ -67,6 +67,19 @@ const hasBrokerMoved = (broker, { host, port }) =>
   broker.connectionPool.host !== host || broker.connectionPool.port !== port
 
 /**
+ * @param {{host: string, port: number}} endpoint
+ * @returns {string} setup inventory and ordering key
+ */
+const endpointAddress = ({ host, port }) => `${host}:${port}`
+
+/**
+ * @param {{nodeId: number, host: string, port: number}} endpoint
+ * @returns {boolean} whether the row names a node and explicit destination
+ */
+const usableEndpoint = ({ nodeId, host, port }) =>
+  Number.isInteger(nodeId) && nodeId >= 0 && Boolean(host) && Number.isInteger(port) && port > 0
+
+/**
  * The broker option of a producer lifecycle's private pre-write check, as an argument list: none
  * without a lifecycle, so an unfenced call keeps the shape it always had.
  * @param {import('../producer/generation')} [fence]
@@ -230,6 +243,7 @@ module.exports = class BrokerPool {
     this.authenticationBlackout = new Map()
     this.setupStates = null
     this.setupMetadataEndpoints = new Map()
+    this.metadataEndpointRows = new Map()
 
     this.telemetryAdvertisementListener = null
     /**
@@ -329,6 +343,7 @@ module.exports = class BrokerPool {
         }
         this.recoveries++
         this.endpointOrder.supersedeAll()
+        this.metadataEndpointRows.clear()
         this.metadata = null
         this.metadataExpireAt = null
         for (const broker of values(table)) brokers.add(broker)
@@ -404,6 +419,20 @@ module.exports = class BrokerPool {
       ...(this.connectionPoolBuilder.bootstrapEndpoints || []),
       ...this.setupMetadataEndpoints.values(),
     ])
+  }
+
+  /**
+   * Updates setup retention for a single independently observed route.
+   * @param {number|string} nodeId
+   * @param {string|undefined} address current intended address, or undefined on removal
+   * @returns {void}
+   */
+  updateSetupEndpoint(nodeId, address) {
+    const key = String(nodeId)
+    const previous = this.setupMetadataEndpoints.get(key)
+    if (address === undefined) this.setupMetadataEndpoints.delete(key)
+    else this.setupMetadataEndpoints.set(key, address)
+    this.setupStates?.replaceEndpoint(previous, address)
   }
 
   /**
@@ -498,9 +527,13 @@ module.exports = class BrokerPool {
     }
     connectionPool.authenticationTimeout = this.authenticationTimeout
     connectionPool.authenticationBlackout = this.authenticationBlackout
-    if (!this.setupStates) this.setupStates = new NodeSetupStates(connectionPool.setupPolicy)
+    if (!this.setupStates) {
+      this.setupStates = new NodeSetupStates(connectionPool.setupPolicy)
+      this.retainSetupEndpoints()
+    } else if (!destination) {
+      this.retainSetupEndpoints()
+    }
     connectionPool.setupStates = this.setupStates
-    this.retainSetupEndpoints()
     return connectionPool
   }
 
@@ -519,10 +552,8 @@ module.exports = class BrokerPool {
    * in flight can finish up to drainTimeout, then its sockets close and queued work rejects.
    * Recovery never waits for that drain.
    *
-   * An unknown node id at the seed broker's address adopts the seed, as `refreshMetadata`'s reduce
-   * does, so the seed's address is not connected twice; a seed the table already holds under
-   * another id is never adopted again. Each endpoint goes through `applyNodeEndpoint`, which
-   * `Cluster#findGroupCoordinator` also calls for the coordinator a FindCoordinator answer names.
+   * Each endpoint goes through the same writer as Metadata and FindCoordinator. The whole hint
+   * claims its rows before any build starts, so a suspended row cannot extend its authority.
    *
    * Three cases never build a bare replacement:
    * - **The seed broker.** `refreshMetadata` can adopt `this.seedBroker` into `this.brokers` under
@@ -531,8 +562,8 @@ module.exports = class BrokerPool {
    *   out from under it would leave them holding a stale, disconnected reference. When the entry
    *   at `nodeId` *is* the seed, its connection pool is swapped in place instead - the seed's
    *   identity and `this.seedBroker` never change - and the pool it was using is drained
-   *   separately, mirroring how `refreshMetadata`'s reduce keeps the seed object rather than
-   *   rebuilding it when it recognises the address (see `refreshMetadata` above).
+   *   separately. A seed pool can acquire one node identity. Another ID at the same address
+   *   receives an independent pool.
    * - **An endpoint with no usable address.** A blank host or a non-positive port is exactly the
    *   input `connectionPoolBuilder` treats as "no destination given" and answers with the next
    *   configured bootstrap broker - silently pointing this node id at an unrelated broker. Such an
@@ -545,10 +576,8 @@ module.exports = class BrokerPool {
    *   node's newest observation are re-checked before writing; on a mismatch the freshly built
    *   pool - never handed to a `Broker` - is retired instead of overwriting whatever is there now.
    *
-   * Each hint counts as observed when it is applied, so it is newer than every Metadata response
-   * published before it and older than every one published after it (see `writeNodeEndpoint`).
-   * Adding an unknown node id is allowed; removing one is not - only a metadata response may
-   * shrink the broker table.
+   * A later address transition or removal can supersede the hint for that node. Disconnect and
+   * rebootstrap fence the entire hint. Hints can add unknown nodes and leave unmentioned IDs alone.
    *
    * @see https://cwiki.apache.org/confluence/display/KAFKA/KIP-951%3A+Leader+discovery+optimisations+for+the+client
    * @public
@@ -556,18 +585,33 @@ module.exports = class BrokerPool {
    * @param {object} [options]
    * @param {import('../producer/generation')} [options.fence] captured producer lifecycle; a pool
    *   completed after its close is retired unused and changes no routing state
+   * @param {number} [options.observedAt] the stamp shared with the partition hint
    * @returns {Promise<void>}
    * @throws {Error} the lifecycle's close error
    */
-  async applyNodeEndpoints(nodeEndpoints, { fence } = {}) {
+  async applyNodeEndpoints(nodeEndpoints, { fence, observedAt = this.endpointStamp() } = {}) {
     fence?.check()
     checked(null)
     if (!nodeEndpoints || nodeEndpoints.length === 0) {
       return
     }
 
+    const rows = new Map()
+    const adoptable = this.captureSeed()
     for (const endpoint of nodeEndpoints) {
-      const writing = this.applyNodeEndpoint(endpoint, { fence })
+      const { nodeId } = endpoint
+      if (rows.has(nodeId) || !usableEndpoint(endpoint)) continue
+      const address = endpointAddress(endpoint)
+      if (!this.endpointOrder.claim(nodeId, observedAt, address)) continue
+      this.updateSetupEndpoint(nodeId, address)
+      rows.set(nodeId, endpoint)
+    }
+    for (const [nodeId, endpoint] of rows) {
+      const writing = this.writeNodeEndpoint(nodeId, this.brokers[nodeId], endpoint, {
+        observedAt,
+        fence,
+        adoptable,
+      })
       if (writing instanceof Promise) await writing
     }
   }
@@ -591,17 +635,20 @@ module.exports = class BrokerPool {
    * @throws {Error} the lifecycle's close error
    */
   applyNodeEndpoint(endpoint, { fence, observedAt = this.endpointOrder.next() } = {}) {
-    const { nodeId, host, port } = endpoint
-    if (!Number.isInteger(nodeId) || nodeId < 0 || !host || !Number.isInteger(port) || port <= 0) {
-      return false
+    fence?.check()
+    checked(null)
+    if (!usableEndpoint(endpoint)) return false
+    const { nodeId } = endpoint
+    const address = endpointAddress(endpoint)
+    if (!this.endpointOrder.claim(nodeId, observedAt, address)) {
+      return this.holdsEndpoint(nodeId, endpoint, observedAt)
     }
-
-    const previous = this.brokers[nodeId]
-    const adoptable =
-      previous === undefined && this.seedBroker && !values(this.brokers).includes(this.seedBroker)
-        ? this.seedBroker
-        : undefined
-    return this.writeNodeEndpoint(nodeId, previous, endpoint, { observedAt, fence, adoptable })
+    this.updateSetupEndpoint(nodeId, address)
+    return this.writeNodeEndpoint(nodeId, this.brokers[nodeId], endpoint, {
+      observedAt,
+      fence,
+      adoptable: this.captureSeed(),
+    })
   }
 
   /**
@@ -612,6 +659,23 @@ module.exports = class BrokerPool {
    */
   endpointStamp() {
     return this.endpointOrder.next()
+  }
+
+  /**
+   * @param {number} stamp observation or operation start
+   * @returns {boolean} whether the pool still belongs to the same routing generation
+   */
+  isEndpointCurrent(stamp) {
+    return this.endpointOrder.isCurrent(stamp)
+  }
+
+  /**
+   * @returns {{broker: Broker, pool: import('../network/connectionPool')}|undefined}
+   *   seed adoption candidate captured before reconciliation can suspend
+   */
+  captureSeed() {
+    const broker = this.seedBroker
+    return broker && { broker, pool: broker.connectionPool }
   }
 
   /**
@@ -629,9 +693,7 @@ module.exports = class BrokerPool {
    * @param {number} options.observedAt the observation's stamp
    * @param {import('../producer/generation')} [options.fence] captured producer lifecycle
    * @param {() => boolean} [options.isCurrent] the caller's own authority, checked with the table's
-   * @param {Broker} [options.adoptable] the seed broker this node may adopt at the seed's address
-   * @param {boolean} [options.seedAddressTaken] another node of the same response holds the seed's
-   *   address, so a seed that moved off it keeps its pool and its node gets a new broker
+   * @param {ReturnType<BrokerPool['captureSeed']>} [options.adoptable] captured seed and pool
    * @returns {boolean|Promise<boolean>} whether the table holds the node at this endpoint
    *   afterwards; a promise only while a replacement pool is built
    * @throws {Error} the lifecycle's close error
@@ -640,14 +702,16 @@ module.exports = class BrokerPool {
     nodeId,
     previous,
     { host, port, rack },
-    { observedAt, fence, isCurrent = () => true, adoptable, seedAddressTaken = false }
+    { observedAt, fence, isCurrent = () => true, adoptable }
   ) {
+    fence?.check()
+    checked(null)
     if (
       this.brokers[nodeId] !== previous ||
       !isCurrent() ||
-      !this.endpointOrder.claim(nodeId, observedAt)
+      !this.endpointOrder.owns(nodeId, observedAt)
     ) {
-      return this.holdsEndpoint(nodeId, { host, port })
+      return this.holdsEndpoint(nodeId, { host, port }, observedAt)
     }
 
     if (previous && !hasBrokerMoved(previous, { host, port })) {
@@ -655,11 +719,18 @@ module.exports = class BrokerPool {
       return true
     }
 
-    if (adoptable && !hasBrokerMoved(adoptable, { host, port })) {
-      adoptable.nodeId = nodeId
-      this.bindTelemetryNode(adoptable)
-      adoptable.connectionPool.rack = rack ?? null
-      this.brokers[nodeId] = adoptable
+    const seed = adoptable?.broker
+    if (
+      seed &&
+      seed === this.seedBroker &&
+      seed.connectionPool === adoptable.pool &&
+      (seed.nodeId === null || seed.nodeId === nodeId) &&
+      !hasBrokerMoved(seed, { host, port })
+    ) {
+      seed.nodeId = nodeId
+      seed.connectionPool.rack = rack ?? null
+      this.brokers[nodeId] = seed
+      this.bindTelemetryNode(seed)
       this.closeObsolete(previous)
       return true
     }
@@ -671,7 +742,7 @@ module.exports = class BrokerPool {
       observedAt,
       fence,
       isCurrent,
-      inPlace: previous !== undefined && previous === this.seedBroker && !seedAddressTaken,
+      inPlace: previous !== undefined && previous === this.seedBroker,
     })
   }
 
@@ -707,7 +778,7 @@ module.exports = class BrokerPool {
       { host, port, rack },
       { fence, isCurrent: owns }
     )
-    if (!connectionPool) return this.holdsEndpoint(nodeId, { host, port })
+    if (!connectionPool) return this.holdsEndpoint(nodeId, { host, port }, observedAt)
     if (fence?.closed || currentDeadline()?.guard()) {
       this.closePool(connectionPool)
       fence?.check()
@@ -716,7 +787,7 @@ module.exports = class BrokerPool {
 
     if (!owns()) {
       this.closePool(connectionPool)
-      return this.holdsEndpoint(nodeId, { host, port })
+      return this.holdsEndpoint(nodeId, { host, port }, observedAt)
     }
 
     if (inPlace) {
@@ -730,20 +801,25 @@ module.exports = class BrokerPool {
       })
       this.closeObsolete(previous)
     }
-    this.setupMetadataEndpoints.set(String(nodeId), `${host}:${port}`)
-    this.retainSetupEndpoints()
-    return this.holdsEndpoint(nodeId, { host, port })
+    return this.holdsEndpoint(nodeId, { host, port }, observedAt)
   }
 
   /**
-   * @private
    * @param {number|string} nodeId
    * @param {{ host: string, port: number }} address
-   * @returns {boolean} whether the table holds the node at this address
+   * @param {number} observedAt observation from the caller's routing generation
+   * @param {Broker} [expected] broker selected before an asynchronous connect
+   * @returns {boolean} whether the installed and intended route agree in that generation
    */
-  holdsEndpoint(nodeId, address) {
+  holdsEndpoint(nodeId, address, observedAt, expected) {
     const broker = this.brokers[nodeId]
-    return broker !== undefined && !hasBrokerMoved(broker, address)
+    return (
+      this.isEndpointCurrent(observedAt) &&
+      this.endpointOrder.routes.get(String(nodeId))?.address === endpointAddress(address) &&
+      broker !== undefined &&
+      (expected === undefined || broker === expected) &&
+      !hasBrokerMoved(broker, address)
+    )
   }
 
   /**
@@ -1104,6 +1180,7 @@ module.exports = class BrokerPool {
     this.disconnects++
     this.brokers = {}
     this.endpointOrder.supersedeAll()
+    this.metadataEndpointRows.clear()
     this.metadata = null
     this.versions = null
     this.authenticationBlackout.clear()
@@ -1155,8 +1232,64 @@ module.exports = class BrokerPool {
     if (this.seedBroker === broker) {
       this.seedBroker = shuffle(values(this.brokers).filter((candidate) => candidate !== broker))[0]
     }
+    const observedAt = this.endpointStamp()
+    for (const nodeId of keys(this.brokers)) {
+      if (this.brokers[nodeId] !== broker) continue
+      this.endpointOrder.claim(nodeId, observedAt, null)
+      this.metadataEndpointRows.delete(nodeId)
+      this.updateSetupEndpoint(nodeId, undefined)
+    }
     this.metadataExpireAt = null
     this.closeObsolete(broker)
+  }
+
+  /**
+   * Records a Metadata address image before any pool build can suspend. Repeated rows keep their
+   * stamps, so an interrupted build can resume from the next image without overruling a newer
+   * hint or coordinator answer. Absence only withdraws the address the previous image named.
+   * @param {Array<{nodeId: number, host: string, port: number, rack: string|null}>} brokers
+   * @param {Object<string, Broker>} previousBrokers installed routes at publication
+   * @param {boolean} firstImage whether setup retention can still carry pre-disconnect addresses
+   * @returns {{rows: Map, removals: Map}} ordered writes and removals for this image
+   */
+  observeMetadataEndpoints(brokers, previousBrokers, firstImage) {
+    const observedAt = this.endpointStamp()
+    const previousRows = this.metadataEndpointRows
+    const rows = new Map()
+    const removals = new Map()
+    if (firstImage) {
+      this.setupMetadataEndpoints.clear()
+      for (const [key, { address }] of this.endpointOrder.routes) {
+        if (address !== null) this.setupMetadataEndpoints.set(key, address)
+      }
+    }
+    for (const endpoint of brokers) {
+      const key = String(endpoint.nodeId)
+      if (rows.has(key) || !usableEndpoint(endpoint)) continue
+      const address = endpointAddress(endpoint)
+      const previous = previousRows.get(key)
+      const stamp = previous?.address === address ? previous.stamp : observedAt
+      if (stamp === observedAt) {
+        this.endpointOrder.claim(key, stamp, address)
+        this.setupMetadataEndpoints.set(key, address)
+      }
+      rows.set(key, { endpoint, stamp, address })
+    }
+    for (const key of new Set([...previousRows.keys(), ...keys(previousBrokers)])) {
+      if (rows.has(key)) continue
+      const route = this.endpointOrder.routes.get(key)
+      const previous = previousRows.get(key)
+      if (!route || (previous && route.address === previous.address)) {
+        this.endpointOrder.claim(key, observedAt, null)
+        this.setupMetadataEndpoints.delete(key)
+        removals.set(key, observedAt)
+      } else if (route.address === null) {
+        removals.set(key, route.stamp)
+      }
+    }
+    this.metadataEndpointRows = rows
+    this.retainSetupEndpoints()
+    return { rows, removals }
   }
 
   /**
@@ -1180,9 +1313,8 @@ module.exports = class BrokerPool {
    * publication number when it is assigned to `this.metadata`, and a refresh stops reconciling the
    * broker table as soon as a newer response has been published: the topology last published is
    * the one installed, and a pool built for an older one is closed unused. A published response is
-   * also the newest observation of every node, and each node is written through `writeNodeEndpoint`:
-   * a leader hint applied, or a FindCoordinator request sent, after the publication is newer for its
-   * node, so the response neither overwrites nor removes that node.
+   * an endpoint observation only for an address or presence transition. See `EndpointOrder` for
+   * how those transitions are ordered against hints and coordinator answers.
    *
    * `findConnectedBroker()` and the seed read happen **inside** the retry callback:
    * a rebootstrap partway through this method (trigger (c), fired from inside
@@ -1327,6 +1459,7 @@ module.exports = class BrokerPool {
           fence?.check()
           check()
           if (!applicable()) return
+          const firstImage = this.metadata === null
           if (accept) {
             const settled = this.settleTopicErrors(response.topicMetadata, accept)
             checkPartitions(settled, { allowLeaderless })
@@ -1356,7 +1489,6 @@ module.exports = class BrokerPool {
           // unavailability. Everything below reads this local instead.
           const metadata = this.metadata
           const publication = ++this.metadataPublications
-          const observedAt = this.endpointOrder.supersedeAll()
           const isLatest = () =>
             applicable() &&
             this.metadataPublications === publication &&
@@ -1375,32 +1507,33 @@ module.exports = class BrokerPool {
           if (!isLatest()) return
           this.metadataExpireAt = Date.now() + this.metadataMaxAge
 
-          this.setupMetadataEndpoints = new Map(
-            metadata.brokers.map(({ nodeId, host, port }) => [String(nodeId), `${host}:${port}`])
-          )
-          this.retainSetupEndpoints()
           const previousBrokers = { ...this.brokers }
-          const freshBrokerIds = new Set(metadata.brokers.map(({ nodeId }) => String(nodeId)))
-          const seedAddressTaken =
-            Boolean(seedBroker) &&
-            metadata.brokers.some((endpoint) => !hasBrokerMoved(seedBroker, endpoint))
+          const adoptable = this.captureSeed()
           const ownsImage = () => isLatest() && this.seedBroker === seedBroker
-          for (const { nodeId, host, port, rack } of metadata.brokers) {
-            if (!ownsImage()) continue
-            const writing = this.writeNodeEndpoint(
-              nodeId,
-              previousBrokers[nodeId],
-              { host, port, rack },
-              { observedAt, fence, isCurrent: ownsImage, adoptable: seedBroker, seedAddressTaken }
-            )
+          if (adoptable?.broker !== seedBroker) return
+          const { rows, removals } = this.observeMetadataEndpoints(
+            metadata.brokers,
+            previousBrokers,
+            firstImage
+          )
+          for (const { endpoint, stamp } of rows.values()) {
+            if (!ownsImage()) break
+            const { nodeId } = endpoint
+            const writing = this.writeNodeEndpoint(nodeId, previousBrokers[nodeId], endpoint, {
+              observedAt: stamp,
+              fence,
+              isCurrent: ownsImage,
+              adoptable,
+            })
             if (writing instanceof Promise) await writing
           }
-          for (const [nodeId, previous] of Object.entries(previousBrokers)) {
+          for (const [nodeId, stamp] of removals) {
+            const previous = previousBrokers[nodeId]
             if (
+              previous &&
               isLatest() &&
-              !freshBrokerIds.has(nodeId) &&
               this.brokers[nodeId] === previous &&
-              this.endpointOrder.owns(nodeId, observedAt)
+              this.endpointOrder.owns(nodeId, stamp)
             ) {
               if (previous === this.seedBroker) delete this.brokers[nodeId]
               else this.closeObsolete(previous)

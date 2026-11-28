@@ -109,7 +109,7 @@ class NodeSetupStates {
     this.policy = policy
     this.entries = new Map()
     this.live = new Map()
-    this.endpoints = new Set()
+    this.endpoints = new Map()
     this.sequence = 0n
   }
 
@@ -119,8 +119,25 @@ class NodeSetupStates {
    * @returns {void}
    */
   retain(addresses) {
-    this.endpoints = new Set(addresses)
+    this.endpoints.clear()
+    for (const address of addresses) this.replaceEndpoint(undefined, address)
     for (const address of this.entries.keys()) this.prune(address)
+  }
+
+  /**
+   * Updates one inventory reference. Bootstrap addresses and multiple nodes can share an address.
+   * @param {string|undefined} previous old endpoint
+   * @param {string|undefined} address new endpoint
+   * @returns {void}
+   */
+  replaceEndpoint(previous, address) {
+    if (previous === address) return
+    if (address !== undefined) this.endpoints.set(address, (this.endpoints.get(address) ?? 0) + 1)
+    if (previous === undefined) return
+    const remaining = this.endpoints.get(previous) - 1
+    if (remaining > 0) this.endpoints.set(previous, remaining)
+    else this.endpoints.delete(previous)
+    this.prune(previous)
   }
 
   /** @param {string} address endpoint @returns {void} */

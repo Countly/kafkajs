@@ -1,4 +1,5 @@
 const Broker = require('../broker')
+const { ON_WRITE } = require('../broker/privateOptions')
 const { checked, waitOf, shareMetadata, retrierOf, sharedSetup } = require('../admin/deadline')
 const describeThrown = require('../network/describeThrown')
 const BrokerPool = require('./brokerPool')
@@ -1638,9 +1639,11 @@ module.exports = class Cluster {
       return false
     }
 
-    await this.brokerPool.applyNodeEndpoints(nodeEndpoints, ...fenceArgs(fence))
+    const observedAt = this.brokerPool.endpointStamp()
+    await this.brokerPool.applyNodeEndpoints(nodeEndpoints, { fence, observedAt })
     fence?.check()
     checked(null)
+    if (!this.brokerPool.isEndpointCurrent(observedAt)) return false
     return this.metadataCache.applyLeaderHint(topic, partition, {
       leaderId,
       leaderEpoch,
@@ -1712,11 +1715,10 @@ module.exports = class Cluster {
    * table does not hold is added, and a known node at another address is replaced (keeping its
    * rack). A coordinator the table holds at that address is its cached broker.
    *
-   * When a Metadata response published, a leader hint applied or another answer requested for the
-   * same node after this request left (or a disconnect or rebootstrap since) is newer, and the table
-   * does not hold the node at the answered address, the answer is not used: the lookup fails with a
-   * retriable `KafkaJSBrokerNotFound`, refreshes metadata and asks again within its retries.
-   * Observations of other nodes never affect the answer.
+   * A later observation for the same node can supersede the answer, including a pending move or
+   * removal. Reuse requires an installed route at the intended address in the current routing
+   * generation. A stale conflict refreshes Metadata and retries with a `KafkaJSBrokerNotFound`
+   * cause. Unchanged Metadata and observations of other nodes leave the answer's order alone.
    * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java
    * @public
    * @param {object} params
@@ -1726,6 +1728,7 @@ module.exports = class Cluster {
    *   close ends the retries, and an answer that arrives after it is neither installed nor used
    * @returns {Promise<import("../../types").Broker>}
    * @throws {Error} the lifecycle's close error
+   * @throws {KafkaJSNumberOfRetriesExceeded} when a stale conflict exhausts the lookup retries
    */
   async findGroupCoordinator({ groupId, coordinatorType = COORDINATOR_TYPES.GROUP, fence }) {
     return this.retryFor(fence)(async (bail, retryCount, retryTime) => {
@@ -1750,13 +1753,14 @@ module.exports = class Cluster {
           fence?.check()
           checked(null)
         }
-        if (!held) {
-          throw new KafkaJSBrokerNotFound(
-            `Coordinator ${coordinator.nodeId} answered at ${coordinator.host}:${coordinator.port} was superseded by a newer endpoint of that node`
-          )
+        const { nodeId } = coordinator
+        if (held && this.brokerPool.holdsEndpoint(nodeId, coordinator, lookupStamp)) {
+          const broker = await this.findBroker({ nodeId, fence })
+          if (this.brokerPool.holdsEndpoint(nodeId, coordinator, lookupStamp, broker)) return broker
         }
-
-        return await this.findBroker({ nodeId: coordinator.nodeId, fence })
+        throw new KafkaJSBrokerNotFound(
+          `Coordinator ${nodeId} answered at ${coordinator.host}:${coordinator.port} was superseded by a newer endpoint of that node`
+        )
       } catch (e) {
         fence?.check()
         checked(null)
@@ -1804,6 +1808,7 @@ module.exports = class Cluster {
    * @throws {Error} the lifecycle's close error
    */
   async findGroupCoordinatorMetadata({ groupId, coordinatorType, fence }) {
+    const lookupStamp = this.brokerPool.endpointStamp()
     let lastError
     let refusal
     const findCoordinator = async ({ nodeId, broker }) => {
@@ -1811,11 +1816,16 @@ module.exports = class Cluster {
         try {
           fence?.check()
           checked(null)
-          const requestStamp = this.brokerPool.endpointStamp()
+          let requestStamp = lookupStamp
           const brokerMetadata = await broker.findGroupCoordinator({
             groupId,
             coordinatorType,
             ...(fence ? { guard: fence.guard } : {}),
+            [ON_WRITE]: () => {
+              if (this.brokerPool.isEndpointCurrent(lookupStamp)) {
+                requestStamp = this.brokerPool.endpointStamp()
+              }
+            },
           })
           fence?.check()
           checked(null)

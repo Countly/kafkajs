@@ -231,7 +231,13 @@ it('authoritative address replacement bounds retained failures', async () => {
     const token = owner.begin(address)
     owner.failed(address, performance.now(), token)
     expect(owner.entries.size).toBeLessThanOrEqual(2)
-    expect(owner.endpoints).toEqual(new Set(['a:9092', `bootstrap-${n}:9092`, address]))
+    expect(owner.endpoints).toEqual(
+      new Map([
+        ['a:9092', 2],
+        [`bootstrap-${n}:9092`, 1],
+        [address, 1],
+      ])
+    )
   }
   rack = 'changed'
   const refresh = pool.refreshMetadata([])

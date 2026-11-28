@@ -1441,13 +1441,10 @@ describe('terminal run cancellation of work started by a run', () => {
 
   /** Routes `cluster.applyLeaderHint` through the production method over a held endpoint step. */
   const holdEndpoints = (endpoints) => {
-    h.cluster.applyLeaderHint = jest.fn((hint, options) =>
-      Cluster.prototype.applyLeaderHint.call(
-        { metadataCache: h.metadataCache, brokerPool: { applyNodeEndpoints: () => endpoints() } },
-        hint,
-        options
-      )
-    )
+    const owner = new Cluster({ logger: newLogger(), brokers: ['node0:9092'] })
+    owner.metadataCache = h.metadataCache
+    jest.spyOn(owner.brokerPool, 'applyNodeEndpoints').mockImplementation(endpoints)
+    h.cluster.applyLeaderHint = jest.fn(owner.applyLeaderHint.bind(owner))
   }
 
   const staleWithHint = (partition, leaderId = 1) => ({

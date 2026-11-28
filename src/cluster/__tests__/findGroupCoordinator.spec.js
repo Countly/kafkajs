@@ -3,6 +3,7 @@ const shuffle = require('../../utils/shuffle')
 shuffle.mockImplementation((brokers) => brokers.sort((a, b) => a > b))
 
 const Broker = require('../../broker')
+const { ON_WRITE } = require('../../broker/privateOptions')
 const { createCluster, secureRandom } = require('testHelpers')
 const { KafkaJSBrokerNotFound, KafkaJSConnectionError } = require('../../errors')
 const COORDINATOR_TYPES = require('../../protocol/coordinatorTypes')
@@ -28,6 +29,7 @@ describe('Cluster > findGroupCoordinator', () => {
     expect(Broker.prototype.findGroupCoordinator).toHaveBeenCalledWith({
       groupId,
       coordinatorType: COORDINATOR_TYPES.GROUP,
+      [ON_WRITE]: expect.any(Function),
     })
     expect(broker).not.toBeFalsy()
   })
@@ -36,6 +38,7 @@ describe('Cluster > findGroupCoordinator', () => {
     const broker = await cluster.findGroupCoordinator({
       groupId,
       coordinatorType: COORDINATOR_TYPES.TRANSACTION,
+      [ON_WRITE]: expect.any(Function),
     })
 
     expect(Broker.prototype.findGroupCoordinator).toHaveBeenCalledWith({
@@ -46,18 +49,12 @@ describe('Cluster > findGroupCoordinator', () => {
   })
 
   test('refresh the metadata and try again in case of broker not found', async () => {
-    const firstNodeId = Object.keys(cluster.brokerPool.brokers)[0]
-    const firstNode = cluster.brokerPool.brokers[firstNodeId]
-
-    cluster.brokerPool.findBroker = jest
-      .fn()
-      .mockImplementationOnce(() => {
-        throw new KafkaJSBrokerNotFound('Not found')
-      })
-      .mockImplementation(() => firstNode)
+    jest.spyOn(cluster.brokerPool, 'findBroker').mockImplementationOnce(() => {
+      throw new KafkaJSBrokerNotFound('Not found')
+    })
 
     const coordinator = await cluster.findGroupCoordinator({ groupId })
-    expect(coordinator).toEqual(firstNode)
+    expect(coordinator).toBe(cluster.brokerPool.brokers[coordinator.nodeId])
     expect(cluster.brokerPool.findBroker).toHaveBeenCalledTimes(4)
   })
 
@@ -65,6 +62,7 @@ describe('Cluster > findGroupCoordinator', () => {
     // Node ids come from the broker pool: the KRaft test cluster numbers its nodes 1-3, not 0-2.
     const nodeIds = cluster.brokerPool.getNodeIds()
     const lastNodeId = nodeIds[nodeIds.length - 1]
+    const lastBroker = cluster.brokerPool.brokers[lastNodeId]
 
     for (const nodeId of nodeIds.slice(0, -1)) {
       jest
@@ -73,13 +71,12 @@ describe('Cluster > findGroupCoordinator', () => {
           throw new KafkaJSConnectionError('Something went wrong')
         })
     }
-    jest
-      .spyOn(cluster.brokerPool.brokers[lastNodeId], 'findGroupCoordinator')
-      .mockImplementation(() => ({ coordinator: { nodeId: lastNodeId } }))
+    const { host, port } = lastBroker.connectionPool
+    jest.spyOn(lastBroker, 'findGroupCoordinator').mockResolvedValue({
+      coordinator: { nodeId: lastBroker.nodeId, host, port },
+    })
 
-    await expect(cluster.findGroupCoordinator({ groupId })).resolves.toEqual(
-      cluster.brokerPool.brokers[lastNodeId]
-    )
+    await expect(cluster.findGroupCoordinator({ groupId })).resolves.toBe(lastBroker)
   })
 
   test('retry on ECONNREFUSED', async () => {

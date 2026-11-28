@@ -475,9 +475,13 @@ describe('share membership and a coordinator that keeps its node id at a new add
       const answer = listed(...args)
       return { ...answer, brokers: answer.brokers.filter(({ nodeId }) => nodeId !== MOVED.id) }
     })
+    const joined = h.hold({
+      api: 'ShareGroupHeartbeat',
+      match: ({ fields }) => fields.memberEpoch === 1,
+    })
     await h.consumer.subscribe({ topics: ['topic-a'] })
     await h.consumer.run({ eachMessage: async () => {} })
-    await until(() => run?.membership.memberEpoch === 1, 'the first join')
+    await joined.arrived()
     const { memberId, token } = run.membership
     const beatsBefore = h.frames(76).length
 
@@ -492,14 +496,18 @@ describe('share membership and a coordinator that keeps its node id at a new add
       })),
     }))
     const reached = h.hold({ api: 'ShareGroupHeartbeat', node: MOVED.id })
-    h.script('ShareGroupHeartbeat', [{ errorCode: 16 }])
+    const next = h.hold({ api: 'ShareGroupHeartbeat', node: MOVED.id })
+    joined.release({ errorCode: 16 })
     const beat = await reached.arrived()
     reached.release()
+    const nextBeat = await next.arrived()
+    next.release()
 
     const after = h.frames(76).slice(beatsBefore)
-    expect(after[0]).toMatchObject({ node: 0 })
+    expect(joined.call).toMatchObject({ node: 0 })
     expect(after.map(({ fields }) => fields.memberEpoch)).not.toContain(0)
     expect(beat.fields).toMatchObject({ memberId, memberEpoch: 1 })
+    expect(nextBeat.fields).toMatchObject({ memberId, memberEpoch: 1 })
     expect(run.membership.token).toBe(token)
   })
 })

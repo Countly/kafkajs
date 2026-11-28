@@ -1,21 +1,34 @@
 /**
- * Orders what a broker pool learns about where its nodes are, so the broker table only ever moves a
- * node to the newest thing learned about it.
+ * Orders intended per-node routes independently of the pools currently installed.
  *
- * Every observation of a node's endpoint takes a stamp from one clock: a published Metadata
- * response, a leader hint as it is applied, a FindCoordinator answer as its request is sent. A
- * node's endpoint is written only by its newest observation, and a write that awaited a pool build
- * is installed only if no newer observation of that node arrived meanwhile. A Metadata response
- * names every node of the cluster, so it supersedes every earlier observation at once, including
- * those of nodes it no longer lists; a cleared broker table does the same.
+ * Source             | Ordering
+ * ------------------ | ------------------------------------------------------------------------
+ * Metadata response  | At publication, a changed host/port or newly listed ID claims that node.
+ *                    | A repeated address keeps its original stamp, including during a build.
+ * Leader hint        | One stamp when admitted, shared by all rows. The first usable row per ID wins.
+ * Coordinator answer | The physical request's pre-write stamp. Each attempt has its own stamp.
+ * Seed adoption      | Inherits the claiming row's stamp. A seed pool acquires at most one node ID.
+ *
+ * Lifecycle event    | Ordering
+ * ------------------ | ------------------------------------------------------------------------
+ * Disconnect         | Raises the floor for all nodes and drops routing observations.
+ * Rebootstrap        | Raises the floor when the new seed commits and drops routing observations.
+ * Node removal       | A failure of the current pool claims a tombstone. Metadata omission claims
+ *                    | one when a listed address disappears and still owns the route by address.
+ *                    | A repeated omission leaves its stamp alone. An independently learned
+ *                    | different address survives omission of the old advertised address.
+ *
+ * The greater stamp wins for that node, including while a build or removal is pending.
+ * An older answer can reuse a matching installed pool only if it matches current intent and
+ * belongs to the same lifecycle. All other refusals can use the existing bounded retry.
  */
 class EndpointOrder {
+  /** Creates an empty routing generation. */
   constructor() {
     this.clock = 0
-    /** The newest observation of every node not observed alone since. */
     this.floor = 0
-    /** @type {Map<string, number>} nodes observed alone since `floor`, by node id */
-    this.stamps = new Map()
+    /** @type {Map<string, {stamp: number, address: string|null}>} */
+    this.routes = new Map()
   }
 
   /**
@@ -30,22 +43,32 @@ class EndpointOrder {
    * @returns {number} its stamp
    */
   supersedeAll() {
-    this.stamps.clear()
+    this.routes.clear()
     this.floor = this.next()
     return this.floor
   }
 
   /**
-   * Makes `stamp` the newest observation of the node, unless a newer one was recorded.
+   * @param {number} stamp
+   * @returns {boolean} whether the observation belongs to the current lifecycle
+   */
+  isCurrent(stamp) {
+    return stamp > this.floor
+  }
+
+  /**
+   * Records the node's desired address or removal, unless a newer observation already owns it.
    * @param {number|string} nodeId
    * @param {number} stamp
+   * @param {string|null} address
    * @returns {boolean} whether `stamp` is now the node's newest observation
    */
-  claim(nodeId, stamp) {
+  claim(nodeId, stamp, address) {
+    if (!this.isCurrent(stamp)) return false
     const key = String(nodeId)
-    const newest = this.stamps.get(key) ?? this.floor
-    if (stamp < newest) return false
-    if (stamp > newest) this.stamps.set(key, stamp)
+    const route = this.routes.get(key)
+    if (route && stamp <= route.stamp) return stamp === route.stamp && address === route.address
+    this.routes.set(key, { stamp, address })
     return true
   }
 
@@ -55,7 +78,7 @@ class EndpointOrder {
    * @returns {boolean} whether `stamp` is still the node's newest observation
    */
   owns(nodeId, stamp) {
-    return (this.stamps.get(String(nodeId)) ?? this.floor) === stamp
+    return this.routes.get(String(nodeId))?.stamp === stamp
   }
 }
 

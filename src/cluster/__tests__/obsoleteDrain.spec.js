@@ -227,12 +227,14 @@ describe('Obsolete broker dispatch', () => {
       for (let refresh = 0; refresh < 2; refresh++) {
         await pool.refreshMetadata([])
         expect(pool.seedBroker).toBe(seed)
-        expect(pool.brokers[3]).toBe(seed)
-        expect(seed.connectionPool).toBe(seedPool)
-        expect(pool.brokers[0]).not.toBe(seed)
+        expect(pool.brokers[0]).toBe(seed)
+        expect(pool.brokers[3]).not.toBe(seed)
+        expect(pool.brokers[3].nodeId).toBe(3)
+        expect(pool.brokers[3].connectionPool.host).toBe('seed')
+        expect(seed.nodeId).toBe(0)
         expect(pool.brokers[0].connectionPool.host).toBe('moved')
       }
-      expect(seedPool.retired).toBe(false)
+      expect(seedPool.retired).toBe(true)
       expect(seed.retire).not.toHaveBeenCalled()
     }
   )
@@ -355,11 +357,9 @@ describe('Obsolete broker dispatch', () => {
   it('a shared seed hint keeps the Broker and retires its previous pool with the bound', async () => {
     const { pool, seed } = build()
     const oldPool = seed.connectionPool
-    pool.brokers[9] = seed
     await pool.applyNodeEndpoints([{ nodeId: 0, host: 'moved', port: 9092 }])
     expect(pool.seedBroker).toBe(seed)
     expect(pool.brokers[0]).toBe(seed)
-    expect(pool.brokers[9]).toBe(seed)
     expect(oldPool.retired).toBe(true)
     expect(oldPool.destroy).toHaveBeenCalledWith({ drainTimeout: 50 })
     expect(seed.retire).not.toHaveBeenCalled()

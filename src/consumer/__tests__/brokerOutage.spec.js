@@ -377,8 +377,10 @@ describe('Consumer > broker outages', () => {
       })
       const events = { crashes: [], records: [] }
       consumer.on(consumer.events.CRASH, ({ payload }) => events.crashes.push(payload))
-      await start(events)
-      await until(() => events.records.length === 1, 'the first record')
+      let received
+      const firstRecord = new Promise((resolve) => (received = resolve))
+      await start(events, { eachMessage: async () => received() })
+      await firstRecord
       const joins = () =>
         classic
           ? wire(cluster, 'JoinGroup')
@@ -403,13 +405,19 @@ describe('Consumer > broker outages', () => {
           : (answered?.(fields, call) ?? {})
       )
       const reached = cluster.schedule.hold({ api: heartbeatApi, node: moved.id })
-      const beat = await reached.arrived()
+      const next = cluster.schedule.hold({ api: heartbeatApi, node: moved.id })
+      const firstBeat = await reached.arrived()
       reached.release()
+      const nextBeat = await next.arrived()
+      next.release()
 
       expect(wire(cluster, heartbeatApi, movedAt).some(({ node }) => node === COORDINATOR)).toBe(
         true
       )
-      expect(beat.fields).toMatchObject(classic ? { groupGenerationId: 1 } : { memberEpoch: 1 })
+      const membership = classic ? { groupGenerationId: 1 } : { memberEpoch: 1 }
+      expect(firstBeat.fields).toMatchObject(membership)
+      expect(nextBeat.fields).toMatchObject(membership)
+      expect(nextBeat.fields.memberId).toBe(firstBeat.fields.memberId)
       expect(joins()).toHaveLength(1)
       expect(events.crashes).toEqual([])
     }
