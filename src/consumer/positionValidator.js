@@ -33,7 +33,9 @@ const UNKNOWN_EPOCH = -1
  * here does synchronously. The consumer group calls `revoke()` from the metadata cache's
  * notification of every change of the partition's leader or leader epoch, so a leader that moved
  * away and back to the same epoch ends the entry too. A holder of the entry therefore answers "may
- * this data still be used" with one field read.
+ * this data still be used" with one field read. `revision` advances each time an admitting entry
+ * stops admitting, so a holder of many entries that saw them all admit at one revision knows they
+ * still do while the revision is unchanged, without reading any of them.
  *
  * Every mutation is idempotent per key and last-writer-wins: fetchers run one per node and a
  * partition normally belongs to one of them per round, but that is best-effort rather than an
@@ -52,6 +54,19 @@ module.exports = class PositionValidator {
     this.entries = new Map()
     this.assignmentGeneration = 0
     this.disabled = false
+    /** @type {number} advances each time an admitting entry stops admitting */
+    this.revision = 0
+  }
+
+  /**
+   * Ends the admission of an entry that is being replaced or dropped.
+   * @param {{admitted: boolean}} entry
+   * @returns {void}
+   */
+  #revokeEntry(entry) {
+    if (!entry.admitted) return
+    entry.admitted = false
+    this.revision++
   }
 
   /**
@@ -63,7 +78,7 @@ module.exports = class PositionValidator {
    */
   #put(key, next) {
     const previous = this.entries.get(key)
-    if (previous !== undefined) previous.admitted = false
+    if (previous !== undefined) this.#revokeEntry(previous)
     this.entries.set(key, next)
   }
 
@@ -75,7 +90,7 @@ module.exports = class PositionValidator {
   #drop(key) {
     const previous = this.entries.get(key)
     if (previous === undefined) return
-    previous.admitted = false
+    this.#revokeEntry(previous)
     this.entries.delete(key)
   }
 
@@ -239,9 +254,7 @@ module.exports = class PositionValidator {
     }
 
     const { pending } = entry
-    const positionMoved =
-      currentPosition.offset !== pending.offset ||
-      currentPosition.trackedEpoch !== pending.trackedEpoch
+    const positionMoved = !this.describes(entry, currentPosition)
 
     if (seekQueued || positionMoved) {
       entry.pending = null
@@ -329,6 +342,18 @@ module.exports = class PositionValidator {
   }
 
   /**
+   * Whether an awaiting entry still describes the position read now: the offset and the tracked
+   * epoch it asked about are the partition's current ones.
+   * @param {{pending: {offset: string, trackedEpoch: number}|null}} entry
+   * @param {{offset: string, trackedEpoch: number}} currentPosition read again now
+   * @returns {boolean} false as well for an entry that awaits nothing
+   */
+  describes(entry, { offset, trackedEpoch }) {
+    const { pending } = entry
+    return pending !== null && pending.offset === offset && pending.trackedEpoch === trackedEpoch
+  }
+
+  /**
    * @param {string} topic
    * @param {number} partition
    * @returns {boolean} whether a request for this partition is in flight
@@ -410,7 +435,7 @@ module.exports = class PositionValidator {
    * @returns {void}
    */
   clear() {
-    for (const entry of this.entries.values()) entry.admitted = false
+    for (const entry of this.entries.values()) this.#revokeEntry(entry)
     this.entries.clear()
     this.disabled = false
     this.assignmentGeneration++

@@ -525,28 +525,13 @@ module.exports = class MetadataCache {
    * @param {{ leaderId: number, leaderEpoch: number, topicId?: string }} hint
    * @returns {boolean} true when the hint advanced the epoch and was applied
    */
-  applyLeaderHint(topic, partition, { leaderId, leaderEpoch, topicId }) {
-    // ProduceResponse's CurrentLeader defaults to { LeaderId: -1, LeaderEpoch: -1 } when the
-    // broker has no hint to offer - never a real leader, regardless of the cached epoch.
-    if (leaderId === NO_LEADER_ID) {
+  applyLeaderHint(topic, partition, hint) {
+    if (!this.admitsLeaderHint(topic, partition, hint)) {
       return false
     }
 
-    const entry = this.topics.get(topic)
-    const cached = entry && entry.partitions.get(partition)
-
-    if (!cached) {
-      return false
-    }
-
-    if (topicId !== undefined && entry.topicId != null && entry.topicId !== topicId) {
-      return false
-    }
-
-    if (cached.leaderEpoch > UNKNOWN_EPOCH && leaderEpoch <= cached.leaderEpoch) {
-      return false
-    }
-
+    const { leaderId, leaderEpoch } = hint
+    const cached = this.topics.get(topic).partitions.get(partition)
     this.route(topic, partition, cached, leaderId, leaderEpoch)
 
     if (cached.decoded) {
@@ -556,6 +541,34 @@ module.exports = class MetadataCache {
 
     this.publishRoutingChange()
     return true
+  }
+
+  /**
+   * Whether `applyLeaderHint` would apply this hint now: it names a leader, the partition is
+   * cached, the topic is not known under another id than the hint's, and the hint's epoch advances
+   * the cached one (an unknown cached epoch, -1, never rejects). The one rule for a leader hint, so
+   * work that must happen before the cache write (`Cluster#applyLeaderHint`'s endpoint install)
+   * can ask it again at the moment it publishes.
+   * @param {string} topic
+   * @param {number} partition
+   * @param {{ leaderId: number, leaderEpoch: number, topicId?: string }} hint
+   * @returns {boolean}
+   */
+  admitsLeaderHint(topic, partition, { leaderId, leaderEpoch, topicId }) {
+    // ProduceResponse's CurrentLeader defaults to { LeaderId: -1, LeaderEpoch: -1 } when the
+    // broker has no hint to offer - never a real leader, regardless of the cached epoch.
+    if (leaderId === NO_LEADER_ID) {
+      return false
+    }
+
+    const entry = this.topics.get(topic)
+    const cached = entry && entry.partitions.get(partition)
+
+    return (
+      cached !== undefined &&
+      !(topicId !== undefined && entry.topicId != null && entry.topicId !== topicId) &&
+      !(cached.leaderEpoch > UNKNOWN_EPOCH && leaderEpoch <= cached.leaderEpoch)
+    )
   }
 
   /**

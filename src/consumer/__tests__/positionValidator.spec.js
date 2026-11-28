@@ -427,6 +427,31 @@ describe('Consumer > PositionValidator', () => {
       expect(validator.entryOf('other', 0)).toBeUndefined()
     })
 
+    it('revision advances once for each admitting entry that stops admitting, and for nothing else', () => {
+      const validator = create()
+      const at = []
+      const step = (action) => {
+        action()
+        at.push(validator.revision)
+      }
+
+      step(() => validator.revoke(TOPIC, 0)) // nothing to drop
+      step(() =>
+        validator.request(TOPIC, 0, { offset: '10', trackedEpoch: 4, currentLeaderEpoch: 5 })
+      ) // nothing admitted yet
+      step(() => validator.markValidated(TOPIC, 0, 5)) // replaces a pending entry
+      step(() => validator.markValidated(TOPIC, 0, 5)) // replaces an admitting entry
+      step(() => validator.markValidated(TOPIC, 1, 5))
+      step(() => validator.revoke(TOPIC, 0)) // drops an admitting entry
+      step(() => validator.revoke(TOPIC, 0)) // already gone
+      step(() =>
+        validator.request(TOPIC, 2, { offset: '10', trackedEpoch: 4, currentLeaderEpoch: 5 })
+      )
+      step(() => validator.clear()) // one admitting entry (partition 1) and one pending
+
+      expect(at).toEqual([0, 0, 0, 1, 1, 2, 2, 2, 3])
+    })
+
     it('is true at the same epoch once revoke() dropped the entry, and request() then asks again', () => {
       const validator = create()
       validator.markValidated(TOPIC, 0, 5)

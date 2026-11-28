@@ -1067,6 +1067,28 @@ describe('Consumer > answers from before a leader epoch change', () => {
       }
     })
 
+    test('a dropped row whose leader hint fails while the run is open starts the paced metadata refresh without holding back the healthy batch', async () => {
+      const h = await createGroup({ knownNodes: [NODE_ID, 1] })
+      h.cluster.applyLeaderHint.mockRejectedValueOnce(new Error('endpoint preparation failed'))
+      answerAfterEpoch(
+        h,
+        6,
+        { errorCode: 74, currentLeader: { leaderId: 1, leaderEpoch: 7 } },
+        { nodeEndpoints: [{ nodeId: 1, host: 'kafka1', port: 9092, rack: null }] }
+      )
+      try {
+        const batches = await h.group.fetch(NODE_ID)
+        await until(() => h.cluster.refreshMetadata.mock.calls.length > 0)
+
+        expect(partitionsOf(batches)).toEqual([1])
+        expect(h.cluster.applyLeaderHint).toHaveBeenCalledTimes(1)
+        expect(h.cluster.refreshMetadata).toHaveBeenCalledTimes(1)
+        expect(h.reset).not.toHaveBeenCalled()
+      } finally {
+        await h.teardown()
+      }
+    })
+
     test('a dropped row whose hint is older than the cached epoch leaves the cached leader and epoch alone', async () => {
       const h = await createGroup({ knownNodes: [NODE_ID, 1] })
       // The hint names the leader at epoch 6; the cache already holds epoch 7.
@@ -1744,6 +1766,173 @@ describe('Consumer > answers from before a leader epoch change', () => {
         expect(h.reset).toHaveBeenCalledTimes(1)
         expect(h.reset.mock.calls[0][0]).toEqual({ topic: TOPIC, partition: 1 })
         expect(truncations.map(({ partition }) => partition)).toEqual([1])
+      } finally {
+        jest.useRealTimers()
+        await h.teardown()
+      }
+    })
+
+    test.each([
+      [
+        'a seek of that partition',
+        (h) => h.group.seek({ topic: TOPIC, partition: 0, offset: '300' }),
+      ],
+      [
+        'a new tracked epoch at the same position',
+        (h) =>
+          h.offsetManager.resolveOffset({
+            topic: TOPIC,
+            partition: 0,
+            offset: '119',
+            leaderEpoch: 6,
+          }),
+      ],
+    ])(
+      'a non-retriable answer superseded by %s while a sibling reset was applied switches validation off nowhere and lets only its own check go',
+      async (_label, supersede) => {
+        const h = await createGroup({ committedEpoch: 4, position: '120' })
+        onFakeTime()
+        const warn = jest.spyOn(h.logger, 'warn')
+        let applyReset
+        h.reset.mockImplementationOnce(() => new Promise((resolve) => (applyReset = resolve)))
+        // First check: partition 0 is refused for good, partition 1's leader no longer knows its
+        // epoch (a reset). Any later check: partition 0's epoch 4 ends at 500, past its position.
+        let checks = 0
+        const rowFor = (partition) => {
+          if (checks > 1) return { partition, leaderEpoch: 4, endOffset: '500' }
+          return partition === 0
+            ? { partition, errorCode: 29 }
+            : { partition, leaderEpoch: -1, endOffset: '-1' }
+        }
+        h.setValidationResponse((partitions) => {
+          checks += 1
+          return offsetForLeaderEpochResponse(partitions.map(rowFor))
+        })
+        // A broker answers exactly the partitions the frame carried.
+        h.setResponse(() =>
+          fetchResponse(
+            h.fetchRequestPartitions().map((partition) => ({ partition, errorCode: 0 }))
+          )
+        )
+        try {
+          const round = h.group.fetch(NODE_ID)
+          await until(() => applyReset !== undefined)
+          // Partition 0's answer was classified while its check was current, and still awaits.
+          const check = h.group.positionValidator.entryOf(TOPIC, 0)
+          expect(h.group.positionValidator.isAwaitingWith(TOPIC, 0, check)).toBe(true)
+
+          supersede(h)
+          applyReset()
+          await round
+
+          expect(h.group.positionValidator.isDisabled()).toBe(false)
+          expect(warn.mock.calls.map(([message]) => message)).not.toContain(
+            'Positions cannot be validated, continuing without validation'
+          )
+          expect(h.group.positionValidator.isAwaitingWith(TOPIC, 0, check)).toBe(false)
+          expect(h.reset).toHaveBeenCalledTimes(1)
+          expect(h.reset.mock.calls[0][0]).toEqual({ topic: TOPIC, partition: 1 })
+        } finally {
+          jest.useRealTimers()
+          await h.teardown()
+        }
+      }
+    )
+
+    test.each(MOVES)(
+      '%s while an incremental Fetch carrying partition 0 without sending it waited in the connection queue: that frame is not written, and one frame at the same session epoch forgets partition 0 while partition 1 is fetched',
+      async (_move, move) => {
+        const h = await createGroup({ fetchSessions: true })
+        onFakeTime()
+        const blocker = withheldAnswer()
+        try {
+          // The broker's session 77 holds both partitions at offset 0 and epoch 5.
+          await openRound(h, true)
+          const connection = await h.broker.connectionPool.getConnection()
+          connection.requestQueue.maxInFlightRequests = 1
+          // An unanswered request on the same connection holds its one in-flight slot.
+          h.setValidationResponse(() => blocker.promise)
+          const blocking = h.broker.offsetForLeaderEpoch({
+            topics: [
+              {
+                topic: TOPIC,
+                partitions: [{ partition: 1, currentLeaderEpoch: 5, leaderEpoch: 4 }],
+              },
+            ],
+          })
+          await until(() => h.validationRequests().length === 1)
+          h.setResponse(fetchResponse([HEALTHY], { sessionId: SESSION_ID }))
+
+          // Both partitions are unchanged, so the queued frame would send neither of them.
+          const fetching = h.group.fetch(NODE_ID)
+          await until(() => connection.requestQueue.pending.length === 1)
+          expect(h.fetchFrames()).toHaveLength(1)
+
+          move(h)
+          const epochAfter = h.metadataCache.leaderEpoch(TOPIC, 0)
+          blocker.resolve(
+            offsetForLeaderEpochResponse([{ partition: 1, leaderEpoch: 4, endOffset: '20' }])
+          )
+          await blocking
+          const batches = await fetching
+
+          const frames = h.fetchFrames()
+          expect(frames.map(({ sessionId, sessionEpoch }) => [sessionId, sessionEpoch])).toEqual([
+            [0, 0],
+            [SESSION_ID, 1],
+          ])
+          expect(cursorsOf(frames[1])).toEqual([])
+          expect(frames[1].forgottenTopics.flatMap(({ partitions }) => partitions)).toEqual([0])
+          expect(partitionsOf(batches)).toEqual([1])
+          // The broker accepted that frame: the session holds partition 1 alone, one epoch on.
+          const session = h.group.fetchSessions.active(NODE_ID)
+          expect([session.sessionId, session.epoch]).toEqual([SESSION_ID, 2])
+          expect([...session.partitions.values()].map(({ partition }) => partition)).toEqual([1])
+
+          // The next round checks partition 0 again and sends it back into the session from its
+          // last offset; partition 1 is still carried without being sent.
+          h.setResponse(fetchResponse([{ partition: 0, errorCode: 0 }], { sessionId: SESSION_ID }))
+          await h.group.fetch(NODE_ID)
+          const next = h.fetchFrames()[2]
+          expect([next.sessionId, next.sessionEpoch]).toEqual([SESSION_ID, 2])
+          expect(cursorsOf(next)).toEqual([[0, '0', epochAfter]])
+          expect(next.forgottenTopics).toEqual([])
+        } finally {
+          jest.useRealTimers()
+          await h.teardown()
+        }
+      }
+    )
+
+    test('a frame whose admissions all still stand is checked with one comparison, and a lapse of a partition it does not carry walks it once and writes it whole', async () => {
+      // Partition 1 is led by node 1, so node 0's request carries partition 0 alone.
+      const h = await createGroup({
+        knownNodes: [NODE_ID, 1],
+        partitionLeaders: { 0: NODE_ID, 1: 1 },
+      })
+      onFakeTime()
+      try {
+        const walk = jest.spyOn(h.group, 'lapsedAdmission')
+        h.setResponse(fetchResponse([{ partition: 0, errorCode: 0, records: true }]))
+        expect(partitionsOf(await h.group.fetch(NODE_ID))).toEqual([0])
+        expect(walk).not.toHaveBeenCalled()
+
+        // Partition 1 gets an admitting entry of its own, then moves while node 0's request waits
+        // for its broker.
+        await h.group.validatePositions([{ topic: TOPIC, partitions: [1] }])
+        expect(h.group.positionValidator.entryOf(TOPIC, 1).admitted).toBe(true)
+        const lookups = h.findBrokerCalls.length
+        const release = h.holdBrokerLookup(NODE_ID)
+        h.setResponse(fetchResponse([{ partition: 0, errorCode: 0, records: true }]))
+        const fetching = h.group.fetch(NODE_ID)
+        await until(() => h.findBrokerCalls.length > lookups)
+        h.metadataCache.applyLeaderHint(TOPIC, 1, { leaderId: 1, leaderEpoch: 6 })
+        release()
+
+        expect(partitionsOf(await fetching)).toEqual([0])
+        expect(walk).toHaveBeenCalledTimes(1)
+        expect(walk.mock.results[0].value).toBeNull()
+        expect(h.fetchFrames().map(cursorsOf)).toEqual([[[0, '0', 5]], [[0, '0', 5]]])
       } finally {
         jest.useRealTimers()
         await h.teardown()

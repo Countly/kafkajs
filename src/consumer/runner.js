@@ -44,17 +44,25 @@ const NOT_COORDINATOR = 16
 
 const isSameOffset = (offsetA, offsetB) => Long.fromValue(offsetA).equals(Long.fromValue(offsetB))
 
+/** The admission of a batch built outside a fetch, which never lapses. */
+const ALWAYS_ADMITTED = Object.freeze({ admitted: true })
+/** The admission of a fetched batch that names no validation entry, which nothing admits. */
+const NEVER_ADMITTED = Object.freeze({ admitted: false })
+
 /**
- * Whether a batch's data may still be used, from its admission (`Batch.admissionOf`): the
- * validation entry its Fetch was admitted under still admits. The validator and the group's routing
- * listener clear that field synchronously when the entry is replaced or dropped, which a new leader
- * or leader epoch, a leader that moved away and back, and a validation redone at the same epoch all
- * do (`ConsumerGroup#admissionEntry`). A batch built outside a fetch has no admission and is used.
- * @param {{admitted: boolean}|null|undefined} admission
- * @returns {boolean}
+ * The admission token of a batch, read once per delivery: the validation entry its Fetch was
+ * admitted under (`Batch.admissionOf`), whose `admitted` field answers whether the batch's data may
+ * still be used. The validator and the group's routing listener clear that field synchronously
+ * when the entry is replaced or dropped, which a new leader or leader epoch, a leader that moved
+ * away and back, and a validation redone at the same epoch all do (`ConsumerGroup#admissionEntry`).
+ * @param {import('./batch')} batch
+ * @returns {{admitted: boolean}} the entry; a token that always admits for a batch built outside a
+ *   fetch, and one that never does for a fetched batch that names no entry
  */
-const admits = (admission) =>
-  admission === undefined || (admission !== null && admission.admitted === true)
+const admissionOf = (batch) => {
+  const entry = Batch.admissionOf(batch)
+  return entry === undefined ? ALWAYS_ADMITTED : (entry ?? NEVER_ADMITTED)
+}
 const CONSUMING_START = 'consuming-start'
 const CONSUMING_STOP = 'consuming-stop'
 const HANDLERS_IDLE = 'handlers-idle'
@@ -1391,7 +1399,16 @@ module.exports = class Runner extends EventEmitter {
     return error
   }
 
-  async processEachMessage(batch) {
+  /**
+   * Hands a batch's messages to `eachMessage` one at a time, stopping before the next message
+   * once the run stops, a seek is queued, the batch's assignment is gone, its admission lapsed or
+   * the partition was paused.
+   * @param {import('./batch')} batch
+   * @param {{admitted: boolean}} [admission] the batch's admission token (`admissionOf`), read
+   *   live before each message
+   * @returns {Promise<void>}
+   */
+  async processEachMessage(batch, admission = admissionOf(batch)) {
     const { topic, partition } = batch
     const authority = this.resolutionAuthority(batch)
 
@@ -1399,15 +1416,12 @@ module.exports = class Runner extends EventEmitter {
       this.consumerGroup.pause([{ topic, partitions: [partition] }])
       return () => this.consumerGroup.resume([{ topic, partitions: [partition] }])
     }
-    // Read once: the batch's validation entry, whose `admitted` field is the admission rule's
-    // answer for this batch from now on.
-    const admission = Batch.admissionOf(batch)
     for (const message of batch.messages) {
       if (
         !this.running ||
         this.consumerGroup.hasSeekOffset({ topic, partition }) ||
         this.isBatchStale(batch) ||
-        !admits(admission)
+        !admission.admitted
       ) {
         break
       }
@@ -1915,8 +1929,10 @@ module.exports = class Runner extends EventEmitter {
     // Likewise a batch whose admission lapsed while it waited: the validation entry it was fetched
     // under was dropped or replaced (a change of its partition's leader or leader epoch, a leader
     // that moved away and back, a check redone at the same epoch). The next round validates the
-    // position first and fetches it again from there.
-    if (!admits(Batch.admissionOf(batch))) {
+    // position first and fetches it again from there. The token is read once here and read live
+    // at every later check of this delivery.
+    const admission = admissionOf(batch)
+    if (!admission.admitted) {
       this.logger.debug('Dropping a queued batch whose admission lapsed', {
         groupId: this.consumerGroup.groupId,
         memberId: this.consumerGroup.memberId,
@@ -1983,7 +1999,7 @@ module.exports = class Runner extends EventEmitter {
         // A START_BATCH_PROCESS listener can pause the partition or cause a routing change that
         // ends the batch's admission: nothing is resolved, and END_BATCH_PROCESS still pairs with
         // START.
-        if (this.#paused(batch) || !admits(Batch.admissionOf(batch))) {
+        if (this.#paused(batch) || !admission.admitted) {
           this.instrumentationEmitter.emit(END_BATCH_PROCESS, {
             ...payload,
             duration: Date.now() - startBatchProcess,
@@ -2032,13 +2048,13 @@ module.exports = class Runner extends EventEmitter {
           topic,
           partition,
         })
-      } else if (!admits(Batch.admissionOf(batch))) {
+      } else if (!admission.admitted) {
         this.logger.debug('Not handing over a batch whose admission lapsed', {
           topic,
           partition,
         })
       } else if (this.eachMessage) {
-        await handlerContext.run(identity, () => this.processEachMessage(batch))
+        await handlerContext.run(identity, () => this.processEachMessage(batch, admission))
       } else if (this.eachBatch) {
         await handlerContext.run(identity, () => this.processEachBatch(batch))
       }

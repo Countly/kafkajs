@@ -9,7 +9,9 @@ const {
 } = require('./fixtures/fetchHarness')
 const { mulberry32 } = require('../../../testHelpers/fuzz')
 const ConsumerGroup = require('../consumerGroup')
+const PositionValidator = require('../positionValidator')
 const SubscriptionState = require('../subscriptionState')
+const { newLogger } = require('../../../testHelpers')
 const { KafkaJSError } = require('../../errors')
 
 /** Hand-built magic 2 batch at offset 0, one record `A`, correct CRC32C. */
@@ -351,14 +353,18 @@ function oracleReadReplicas(topic, partitions, routing) {
 
 /**
  * The request builder this client shipped before, with its whole-assignment active set, kept as
- * the oracle. Its validation filter is the admission rule written out from its definition, not
- * from the token the group reads: a partition is fetched only when its entry was validated against
- * the epoch the cluster caches now and still admits, and it is fetched at that cached epoch.
+ * the oracle. Its validation filter reads nothing of the group's validator: the test's own record
+ * of each partition's validation and routing events says whether, and at which epoch, the
+ * partition stands validated, and the expected request entry carries a validated entry of that
+ * epoch.
  * @this {ConsumerGroup}
  * @param {{topic: string, partitions: number[]}[]} topicPartitions
+ * @param {(topic: string, partition: number) => number|undefined} admittedAt the epoch the
+ *   partition was last validated against when no routing change or new check has ended that since,
+ *   `undefined` otherwise
  * @returns {object[]}
  */
-function oracleBuildFetchRequests(topicPartitions) {
+function oracleBuildFetchRequests(topicPartitions, admittedAt) {
   const manager = this.offsetManager
   const activeTopicPartitions = {}
   this.subscriptionState.active().forEach(({ topic, partitions }) => {
@@ -370,17 +376,11 @@ function oracleBuildFetchRequests(topicPartitions) {
       topic,
       partitions: partitions.reduce((requests, partition) => {
         const baseline = manager.heldOffsetAt(topic, partition)
-        const entry = this.positionValidator.entryOf(topic, partition)
-        const currentLeaderEpoch = this.cluster.leaderEpoch(topic, partition)
-        const validatedNow =
-          entry !== undefined &&
-          entry.validatedAgainst !== undefined &&
-          entry.validatedAgainst === currentLeaderEpoch &&
-          entry.admitted === true
+        const epoch = admittedAt(topic, partition)
         if (
           baseline != null &&
           activeTopicPartitions[topic].has(partition) &&
-          validatedNow &&
+          epoch !== undefined &&
           (this.haltedPartitions.size === 0 ||
             !this.haltedPartitions.has(`${topic}|${partition}`)) &&
           !(this.hasSeekGates() && this.isSeekGated(topic, partition))
@@ -388,9 +388,9 @@ function oracleBuildFetchRequests(topicPartitions) {
           requests.push({
             partition,
             fetchOffset: manager.nextOffset(topic, partition, baseline).toString(),
-            currentLeaderEpoch,
+            currentLeaderEpoch: epoch,
             maxBytes: this.maxBytesPerPartition,
-            admittedUnder: entry,
+            admittedUnder: { validatedAgainst: epoch, admitted: true, pending: null },
           })
         }
         return requests
@@ -496,6 +496,35 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
       if (random() < 0.3) state.hold([{ topic: topics[0], partitions: [0, 1] }], {})
       const coin = (salt) => (topic, partition) =>
         mulberry32(seed * 1000 + salt + partition)() < 0.15
+      // Each partition's history, applied to a real validator and recorded in the test's own
+      // model: never validated; validated and standing; validated, then dropped by a routing change
+      // (a leader that moved away and back to the same epoch); validated, dropped and validated
+      // again at the same epoch; or validated, then checked again and awaiting the answer.
+      const validator = new PositionValidator({ logger: newLogger() })
+      const standing = new Map()
+      for (const { topic, partitions } of assignment) {
+        for (const partition of partitions) {
+          if (coin(2)(topic, partition)) continue
+          const epoch = partition % 3
+          validator.markValidated(topic, partition, epoch)
+          standing.set(`${topic}|${partition}`, epoch)
+          if (coin(4)(topic, partition)) {
+            validator.revoke(topic, partition)
+            standing.delete(`${topic}|${partition}`)
+            if (coin(6)(topic, partition)) {
+              validator.markValidated(topic, partition, epoch)
+              standing.set(`${topic}|${partition}`, epoch)
+            }
+          } else if (coin(5)(topic, partition)) {
+            validator.request(topic, partition, {
+              offset: '4',
+              trackedEpoch: 1,
+              currentLeaderEpoch: epoch + 1,
+            })
+            standing.delete(`${topic}|${partition}`)
+          }
+        }
+      }
       const group = derivationGroup({
         subscriptionState: state,
         offsetManager: {
@@ -503,18 +532,7 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
           nextOffset: (topic, partition, baseline) => BigInt(baseline) + BigInt(partition),
         },
         obligations: { current: (topic) => (topic === 't5' ? null : {}) },
-        // Unvalidated, awaiting an answer, validated and still admitting, or validated and since
-        // replaced or dropped (no longer admitting). An entry that admits was validated against the
-        // epoch the cluster caches: every change of that epoch drops the entry at once.
-        positionValidator: {
-          entryOf: (topic, partition) =>
-            coin(2)(topic, partition)
-              ? undefined
-              : {
-                  validatedAgainst: coin(5)(topic, partition) ? undefined : partition % 3,
-                  admitted: !coin(4)(topic, partition) && !coin(5)(topic, partition),
-                },
-        },
+        positionValidator: validator,
         haltedPartitions: new Set(random() < 0.5 ? ['t0|2', 't1|0'] : []),
         hasSeekGates: () => true,
         isSeekGated: coin(3),
@@ -525,8 +543,11 @@ describe('Consumer > ConsumerGroup > fetch-round derivation', () => {
         topic,
         partitions: partitions.filter(() => random() < 0.6),
       }))
+      const admittedAt = (topic, partition) => standing.get(`${topic}|${partition}`)
       try {
-        expect(group.buildFetchRequests(parts)).toEqual(oracleBuildFetchRequests.call(group, parts))
+        expect(group.buildFetchRequests(parts)).toEqual(
+          oracleBuildFetchRequests.call(group, parts, admittedAt)
+        )
       } catch (error) {
         error.message += ` seed=${seed}`
         throw error
@@ -660,7 +681,12 @@ describe('Consumer > ConsumerGroup > fetch round over the wire', () => {
     rigs.push(rig)
     if (oracle) {
       rig.group.findReadReplicaForPartitions = oracleReadReplicas
-      rig.group.buildFetchRequests = oracleBuildFetchRequests
+      // No routing changes here: each partition of the round stands validated against the cached
+      // epoch, which the round's own preparation checked it against.
+      rig.group.buildFetchRequests = (parts) =>
+        oracleBuildFetchRequests.call(rig.group, parts, (topic, partition) =>
+          rig.cluster.leaderEpoch(topic, partition)
+        )
     }
     rig.group.pause([
       { topic: TOPIC, partitions: partitions.filter((p) => p !== 0 && random() < 0.2) },

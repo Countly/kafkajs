@@ -3,6 +3,7 @@ const BrokerPool = require('../brokerPool')
 const Cluster = require('../index')
 const InstrumentationEventEmitter = require('../../instrumentation/emitter')
 const RequestQueue = require('../../network/requestQueue')
+const ConnectionPool = require('../../network/connectionPool')
 const { currentDeadline, shareMetadata } = require('../../admin/deadline')
 const { CLUSTER_TOPIC_RECREATED } = require('../instrumentationEvents')
 const { newLogger, connectionOpts } = require('testHelpers')
@@ -49,6 +50,59 @@ const response = ({ topicId = ID_A, leader = 1, leaderEpoch = 5, brokers = [0, 1
 })
 
 const partition0 = (metadata) => metadata.topicMetadata[0].partitionMetadata[0]
+
+/** A Fetch leader hint for test-topic partition 0 at epoch 7, moving node 2 to a new address. */
+const HINT = {
+  topic: 'test-topic',
+  partition: 0,
+  leaderId: 2,
+  leaderEpoch: 7,
+  topicId: ID_A,
+  nodeEndpoints: [{ nodeId: 2, host: '10.0.0.9', port: 9094, rack: null }],
+}
+
+/**
+ * A real Cluster and BrokerPool whose cache holds test-topic at epoch 5 under ID_A and whose table
+ * holds node 2 at its old address. Each endpoint pool build is held: `builds` lists them in call
+ * order, each with the real pool it resolves to once `finish()` is called.
+ * @returns {{ cluster: Cluster, previous: object, previousPool: object,
+ *   builds: { pool: ConnectionPool, finish: () => void }[] }}
+ */
+const hintedEndpoint = () => {
+  const cluster = new Cluster({ ...connectionOpts(), logger: newLogger(), retry: { retries: 0 } })
+  cluster.metadataCache.update(response({ topicId: ID_A, leader: 1, leaderEpoch: 5 }))
+  const previousPool = {
+    host: '127.0.0.1',
+    port: 9094,
+    rack: null,
+    retire: jest.fn(),
+    destroy: jest.fn(async () => {}),
+  }
+  const previous = { nodeId: 2, connectionPool: previousPool, retire: jest.fn(async () => {}) }
+  cluster.brokerPool.brokers = { 2: previous }
+  cluster.brokerPool.createBroker = jest.fn(({ nodeId, connectionPool }) => ({
+    nodeId,
+    connectionPool,
+  }))
+  const builds = []
+  jest.spyOn(cluster.brokerPool.connectionPoolBuilder, 'build').mockImplementation(
+    ({ host, port }) =>
+      new Promise((resolve) => {
+        const pool = new ConnectionPool({ ...connectionOpts(), host, port })
+        pool.destroy = jest.fn(async () => {})
+        builds.push({ pool, finish: () => resolve(pool) })
+      })
+  )
+  return { cluster, previous, previousPool, builds }
+}
+
+/** Lets queued work run until `condition` holds, or fails the test. */
+const until = async (condition) => {
+  for (let turns = 0; turns < 100 && !condition(); turns++) {
+    await new Promise(setImmediate)
+  }
+  if (!condition()) throw new Error('the schedule never reached its hold point')
+}
 
 describe('Cluster > MetadataCache', () => {
   let cache
@@ -998,36 +1052,85 @@ describe('Cluster > MetadataCache', () => {
         cache.applyLeaderHint('test-topic', 0, { leaderId: 2, leaderEpoch: 7, topicId: ID_B })
       ).toBe(true)
     })
+  })
 
-    test('Cluster#applyLeaderHint publishes nothing when the topic was recreated while its endpoints were installed', async () => {
-      const cluster = new Cluster({
-        ...connectionOpts(),
-        logger: newLogger(),
-        retry: { retries: 0 },
-      })
-      cluster.metadataCache.update(response({ topicId: ID_A, leader: 1, leaderEpoch: 5 }))
-      let endpointsInstalled
-      jest
-        .spyOn(cluster.brokerPool, 'applyNodeEndpoints')
-        .mockImplementation(() => new Promise((resolve) => (endpointsInstalled = resolve)))
+  describe('a leader hint overtaken while its endpoint pool is built', () => {
+    test.each([
+      [
+        'a newer epoch of the same topic',
+        (cache) => cache.update(response({ topicId: ID_A, leader: 1, leaderEpoch: 8 })),
+        [1, 8],
+      ],
+      [
+        'a recreation of the topic',
+        (cache) => cache.update(response({ topicId: ID_B, leader: 1, leaderEpoch: 0 })),
+        [1, 0],
+      ],
+    ])(
+      'Cluster#applyLeaderHint overtaken by %s keeps the broker, its connection and the route',
+      async (_label, overtake, route) => {
+        const { cluster, previous, previousPool, builds } = hintedEndpoint()
 
+        const hint = cluster.applyLeaderHint(HINT)
+        expect(builds).toHaveLength(1)
+        overtake(cluster.metadataCache)
+        builds[0].finish()
+
+        await expect(hint).resolves.toBe(false)
+        // The table still holds the broker at its old address, with the connection it was using.
+        expect(cluster.brokerPool.brokers[2]).toBe(previous)
+        expect(previous.connectionPool).toBe(previousPool)
+        expect(previous.retire).not.toHaveBeenCalled()
+        expect(previousPool.destroy).not.toHaveBeenCalled()
+        expect(cluster.brokerPool.createBroker).not.toHaveBeenCalled()
+        // The pool built for the obsolete address is retired unused.
+        expect(builds[0].pool.destroy).toHaveBeenCalledTimes(1)
+        expect([
+          cluster.metadataCache.leader('test-topic', 0),
+          cluster.metadataCache.leaderEpoch('test-topic', 0),
+        ]).toEqual(route)
+      }
+    )
+
+    test('Cluster#applyLeaderHint overtaken after the first of two endpoint pools was built installs neither', async () => {
+      const { cluster, previous, builds } = hintedEndpoint()
       const hint = cluster.applyLeaderHint({
-        topic: 'test-topic',
-        partition: 0,
-        leaderId: 2,
-        leaderEpoch: 7,
-        topicId: ID_A,
-        nodeEndpoints: [{ nodeId: 2, host: '127.0.0.1', port: 9094, rack: null }],
+        ...HINT,
+        nodeEndpoints: [
+          ...HINT.nodeEndpoints,
+          { nodeId: 3, host: '10.0.0.10', port: 9095, rack: null },
+        ],
       })
-      // The topic is recreated under ID_B, at epoch 0, while the endpoint work waits.
-      cluster.metadataCache.update(response({ topicId: ID_B, leader: 1, leaderEpoch: 0 }))
-      endpointsInstalled()
+
+      builds[0].finish()
+      await until(() => builds.length === 2)
+      cluster.metadataCache.update(response({ topicId: ID_A, leader: 1, leaderEpoch: 8 }))
+      builds[1].finish()
 
       await expect(hint).resolves.toBe(false)
+      expect(cluster.brokerPool.brokers[2]).toBe(previous)
+      expect(cluster.brokerPool.brokers[3]).toBeUndefined()
+      expect(previous.retire).not.toHaveBeenCalled()
+      expect(cluster.brokerPool.createBroker).not.toHaveBeenCalled()
+      expect(builds.map(({ pool }) => pool.destroy.mock.calls.length)).toEqual([1, 1])
+      expect(cluster.metadataCache.leaderEpoch('test-topic', 0)).toBe(8)
+    })
+
+    test('Cluster#applyLeaderHint that nothing overtook installs the endpoint, retires the old broker and moves the route', async () => {
+      const { cluster, previous, builds } = hintedEndpoint()
+
+      const hint = cluster.applyLeaderHint(HINT)
+      builds[0].finish()
+
+      await expect(hint).resolves.toBe(true)
+      expect(cluster.brokerPool.brokers[2]).not.toBe(previous)
+      expect(cluster.brokerPool.brokers[2].connectionPool).toBe(builds[0].pool)
+      expect(previous.retire).toHaveBeenCalledTimes(1)
+      expect(builds[0].pool.destroy).not.toHaveBeenCalled()
       expect([
         cluster.metadataCache.leader('test-topic', 0),
         cluster.metadataCache.leaderEpoch('test-topic', 0),
-      ]).toEqual([1, 0])
+      ]).toEqual([2, 7])
     })
   })
 

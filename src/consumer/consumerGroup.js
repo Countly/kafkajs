@@ -2113,19 +2113,6 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * Whether a partition was sought after `since`, the acquisition clock read when its offset was
-   * selected: that offset is no longer the position the application asked for. Constant time
-   * while nothing was sought since.
-   * @param {string} topic
-   * @param {number|string} partition
-   * @param {number} since the acquisition clock at selection
-   * @returns {boolean}
-   */
-  isSoughtAfter(topic, partition, since) {
-    return this.lastSoughtAt > since && this.acquired.get(`${topic}|${partition}`)?.soughtAt > since
-  }
-
-  /**
    * The per-cell authority of a default commit selected at `since`: whether the partition was
    * sought, or acquired again, after it, or still has a seek that is not applied. A seek's
    * admission keeps the partition's position, so this gate is what keeps a pending seek's cell
@@ -2507,6 +2494,8 @@ module.exports = class ConsumerGroup {
       prepared.check()
       const { assignmentEpoch } = prepared
       requestClock = this.acquireClock
+      // Every request entry is built under an entry that admits at this revision.
+      let verifiedAt = this.positionValidator.revision
       const resolved = this.resolveTopicIds(this.buildFetchRequests(prepared.parts))
       const { requests, missing } = resolved
       if (missing) {
@@ -2565,19 +2554,26 @@ module.exports = class ConsumerGroup {
       // refusal leaves out at least one partition for good (a lapsed entry never admits again), so
       // a round writes at most one frame per partition plus one, and a healthy partition is fetched
       // in the round whatever another partition's routing does. Bytes already written are judged
-      // at receipt.
+      // at receipt. While no admitting entry stopped admitting since `verifiedAt`, the check is one
+      // comparison; only after one did is the request walked.
       let sent = requests
       let tracked = null
       let response
+      let lapsed = null
+      const guard = (frameLength) => {
+        const refusal = prepared.guard()
+        if (refusal || frameLength === undefined) return refusal
+        const revision = this.positionValidator.revision
+        if (revision === verifiedAt) return null
+        lapsed = this.lapsedAdmission(sent)
+        if (lapsed === null) verifiedAt = revision
+        return lapsed
+      }
       for (;;) {
         tracked =
           usesTopicIds === null
             ? null
             : this.trackFetch(registry, nodeId, sent, topicIds, usesTopicIds)
-        let lapsed = null
-        const guard = (frameLength) =>
-          prepared.guard() ||
-          (frameLength === undefined ? null : (lapsed = this.lapsedAdmission(sent)))
         try {
           response = await broker.fetch({
             guard,
@@ -2603,9 +2599,11 @@ module.exports = class ConsumerGroup {
             tracked.session.handleError(tracked.token)
             return []
           }
-          if (error === lapsed) {
+          if (lapsed !== null && error === lapsed) {
             // Written nowhere: the broker's session is still where the previous frame left it.
             tracked?.session.withdraw(tracked.token, tracked.previous)
+            lapsed = null
+            verifiedAt = this.positionValidator.revision
             sent = this.stillAdmitted(sent)
             if (sent.length === 0) return []
             prepared.check()
@@ -3335,7 +3333,8 @@ module.exports = class ConsumerGroup {
    * names the current leader. A leader hint of the topic incarnation the cache knows is applied
    * through the cache's monotonic rule, and the cache checks that incarnation again at its write,
    * after any endpoint work; a hint older than what the cache holds changes nothing. A row whose
-   * hint was not applied starts the run's paced refresh (`refreshLeaderlessMetadata`).
+   * hint was not applied, or whose endpoint work failed while the run is open, starts the run's
+   * paced refresh (`refreshLeaderlessMetadata`).
    *
    * Nothing here is awaited by the round: the batches of the answer's other rows are returned
    * without waiting for endpoint work or a refresh. All of it is bound to the run.
@@ -3361,16 +3360,18 @@ module.exports = class ConsumerGroup {
       run.fence,
       context.topicId
     )
-      .then((applied) => (applied ? undefined : this.refreshLeaderlessMetadata(run)))
       .catch((error) => {
-        if (run.fence.closed) return
-        this.logger.debug('Leader hint of a dropped Fetch row not applied', {
-          groupId: this.groupId,
-          topic: topicName,
-          partition,
-          error: describeThrown(error),
-        })
+        if (!run.fence.closed) {
+          this.logger.debug('Leader hint of a dropped Fetch row not applied', {
+            groupId: this.groupId,
+            topic: topicName,
+            partition,
+            error: describeThrown(error),
+          })
+        }
+        return false
       })
+      .then((applied) => (applied ? undefined : this.refreshLeaderlessMetadata(run)))
   }
 
   /**
@@ -4182,8 +4183,9 @@ module.exports = class ConsumerGroup {
    *
    * Nothing this method does may reach the caller as an exception. A transport failure, a
    * coordinator failure or anything unexpected is warned and swallowed, every partition it touched
-   * is marked validated, and the round proceeds - validation is an optimisation over
-   * correctness-on-the-next-round, never a reason to crash a consumer.
+   * is marked validated (or, when a seek, a reset or a new tracked epoch moved it on meanwhile, left
+   * to be checked again: `settleUnanswered`), and the round proceeds - validation is an optimisation
+   * over correctness-on-the-next-round, never a reason to crash a consumer.
    *
    * Positions are read without seeding (`peekNextOffset`): validation observes a position and
    * never makes the committed offset count as resolved progress, which a seek being applied has
@@ -4292,14 +4294,7 @@ module.exports = class ConsumerGroup {
       if (preparation?.guard()) {
         this.positionValidator.release(awaiting || [])
       } else {
-        // Only an entry still this round's own and still awaiting: one a routing change or another
-        // round replaced carries a different epoch than the one captured here, and one whose
-        // answer was applied or discarded is settled already.
-        for (const { topic, partition, currentLeaderEpoch, generation, entry } of awaiting || []) {
-          if (this.positionValidator.isAwaitingWith(topic, partition, entry)) {
-            this.positionValidator.markValidated(topic, partition, currentLeaderEpoch, generation)
-          }
-        }
+        for (const attempt of awaiting || []) this.settleUnanswered(attempt.topic, attempt, manager)
       }
     }
   }
@@ -4366,10 +4361,11 @@ module.exports = class ConsumerGroup {
    * @throws {Error} the preparation's refusal
    */
   async validateOnLeader(nodeId, topics, preparation) {
+    const manager = preparation ? preparation.manager : this.offsetManager
     // A non-retriable reply from an earlier leader in this same round switched validation off for
     // the assignment; asking the remaining leaders would buy nothing and cost a round trip each.
     if (this.positionValidator.isDisabled()) {
-      this.markAllValidated(topics)
+      this.markAllValidated(topics, manager)
       return
     }
 
@@ -4390,7 +4386,7 @@ module.exports = class ConsumerGroup {
         })
       }
 
-      this.markAllValidated(topics)
+      this.markAllValidated(topics, manager)
       return
     }
 
@@ -4438,19 +4434,13 @@ module.exports = class ConsumerGroup {
       })
 
       for (const { topic, entries } of pending) {
-        for (const { partition, currentLeaderEpoch, generation, entry } of entries) {
-          if (!this.positionValidator.isAwaitingWith(topic, partition, entry)) {
-            continue
-          }
-
+        for (const attempt of entries) {
           // The epoch is cleared and the offset left alone: the partition is fetched from where it
           // is, unvalidated, and validates again once it consumes a record. Both only happen when
-          // the mark applied - on a stale generation this round's exhaustion says nothing about
-          // the partition the current assignment holds.
-          if (
-            this.positionValidator.markValidated(topic, partition, currentLeaderEpoch, generation)
-          ) {
-            this.offsetManager.forgetConsumedEpoch(topic, partition)
+          // the mark applied - on a stale generation, or for an attempt whose position moved on,
+          // this round's exhaustion says nothing about the partition as it stands now.
+          if (this.settleUnanswered(topic, attempt, manager)) {
+            this.offsetManager.forgetConsumedEpoch(topic, attempt.partition)
           }
         }
       }
@@ -4481,7 +4471,7 @@ module.exports = class ConsumerGroup {
     }
 
     const retry = []
-    /** @type {{topic: string, partition: number, entry: object}[]} */
+    /** @type {object[]} the attempts a non-retriable answer refused */
     const fatal = []
 
     for (const { topic, entries } of pending) {
@@ -4523,9 +4513,7 @@ module.exports = class ConsumerGroup {
             errorCode: reply.errorCode,
             endOffset: reply.endOffset,
             leaderEpoch: reply.leaderEpoch,
-            seekQueued:
-              this.seekOffset.has(topic, entry.partition) ||
-              this.isSoughtAfter(topic, entry.partition, entry.requestClock),
+            seekQueued: this.isPositionSuperseded(topic, entry.partition, entry.requestClock),
             generation: entry.generation,
           }
         )
@@ -4533,7 +4521,7 @@ module.exports = class ConsumerGroup {
         if (outcome.action === 'retry') {
           retriable.push(entry)
         } else if (outcome.action === 'fatal') {
-          fatal.push({ topic, partition: entry.partition, entry: entry.entry })
+          fatal.push(entry)
         } else {
           const decided = preparation && this.positionValidator.entryOf(topic, entry.partition)
           try {
@@ -4575,15 +4563,17 @@ module.exports = class ConsumerGroup {
       }
     }
 
-    // A non-retriable answer switches validation off only while its own attempt is still the
-    // partition's awaiting entry here, where the switch happens: a sibling's outcome may have been
-    // awaited since it was classified, and a routing change, a rebalance or another attempt in that
-    // time took its authority away. Such an answer applies nothing; the next round asks again.
-    if (
-      fatal.some(({ topic, partition, entry }) =>
-        this.positionValidator.isAwaitingWith(topic, partition, entry)
-      )
-    ) {
+    // A non-retriable answer switches validation off only while its own attempt still holds here,
+    // where the switch happens (`validationAttemptHolds`): a sibling's outcome may have been
+    // awaited since it was classified, and a routing change, a rebalance, another attempt, a seek,
+    // a reset or a new tracked epoch in that time took its authority away. Such an answer applies
+    // nothing and lets only its own attempt go; the next round asks again.
+    let switchOff = false
+    for (const attempt of fatal) {
+      if (this.validationAttemptHolds(attempt.topic, attempt, manager)) switchOff = true
+      else this.positionValidator.release([attempt])
+    }
+    if (switchOff) {
       // Once per assignment, and only from the call that flips validation off: `disable()` makes
       // `request()` answer without a reply from here on and `validateOnLeader` returns early for
       // every remaining leader of this round, but fetchers run one per node and two of them can
@@ -4596,7 +4586,7 @@ module.exports = class ConsumerGroup {
         this.positionValidator.disable()
       }
 
-      this.markAllValidated(pending)
+      this.markAllValidated(pending, manager)
       return []
     }
 
@@ -4604,25 +4594,82 @@ module.exports = class ConsumerGroup {
   }
 
   /**
-   * Moves every partition of these entries on without a reply, leaving their tracked epochs alone.
-   *
-   * Each entry is marked under the generation it was requested with, so an entry belonging to a
-   * previous assignment is a no-op rather than a claim about the current one, and only while the
-   * partition's entry is still the attempt's own and still awaiting: one a routing change dropped,
-   * another attempt or answer replaced, or an answer discarded, carries nothing this attempt could
-   * claim.
+   * Moves every partition of these entries on without a reply, leaving their tracked epochs alone
+   * (`settleUnanswered`).
    *
    * @private
    * @param {{topic: string, entries: object[]}[]} topics
+   * @param {import('./offsetManager')} manager the offset manager the attempts were made under
    * @returns {void}
    */
-  markAllValidated(topics) {
+  markAllValidated(topics, manager) {
     for (const { topic, entries } of topics) {
-      for (const { partition, currentLeaderEpoch, generation, entry } of entries) {
-        if (!this.positionValidator.isAwaitingWith(topic, partition, entry)) continue
-        this.positionValidator.markValidated(topic, partition, currentLeaderEpoch, generation)
-      }
+      for (const attempt of entries) this.settleUnanswered(topic, attempt, manager)
     }
+  }
+
+  /**
+   * Whether a position validation attempt still speaks for its partition, read now: its entry is
+   * still the partition's awaiting entry, no seek, reset, recreation or new acquisition reached
+   * the partition since it was asked (`isPositionSuperseded`), and the partition still has the
+   * offset and tracked epoch it asked about. Only such an attempt may switch validation off or
+   * move its partition on without an answer. The rebalance and run checks are the entry's: a
+   * rebalance or a lost partition drops it.
+   * @private
+   * @param {string} topic
+   * @param {{partition: number, entry: object, requestClock: number}} attempt one entry of the
+   *   round's awaiting list (`validatePositions`)
+   * @param {import('./offsetManager')} manager the offset manager the attempt was made under
+   * @returns {boolean}
+   */
+  validationAttemptHolds(topic, { partition, entry, requestClock }, manager) {
+    return (
+      this.positionValidator.isAwaitingWith(topic, partition, entry) &&
+      !this.isPositionSuperseded(topic, partition, requestClock) &&
+      manager.heldOffsetAt(topic, partition) != null &&
+      this.positionValidator.describes(entry, {
+        offset: manager.peekNextOffset(topic, partition).toString(),
+        trackedEpoch: manager.lastConsumedEpoch(topic, partition),
+      })
+    )
+  }
+
+  /**
+   * Settles a validation attempt that got no usable answer (none at all, spent retries, a
+   * non-retriable sibling, an unsupported leader, a failed round): recorded as validated against
+   * the epoch it asked under while it still holds (`validationAttemptHolds`), under the generation
+   * it was asked in; otherwise only its own entry is let go, so the partition is checked again
+   * from where it stands now and no superseded position is admitted.
+   * @private
+   * @param {string} topic
+   * @param {{partition: number, entry: object, requestClock: number, currentLeaderEpoch: number,
+   *   generation: number}} attempt
+   * @param {import('./offsetManager')} manager the offset manager the attempt was made under
+   * @returns {boolean} whether it was recorded as validated
+   */
+  settleUnanswered(topic, attempt, manager) {
+    const { partition, entry, currentLeaderEpoch, generation } = attempt
+    if (this.validationAttemptHolds(topic, attempt, manager)) {
+      return this.positionValidator.markValidated(topic, partition, currentLeaderEpoch, generation)
+    }
+    this.positionValidator.release([{ topic, partition, entry }])
+    return false
+  }
+
+  /**
+   * Whether a seek, a reset, a recreation or a new acquisition reached the partition after
+   * `requestClock`, or a seek for it is queued: a position read at `requestClock` is no longer the
+   * one the application or the group stands behind.
+   * @private
+   * @param {string} topic
+   * @param {number} partition
+   * @param {number} requestClock the acquisition clock when the attempt was made
+   * @returns {boolean}
+   */
+  isPositionSuperseded(topic, partition, requestClock) {
+    if (this.seekOffset.size !== 0 && this.seekOffset.has(topic, partition)) return true
+    const acquired = this.acquired.get(`${topic}|${partition}`)
+    return acquired !== undefined && isChangedSince(acquired, requestClock)
   }
 
   /**

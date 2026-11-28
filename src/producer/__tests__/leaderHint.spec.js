@@ -564,13 +564,10 @@ describe('Producer > KIP-951 leader hint', () => {
     expect(cluster.brokerPool.brokers[3]).toBeTruthy()
   })
 
-  test('a hint for a partition the cache does not know is rejected, but only after the endpoint work already ran', async () => {
-    // Cluster#applyLeaderHint's pre-check only sees the epoch, not whether the topic/partition is
-    // known at all - that check lives inside MetadataCache#applyLeaderHint, which runs *after* the
-    // endpoint work. A hint for an unknown partition therefore still pays for `applyNodeEndpoints`
-    // even though it is ultimately rejected - the opposite of "a rejected hint costs nothing",
-    // true only for the epoch-rejection case.
-    const { cluster } = createHintCluster({ answer: acceptAll })
+  test('a hint for a partition the cache does not know is rejected before any endpoint work', async () => {
+    // Cluster#applyLeaderHint asks the cache's own rule first, which also knows whether the topic
+    // and partition are cached at all.
+    const { cluster, brokers } = createHintCluster({ answer: acceptAll })
 
     await expect(
       cluster.applyLeaderHint({
@@ -582,7 +579,8 @@ describe('Producer > KIP-951 leader hint', () => {
       })
     ).resolves.toBe(false)
 
-    expect(cluster.brokerPool.buildConnectionPool).toHaveBeenCalled()
+    expect(cluster.brokerPool.buildConnectionPool).not.toHaveBeenCalled()
+    expect(cluster.brokerPool.brokers[2]).toBe(brokers[2])
   })
 
   test.each([[undefined], [[]]])(
