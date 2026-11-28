@@ -303,7 +303,8 @@ describe('Consumer > PositionValidator', () => {
       it.each([
         ['validated', {}, position('10', 4)],
         ['truncated', { endOffset: '5' }, position('10', 4)],
-        ['reset', { endOffset: '-1' }, position('10', 4)],
+        // A broker's undefined answer is -1 with -1; an error row is -1 with -1 as well.
+        ['reset', { endOffset: '-1', leaderEpoch: -1 }, position('10', 4)],
         ['discarded', {}, position('55', 4)],
       ])('%s is an exit complete performs itself', (action, overrides, currentPosition) => {
         const { validator, generation } = awaiting(create())
@@ -315,8 +316,8 @@ describe('Consumer > PositionValidator', () => {
       })
 
       it.each([
-        ['retry', { errorCode: 6 }],
-        ['fatal', { errorCode: 29 }],
+        ['retry', { errorCode: 6, endOffset: '-1', leaderEpoch: -1 }],
+        ['fatal', { errorCode: 29, endOffset: '-1', leaderEpoch: -1 }],
       ])(
         '%s keeps the request in flight, and every caller-side exit ends it',
         (action, overrides) => {

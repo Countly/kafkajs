@@ -1,5 +1,6 @@
 const createProducer = require('../index')
 const { createFakeCluster } = require('./fixtures/fakeCluster')
+const { takeSent } = require('./fixtures/bufferHarness')
 const {
   KafkaJSConnectionClosedError,
   KafkaJSNumberOfRetriesExceeded,
@@ -47,27 +48,27 @@ const stampsOf = ({ producerId, producerEpoch, topicData }) =>
  * real one does, and loses the acknowledgement of the first `lost` Produce requests after
  * appending them.
  * @param {number} lost how many acknowledgements never arrive
- * @returns {{ cluster: object, written: string[], stamps: string[] }} what the broker appended,
- *   and the `producerId/epoch/firstSequence` of every request it received
+ * @returns {{ cluster: object, written: () => Promise<string[]>, stamps: string[] }} the values
+ *   the broker appended, read from the bytes it was sent, and the `producerId/epoch/firstSequence`
+ *   of every request it received
  */
 const createLossyCluster = (lost) => {
   const seen = new Set()
-  const written = []
+  const appended = []
   const stamps = []
   let requests = 0
 
   const cluster = createFakeCluster({
     produce: async (request) => {
-      for (const { partitions } of request.topicData) {
-        for (const batch of partitions) {
-          const stamp = `${request.producerId}/${request.producerEpoch}/${batch.firstSequence}`
-          stamps.push(stamp)
-          if (!seen.has(stamp)) {
-            seen.add(stamp)
-            written.push(...batch.messages.map(({ value }) => value))
-          }
+      const sent = takeSent(request)
+      sent.batches.forEach(({ firstSequence }, at) => {
+        const stamp = `${request.producerId}/${request.producerEpoch}/${firstSequence}`
+        stamps.push(stamp)
+        if (!seen.has(stamp)) {
+          seen.add(stamp)
+          appended.push({ sent, at })
         }
-      }
+      })
 
       if (++requests <= lost) {
         throw new KafkaJSConnectionClosedError('acknowledgement lost', { broker: 'fake' })
@@ -75,6 +76,15 @@ const createLossyCluster = (lost) => {
       return answer(request)
     },
   })
+
+  const written = async () =>
+    (
+      await Promise.all(
+        appended.map(async ({ sent, at }) =>
+          (await sent.read())[at].records.map(({ value }) => value.toString())
+        )
+      )
+    ).flat()
 
   return { cluster, written, stamps }
 }
@@ -89,7 +99,7 @@ describe('Producer > an idempotent send whose acknowledgement is lost', () => {
     await producer.disconnect()
 
     expect(stamps).toEqual(['1000/0/0', '1000/0/0'])
-    expect(written).toEqual(['event-1'])
+    expect(await written()).toEqual(['event-1'])
   })
 
   test('after the retries run out the outcome is unknown, and sending the same records again writes them a second time', async () => {
@@ -103,7 +113,7 @@ describe('Producer > an idempotent send whose acknowledgement is lost', () => {
     await producer.disconnect()
 
     expect(stamps).toEqual(['1000/0/0', '1000/0/0', '1000/1/0'])
-    expect(written).toEqual(['event-1', 'event-1'])
+    expect(await written()).toEqual(['event-1', 'event-1'])
   })
 })
 
