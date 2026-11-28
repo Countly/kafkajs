@@ -72,7 +72,7 @@ On Kafka 4.4 or newer, [`admin.unregisterController({ controllerId })`](./docs/A
 
 ## Migrating from `kafkajs`
 
-Replace the package name for the preserved API plus documented semantic differences. Read the [migration guide](./docs/MigrationGuide-3-0-0.md) for the changed defaults and behavior, and the [CHANGELOG](./CHANGELOG.md) for release details.
+Replace the package name for the preserved API plus documented semantic differences. Read the [migration guide](./docs/MigrationGuide-3-0-0.md) for the changed defaults and behavior, its [performance comparison with kafkajs 2.2.4](./docs/MigrationGuide-3-0-0.md#performance-compared-with-kafkajs-224) and [tested scale](./docs/MigrationGuide-3-0-0.md#tested-scale), and the [CHANGELOG](./CHANGELOG.md) for release details.
 
 ## Contributing
 

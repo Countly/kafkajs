@@ -9,7 +9,10 @@ lists every behavior change a caller might actually notice, grouped by the part 
 it touches; each item says what changed and what, if anything, to do. The goal is that a change not
 listed here did not change observable behavior. Start with **Install and runtime**, then read the
 areas you use. If you come from the Java or Go client instead, also read
-[Coming from the Java or Go client](#coming-from-the-java-or-go-client).
+[Coming from the Java or Go client](#coming-from-the-java-or-go-client). For speed compared with
+2.2.4 and the scale this release was tested at, see
+[Performance compared with kafkajs 2.2.4](#performance-compared-with-kafkajs-224) and
+[Tested scale](#tested-scale).
 
 ### Install and runtime
 
@@ -1808,6 +1811,138 @@ Broker client telemetry (KIP-714) is opt-in on every client. The table gives eac
 | “Each client exposes an asynchronous stable `clientInstanceId({ timeout })`; disabled/unsupported/closed/unavailable calls reject with `KafkaJSTelemetryError`.” | UUID is per returned client, stable through reconnect, not a group instance ID. Cached IDs are available without a new network request. Call after connect; timeout0 means cached-only. | Do not call getter or disable metrics; ordinary Kafka calls keep their old error/result identity. |
 | “Applications may register/unregister finite numeric Gauge and monotonic BigInt Sum snapshots for broker subscriptions.” | Re-register the same identity to update its value; there is no callback invocation or OTel SDK bridge. Unregister before resetting a Sum or changing immutable name type/unit. All four client kinds have this API. | Use existing instrumentation/optional OTel instead of registering; registered data only transmits when telemetry is enabled and selected. |
 | “Disconnect sends a best-effort terminating telemetry push on an active connected subscription, for at most 1000 ms within the existing close budget; timeout0 sends no final.” | Final failure cannot delay core close past its inherited deadline or change its result. No reconnect/Get occurs for a final. Internal crash recovery and stop alone are not terminal. Explicit reconnect retains UUID and stays provisional through Get until its first successful normal Push. Only a first-Push 42 in that captured post-final reopen permits one corrective telemetry-transport retirement, ordinary backoff, nonzero-ID Get and additional normal Push; Get cannot replenish the allowance. A second 42 or other fatal result stops only telemetry; close/expiry tears down under existing limits. No UUID rotation, final resend, foreground reconnect or exception for established streams. | `disconnect({ timeout: 0 })` where inherited, or disable metrics; no new close overload/default. |
+
+### Performance compared with kafkajs 2.2.4
+
+In these comparisons, this package consumed 200-byte values faster and used less CPU per message
+than kafkajs 2.2.4. For uncompressed 200-byte produces with each client's defaults, its median
+throughput was about 8 % lower. It used more CPU per produced message in every row shown. Its
+median consume throughput was lower and its CPU per message was higher in both 1 KiB rows.
+
+Every number here was measured in CI on GitHub-hosted `ubuntu-latest` runners (4 CPUs and 16 GB
+in GitHub's published size for public repositories), Kafka 4.4.0, three brokers, Node 24. Both
+clients ran on the same runner, through their public API only. The numbers describe one kind of
+machine and one workload per row. They are not a guarantee: measure your own workload before you
+size a deployment.
+
+How to read the tables:
+
+- Each row ran five times per client, the two clients taking turns. Each run measured at least 30
+  seconds after a warm-up that was not measured. Each cell gives the median across five runs and
+  the rounded minimum and maximum in parentheses.
+- **Defaults** uses each client's default options for the stated workload. **Same settings**
+  applies matching explicit options where supported. For producing: `idempotent: false`,
+  `maxInFlightRequests: null`, `retry: { retries: 5 }`, `linger: 0`, `batchSize: 1048576` and
+  `createPartitioner: Partitioners.DefaultPartitioner`. For consuming: `checkCrcs: false`,
+  `sessionTimeout: 30000` and `maxInFlightRequests: null`.
+- Unless a row says otherwise, records have a 200-byte value and no key, the topic has 3
+  partitions, and nothing is compressed. The produce throughput runs await one send of 500
+  messages at a time. The consume runs use an `eachMessage` handler that tracks offsets and seeks
+  between passes over logs seeded with the same layout.
+- CPU is the process's user plus system CPU time per message, on all threads, in microseconds
+  (µs).
+- The default 2.2.4 produce median was about 230,000 messages/s in one CI run and 131,000 in
+  another. Compare the clients within each row, where they shared a runner.
+
+Measured on the code of this release:
+
+| Workload | Settings | Messages/s, this package | Messages/s, 2.2.4 | CPU µs/message, this package | CPU µs/message, 2.2.4 |
+| --- | --- | --- | --- | --- | --- |
+| Produce | Defaults | 121,000 (85,000–130,000) | 131,000 (110,000–140,000) | 6.26 (6.22–7.60) | 4.86 (4.50–5.22) |
+| Produce | Same settings | 134,000 (112,000–154,000) | 122,000 (111,000–155,000) | 7.22 (6.49–8.64) | 4.97 (4.17–5.57) |
+| Consume | Defaults | 527,000 (518,000–554,000) | 475,000 (457,000–482,000) | 2.39 (2.36–2.42) | 2.65 (2.59–2.72) |
+| Consume, 1 KiB values | Defaults | 267,000 (244,000–275,000) | 320,000 (290,000–376,000) | 4.37 (4.34–4.61) | 2.93 (2.53–3.15) |
+| Consume, 1 KiB values | Same settings | 286,000 (275,000–347,000) | 309,000 (286,000–359,000) | 4.04 (3.51–4.17) | 2.99 (2.65–3.08) |
+
+Measured on earlier builds. The first two rows below are from the build just before the change
+that releases outgrown fetch buffers. The last two and the latency measurements are from an older
+build, before that change and before the latest change to checksum verification:
+
+| Workload | Settings | Messages/s, this package | Messages/s, 2.2.4 | CPU µs/message, this package | CPU µs/message, 2.2.4 |
+| --- | --- | --- | --- | --- | --- |
+| Produce, 1 KiB values | Defaults | 78,000 (59,000–79,000) | 78,000 (68,000–78,000) | 17.20 (16.64–19.49) | 13.90 (13.64–14.75) |
+| Consume | Same settings | 460,000 (458,000–476,000) | 385,000 (383,000–388,000) | 2.85 (2.78–2.86) | 3.24 (3.22–3.27) |
+| Produce, LZ4 (2.2.4 with an `lz4-napi` codec) | Defaults | 227,000 (226,000–229,000) | 238,000 (235,000–239,000) | 4.98 (4.94–5.07) | 4.61 (4.60–4.83) |
+| Produce, 12 partitions | Defaults | 173,000 (172,000–176,000) | 198,000 (195,000–202,000) | 5.11 (5.07–5.14) | 4.20 (4.15–4.36) |
+
+Latency of one awaited single-message `send()` at a time, on the older build, in milliseconds:
+
+| Settings | p50, this package | p99, this package | p50, 2.2.4 | p99, 2.2.4 |
+| --- | --- | --- | --- | --- |
+| Defaults | 5.93 (5.92–6.53) | 6.92 (6.88–8.48) | 0.40 (0.39–0.44) | 0.50 (0.48–1.16) |
+| Same settings | 0.45 (0.45–0.45) | 0.58 (0.57–0.58) | 0.39 (0.39–0.40) | 0.48 (0.48–0.49) |
+
+Settings and possible sources of overhead:
+
+- **The producer's default `linger` is 5 ms.** A lone send can wait up to that long for more
+  records. In the latency table above, the median with default settings was 5.93 ms. See
+  [The cost of one `send()` call](Producing.md#send-cost).
+- **The producer is idempotent by default.** It keeps one batch per partition in flight, so a busy
+  partition carries one batch per round trip (see
+  [One batch in flight per partition](Producing.md#partition-throughput)).
+- **Producing used more CPU per message in these rows.** Earlier profiles identified admission
+  accounting, send-time record snapshots and batch construction as possible contributors. The
+  current comparison leaves their individual costs unmeasured. See [Memory](Producing.md#memory)
+  for the producer's accounting bound and the [Producer](#producer) section for how it handles
+  Buffer values.
+- **The consumer checks record-batch checksums by default** (`checkCrcs: true`). Pass
+  `checkCrcs: false` to skip this check. In the 1 KiB runs, this package used about 0.3 µs more
+  CPU per message with defaults than with the explicit settings, which also changed other consumer
+  options.
+- **The 1 KiB runs counted more full garbage collections.** Median counts were 537 versus 199 with
+  defaults and 542 versus 186 with the same settings. A separate probe found that releasing
+  outgrown fetch buffers on runtimes that support detaching them reduced full collections; this
+  release includes that change. The remaining difference is unexplained. If you consume large records at high rates, measure your workload
+  before you move.
+
+### Tested scale
+
+The client was run at a target rate for 5 or 10 minutes per run, on builds shortly before this
+release: a GitHub-hosted `ubuntu-latest` runner (4 CPUs and 16 GB in GitHub's published size for
+public repositories), Kafka 4.4.0, three brokers on the same runner (replication
+factor 3, `min.insync.replicas` 2), Node 26, plaintext connections. Each run had three producers
+(one idempotent, one not idempotent, one transactional) and three consumers in one group, all with
+1 KiB records. Every record carried a per-partition sequence number, and each run checked for lost,
+duplicated and reordered records, skipped commits and visible aborted records; the data was also
+read back with Apache Kafka's console consumer.
+
+Rates are records per second across all producers. The acknowledged rate uses the offering window
+as its denominator and counts sends that settle after offering ends, including records in
+deliberately aborted transactions. The target-rate check requires both the sent and acknowledged
+totals to reach at least 95 % of offered records. Where a run missed its target, the "limited by"
+note is the load tool's own classification of the shortfall, not the result of an investigation.
+
+| Scenario | Topics × partitions | Target rate | Acknowledged rate | Producer processes | Result |
+| --- | --- | --- | --- | --- | --- |
+| No faults | 12 × 16 | 10,000 | 10,000 | 1 | Integrity checks passed. |
+| Rolling broker restarts (3 clean, 3 killed) | 12 × 16 | 10,000 | 10,000 | 1 | Integrity checks passed. Measured broker outages were about 14–17 s after clean stops and 15–24 s after kills. |
+| Rolling broker restarts (3 clean, 3 killed) | 12 × 16 | 30,000 | 30,000 | 1 | Integrity checks passed. Measured broker outages were about 13–17 s after clean stops and 40–60 s after kills. |
+| Rolling broker restarts (3 clean, 3 killed) | 12 × 16 | 50,000 | 46,396 | 1 | Integrity checks passed. The run missed its target rate. Measured broker outages were about 12–24 s after clean stops and 69–89 s after kills. |
+| No faults | 12 × 16 | 30,000 | 30,000 / 29,999 | 1 / 3 | Integrity checks passed. |
+| LZ4 | 12 × 16 | 30,000 | 21,817 / 22,019 / 30,000 | 1 / 1 / 3 | Integrity checks passed. Both one-process runs missed the target rate, limited by client CPU. |
+| Snappy, ZSTD, GZIP (5 minutes each) | 12 × 16 | 30,000 | 29,987 / 21,620 / 19,836 | 1 | Integrity checks passed. ZSTD and GZIP missed the target rate, limited by client CPU. |
+| Many topics, rolling broker restarts | 2,000 × 1 | 2,000 | 1,996 | 1 | Integrity checks passed. Three clean restarts completed. |
+| Many partitions, rolling broker restarts | 48 × 64 (3,072) | 30,000 | 13,216 | 3 | Integrity checks passed. The run missed its target rate, limited by runner capacity. The window ended before the final scheduled restart. |
+| One broker slowed, then frozen for about 45 s | 12 × 16 | 10,000 | 10,000 | 1 | Integrity checks passed. Acknowledgements on the other brokers' leaders resumed about 11 s after the freeze began, while the broker was still frozen. |
+
+The highest rates and counts in this table are what one shared runner reached with the brokers
+on it. They are the scale that was tested, not a limit of the client. An earlier slow-broker run
+found that concurrent sends could reach a partition out of call order; that is fixed in this
+release (see the CHANGELOG), and the slow-broker runs after the fix found no lost, duplicated or
+reordered records. These runs did not use TLS or SASL, share groups, Node.js 22 or 24, or other
+Kafka versions.
+
+Known limits that apply at scale are documented with the feature they belong to:
+
+- [One batch in flight per partition](Producing.md#partition-throughput) for idempotent and
+  transactional producers, and [the cost of one `send()` call](Producing.md#send-cost).
+- [Memory with large assignments](Consuming.md#large-assignment-memory): `maxBytes` is a response
+  target, not a heap ceiling.
+- [Queued requests and memory](Configuration.md#queued-requests-and-memory): each broker connection
+  queues requests without a size limit.
+- [Consumer options](Consuming.md#options) describe how an unanswered metadata refresh can pause
+  fetches.
+- [Known issues](#known-issues) in this release.
 
 ### Known issues
 

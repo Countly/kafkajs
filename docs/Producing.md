@@ -121,7 +121,7 @@ const producer = kafka.producer({ maxRequestSize: 4194304 })
 
 ## <a name="high-throughput"></a> Running at high throughput
 
-Two limits decide how fast one producer can write: [one batch in flight per partition](#partition-throughput), and [the fixed cost of each `send()` call](#send-cost). This guide does not state a tested scale: see the release notes for the scale this release has been tested at.
+Two limits decide how fast one producer can write: [one batch in flight per partition](#partition-throughput), and [the fixed cost of each `send()` call](#send-cost). This guide does not state a tested scale. See [Tested scale](MigrationGuide-3-0-0.md#tested-scale) for the workloads and rates measured before this release.
 
 ### <a name="partition-throughput"></a> One batch in flight per partition
 
