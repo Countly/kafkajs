@@ -13,6 +13,7 @@ const JoinOrder = require('./joinOrder')
 const {
   chargeOf,
   share,
+  SendCharge,
   SendCopy,
   wire,
   recordsBytes,
@@ -37,10 +38,21 @@ const isBytes = (value) => typeof value === 'string' || Buffer.isBuffer(value)
 
 /**
  * @param {*} headers
- * @returns {boolean} whether the record encoder can write `headers`: each value bytes, or an
- *   array of them
+ * @returns {boolean} whether the record encoder can write `headers`: each own value bytes, or an
+ *   array of them, whose holes it skips
  */
-const isHeaders = (headers) => headers !== null && Object.values(headers).flat().every(isBytes)
+const isHeaders = (headers) => {
+  if (headers === null) {
+    return false
+  }
+  for (const name of Object.keys(headers)) {
+    const header = headers[name]
+    if (Array.isArray(header) ? !header.every(isBytes) : !isBytes(header)) {
+      return false
+    }
+  }
+  return true
+}
 
 /** The largest int64, the upper bound of a timestamp. */
 const MAX_TIMESTAMP = 2n ** 63n - 1n
@@ -87,19 +99,31 @@ const unencodableField = ({ key, value, headers, timestamp }) => {
  * batch: a coalesced batch, and the Produce request carrying it, fail as a whole when one record
  * cannot be encoded, which would fail every other send sharing them.
  * @param {string} topic
- * @param {object[]} messages
+ * @param {object} message
  * @returns {void}
  * @throws {KafkaJSInvalidConfigurationError} naming the topic and the field: the record has to be
  *   fixed
  */
-const assertEncodable = (topic, messages) => {
+const assertEncodable = (topic, message) => {
+  const field = unencodableField(message)
+  if (field !== null) {
+    throw new KafkaJSInvalidConfigurationError(
+      `Invalid message for topic "${topic}": its ${field} must be ${ENCODABLE[field]}`
+    )
+  }
+}
+
+/**
+ * `assertEncodable` for each record of a topic. A function of its own, so the loop's iterator and
+ * temporaries stay out of `append`, whose frame a send waiting for room keeps.
+ * @param {string} topic
+ * @param {object[]} messages
+ * @returns {void}
+ * @throws {KafkaJSInvalidConfigurationError} for the first record the encoder cannot write
+ */
+const assertAllEncodable = (topic, messages) => {
   for (const message of messages) {
-    const field = unencodableField(message)
-    if (field !== null) {
-      throw new KafkaJSInvalidConfigurationError(
-        `Invalid message for topic "${topic}": its ${field} must be ${ENCODABLE[field]}`
-      )
-    }
+    assertEncodable(topic, message)
   }
 }
 
@@ -116,23 +140,6 @@ const hasRecords = (topicMessages) => {
     }
   }
   return false
-}
-
-/**
- * @param {object[]} messages
- * @returns {number} the bytes of their keys and values, the accumulator's estimate of a batch
- */
-const sizeOf = (messages) => {
-  let bytes = 0
-  for (const { key, value } of messages) {
-    if (key != null) {
-      bytes += Buffer.byteLength(key)
-    }
-    if (value != null) {
-      bytes += Buffer.byteLength(value)
-    }
-  }
-  return bytes
 }
 
 /**
@@ -397,18 +404,35 @@ const ownedRecord = (message, copies) => {
   return record
 }
 
+/** Notes nothing: headers copied for a batch keep their Buffers as they are. */
+const NO_COPIES = { note() {} }
+
 /**
- * A record as its batch carries it: one with a `BigInt` timestamp is copied with that timestamp as
- * a `Long`. The record encoder subtracts a batch's timestamps from each other, and a `BigInt`
- * cannot be mixed with the numbers of the other sends' records. A `0n` stays as it is: like `0` it
- * is falsy and means the send time, which a `Long` of 0 would not.
+ * A record as its batch carries it, read once into plain data before any batch changes: a custom
+ * partitioner works on the producer's copy and may have changed it, getters included. Its key,
+ * value, headers and timestamp are each read exactly once, its other own enumerable fields are
+ * kept, its headers are copied as `ownedHeaders` copies them and its timestamp is kept as
+ * `ownedTimestamp` keeps it. A `BigInt` timestamp other than `0n` becomes a `Long`: the record
+ * encoder subtracts a batch's timestamps from each other, and a `BigInt` cannot be mixed with the
+ * numbers of the other sends' records; like `0`, `0n` means the send time, which a `Long` of 0
+ * would not. The copy is what `#plan` validates, sizes and charges, and what the batch carries.
  * @param {object} message
  * @returns {object}
+ * @throws {*} whatever reading one of its fields throws
  */
-const withEncodableTimestamp = (message) =>
-  typeof message.timestamp === 'bigint' && message.timestamp !== 0n
-    ? { ...message, timestamp: Long.fromValue(message.timestamp) }
-    : message
+const batchRecord = (message) => {
+  const { key, value, headers, timestamp, ...record } = message
+  if (key !== undefined) record.key = key
+  if (value !== undefined) record.value = value
+  if (headers !== undefined) {
+    record.headers = headers === null ? null : ownedHeaders(headers, NO_COPIES)
+  }
+  if (timestamp !== undefined) {
+    const owned = ownedTimestamp(timestamp)
+    record.timestamp = typeof owned === 'bigint' && owned !== 0n ? Long.fromValue(owned) : owned
+  }
+  return record
+}
 
 /**
  * A batch's `RecordMetadata` for the records a send placed at `index` in it: the base offset moves
@@ -425,31 +449,6 @@ const offsetBy = (metadata, index) =>
 /** Sorts `RecordMetadata` by topic name, then partition. */
 const byTopicThenPartition = (a, b) =>
   a.topicName < b.topicName ? -1 : a.topicName > b.topicName ? 1 : a.partition - b.partition
-
-/**
- * Cuts one partition's records of a send at record boundaries into runs that each fit a batch of
- * `capacity` wire bytes, greedily, in order; no record is above `capacity` (`append` refused it).
- * @param {object[]} messages
- * @param {number} capacity
- * @returns {{ messages: object[], wire: number, origin: number }[]} `origin` is the position of
- *   a run's first record among `messages`
- */
-const chunksOf = (messages, capacity) => {
-  const chunks = []
-  let start = 0
-  let bytes = 0
-  for (let index = 0; index < messages.length; index++) {
-    const size = wire(messages[index])
-    if (index > start && bytes + size > capacity) {
-      chunks.push({ messages: messages.slice(start, index), wire: bytes, origin: start })
-      start = index
-      bytes = 0
-    }
-    bytes += size
-  }
-  chunks.push({ messages: messages.slice(start), wire: bytes, origin: start })
-  return chunks
-}
 
 /**
  * Two settlers that settle `settler` once both have: with the first one's value, or with the
@@ -853,6 +852,26 @@ class PendingSend {
     this.payload = total - shell
   }
 
+  /**
+   * @returns {number} what it was admitted with, while its records have not joined a batch: no
+   *   part of the reservation is given back before then
+   */
+  get charged() {
+    return this.reservation.remaining
+  }
+
+  /**
+   * Divides the reservation again when its records join their batches, as those batches carry them
+   * (a custom partitioner may have changed them): `shell` of it stays until the send's last batch
+   * retires, and the rest is their shares, given back as their batches retire or, for what no batch
+   * takes, once the join ends.
+   * @param {number} shell at most `charged`
+   * @returns {void}
+   */
+  carry(shell) {
+    this.payload = this.charged - shell
+  }
+
   /** Counts one continuation that holds this send. @returns {void} */
   pin() {
     this.pins += 1
@@ -1025,7 +1044,8 @@ class Accumulator {
    * @param {(request: { acks: number, timeout?: number, compression?: number,
    *   batches: PendingBatch[] }) => Promise<object[]>} options.sendPartitioned sends the batches
    *   and settles each one's `settlers` as it settles; it must enqueue them before it returns, so
-   *   that a flush is complete when `flush()` returns
+   *   that a flush is complete when `flush()` returns. Once it returns it owns them and retires
+   *   each; when it throws instead it took none, and the accumulator retires them
    * @param {() => boolean} [options.lingers] whether a batch that forms now may wait for `linger`
    * @param {() => boolean} [options.holds] whether a due batch waits for its partition's batch in
    *   flight to settle
@@ -1194,7 +1214,7 @@ class Accumulator {
    */
   async append({ acks, timeout, compression, topicMessages, startedAt = Date.now() }) {
     for (const { topic, messages } of topicMessages) {
-      assertEncodable(topic, messages)
+      assertAllEncodable(topic, messages)
     }
     if (!hasRecords(topicMessages)) {
       return []
@@ -1245,12 +1265,22 @@ class Accumulator {
     const lifecycle = this.#getGeneration()
     if (lifecycle?.closed) {
       reservation.releaseAll()
-      if (lifecycle.error instanceof KafkaJSApplicationRecoverableError) throw lifecycle.error
-      throw new KafkaJSProducerClosedError('The producer was closed before admission completed', {
-        outcome: 'unsent',
-      })
+      throw this.#closedError(lifecycle, 'The producer was closed before admission completed')
     }
     return reservation
+  }
+
+  /**
+   * @param {import('../generation')} lifecycle a closed lifecycle
+   * @param {string} message
+   * @returns {Error} what a send it closed before any of its records joined a batch rejects with:
+   *   the exact armed error when initial fencing closed it, else `KafkaJSProducerClosedError`,
+   *   `outcome: 'unsent'`
+   */
+  #closedError(lifecycle, message) {
+    return lifecycle.error instanceof KafkaJSApplicationRecoverableError
+      ? lifecycle.error
+      : new KafkaJSProducerClosedError(message, { outcome: 'unsent' })
   }
 
   /**
@@ -1333,14 +1363,24 @@ class Accumulator {
       for (const message of messages) {
         const size = wire(message)
         if (size > limit) {
-          throw new KafkaJSRecordTooLargeError(
-            `A record of ${size} bytes for topic "${topic}" can never fit in a Produce request of ` +
-              `maxRequestSize (${this.#budget.maxRequestSize} bytes), which carries at most ${limit} bytes of records`,
-            { reason: 'maxRequestSize', scope: 'record', size, limit, topic }
-          )
+          throw this.#tooLarge(topic, size, limit)
         }
       }
     }
+  }
+
+  /**
+   * @param {string} topic
+   * @param {number} size a record's wire bytes
+   * @param {number} limit the chunk capacity of its topic and codec
+   * @returns {KafkaJSRecordTooLargeError} `reason: 'maxRequestSize'`, `scope: 'record'`
+   */
+  #tooLarge(topic, size, limit) {
+    return new KafkaJSRecordTooLargeError(
+      `A record of ${size} bytes for topic "${topic}" can never fit in a Produce request of ` +
+        `maxRequestSize (${this.#budget.maxRequestSize} bytes), which carries at most ${limit} bytes of records`,
+      { reason: 'maxRequestSize', scope: 'record', size, limit, topic }
+    )
   }
 
   /**
@@ -1524,30 +1564,46 @@ class Accumulator {
    * full and goes out in this hand-off, and no batch grows past `batchSize` or the chunk capacity.
    * Each batch takes the shares of the send's records it carries (see `PendingSend#share`), and a
    * batch created here debits its own charge from the buffer, without waiting.
+   * The request options are read into one key and every chunk is planned and measured first
+   * (`#plan`), which changes nothing, so a send that fails there leaves no batch, share, debit or
+   * timer behind. Both can run user code that closes the producer (an option's conversion, a
+   * record's getter): a send whose lifecycle closed meanwhile is refused then. Applying the plan
+   * only changes batches and timers, reads no record or option and calls no user code; the batches
+   * it displaces or fills are handed on after it, in order, and `#send` never lets a hand-off
+   * throw.
    * @param {{ topic: string, partition: number, messages: object[] }[]} entries
    * @param {{ acks: number, timeout?: number, compression?: number, createdAt: number }} options
    * @param {PendingSend} holder the send whose records these are
    * @returns {Promise<object[]>} the append's outcome, as `append()` describes it
+   * @throws {KafkaJSProducerClosedError} `outcome: 'unsent'`, when the lifecycle closed while the
+   *   options or records were read; the lifecycle's own error when initial fencing closed it
+   * @throws {KafkaJSInvalidConfigurationError} a record the encoder cannot write, or records that
+   *   take more of the buffer than the send was charged (see `#plan`)
+   * @throws {KafkaJSRecordTooLargeError} a record above its chunk capacity (see `#plan`)
    */
   #join(entries, { acks, timeout, compression, createdAt }, holder) {
+    const lifecycle = this.#getGeneration()
+    const options = `${acks}/${timeout}/${compression}`
+    const { plan, shell } = this.#plan(entries, compression, holder)
+    if (lifecycle?.closed) {
+      throw this.#closedError(lifecycle, 'The producer was closed before the send joined a batch')
+    }
+    holder.carry(shell)
     let send
     const appended = new Promise((resolve, reject) => {
       send = new AppendedSend(holder, resolve, reject)
     })
-    const options = `${acks}/${timeout}/${compression}`
     // One due time for every batch this append creates, so they fall due together.
     const dueAt = Date.now() + this.#linger
+    /** @type {PendingBatch[]} earlier batches its records do not fit in, out of the pending ones */
+    const displaced = []
     /** @type {PendingBatch[]} the batches this append fills, out of the pending ones */
     const full = []
     /** @type {PendingBatch[]} the other batches carrying its records, still pending */
     const joined = []
-    for (const { topic, partition, messages } of entries) {
-      const capacity = this.#budget.chunkCapacity(topic, compression)
-      const bytes = recordsBytes(messages)
-      const chunks =
-        bytes <= capacity ? [{ messages, wire: bytes, origin: 0 }] : chunksOf(messages, capacity)
+    for (const { topic, partition, capacity, chunks } of plan) {
       chunks.forEach((chunk, index) => {
-        const batch = this.#add(topic, partition, chunk, capacity, holder, send, {
+        const batch = this.#add(topic, partition, chunk, capacity, holder, send, displaced, {
           options,
           acks,
           timeout,
@@ -1579,6 +1635,9 @@ class Accumulator {
         batch.timer = setTimeout(() => this.#expire(batch), this.#lingerOf(batch))
       }
     }
+    for (const batch of displaced) {
+      this.#send([batch])
+    }
     if (full.length > 0) {
       this.#handOnDue(full)
     } else if (this.#linger === 0) {
@@ -1589,23 +1648,81 @@ class Accumulator {
   }
 
   /**
-   * Adds one chunk of a send's records to its partition's pending batch, or to a new one when the
-   * pending batch has other options or would pass `batchSize` or `capacity`, which hands that one
-   * on first.
+   * The chunks a send's assigned records join, prepared before any batch changes. This is the one
+   * place after the custom partitioner where the records are read: each record once, in one walk,
+   * into the plain copy its batch carries (see `batchRecord`), which is then checked as `append`
+   * checks the caller's records and sized as `chargeOf` sizes them (see `SendCharge`). Per entry
+   * the chunk capacity of its topic and codec; its records cut greedily, in order, into chunks
+   * that fit it; and per chunk the wire bytes, the key and value bytes and the shares `#add`
+   * charges. Everything after it reads only that data.
+   * @param {{ topic: string, partition: number, messages: object[] }[]} entries
+   * @param {number} [compression]
+   * @param {PendingSend} holder whose admitted charge must cover the copies
+   * @returns {{ plan: { topic: string, partition: number, capacity: number, chunks: { messages:
+   *   object[], wire: number, origin: number, bytes: number, shares: number }[] }[],
+   *   shell: number }} `shell` is the copies' part of the charge no batch releases
+   * @throws {KafkaJSInvalidConfigurationError} a copy the encoder cannot write, or copies that take
+   *   more of the buffer than the send was charged: a custom partitioner changed them
+   * @throws {KafkaJSRecordTooLargeError} a record above the chunk capacity now, which can be
+   *   smaller than when the send was admitted (a codec registered or replaced since), as
+   *   `#assertFits` refuses it
+   * @throws {*} whatever reading a record throws
+   */
+  #plan(entries, compression, holder) {
+    const charge = new SendCharge()
+    const plan = []
+    for (const { topic, partition, messages: assigned } of entries) {
+      const capacity = this.#budget.chunkCapacity(topic, compression)
+      let chunk = { messages: [], wire: 0, origin: 0, bytes: 0, shares: 0 }
+      const chunks = [chunk]
+      for (let index = 0; index < assigned.length; index++) {
+        const record = batchRecord(assigned[index])
+        assertEncodable(topic, record)
+        charge.add(record)
+        const size = charge.wire
+        if (size > capacity) {
+          throw this.#tooLarge(topic, size, capacity)
+        }
+        if (index > chunk.origin && chunk.wire + size > capacity) {
+          chunk = { messages: [], wire: 0, origin: index, bytes: 0, shares: 0 }
+          chunks.push(chunk)
+        }
+        chunk.messages.push(record)
+        chunk.wire += size
+        chunk.bytes += charge.payload
+        chunk.shares += charge.share
+      }
+      plan.push({ topic, partition, capacity, chunks })
+    }
+    if (charge.total > holder.charged) {
+      throw new KafkaJSInvalidConfigurationError(
+        `The records of a send changed after it was charged: they need ${charge.total} bytes of ` +
+          `bufferMemory, and the send was charged ${holder.charged}`
+      )
+    }
+    return { plan, shell: charge.shell }
+  }
+
+  /**
+   * Adds one planned chunk of a send's records to its partition's pending batch, or to a new one
+   * when the pending batch has other options or would pass `batchSize` or `capacity`: that one
+   * leaves the pending ones and its timer is cleared, to be handed on by the caller.
    * @param {string} topic
    * @param {number} partition
-   * @param {{ messages: object[], wire: number, origin: number }} chunk
+   * @param {{ messages: object[], wire: number, origin: number, bytes: number, shares: number }}
+   *   chunk prepared by `#plan`
    * @param {number} capacity the chunk capacity of the topic and codec
    * @param {PendingSend} holder
    * @param {AppendedSend} send
+   * @param {PendingBatch[]} displaced takes the pending batch the chunk does not fit in
    * @param {{ options: string, acks: number, timeout?: number, compression?: number,
    *   createdAt: number, dueAt: number }} shape
    * @returns {PendingBatch} the batch now carrying the chunk, still pending
    */
-  #add(topic, partition, { messages, wire: wireBytes, origin }, capacity, holder, send, shape) {
+  #add(topic, partition, chunk, capacity, holder, send, displaced, shape) {
+    const { messages, wire: wireBytes, origin, bytes, shares } = chunk
     const { options, acks, timeout, compression, createdAt, dueAt } = shape
     const key = `${topic}/${partition}`
-    const bytes = sizeOf(messages)
     let batch = this.#pending.get(key)
     if (
       batch !== undefined &&
@@ -1613,7 +1730,9 @@ class Accumulator {
         batch.bytes + bytes > this.#batchSize ||
         batch.wire + wireBytes > capacity)
     ) {
-      this.#flushBatch(batch)
+      clearTimeout(batch.timer)
+      this.#pending.delete(key)
+      displaced.push(batch)
       batch = undefined
     }
     if (batch === undefined) {
@@ -1652,10 +1771,8 @@ class Accumulator {
       this.#rearm(batch)
     }
     batch.settlers.push(new Settler(send, batch.messages.length, origin))
-    let shares = 0
     for (const message of messages) {
-      batch.messages.push(withEncodableTimestamp(message))
-      shares += share(message)
+      batch.messages.push(message)
     }
     batch.bytes += bytes
     batch.wire += wireBytes
@@ -1891,35 +2008,30 @@ class Accumulator {
    * options - every hand-off of a send that asked for one set of them - go to the send path as
    * they are, with no grouping.
    * @param {PendingBatch[]} batches
-   * @returns {Promise<unknown>} settles once they all have; never rejects, unless the send path
-   *   throws before it answers, which rejects the promise the hand-off sites leave unawaited
+   * @returns {Promise<unknown>} settles once they all have; never rejects
    */
   #sendGrouped(batches) {
-    try {
-      if (batches.length === 0) {
-        return Promise.resolve()
-      }
-      let shared = true
-      for (let i = 1; i < batches.length && shared; i++) {
-        shared = batches[i].options === batches[0].options
-      }
-      if (shared) {
-        return this.#send(batches)
-      }
-      /** @type {Map<string, PendingBatch[]>} */
-      const groups = new Map()
-      for (const batch of batches) {
-        const group = groups.get(batch.options)
-        if (group === undefined) {
-          groups.set(batch.options, [batch])
-        } else {
-          group.push(batch)
-        }
-      }
-      return Promise.all(Array.from(groups.values(), (group) => this.#send(group)))
-    } catch (error) {
-      return Promise.reject(error)
+    if (batches.length === 0) {
+      return Promise.resolve()
     }
+    let shared = true
+    for (let i = 1; i < batches.length && shared; i++) {
+      shared = batches[i].options === batches[0].options
+    }
+    if (shared) {
+      return this.#send(batches)
+    }
+    /** @type {Map<string, PendingBatch[]>} */
+    const groups = new Map()
+    for (const batch of batches) {
+      const group = groups.get(batch.options)
+      if (group === undefined) {
+        groups.set(batch.options, [batch])
+      } else {
+        group.push(batch)
+      }
+    }
+    return Promise.all(Array.from(groups.values(), (group) => this.#send(group)))
   }
 
   /**
@@ -1934,8 +2046,11 @@ class Accumulator {
 
   /**
    * Sends batches that share their options, each with one more settler that counts it as unsettled
-   * until it settles. A failure of the call itself - one that settled no batch - rejects every
-   * settler that is still waiting.
+   * until it settles. A failure of the call itself - one that settled no batch, whether the send
+   * path threw or rejected - rejects every settler that is still waiting, so a hand-off never
+   * throws into the join or timer that made it. A send path that throws took none of the batches,
+   * so they retire here, once; one that rejects took them and retires them itself, when nothing of
+   * it holds them any more.
    * @param {PendingBatch[]} batches
    * @returns {Promise<void>} never rejects
    */
@@ -1951,7 +2066,14 @@ class Accumulator {
       )
     }
     const [{ acks, timeout, compression }] = batches
-    return this.#sendPartitioned({ acks, timeout, compression, batches }).then(
+    let sent
+    try {
+      sent = this.#sendPartitioned({ acks, timeout, compression, batches })
+    } catch (error) {
+      batches.forEach((batch) => batch.retire())
+      sent = Promise.reject(error)
+    }
+    return sent.then(
       () => {},
       (error) => {
         for (const batch of batches) {

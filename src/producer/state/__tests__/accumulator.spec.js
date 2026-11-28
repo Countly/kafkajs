@@ -1812,32 +1812,36 @@ describe('Producer > the accumulator', () => {
       ['a linger of 0 hands the batch on from a queued microtask', { linger: 0, batchSize: 16384 }],
       ['a send that fills its batch hands it on from its own call', { linger: 5, batchSize: 1 }],
     ])(
-      '%s: the failure is an unhandled rejection, never an uncaught exception or a rejected append',
+      '%s: the failure rejects the append, never an uncaught exception or an unhandled rejection',
       (_, options) => {
-        expect(whereASendPathFailureGoes(options)).toEqual([
-          'unhandledRejection: send path failure',
-        ])
+        expect(whereASendPathFailureGoes(options)).toEqual(['append rejected: send path failure'])
       }
     )
 
     test.each([
-      ['batches that share their options', [{}, {}]],
-      ['batches of different options', [{ timeout: 1 }, { timeout: 2 }]],
-    ])('flush() rejects with that failure, for %s', async (_, optionSets) => {
-      jest.useFakeTimers({ now: 0 })
-      const failure = new Error('send path failure')
-      const { accumulator } = createAccumulator({
-        sendPartitioned: () => {
+      ['batches that share their options', [{}, {}], 1],
+      ['batches of different options', [{ timeout: 1 }, { timeout: 2 }], 2],
+    ])(
+      'flush() settles and every send it carried rejects with that failure, for %s',
+      async (_, optionSets, handOffs) => {
+        jest.useFakeTimers({ now: 0 })
+        const failure = new Error('send path failure')
+        const sendPartitioned = jest.fn(() => {
           throw failure
-        },
-      })
-      optionSets.forEach((options, partition) =>
-        append(accumulator, records(partition, 'a'), options)
-      )
-      await jest.advanceTimersByTimeAsync(0)
+        })
+        const { accumulator } = createAccumulator({ sendPartitioned })
+        const outcomes = optionSets.map((options, partition) =>
+          append(accumulator, records(partition, 'a'), options).catch((error) => error)
+        )
+        await jest.advanceTimersByTimeAsync(0)
 
-      await expect(settledWithin(accumulator.flush())).rejects.toBe(failure)
-    })
+        await expect(settledWithin(accumulator.flush())).resolves.toBeUndefined()
+        expect(sendPartitioned).toHaveBeenCalledTimes(handOffs)
+        const errors = await settledWithin(Promise.all(outcomes))
+        expect(errors).toHaveLength(optionSets.length)
+        errors.forEach((error) => expect(error).toBe(failure))
+      }
+    )
   })
 
   describe('a producer', () => {

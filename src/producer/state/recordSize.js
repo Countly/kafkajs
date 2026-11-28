@@ -45,118 +45,79 @@ const varintSize = (length) =>
   length < 64 ? 1 : length < 8192 ? 2 : length < 1048576 ? 3 : length < 134217728 ? 4 : 5
 
 /**
- * @param {string|Buffer|null|undefined} field
- * @returns {number} its bytes on the wire with their length varint: UTF-8 bytes for a string, 1
- *   for null or absent
+ * @param {string|Buffer|null|undefined} field one the encoder accepts
+ * @param {{ buffer(view: Buffer): void }} tally told about the field when it is a Buffer
+ * @returns {number} its bytes, UTF-8 for a string; -1 for null or absent
  */
-const fieldSize = (field) => {
+const bytesOf = (field, tally) => {
   if (field == null) {
-    return 1
+    return -1
   }
-  const length = typeof field === 'string' ? Buffer.byteLength(field) : field.length
-  return varintSize(length) + length
+  if (typeof field === 'string') {
+    return Buffer.byteLength(field)
+  }
+  tally.buffer(field)
+  return field.length
 }
 
 /**
- * A record's wire size plus `perRecord`, and `perHeader` for each header. Its headers are read as
- * the record encoder writes them: each own key, and an array value as one header per element.
- * @param {object} record
- * @param {number} perRecord
- * @param {number} perHeader
- * @returns {number}
+ * @param {number} bytes a field's bytes; -1 for null or absent
+ * @returns {number} its bytes on the wire with their length varint; 1 for null or absent
  */
-const sizeOf = ({ key, value, headers }, perRecord, perHeader) => {
-  let size = RECORD_OVERHEAD + perRecord + fieldSize(key) + fieldSize(value)
+const sized = (bytes) => (bytes < 0 ? 1 : varintSize(bytes) + bytes)
+
+/**
+ * Reads a record's key, value and headers once, as the record encoder writes them: each own key
+ * of its headers, and an array value as one header per element, a hole none.
+ * @param {object} record one the encoder accepts
+ * @param {{ headers: number, payload: number, buffer(view: Buffer): void }} tally told about each
+ *   Buffer among the fields, in that order, then given the record's header count and the bytes of
+ *   its key and value
+ * @returns {number} its wire size
+ */
+const walk = ({ key, value, headers }, tally) => {
+  const keyBytes = bytesOf(key, tally)
+  const valueBytes = bytesOf(value, tally)
+  let size = RECORD_OVERHEAD + sized(keyBytes) + sized(valueBytes)
   let count = 0
   if (headers != null) {
     for (const name of Object.keys(headers)) {
       const header = headers[name]
-      const nameSize = fieldSize(name)
+      const nameSize = sized(Buffer.byteLength(name))
       if (!Array.isArray(header)) {
         count += 1
-        size += perHeader + nameSize + fieldSize(header)
+        size += nameSize + sized(bytesOf(header, tally))
         continue
       }
       for (let i = 0; i < header.length; i++) {
         if (i in header) {
           count += 1
-          size += perHeader + nameSize + fieldSize(header[i])
+          size += nameSize + sized(bytesOf(header[i], tally))
         }
       }
     }
   }
+  tally.headers = count
+  tally.payload = (keyBytes < 0 ? 0 : keyBytes) + (valueBytes < 0 ? 0 : valueBytes)
   return size + varintSize(count)
 }
+
+/** The tally of `wire` and `held`, which keep only the header count; read right after `walk`. */
+const COUNT = { headers: 0, payload: 0, buffer() {} }
 
 /**
  * The Java client's upper bound of a record's size in a batch (`recordSizeUpperBound`).
  * @param {object} record
  * @returns {number} bytes, at least 24
  */
-const wire = (record) => sizeOf(record, 0, 0)
+const wire = (record) => walk(record, COUNT)
 
 /**
  * What the producer holds for a record: its wire size, 64, and 16 per header.
  * @param {object} record
  * @returns {number} bytes, at least 88
  */
-const held = (record) => sizeOf(record, HELD_RECORD, HELD_HEADER)
-
-/**
- * Adds the Buffers among a record's key, value and header values to `views`, as the encoder
- * writes them: an array header value is one header per element, a hole none.
- * @param {object} record
- * @param {Buffer[]} views
- * @returns {void}
- */
-const collectBuffers = ({ key, value, headers }, views) => {
-  if (Buffer.isBuffer(key)) {
-    views.push(key)
-  }
-  if (Buffer.isBuffer(value)) {
-    views.push(value)
-  }
-  if (headers != null) {
-    for (const name of Object.keys(headers)) {
-      const header = headers[name]
-      if (!Array.isArray(header)) {
-        if (Buffer.isBuffer(header)) {
-          views.push(header)
-        }
-        continue
-      }
-      for (let i = 0; i < header.length; i++) {
-        if (i in header && Buffer.isBuffer(header[i])) {
-          views.push(header[i])
-        }
-      }
-    }
-  }
-}
-
-/**
- * A record's share of its send's charge, released when the batch carrying it retires: its held
- * size without the bytes of its Buffers, which the send's shell pays for (see `chargeOf`).
- * @param {object} record
- * @returns {number}
- */
-const share = (record) => {
-  let size = held(record)
-  if (Buffer.isBuffer(record.key)) {
-    size -= record.key.length
-  }
-  if (Buffer.isBuffer(record.value)) {
-    size -= record.value.length
-  }
-  if (record.headers != null) {
-    const views = []
-    collectBuffers({ headers: record.headers }, views)
-    for (const view of views) {
-      size -= view.length
-    }
-  }
-  return size
-}
+const held = (record) => walk(record, COUNT) + HELD_RECORD + HELD_HEADER * COUNT.headers
 
 /**
  * Adds the bytes from `start` to `end` of a backing store to those this send's earlier views of it
@@ -212,6 +173,70 @@ const storeCharge = (stores, view) => {
 }
 
 /**
+ * A send's charge (see `chargeOf`), added up a record at a time: `add` reads each record once
+ * (`walk`) and leaves that record's wire size, share and key and value bytes on the charge.
+ */
+class SendCharge {
+  /** the charge of the records added so far, with the send's own 1536 */
+  total = SEND_CHARGE
+  /** the wire size of the record last added */
+  wire = 0
+  /** that record's share (see `share`) */
+  share = 0
+  /** the bytes of that record's key and value, which `batchSize` counts */
+  payload = 0
+  /** that record's header count */
+  headers = 0
+  #stores = 0
+  #buffered = 0
+  /** @type {Map<ArrayBufferLike, number[]>|null} by backing store, the bytes the send's views cover */
+  #covered = null
+
+  /** @returns {number} the part no batch releases: 1536, the stores and the bytes of its Buffers */
+  get shell() {
+    return SEND_CHARGE + this.#stores + this.#buffered
+  }
+
+  /**
+   * Adds one record, with its Buffers' backing stores.
+   * @param {object} record one the encoder accepts
+   * @returns {number} its held size (see `held`)
+   */
+  add(record) {
+    const buffered = this.#buffered
+    const stores = this.#stores
+    this.wire = walk(record, this)
+    const size = this.wire + HELD_RECORD + HELD_HEADER * this.headers
+    this.share = size - (this.#buffered - buffered)
+    this.total += size + this.#stores - stores
+    return size
+  }
+
+  /**
+   * Counts one Buffer of the record being added, and the bytes of its store it keeps alive.
+   * @param {Buffer} view
+   * @returns {void}
+   */
+  buffer(view) {
+    this.#covered ??= new Map()
+    this.#stores += storeCharge(this.#covered, view)
+    this.#buffered += view.length
+  }
+}
+
+/**
+ * A record's share of its send's charge, released when the batch carrying it retires: its held
+ * size without the bytes of its Buffers, which the send's shell pays for (see `chargeOf`).
+ * @param {object} record
+ * @returns {number}
+ */
+const share = (record) => {
+  const charge = new SendCharge()
+  charge.add(record)
+  return charge.share
+}
+
+/**
  * What admitting a send charges: the held size of every record, 1536, and every backing store its
  * Buffers keep alive beyond the bytes they show. Views are grouped by store, the store being the
  * `ArrayBuffer` itself: a store several of the send's views share is counted once, and a store
@@ -230,38 +255,22 @@ const storeCharge = (stores, view) => {
  * @throws {KafkaJSRecordTooLargeError} for a record whose held size alone is above `limit`
  */
 const chargeOf = (topicMessages, limit) => {
-  let total = SEND_CHARGE
-  let stores = 0
-  let buffered = 0
-  /** @type {Map<ArrayBufferLike, number[]>|null} by backing store, the bytes the send's views cover */
-  let covered = null
-  /** @type {Buffer[]} the Buffers of the record being charged */
-  const views = []
+  const charge = new SendCharge()
   for (const { topic, messages } of topicMessages) {
     for (const message of messages) {
-      const size = held(message)
+      const size = charge.add(message)
       if (size > limit) {
         throw new KafkaJSRecordTooLargeError(
           `A record of ${size} bytes for topic "${topic}" can never fit in bufferMemory (${limit} bytes)`,
           { reason: 'bufferMemory', scope: 'record', size, limit, topic }
         )
       }
-      total += size
-      collectBuffers(message, views)
-      for (const view of views) {
-        covered ??= new Map()
-        const charge = storeCharge(covered, view)
-        stores += charge
-        total += charge
-        buffered += view.length
-      }
-      views.length = 0
-      if (total > limit) {
-        return { total, shell: 0 }
+      if (charge.total > limit) {
+        return { total: charge.total, shell: 0 }
       }
     }
   }
-  return { total, shell: SEND_CHARGE + stores + buffered }
+  return { total: charge.total, shell: charge.shell }
 }
 
 /**
@@ -513,6 +522,7 @@ module.exports = {
   held,
   share,
   chargeOf,
+  SendCharge,
   SendCopy,
   varintSize,
   framing,

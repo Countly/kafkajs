@@ -22,6 +22,11 @@ class Reservation {
     this.#give = give
   }
 
+  /** @returns {number} the bytes not given back yet */
+  get remaining() {
+    return this.#remaining
+  }
+
   /**
    * Gives back `bytes` of the reservation, or what is left of it when that is less.
    * @param {number} bytes
