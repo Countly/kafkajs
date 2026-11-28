@@ -121,15 +121,20 @@ class MembersByLoad {
  * A claim on a partition the group has no metadata for is ignored: a topic recreated with fewer
  * partitions leaves members claiming partitions that no longer exist.
  *
+ * Java keeps a partition marked as doubly claimed even after a newer generation claims it, so a
+ * stale tie still stops the newest claimant keeping it. With `tiesYieldToNewerClaims` a newer
+ * claim clears the mark, and only a tie at the highest generation remains, in any member order.
+ *
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractStickyAssignor.java
  * @param {object} input
  * @param {StickyMember[]} input.members already in member-info order
  * @param {{[topic: string]: number[]}} input.partitionsPerTopic every partition the group has
  *   metadata for
+ * @param {boolean} [input.tiesYieldToNewerClaims=false]
  * @returns {{ subscriptionsEqual: boolean, owned: Map<string, Set<string>>,
  *   doublyClaimed: Set<string>, maxGeneration: number }}
  */
-const resolveOwnership = ({ members, partitionsPerTopic }) => {
+const resolveOwnership = ({ members, partitionsPerTopic, tiesYieldToNewerClaims = false }) => {
   const existing = new Map(
     Object.keys(partitionsPerTopic).map((topic) => [topic, new Set(partitionsPerTopic[topic])])
   )
@@ -191,6 +196,7 @@ const resolveOwnership = ({ members, partitionsPerTopic }) => {
           mine.add(key)
           owned.get(other).delete(key)
           owner.set(key, memberId)
+          if (tiesYieldToNewerClaims) doublyClaimed.delete(key)
         }
       }
     }
@@ -959,11 +965,13 @@ class PartitionMovements {
  * @param {{[topic: string]: number[]}} input.partitionsPerTopic every partition of every topic
  *   any member subscribes to
  * @param {StickyMember[]} input.members
+ * @param {boolean} [input.tiesYieldToNewerClaims=false] a newer claim ends an older tie, so the
+ *   newest claimant can keep the partition; the eager assigner keeps Java's behaviour
  * @returns {Map<string, {[topic: string]: number[]}>} one entry per member, including members
  *   that end up with nothing
  * @see https://github.com/apache/kafka/blob/4.3/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractStickyAssignor.java
  */
-const assignSticky = ({ partitionsPerTopic, members }) => {
+const assignSticky = ({ partitionsPerTopic, members, tiesYieldToNewerClaims = false }) => {
   const ordered = [...members].sort(compareMembers)
   const subscribed = new Set(ordered.flatMap(({ topics }) => topics))
   const partitions = dictionary()
@@ -980,6 +988,7 @@ const assignSticky = ({ partitionsPerTopic, members }) => {
   const { subscriptionsEqual, owned, doublyClaimed, maxGeneration } = resolveOwnership({
     members: ordered,
     partitionsPerTopic: partitions,
+    tiesYieldToNewerClaims,
   })
 
   const assigned = subscriptionsEqual

@@ -14,11 +14,7 @@ const {
 } = require('../instrumentationEvents')
 const { EAGER, COOPERATIVE } = require('./interface')
 const AssignerOffers = require('./assignerOffers')
-const {
-  CooperativeOwnership,
-  claimGeneration,
-  COOPERATIVE_STICKY,
-} = require('../assigners/cooperativeOwnership')
+const OwnedPartitionClaims = require('./ownedPartitionClaims')
 const LeaderUnionWatch = require('../leaderUnionWatch')
 const CoordinatorLookup = require('../coordinatorLookup')
 const {
@@ -665,7 +661,7 @@ module.exports = class ClassicGroupProtocol {
    *   or when every member shares the leader's subscription
    * @throws {KafkaJSNonRetriableError} when the coordinator picked an assignor this member does
    *   not have, and, under the cooperative protocol, when the plan breaks the
-   *   {@link CooperativeOwnership} rule; no SyncGroup is written then
+   *   {@link OwnedPartitionClaims} check; no SyncGroup is written then
    */
   async sync({ topics, topicsSubscribed, beforeSync, round }) {
     let assignment = []
@@ -711,9 +707,9 @@ module.exports = class ClassicGroupProtocol {
       )
       // An incremental rebalance must never hand a partition to a member while another member
       // still owns it: the new owner would fetch it while the old one is still delivering. Every
-      // plan is checked, the built-in assigner's included, against claims read before `assign`
-      // runs, and the plan checked is the copy that is sent.
-      const ownership = this.mode === COOPERATIVE ? this.ownershipOf(members, groupProtocol) : null
+      // plan is checked against claims read before `assign` runs, and the plan checked is the
+      // copy that is sent.
+      const ownership = this.mode === COOPERATIVE ? this.ownershipOf(members) : null
       const returned = await round.wait(() =>
         assigner.assign({
           members,
@@ -768,29 +764,19 @@ module.exports = class ClassicGroupProtocol {
    * sees the members, so an assigner that edits its input cannot change what its plan is checked
    * against.
    *
-   * A member whose subscription carries no owned partitions - a v0 subscription, or one this
-   * member cannot decode - claims nothing. The generation of a claim follows
-   * {@link claimGeneration}: the subscription's `GenerationId`, or, under the `cooperative-sticky`
-   * protocol only, the generation in its four-byte userData. Another protocol's userData is its
-   * assigner's own and is never read, so a claim without a `GenerationId` there is of unknown
-   * generation, older than any known one.
+   * Only the owned partitions are read. A member whose subscription carries none - a v0
+   * subscription, or one this member cannot decode - claims nothing.
    *
    * @private
    * @param {Array<{memberId: string, memberMetadata: Buffer}>} members the JoinGroup members
-   * @param {string} groupProtocol the protocol the coordinator selected
-   * @returns {CooperativeOwnership}
+   * @returns {OwnedPartitionClaims}
    */
-  ownershipOf(members, groupProtocol) {
-    const userDataGeneration = groupProtocol === COOPERATIVE_STICKY
-    return new CooperativeOwnership(
-      members.map(({ memberId, memberMetadata }) => {
-        const subscription = this.decodeSubscription(memberMetadata)
-        return {
-          memberId,
-          ownedPartitions: subscription && subscription.ownedPartitions,
-          generationId: subscription && claimGeneration(subscription, { userDataGeneration }),
-        }
-      })
+  ownershipOf(members) {
+    return new OwnedPartitionClaims(
+      members.map(({ memberId, memberMetadata }) => ({
+        memberId,
+        ownedPartitions: this.decodeSubscription(memberMetadata)?.ownedPartitions,
+      }))
     )
   }
 
