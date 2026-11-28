@@ -3,7 +3,11 @@ const OffsetOperations = require('../offsetOperations')
 const ResetObligations = require('../resetObligations')
 const createConsumer = require('../../index')
 const Runner = require('../../runner')
-const { createFetchGroup, fetchResponse } = require('../../__tests__/fixtures/fetchHarness')
+const {
+  createFetchGroup,
+  fetchResponse,
+  trackFixtures,
+} = require('../../__tests__/fixtures/fetchHarness')
 const InstrumentationEventEmitter = require('../../../instrumentation/emitter')
 const { newLogger } = require('testHelpers')
 const {
@@ -16,6 +20,8 @@ const {
   createScheduledOffsetManager,
   groupOver,
 } = require('./fixtures/scheduledOffsetManager')
+
+trackFixtures()
 
 const commitOf = (partition, offset) => ({
   topics: [{ topic: TOPIC, partitions: [{ partition, offset }] }],
