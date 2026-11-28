@@ -196,11 +196,27 @@ describe('Benchmark report clientCompare adapter', () => {
       })
     })
 
-    test("a send of every produce-throughput row, with records at their real encoded size at the longest key and all their headers, fits one request under the producer's request budget (framing, topic name, a batch header and partition framing for every partition it can reach, the built-in codec's worst case) at the default 1 MiB limit", () => {
+    test('the fork built-in gzip and lz4 bounds of a split of bytes over batches never exceed the bound of the whole plus the empty batch and one block of rounding per extra batch', () => {
+      const edges = [0, 1, 4095, 4096, 16383, 16384, 65535, 65536, 65537, 131072, 819360, 1048576]
+      const rounding = (codec) => (codec === Types.LZ4 ? 8 : 0)
+
+      for (const codec of [Types.GZIP, Types.LZ4]) {
+        for (const a of edges) {
+          for (const b of edges) {
+            const split = encodedBound(codec, a) + encodedBound(codec, b)
+            const whole = encodedBound(codec, a + b) + encodedBound(codec, 0) + rounding(codec)
+            expect([codec, a, b, split <= whole]).toEqual([codec, a, b, true])
+          }
+        }
+      }
+    })
+
+    test("a send of every produce-throughput row, with records at their real encoded size at the longest key and all their headers, fits one request under the producer's request budget for every split of its records over the partitions it can reach (framing, topic name, a batch header and partition framing per partition, the fork's built-in codec bound for any split) at the default 1 MiB limit", () => {
       const produceRows = compareRows.filter(
         (row) => valueOf(row.command, '--workload') === 'produce-throughput'
       )
       const codecs = { lz4: Types.LZ4, gzip: Types.GZIP }
+      const rounding = (codec) => (codec === Types.LZ4 ? 8 : 0)
       const budget = new RequestBudget({
         maxRequestSize: 1048576,
         clientId: 'bench-compare-produce-throughput',
@@ -228,11 +244,20 @@ describe('Benchmark report clientCompare adapter', () => {
           value: Buffer.alloc(size, 0x78),
           headers,
         })
-        const spread = Math.min(partitions, perSend)
-        const wire = Math.ceil(perSend / spread) * record.buffer.length
+        // However the records split, they make at most `batches` non-empty batches, and the wire
+        // bytes of all of them together are the same. Per batch the plan adds a fixed amount and
+        // the codec's bound; the bounds of the parts sum to at most the bound of the whole plus
+        // the empty batch's bound and the codec's rounding for each part after the first.
+        const batches = Math.min(partitions, perSend)
+        const wire = perSend * record.buffer.length
         const compression = codecs[valueOf(row.command, '--compression')]
-        const batch = budget.batchBytes({ compression, messages: [], wire })
-        planned[row.name] = budget.topicBytes(topic) + spread * batch <= budget.maxRequestBytes
+        const empty = budget.batchBytes({ compression, messages: [], wire: 0 })
+        const worst =
+          batches * empty +
+          encodedBound(compression, wire) -
+          encodedBound(compression, 0) +
+          (batches - 1) * rounding(compression)
+        planned[row.name] = budget.topicBytes(topic) + worst <= budget.maxRequestBytes
       }
 
       expect(planned).toEqual(Object.fromEntries(produceRows.map(({ name }) => [name, true])))
@@ -699,6 +724,28 @@ describe('Benchmark report clientCompare adapter', () => {
         "gzip: zlib@1.3.1, the package's built-in codec",
         'workload shape (the same on both arms): batch=8, keys="index", headers=20, partitioner="custom", valueType="string"',
       ])
+    })
+
+    test('an arm with the custom partitioner says its partitioner is the custom one and the rest are the package defaults, and an arm without says only the package defaults', () => {
+      const produce = {
+        ...entry,
+        command: ['scripts/benchmarks/clientCompare.js', '--workload', 'produce-throughput'],
+      }
+      const noteOf = (extra) =>
+        adapter.rows(produce, 'fork', { outputs: [output(1, 30000, extra)] }, 1).detail.notes[1]
+
+      const custom = noteOf({
+        settings: { defaults: { linger: 5, partitioner: 'custom (record n)' } },
+        shape: { partitioner: 'custom' },
+      })
+      const plain = noteOf({ settings: { defaults: { linger: 5, partitioner: 'Default' } } })
+
+      expect(custom).toBe(
+        'producer settings in force (this package\'s defaults, except the partitioner, which is the custom one): linger=5, partitioner="custom (record n)"'
+      )
+      expect(plain).toBe(
+        'producer settings in force (this package\'s defaults): linger=5, partitioner="Default"'
+      )
     })
 
     test('a consume arm notes its corpus layout', () => {

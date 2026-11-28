@@ -535,30 +535,23 @@ const countFullGcs = ({
 
 /**
  * Registers a `gc` PerformanceObserver that records every garbage collection (any kind) inside a
- * window the caller marks with the readings of its own monotonic clock: `open(at)` and `stop(at)`
- * take the `process.hrtime.bigint()` readings that start and end the rate's window, and a
- * collection counts, with its whole pause, when it started between them (entries carry their start
- * on the performance clock, which this converts with one offset read at registration), even if
- * Node delivers its entry later, during `result()`'s drain. Entries delivered before `open` all
- * started before it, since the marks are taken in the same synchronous step as the call, and are
- * ignored. Only the count and the total pause are kept, so a window with many collections holds no
- * entries. Register before the window and open it at its first reading.
- * @param {{ Observer?: Function, now?: () => number, hrtime?: () => bigint,
- *   drain?: () => Promise<void> }} [seams] the observer class, the performance clock, the
- *   monotonic clock the marks come from and the wait for late entries, replaced in tests
- * @returns {{ open: (at: bigint) => void, stop: (at: bigint) => void,
+ * window the caller marks on the performance clock (`performance.now()`, ms), the clock the
+ * entries' `startTime` is on: `open(at)` and `stop(at)` take the readings that start and end the
+ * window, and a collection counts, with its whole pause, when it started between them (both ends
+ * included), even if Node delivers its entry later, during `result()`'s drain. Entries delivered
+ * before `open` all started before it, since the mark is taken in the same synchronous step as the
+ * call, and are ignored. Only the count and the total pause are kept, so a window with many
+ * collections holds no entries. Register before the window and open it at its first reading.
+ * @param {{ Observer?: Function, drain?: () => Promise<void> }} [seams] the observer class and
+ *   the wait for late entries, replaced in tests
+ * @returns {{ open: (at: number) => void, stop: (at: number) => void,
  *   result: () => Promise<{ count: number, pauseMs: number }>, close: () => void }} `open` and
  *   `stop` mark the window's two ends (the first call of each counts); `result` drains late
  *   entries, closes the observer and returns the window's collections and their total duration in
  *   ms (all collections after `open` when `stop` was not called); `close` disconnects the observer
  *   once, without a result
  */
-const trackGcs = ({
-  Observer = PerformanceObserver,
-  now: performanceNow = () => performance.now(),
-  hrtime = now,
-  drain = drainGcEntries,
-} = {}) => {
+const trackGcs = ({ Observer = PerformanceObserver, drain = drainGcEntries } = {}) => {
   let from = null
   let to = null
   let count = 0
@@ -573,8 +566,6 @@ const trackGcs = ({
   }
   const observer = new Observer((list) => keep(list.getEntries()))
   observer.observe({ entryTypes: ['gc'] })
-  const offsetMs = performanceNow() - Number(hrtime()) / 1e6
-  const toPerformance = (at) => Number(at) / 1e6 + offsetMs
   let closed = false
   const close = () => {
     if (closed) return
@@ -583,10 +574,10 @@ const trackGcs = ({
   }
   return {
     open: (at) => {
-      from ??= toPerformance(at)
+      from ??= at
     },
     stop: (at) => {
-      to ??= toPerformance(at)
+      to ??= at
     },
     result: async () => {
       await drain()
@@ -599,22 +590,25 @@ const trackGcs = ({
 }
 
 /**
- * @typedef {{ now: () => bigint, setTimeout: Function, clearTimeout: Function,
- *   setInterval: Function, clearInterval: Function,
+ * @typedef {{ now: () => bigint, performanceNow: () => number, setTimeout: Function,
+ *   clearTimeout: Function, setInterval: Function, clearInterval: Function,
  *   sleep: (ms: number) => Promise<void>,
  *   cpuUsage: (previous?: object) => { user: number, system: number },
  *   threadCpuUsage: ((previous?: object) => { user: number, system: number })|null,
  *   memoryUsage: () => { rss: number, arrayBuffers: number },
  *   countFullGcs: () => { stop: () => void, count: () => Promise<number>, close: () => void },
- *   trackGcs: () => { open: (at: bigint) => void, stop: (at: bigint) => void,
+ *   trackGcs: () => { open: (at: number) => void, stop: (at: number) => void,
  *     result: () => Promise<{ count: number, pauseMs: number }>, close: () => void },
  *   eventLoopDelay: () => { enable: Function, disable: Function, percentile: (p: number) => number,
- *     max: number } }} Timing clocks, timers, process CPU, the JavaScript thread's CPU (null on a
- *   Node without `process.threadCpuUsage`), the resident and `ArrayBuffer` memory in bytes, a
- *   full-GC counter, an any-GC recorder and an event-loop delay histogram (ns)
+ *     max: number } }} Timing clocks (the monotonic one in ns for the ordinary windows, the
+ *   performance clock in ms for a probed window, whose marks the any-GC recorder shares), timers,
+ *   process CPU, the JavaScript thread's CPU (null on a Node without `process.threadCpuUsage`),
+ *   the resident and `ArrayBuffer` memory in bytes, a full-GC counter, an any-GC recorder and an
+ *   event-loop delay histogram (ns)
  */
 const DEFAULT_TIMING = {
   now,
+  performanceNow: () => performance.now(),
   setTimeout,
   clearTimeout,
   setInterval,
@@ -747,26 +741,32 @@ const withProducer = async (kafka, work, config = {}) => {
 }
 
 /**
- * Repeats `send` until `ms` milliseconds of the monotonic clock have passed since `started`.
- * @param {() => bigint} clock
- * @param {bigint} started
+ * Repeats `send` until `ms` milliseconds of `clock` have passed since `started`.
+ * @param {() => bigint|number} clock the monotonic clock (ns, the default) or the performance
+ *   clock (ms, with `unitsPerMs` 1)
+ * @param {bigint|number} started a reading of `clock`
  * @param {number} ms
  * @param {() => Promise<number>} send one send; resolves to the messages it carried
+ * @param {number} [unitsPerMs] the readings of `clock` in one millisecond
  * @returns {Promise<number>} the messages sent
  */
-const sendFor = async (clock, started, ms, send) => {
+const sendFor = async (clock, started, ms, send, unitsPerMs = 1e6) => {
   let sent = 0
-  while (Number(clock() - started) / 1e6 < ms) sent += await send()
+  while (Number(clock() - started) / unitsPerMs < ms) sent += await send()
   return sent
 }
 
 /**
  * What a `--probe on` run measures beside its rate: the time of each `send()` call, the peak
- * memory, and the garbage collections, all over one window. `start()` and `stop()` are called
- * next to the reads of the rate clock, so the window is the one the rate is measured over; the
- * collection observer takes its start last in `start()` and its end first in `stop()`. Nothing is
- * kept per call (the times go into a fixed-size histogram) and `close()` releases the sampling
- * timer and the collection observer when a run fails before `finish()`.
+ * memory, and the garbage collections. The window is the one the rate is measured over: the run
+ * reads the performance clock once for each end of it and gives `open` and `stop` those readings,
+ * which are also the ones its elapsed time is computed from, and the collection observer counts by
+ * the entries' start on that same clock. `start()` runs just before the window opens and
+ * registers the observer, takes a memory reading and starts the sampling timer, so its reading and
+ * `finish()`'s are the two endpoint samples, taken immediately outside the window; the timer's
+ * readings fall inside it. Nothing is kept per call (the times go into a fixed-size histogram)
+ * and `close()` releases the sampling timer and the collection observer when a run fails before
+ * `finish()`.
  */
 class ProduceProbe {
   #timing
@@ -797,7 +797,7 @@ class ProduceProbe {
     this.#gcs = this.#timing.trackGcs()
   }
 
-  /** @param {bigint} at the reading of the rate's clock that starts the rate's window */
+  /** @param {number} at the performance-clock reading (ms) that starts the rate's window */
   open(at) {
     this.#gcs.open(at)
     this.#measuring = true
@@ -809,9 +809,9 @@ class ProduceProbe {
   }
 
   /**
-   * Closes the window at the reading of the rate's clock that ends the rate's window: no call is
-   * timed after this, and a collection that starts later is not counted.
-   * @param {bigint} at
+   * Closes the window at the performance-clock reading (ms) that ends the rate's window: no call
+   * is timed after this, and a collection that starts later is not counted.
+   * @param {number} at
    */
   stop(at) {
     this.#measuring = false
@@ -914,14 +914,17 @@ const produceLatency = (
  * With `durationMs` the measured window is that long; otherwise it is `messages` messages. With
  * `keys` message `n` of the window carries the key `keyOf(n)`, and with `headers` every message,
  * the first send included, carries that many string headers; the numbering starts at 0 when the
- * window starts, so both packages send the same records in the window whatever their warm-up
- * managed. A run with none of the shape flags and a `durationMs` window sends the first values of
- * the corpus on every send, as it always did; any other run walks the corpus. With `probe` the
- * window also reports the time of each `send()` call, the peak memory and the garbage collections
- * of the window the rate is measured over, whose two clock readings the probe is given
- * (`ProduceProbe`); without it the run adds no clock read, timer or observer of its own. With
- * `routing` the custom partitioner's count starts again at 0 when the window starts, like the
- * record numbering.
+ * window starts, so both packages walk the same deterministic sequence of records from the start
+ * of the window; how many records and rounds each sends before the window ends is its own, so the
+ * sequences are equal only as far as the shorter one goes. A run with none of the shape flags and
+ * a `durationMs` window sends the first values of the corpus on every send, as it always did; any
+ * other run walks the corpus. With `probe` the window also reports the time of each `send()` call
+ * (on the monotonic clock), the peak memory and the garbage collections of the window the rate is
+ * measured over; a probed run takes that window's two marks, its elapsed time and its duration
+ * loop from the performance clock, the one the collection entries are on, so the rate and the
+ * collections share one pair of readings (`ProduceProbe`); without `probe` the window is on the
+ * monotonic clock and the run adds no clock read, timer or observer of its own. With `routing` the
+ * custom partitioner's count starts again at 0 when the window starts, like the record numbering.
  * @param {object} kafka
  * @param {object} target topic and codec of every send
  * @param {{ messages: number, durationMs: number|null, values: (Buffer|string)[],
@@ -937,7 +940,7 @@ const produceThroughput = (kafka, target, options, timing) =>
     kafka,
     async (producer) => {
       const { messages, durationMs, values, batch = BATCH, unawaited } = options
-      const { now, cpuUsage } = timing
+      const { now, performanceNow, cpuUsage } = timing
       const shape = {
         keyed: options.keys !== undefined,
         headers: options.headers === undefined ? undefined : headerPool(options.headers),
@@ -982,19 +985,20 @@ const produceThroughput = (kafka, target, options, timing) =>
         issued = 0
         options.routing?.reset()
         probe?.start()
-        const started = now()
+        const [clock, unitsPerMs] = probe ? [performanceNow, 1] : [now, 1e6]
+        const started = clock()
         probe?.open(started)
         const cpu = cpuUsage()
         let measuredMessages = messages
         if (durationMs !== null) {
-          measuredMessages = await sendFor(now, started, durationMs, send)
+          measuredMessages = await sendFor(clock, started, durationMs, send, unitsPerMs)
         } else {
           let left = messages
           while (left > 0) left -= await send(left)
         }
-        const ended = now()
+        const ended = clock()
         probe?.stop(ended)
-        const elapsedMs = Number(ended - started) / 1e6
+        const elapsedMs = Number(ended - started) / unitsPerMs
         const { user, system } = cpuUsage(cpu)
         return {
           messagesPerSecond: (measuredMessages / elapsedMs) * 1000,
@@ -1183,6 +1187,9 @@ const waitForLeaders = async (admin, topic, partitions, { now, sleep }) => {
   }
 }
 
+/** What a `--partitioner custom` run reports as its partitioner, whatever the other settings. */
+const CUSTOM_PARTITIONER = 'custom (record n of the window to partition n % partitions)'
+
 /**
  * The `--partitioner custom` routing, a plain function both packages call the same way, with one
  * count shared by every partitioner it creates, which the run resets when its window starts so the
@@ -1259,13 +1266,19 @@ const runWorkload = async (client, workload, options, timing = {}) => {
       ([, value]) => value !== undefined
     )
   )
+  const partitionerInForce = routing ? CUSTOM_PARTITIONER : 'DefaultPartitioner'
+  const defaultsInForce = (consume ? PACKAGE_DEFAULTS : PRODUCER_DEFAULTS)[client.name] ?? null
   const inForce = same
     ? {
         same: consume
           ? SAME_SETTINGS
-          : { ...SAME_PRODUCER_SETTINGS, partitioner: 'DefaultPartitioner' },
+          : { ...SAME_PRODUCER_SETTINGS, partitioner: partitionerInForce },
       }
-    : { defaults: (consume ? PACKAGE_DEFAULTS : PRODUCER_DEFAULTS)[client.name] ?? null }
+    : {
+        defaults: routing
+          ? { ...defaultsInForce, partitioner: CUSTOM_PARTITIONER }
+          : defaultsInForce,
+      }
   const clock = { ...DEFAULT_TIMING, ...timing }
   const admin = kafka.admin()
   try {

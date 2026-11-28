@@ -44,6 +44,9 @@ const installStub = (prefix, name, version, origin) => {
   )
 }
 
+/** Where the fake's performance clock starts, so it never equals its monotonic clock. */
+const PERFORMANCE_ORIGIN_MS = 5000
+
 /** What kafkajs 2.2.4's admin throws while a broker does not know a topic yet. */
 const unknownTopic = () =>
   Object.assign(new Error('This server does not host this topic-partition'), {
@@ -108,6 +111,7 @@ const fakeKafka = ({
   })
   const timing = {
     now: () => elapsedNs,
+    performanceNow: () => Number(elapsedNs) / 1e6 + PERFORMANCE_ORIGIN_MS,
     setTimeout: (callback, delay) => {
       const timer = Symbol('timeout')
       state.timers.set(timer, { callback, delay })
@@ -946,7 +950,7 @@ describe('Benchmarks > clientCompare', () => {
       expect(logOf(plain).some((record) => 'key' in record)).toBe(false)
     })
 
-    test('produce-throughput numbers the records of its window from 0 whatever its warm-up sent, so two packages send the same keys and values in it', async () => {
+    test('produce-throughput numbers the records of its window from 0 whatever its warm-up sent, so runs with different warm-ups walk the same keys and values from the start of the window', async () => {
       const many = await runWith(
         'produce-throughput',
         { messages: null, durationMs: 30000, batch: 3, keys: 'index' },
@@ -1036,7 +1040,35 @@ describe('Benchmarks > clientCompare', () => {
       expect([second(metadata), first(metadata)]).toEqual([0, 1])
     })
 
-    test('the custom routing of the measured window starts at partition 0 whatever the warm-up sent, so two packages route the same records alike', async () => {
+    test('--partitioner custom reports the custom partitioner as the partitioner in force and the package defaults for every other setting, with or without --settings same', async () => {
+      const fork = fakeKafka()
+      fork.client.name = '@countly/kafkajs'
+      const defaults = await runWith(
+        'produce-throughput',
+        { messages: 5, partitioner: 'custom' },
+        fork
+      )
+      const same = await runWith('produce-throughput', {
+        messages: 5,
+        partitioner: 'custom',
+        settings: 'same',
+      })
+      const plain = await runWith('produce-throughput', { messages: 5 }, fakeKafka())
+
+      expect(defaults.metrics.settings).toEqual({
+        defaults: {
+          ...PRODUCER_DEFAULTS['@countly/kafkajs'],
+          partitioner: 'custom (record n of the window to partition n % partitions)',
+        },
+      })
+      expect(same.metrics.settings.same).toEqual({
+        ...SAME_PRODUCER_SETTINGS,
+        partitioner: 'custom (record n of the window to partition n % partitions)',
+      })
+      expect(plain.metrics.settings).toEqual({ defaults: null })
+    })
+
+    test('the custom routing of the measured window starts at partition 0 whatever the warm-up sent, so runs with different warm-ups route the first records of the window alike', async () => {
       const routed = async (sendMs) => {
         const kafka = fakeKafka({ sendMs })
         const routes = []
@@ -1101,13 +1133,44 @@ describe('Benchmarks > clientCompare', () => {
       expect(state.allGcs).toMatchObject({ started: 1, stopped: 1, resulted: 1, closed: 1 })
     })
 
+    test("the sampling timer's readings reach the peak memory: a transient peak it reads inside the window counts though the start and finish readings are lower", async () => {
+      const kafka = fakeKafka()
+      let reading = { rss: 100, arrayBuffers: 10 }
+      kafka.timing.memoryUsage = () => reading
+      const create = kafka.client.Kafka.prototype.producer
+      let sends = 0
+      kafka.client.Kafka.prototype.producer = function producer(config) {
+        const created = create.call(this, config)
+        const send = created.send
+        created.send = (request) => {
+          // The first send is the untimed one; this is the second send of the window.
+          if (++sends === 3) {
+            reading = { rss: 9000, arrayBuffers: 900 }
+            kafka.state.intervals[0].callback()
+            reading = { rss: 100, arrayBuffers: 10 }
+          }
+          return send(request)
+        }
+        return created
+      }
+
+      const { metrics } = await runWith(
+        'produce-throughput',
+        { messages: 1200, durationMs: null, probe: 'on' },
+        kafka
+      )
+
+      expect(sends).toBe(4)
+      expect(metrics).toMatchObject({ peakRssBytes: 9000, peakArrayBuffers: 900 })
+    })
+
     test('the collections of a probed run are counted over the exact clock readings that bound the rate window', async () => {
       const kafka = fakeKafka()
-      const reads = []
-      const read = kafka.timing.now
-      kafka.timing.now = () => {
-        const reading = read() + BigInt(reads.length) * 1000000n
-        reads.push(reading)
+      const marks = []
+      const read = kafka.timing.performanceNow
+      kafka.timing.performanceNow = () => {
+        const reading = read() + marks.length * 1000
+        marks.push(reading)
         return reading
       }
 
@@ -1117,12 +1180,28 @@ describe('Benchmarks > clientCompare', () => {
         kafka
       )
 
-      // Every read advances this clock by 1 ms: the leader wait, the window start, two reads for
-      // each of the three timed calls, and the window end.
-      expect(reads).toHaveLength(9)
-      expect(state.allGcs.from).toBe(reads[1])
-      expect(state.allGcs.to).toBe(reads[8])
-      expect(Number(state.allGcs.to - state.allGcs.from) / 1e6).toBe(metrics.elapsedMs)
+      // The performance clock is read twice, for the window's start and its end, and nowhere
+      // else; the rate is those two readings' difference and the recorder gets the same two.
+      expect(marks).toHaveLength(2)
+      expect(marks[0]).toBeGreaterThanOrEqual(PERFORMANCE_ORIGIN_MS)
+      expect(state.allGcs.from).toBe(marks[0])
+      expect(state.allGcs.to).toBe(marks[1])
+      expect(marks[1] - marks[0]).toBe(metrics.elapsedMs)
+      expect(metrics.messagesPerSecond).toBe((1200 / metrics.elapsedMs) * 1000)
+    })
+
+    test('a probed run with a time window ends it, and computes its elapsed time, on the performance clock the collection recorder is given', async () => {
+      const kafka = fakeKafka({ sendMs: 100 })
+
+      const { metrics, state } = await runWith(
+        'produce-throughput',
+        { messages: null, durationMs: 30000, batch: 3, probe: 'on' },
+        kafka
+      )
+
+      expect(metrics).toMatchObject({ measuredMessages: 900, elapsedMs: 30000 })
+      expect(state.allGcs.to - state.allGcs.from).toBe(30000)
+      expect(state.allGcs.from).toBeGreaterThanOrEqual(PERFORMANCE_ORIGIN_MS)
     })
 
     test('the send-call time starts once the request is built and stops when send returns its promise, before the reply', async () => {
@@ -1180,12 +1259,18 @@ describe('Benchmarks > clientCompare', () => {
           reads++
           return read()
         }
+        let performanceReads = 0
+        const performanceRead = kafka.timing.performanceNow
+        kafka.timing.performanceNow = () => {
+          performanceReads++
+          return performanceRead()
+        }
         const { metrics, state } = await runWith(
           'produce-throughput',
           { messages, durationMs: null, ...(probe && { probe }) },
           kafka
         )
-        return { reads, metrics, state }
+        return { reads, performanceReads, metrics, state }
       }
 
       const one = await clockReads(500)
@@ -1194,7 +1279,9 @@ describe('Benchmarks > clientCompare', () => {
       const probedThree = await clockReads(1500, 'on')
 
       expect(three.reads).toBe(one.reads)
+      expect([one.performanceReads, three.performanceReads]).toEqual([0, 0])
       expect(probedThree.reads - probedOne.reads).toBe(2 * 2)
+      expect([probedOne.performanceReads, probedThree.performanceReads]).toEqual([2, 2])
       expect(Object.keys(three.metrics).sort()).toEqual([
         'cpuMicrosPerMessage',
         'elapsedMs',
@@ -1499,9 +1586,6 @@ describe('Benchmarks > clientCompare', () => {
         return { Observer, observers }
       }
 
-      /** The monotonic reading, in ns, that stands for `ms` on the performance clock in these tests. */
-      const hr = (ms) => BigInt(ms + 5000) * 1000000n
-
       test('counts every collection kind that started between the two marks, with its pause, whether its entry came before, during or after the window, and not one that started in the gap before the start mark or after the end mark', async () => {
         const { Observer, observers } = controlled()
         const { MAJOR, MINOR, INCREMENTAL, WEAKCB } = {
@@ -1510,41 +1594,37 @@ describe('Benchmarks > clientCompare', () => {
           INCREMENTAL: constants.NODE_PERFORMANCE_GC_INCREMENTAL,
           WEAKCB: constants.NODE_PERFORMANCE_GC_WEAKCB,
         }
-        let clock = 10
+        // The marks are 20 and 30 on the performance clock; entries just before, at and just
+        // after each of them tell where the window's edges are.
         const drain = async () => {
-          observer.deliver(entry(13, 5, MAJOR), entry(26, 3, WEAKCB))
-          observer.buffered.push(entry(28, 1, MINOR), entry(31, 7, MAJOR))
+          observer.deliver(entry(13, 5, MAJOR), entry(30, 3, WEAKCB))
+          observer.buffered.push(entry(30.001, 1, MINOR), entry(31, 7, MAJOR))
         }
-        const tracker = trackGcs({ Observer, now: () => clock, hrtime: () => hr(clock), drain })
+        const tracker = trackGcs({ Observer, drain })
         const [observer] = observers
         observer.deliver(entry(12, 9, MAJOR))
-        clock = 20
-        tracker.open(hr(20))
-        observer.deliver(entry(19, 4, MAJOR), entry(21, 2, MAJOR), entry(24, 6, INCREMENTAL))
-        clock = 30
-        tracker.stop(hr(30))
+        tracker.open(20)
+        observer.deliver(entry(19.999, 4, MAJOR), entry(20, 2, MAJOR), entry(24, 6, INCREMENTAL))
+        tracker.stop(30)
 
         const result = await tracker.result()
 
         expect(new Set([MAJOR, MINOR, INCREMENTAL, WEAKCB]).size).toBe(4)
         expect(observer.options).toEqual({ entryTypes: ['gc'] })
-        expect(result).toEqual({ count: 4, pauseMs: 12 })
+        expect(result).toEqual({ count: 3, pauseMs: 11 })
         expect(observer.disconnects).toBe(1)
       })
 
       test('ends its window at the stop mark, not at result: a collection that started after it is not counted, whenever its entry arrives', async () => {
         const { Observer, observers } = controlled()
-        let clock = 10
         const drain = async () => {
           observer.deliver(entry(18, 4), entry(26, 8))
         }
-        const tracker = trackGcs({ Observer, now: () => clock, hrtime: () => hr(clock), drain })
+        const tracker = trackGcs({ Observer, drain })
         const [observer] = observers
-        tracker.open(hr(10))
+        tracker.open(10)
         observer.deliver(entry(11, 1))
-        clock = 20
-        tracker.stop(hr(20))
-        clock = 50
+        tracker.stop(20)
         observer.deliver(entry(19, 2), entry(30, 100))
 
         const result = await tracker.result()
@@ -1554,8 +1634,8 @@ describe('Benchmarks > clientCompare', () => {
 
       test('counts nothing before its window is opened, and disconnects its observer once whether it ended or was only closed', async () => {
         const { Observer, observers } = controlled()
-        const ended = trackGcs({ Observer, now: () => 0, hrtime: () => 0n, drain: async () => {} })
-        const closed = trackGcs({ Observer, now: () => 0, hrtime: () => 0n, drain: async () => {} })
+        const ended = trackGcs({ Observer, drain: async () => {} })
+        const closed = trackGcs({ Observer, drain: async () => {} })
         observers[0].deliver(entry(1, 5))
 
         expect(await ended.result()).toEqual({ count: 0, pauseMs: 0 })
