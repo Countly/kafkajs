@@ -23,7 +23,8 @@ describe('Producer > deliveryTimeout', () => {
 
   beforeEach(() => {
     // Delivery deadlines read Date.now(); CPU load must not spend the test's retry budget.
-    jest.useFakeTimers({ now: 0, doNotFake: ['nextTick', 'setImmediate'] })
+    // The default linger of 0 hands a batch on through queueMicrotask, which must stay real.
+    jest.useFakeTimers({ now: 0, doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] })
   })
 
   afterEach(async () => {
